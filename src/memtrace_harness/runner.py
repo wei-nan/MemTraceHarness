@@ -110,6 +110,14 @@ def render_memtrace_draft(
         "",
     ]
     lines.extend([f"- `{ref}`" for ref in task.context_refs] or ["- none"])
+    if task.context_items:
+        lines.extend(["", "## Hydrated Context", ""])
+        for item in task.context_items:
+            body = (item.body or "").replace("\n", " ")
+            excerpt = body[:300] + ("..." if len(body) > 300 else "")
+            lines.append(f"- `{item.ref}` {item.title or ''}".strip())
+            if excerpt:
+                lines.append(f"  Excerpt: {excerpt}")
     lines.extend(["", "## Claims", ""])
     for response in responses:
         lines.append(f"### {response.adapter_id} ({response.role})")

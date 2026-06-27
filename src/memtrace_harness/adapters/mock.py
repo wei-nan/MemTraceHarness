@@ -11,10 +11,16 @@ class MockModelAdapter(ModelAdapter):
 
     def run(self, task: TaskEnvelope) -> ModelResponse:
         evidence_refs = task.context_refs[:3]
+        hydrated_count = len([item for item in task.context_items if item.body])
+        context_note = (
+            f" Hydrated context items available: {hydrated_count}."
+            if task.context_items
+            else " Context refs were not hydrated."
+        )
         claim = ModelClaim(
             claim=(
                 f"{self.role} view: handle '{task.goal}' as a draft-first MemTrace "
-                "workflow with explicit evidence and human review."
+                f"workflow with explicit evidence and human review.{context_note}"
             ),
             evidence_refs=evidence_refs,
             confidence=0.72,
