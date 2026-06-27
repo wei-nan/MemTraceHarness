@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import sqlite3
 from pathlib import Path
+from typing import Iterator
 from uuid import uuid4
 
 from memtrace_harness.schemas import HarnessSummary, TaskEnvelope, utc_now_iso
@@ -16,7 +18,7 @@ class TraceStore:
 
     def create_run(self, task: TaskEnvelope) -> str:
         trace_id = f"run_{uuid4().hex[:12]}"
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (id, workspace_id, goal, task_json, created_at)
@@ -33,7 +35,7 @@ class TraceStore:
         return trace_id
 
     def save_summary(self, summary: HarnessSummary) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """
                 UPDATE runs
@@ -73,11 +75,17 @@ class TraceStore:
                     ),
                 )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
