@@ -56,6 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Risk level for the task envelope",
     )
     run_parser.add_argument(
+        "--hydrate-context",
+        action="store_true",
+        help="Read MemTrace node bodies for mem_* context refs and include them in the task envelope.",
+    )
+    run_parser.add_argument(
+        "--context-max-tokens",
+        type=int,
+        default=3000,
+        help="Max response tokens per hydrated context node.",
+    )
+    run_parser.add_argument(
         "--writeback",
         action="store_true",
         help="Create a draft inquiry node in MemTrace. Defaults to dry-run only.",
@@ -72,17 +83,31 @@ def run_command(args: argparse.Namespace) -> int:
     config = HarnessConfig.from_env()
     trace_store = TraceStore(config.trace_db_path)
     memtrace_client = None
-    if args.writeback:
+    if args.writeback or args.hydrate_context:
         if not config.memtrace_mcp_url:
-            print("MEMTRACE_MCP_URL is required when --writeback is set", file=sys.stderr)
+            print(
+                "MEMTRACE_MCP_URL is required when --writeback or --hydrate-context is set",
+                file=sys.stderr,
+            )
             return 2
         memtrace_client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+
+    context_refs = list(args.context_ref)
+    context_items = []
+    if args.hydrate_context:
+        assert memtrace_client is not None
+        context_items = memtrace_client.hydrate_context_refs(
+            workspace_id=args.workspace,
+            refs=context_refs,
+            max_response_tokens=args.context_max_tokens,
+        )
 
     task = TaskEnvelope(
         task_id=f"task_{uuid4().hex[:12]}",
         workspace_id=args.workspace,
         goal=args.goal,
-        context_refs=list(args.context_ref),
+        context_refs=context_refs,
+        context_items=context_items,
         constraints=DEFAULT_CONSTRAINTS,
         done_when=DEFAULT_DONE_WHEN,
         risk_level=args.risk_level,

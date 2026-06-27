@@ -14,11 +14,24 @@ def utc_now_iso() -> str:
 
 
 @dataclass(frozen=True)
+class ContextItem:
+    ref: str
+    title: str | None = None
+    body: str | None = None
+    content_type: str | None = None
+    source: str = "memtrace"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class TaskEnvelope:
     task_id: str
     workspace_id: str
     goal: str
     context_refs: list[str] = field(default_factory=list)
+    context_items: list[ContextItem] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
     done_when: list[str] = field(default_factory=list)
     risk_level: RiskLevel = "medium"

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from memtrace_harness.schemas import ContextItem
+
 
 class MemTraceClientError(RuntimeError):
     pass
@@ -28,6 +30,61 @@ class MemTraceClient:
         if "error" in result:
             raise MemTraceClientError(str(result["error"]))
         return result.get("result") or {}
+
+    def get_node(
+        self,
+        *,
+        workspace_id: str,
+        node_id: str,
+        detail_level: str = "full",
+        max_response_tokens: int = 3000,
+    ) -> dict[str, Any]:
+        result = self.call_tool(
+            "get_node",
+            {
+                "workspace_id": workspace_id,
+                "node_id": node_id,
+                "detail_level": detail_level,
+                "max_response_tokens": max_response_tokens,
+            },
+        )
+        text = _extract_text(result)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise MemTraceClientError(f"get_node returned non-JSON content: {text}") from exc
+        if not isinstance(data, dict):
+            raise MemTraceClientError(f"get_node returned unexpected payload: {data}")
+        return data
+
+    def hydrate_context_refs(
+        self,
+        *,
+        workspace_id: str,
+        refs: list[str],
+        max_response_tokens: int = 3000,
+    ) -> list[ContextItem]:
+        items: list[ContextItem] = []
+        for ref in refs:
+            if not ref.startswith("mem_"):
+                items.append(ContextItem(ref=ref, source="external"))
+                continue
+            node = self.get_node(
+                workspace_id=workspace_id,
+                node_id=ref,
+                detail_level="full",
+                max_response_tokens=max_response_tokens,
+            )
+            items.append(
+                ContextItem(
+                    ref=ref,
+                    title=_optional_str(node.get("title")),
+                    body=_optional_str(node.get("body")),
+                    content_type=_optional_str(node.get("content_type")),
+                    source="memtrace",
+                )
+            )
+        return items
 
     def create_node(
         self,
@@ -96,3 +153,9 @@ def _extract_text(result: dict[str, Any]) -> str:
         if parts:
             return "\n".join(parts)
     return json.dumps(result)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)

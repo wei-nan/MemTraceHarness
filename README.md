@@ -35,6 +35,21 @@ After install, the shorter module form also works:
 .\.venv\Scripts\python -m memtrace_harness run --workspace ws_spec_plan --goal "Review harness boundary"
 ```
 
+To fetch MemTrace node bodies into the task envelope, set connection variables and add
+`--hydrate-context`:
+
+```powershell
+$env:MEMTRACE_MCP_URL = "http://localhost:8000/api/v1/mcp/mcp"
+$env:MEMTRACE_API_TOKEN = "<token>"
+
+.\.venv\Scripts\python -m memtrace_harness run `
+  --workspace ws_spec_plan `
+  --goal "Review harness boundary" `
+  --context-ref mem_f178ea8d `
+  --hydrate-context `
+  --json
+```
+
 This writes a local trace to:
 
 ```text
