@@ -197,6 +197,117 @@ HARNESS_TRACE_ROOT=data/traces
 verified Antigravity 1.1.10 advertises stream JSON and model selection. Its usage schema remains
 version-sensitive and is normalized as partial until pinned by real fixtures.
 
+## Remote operations (Telegram gateway + unattended scanner)
+
+One Harness installation can drive multiple target projects — **you do not clone this repo per
+project.** You clone `MemTraceHarness` once, keep your actual project repos wherever they already
+live, and point the Harness at each of them by path. See "Running multiple projects" below.
+
+### 1. Register a project
+
+Each project you want the gateway/scanner to know about needs one `harness-scope.md` file, placed
+anywhere convenient (typically at the root of that project's own repo). It's plain markdown; the
+Harness reads a handful of `key: value` lines out of it:
+
+```markdown
+# Harness scope — MemTrace
+
+- workspace_id: ws_spec_plan_memtrace
+- working_directory: D:\Workspace\MemTrace
+- default_risk_level: medium
+- off_limits: production database, deploy to prod
+
+This project is the MemTrace core service. Backlog items live in the workspace above.
+```
+
+Required: `workspace_id` (the MemTrace workspace this project's specs/decisions live in). Optional:
+`working_directory` (defaults to the folder the `harness-scope.md` file is in), `name` (defaults to
+the working-directory folder name), `default_risk_level` (`low`/`medium`/`high`, defaults to
+`medium`), `off_limits` (comma-separated phrases the Harness refuses to act on even inside the working
+tree).
+
+### 2. Build the project index
+
+`HARNESS_PROJECT_INDEX` points at one small text file listing the path to every project's
+`harness-scope.md`, one per line:
+
+```text
+# projects.index.txt
+D:\Workspace\MemTraceHarness\harness-scope.md
+D:\Workspace\MemTrace\harness-scope.md
+```
+
+This index file is the only thing that has to live near the Harness install; everything else about a
+project's scope stays in that project's own `harness-scope.md`.
+
+### 3. Configure the Telegram channel
+
+```text
+HARNESS_TELEGRAM_BOT_TOKEN=<token from @BotFather>
+HARNESS_TELEGRAM_ALLOWED_CHAT_IDS=123456789,987654321
+HARNESS_CHAT_PROVIDER=claude
+HARNESS_CHAT_MODEL=haiku
+HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL=true
+```
+
+`HARNESS_TELEGRAM_ALLOWED_CHAT_IDS` is a hard allowlist enforced before any message is even read —
+a chat ID that isn't listed gets silently dropped, token or no token. Without
+`HARNESS_TELEGRAM_BOT_TOKEN` the gateway simply doesn't start; nothing else in the Harness requires
+it.
+
+### 4. Run it
+
+```powershell
+# One poll cycle: process pending Telegram messages, then run one backlog scan pass
+.\.venv\Scripts\python -m memtrace_harness gateway
+
+# Backlog scan only (no Telegram polling) — useful for a scheduled task
+.\.venv\Scripts\python -m memtrace_harness scan
+```
+
+Both commands do one pass and exit; there is no built-in daemon loop yet. Schedule `gateway`
+repeatedly (e.g. every minute via Windows Task Scheduler) for near-real-time chat, and/or schedule
+`scan` hourly if you want chat polling and backlog scanning on different cadences.
+
+### What happens on each
+
+- **`gateway`**: fetches new Telegram messages. A message resolves to a registered project by name
+  or workspace ID; replies to `/approve <id>`, `/reject <id> <reason>`, `/clarify <id> <answer>`
+  resolve pending approvals and, on approval, resume that conversation's Agent Loop automatically.
+  Anything asking for something out of scope (GitHub PRs, email, an off-limits phrase from that
+  project's `harness-scope.md`) is rejected with an explanation instead of acted on.
+- **`scan`**: for each registered project, checks MemTrace for planned-but-not-implemented backlog
+  items. If `HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL=true` (the default), it sends a Telegram
+  approval request before doing any work; otherwise it runs the Agent Loop immediately. A project
+  already mid-loop is skipped for that pass (workspace lock), so the same backlog won't be triggered
+  twice while it's still running.
+- Every chat message and every Agent Loop outcome is appended to that project's own running
+  transcript (its "primary session"), so a later question like "what happened with that last task"
+  is answerable from the same conversation, and a periodic consolidation pass can promote the
+  substantive parts back into MemTrace as draft evidence — never silently, never as canonical
+  knowledge. `git push` always requires a separate Telegram approval, even after a full Agent Loop
+  pass.
+
+Full design rationale and the open decisions behind this feature are in
+[`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).
+
+### Running multiple projects
+
+No, you do not need multiple clones of `MemTraceHarness`. One installation (one `.venv`, one
+`data/harness.sqlite3`, one running `gateway`/`scan` process) serves every project listed in
+`HARNESS_PROJECT_INDEX`. Each project only needs:
+
+1. its own `harness-scope.md` (in its own repo, pointing at its own `working_directory` and
+   MemTrace `workspace_id`);
+2. a line in the shared `projects.index.txt` pointing at that file.
+
+The Harness itself stays a single install; what varies per project is only which folder it's told to
+operate in for that turn (`--working-directory` for `run`/`loop`, or the resolved `working_directory`
+from `harness-scope.md` for `gateway`/`scan`). The one thing that is still single-writer per project
+is the Agent Loop itself — the Developer role only ever writes into one working tree at a time per
+project, so two overlapping scans of the *same* project are serialized by the workspace lock
+described above; two *different* projects run independently in the same pass.
+
 ## Traces
 
 ```text
@@ -226,7 +337,9 @@ See [`docs/operating-contract.md`](docs/operating-contract.md) for behavioral st
 ```powershell
 $env:PYTHONPATH = "src"
 .\.venv\Scripts\python -m compileall -q src tests
-.\.venv\Scripts\python -m unittest discover -s tests -v
+.\.venv\Scripts\python -m unittest discover -s tests -p "test_*.py" -v
+# or run with pytest:
+.\.venv\Scripts\pytest -v
 ```
 
-Tests inject deterministic subprocess results; they do not launch Claude, Codex, or Antigravity.
+Tests inject deterministic subprocess results and mock external HTTP/API connections; they do not launch Claude, Codex, or Antigravity, nor do they hit Telegram servers.

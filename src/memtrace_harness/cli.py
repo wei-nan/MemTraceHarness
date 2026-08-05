@@ -14,11 +14,17 @@ from memtrace_harness.adapter_factory import (
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
+from memtrace_harness.approval import ApprovalManager
+from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.memtrace_client import MemTraceClient
+from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
+from memtrace_harness.scanner import UnattendedScanner
 from memtrace_harness.schemas import TaskEnvelope
+from memtrace_harness.scope import load_project_index
+from memtrace_harness.telegram_gateway import TelegramGateway
 from memtrace_harness.trace_store import TraceStore
 
 
@@ -55,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
             return probe_command(args)
         if args.command == "loop":
             return loop_command(args)
+        if args.command == "gateway":
+            return gateway_command(args)
+        if args.command == "scan":
+            return scan_command(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -157,6 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a draft-only loop evidence node through MemTrace MCP.",
     )
     loop_parser.add_argument("--json", action="store_true")
+
+    subparsers.add_parser(
+        "gateway", help="Start the persistent Telegram gateway and unattended scanner"
+    )
+
+    subparsers.add_parser(
+        "scan", help="Run a single pass of the unattended backlog scanner"
+    )
     return parser
 
 
@@ -384,6 +402,40 @@ def _print_loop_summary(summary, config: HarnessConfig) -> None:
     if summary.writeback_node_id:
         print(f"writeback_node_id: {summary.writeback_node_id}")
     print(f"trace_db: {config.trace_db_path}")
+
+
+def gateway_command(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    if not config.telegram_bot_token:
+        raise RuntimeError("HARNESS_TELEGRAM_BOT_TOKEN is required to run the gateway")
+    trace_store = TraceStore(config.trace_db_path)
+    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+    projects = load_project_index(config.project_index_path)
+    triage = ChatTriage(projects)
+    memtrace_client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token) if config.memtrace_mcp_url else None
+    primary_session_mgr = PrimarySessionManager(trace_store, memtrace_client)
+    gateway = TelegramGateway(config, approval_mgr, triage, primary_session_mgr, projects)
+    scanner = UnattendedScanner(config, trace_store, projects, memtrace_client, gateway, approval_mgr)
+
+    print("Starting Telegram gateway and unattended scanner...")
+    processed = gateway.poll_once()
+    scan_results = scanner.run_scan_pass()
+    print(f"Processed {processed} Telegram updates; scan pass results: {scan_results}")
+    return 0
+
+
+def scan_command(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    trace_store = TraceStore(config.trace_db_path)
+    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+    projects = load_project_index(config.project_index_path)
+    memtrace_client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token) if config.memtrace_mcp_url else None
+    gateway = TelegramGateway(config, approval_mgr, ChatTriage(projects), PrimarySessionManager(trace_store, memtrace_client), projects) if config.telegram_bot_token else None
+    scanner = UnattendedScanner(config, trace_store, projects, memtrace_client, gateway, approval_mgr)
+
+    results = scanner.run_scan_pass()
+    print(json.dumps(results, indent=2))
+    return 0
 
 
 def _deduplicate(values: list[str]) -> list[str]:

@@ -739,10 +739,49 @@ class TraceStore:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS primary_sessions_hot_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    primary_session_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    turn_seq INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    speaker TEXT NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    turn_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source_work_conversation_id TEXT,
+                    consolidated INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS approval_requests (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    working_directory TEXT NOT NULL,
+                    stage_ref TEXT,
+                    reason TEXT NOT NULL,
+                    proposed_action TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    responded_at TEXT,
+                    responded_by_chat_id INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS workspace_locks (
+                    workspace_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    locked_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_turns_conversation
                     ON turns(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
                     ON checkpoints(conversation_id, generation);
+                CREATE INDEX IF NOT EXISTS idx_hot_log_session
+                    ON primary_sessions_hot_log(primary_session_id, turn_seq);
+                CREATE INDEX IF NOT EXISTS idx_approval_conv
+                    ON approval_requests(conversation_id, status);
                 """
             )
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
@@ -780,6 +819,223 @@ class TraceStore:
             )
             self._ensure_column(conn, "loop_stages", "fallback_from_model", "TEXT")
             self._ensure_column(conn, "loop_stages", "checkpoint_id", "TEXT")
+
+    def append_primary_session_turn(
+        self,
+        *,
+        primary_session_id: str,
+        project: str,
+        speaker: str,
+        turn_type: str,
+        content: str,
+        provider: str | None = None,
+        model: str | None = None,
+        source_work_conversation_id: str | None = None,
+    ) -> int:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(turn_seq), 0) FROM primary_sessions_hot_log WHERE primary_session_id = ?",
+                (primary_session_id,),
+            ).fetchone()
+            next_seq = int(row[0]) + 1 if row else 1
+            cursor = conn.execute(
+                """
+                INSERT INTO primary_sessions_hot_log (
+                    primary_session_id, project, turn_seq, created_at, speaker,
+                    provider, model, turn_type, content, source_work_conversation_id, consolidated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    primary_session_id,
+                    project,
+                    next_seq,
+                    now,
+                    speaker,
+                    provider,
+                    model,
+                    turn_type,
+                    content,
+                    source_work_conversation_id,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_primary_session_turns(
+        self, primary_session_id: str, limit: int | None = None, include_consolidated: bool = True
+    ) -> list[dict]:
+        with self._connection() as conn:
+            query = "SELECT id, primary_session_id, project, turn_seq, created_at, speaker, provider, model, turn_type, content, source_work_conversation_id, consolidated FROM primary_sessions_hot_log WHERE primary_session_id = ?"
+            params: list[object] = [primary_session_id]
+            if not include_consolidated:
+                query += " AND consolidated = 0"
+            query += " ORDER BY turn_seq ASC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+            rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "id": row[0],
+                "primary_session_id": row[1],
+                "project": row[2],
+                "turn_seq": row[3],
+                "created_at": row[4],
+                "speaker": row[5],
+                "provider": row[6],
+                "model": row[7],
+                "turn_type": row[8],
+                "content": row[9],
+                "source_work_conversation_id": row[10],
+                "consolidated": bool(row[11]),
+            }
+            for row in rows
+        ]
+
+    def get_unconsolidated_turns(self, primary_session_id: str) -> list[dict]:
+        return self.get_primary_session_turns(primary_session_id, include_consolidated=False)
+
+    def mark_turns_consolidated(self, turn_ids: list[int]) -> None:
+        if not turn_ids:
+            return
+        with self._connection() as conn:
+            placeholders = ",".join("?" * len(turn_ids))
+            conn.execute(
+                f"UPDATE primary_sessions_hot_log SET consolidated = 1 WHERE id IN ({placeholders})",
+                turn_ids,
+            )
+
+    def create_approval_request(
+        self,
+        *,
+        conversation_id: str,
+        workspace: str,
+        working_directory: str,
+        reason: str,
+        proposed_action: str,
+        stage_ref: str | None = None,
+    ) -> str:
+        request_id = f"appr_{uuid4().hex[:12]}"
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO approval_requests (
+                    id, conversation_id, workspace, working_directory, stage_ref,
+                    reason, proposed_action, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    request_id,
+                    conversation_id,
+                    workspace,
+                    working_directory,
+                    stage_ref,
+                    reason,
+                    proposed_action,
+                    now,
+                ),
+            )
+        return request_id
+
+    def get_approval_request(self, request_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, workspace, working_directory, stage_ref,
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                FROM approval_requests WHERE id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "conversation_id": row[1],
+            "workspace": row[2],
+            "working_directory": row[3],
+            "stage_ref": row[4],
+            "reason": row[5],
+            "proposed_action": row[6],
+            "status": row[7],
+            "created_at": row[8],
+            "responded_at": row[9],
+            "responded_by_chat_id": row[10],
+        }
+
+    def get_pending_approval_request(self, conversation_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, workspace, working_directory, stage_ref,
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                FROM approval_requests WHERE conversation_id = ? AND status = 'pending'
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "conversation_id": row[1],
+            "workspace": row[2],
+            "working_directory": row[3],
+            "stage_ref": row[4],
+            "reason": row[5],
+            "proposed_action": row[6],
+            "status": row[7],
+            "created_at": row[8],
+            "responded_at": row[9],
+            "responded_by_chat_id": row[10],
+        }
+
+    def resolve_approval_request(
+        self, request_id: str, status: str, responded_by_chat_id: int | None = None
+    ) -> bool:
+        if status not in {"approved", "rejected", "expired"}:
+            raise ValueError(f"Invalid approval status: {status}")
+        now = utc_now_iso()
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE approval_requests
+                SET status = ?, responded_at = ?, responded_by_chat_id = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (status, now, responded_by_chat_id, request_id),
+            )
+            return cursor.rowcount > 0
+
+    def acquire_workspace_lock(self, workspace_id: str, conversation_id: str) -> bool:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO workspace_locks (workspace_id, conversation_id, locked_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (workspace_id, conversation_id, now),
+                )
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def release_workspace_lock(self, workspace_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute("DELETE FROM workspace_locks WHERE workspace_id = ?", (workspace_id,))
+
+    def get_workspace_lock(self, workspace_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT workspace_id, conversation_id, locked_at FROM workspace_locks WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {"workspace_id": row[0], "conversation_id": row[1], "locked_at": row[2]}
 
     @staticmethod
     def _ensure_column(

@@ -39,6 +39,7 @@ class AgentLoopRunner:
         trace_store: TraceStore,
         memtrace_client: MemTraceClient | None = None,
         max_total_tokens: int | None = None,
+        approval_manager: Any | None = None,
     ) -> None:
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
@@ -46,6 +47,7 @@ class AgentLoopRunner:
         self.trace_store = trace_store
         self.memtrace_client = memtrace_client
         self.max_total_tokens = max_total_tokens
+        self.approval_manager = approval_manager
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -191,6 +193,27 @@ class AgentLoopRunner:
                 self._summary(task, trace_id, stages, "needs_human", detail),
                 writeback=writeback,
             )
+
+        if "git push" in task.goal.lower() and self.approval_manager:
+            pending = self.approval_manager.get_pending_for_conversation(self._required_conversation_id())
+            if not pending or pending.reason != "git_push" or pending.status != "approved":
+                self.approval_manager.request_approval(
+                    conversation_id=self._required_conversation_id(),
+                    workspace=task.workspace_id,
+                    working_directory=str(task.working_directory or ""),
+                    reason="git_push",
+                    proposed_action=f"Execute git push for task: {task.goal[:80]}",
+                )
+                return self._persist(
+                    self._summary(
+                        task,
+                        trace_id,
+                        stages,
+                        "needs_human",
+                        "git push is a gated remote action requiring explicit out-of-band human approval.",
+                    ),
+                    writeback=writeback,
+                )
 
         development = self._execute(
             task=developer_task(task, plan.artifact or {}),
@@ -669,6 +692,15 @@ class AgentLoopRunner:
 
     def _persist(self, summary: LoopSummary, *, writeback: bool) -> LoopSummary:
         self.trace_store.save_loop_summary(summary)
+        if summary.status in {"needs_human", "budget_exhausted"} and self.approval_manager:
+            reason = "budget_exhausted" if summary.status == "budget_exhausted" else "ambiguous_requirement"
+            self.approval_manager.request_approval(
+                conversation_id=summary.conversation_id or self._required_conversation_id(),
+                workspace=summary.task.workspace_id,
+                working_directory=str(summary.task.working_directory or ""),
+                reason=reason,
+                proposed_action=summary.recommendation,
+            )
         if writeback:
             if not self.memtrace_client:
                 raise RuntimeError("writeback requested, but no MemTrace client is configured")

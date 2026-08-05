@@ -137,6 +137,6 @@ must not approve or adopt the proposal, change Agent Loop policy, or lower the q
 1. semantic compaction with source lineage and drift tests;
 2. exact stage-machine resume from a checkpoint;
 3. provider-specific reset/retry-after parsing;
-4. backlog polling and paused-run wakeup;
+4. backlog polling and paused-run wakeup (POLICY_ONLY via Telegram Gateway & UnattendedScanner);
 5. scheduled/wave Improvement aggregation with deduplication;
 6. isolated-worktree multi-writer execution.
