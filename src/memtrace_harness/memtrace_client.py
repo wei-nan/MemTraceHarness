@@ -105,7 +105,6 @@ class MemTraceClient:
                 "content_format": "markdown",
                 "source_type": "ai",
                 "visibility": "private",
-                "trust_score": 0.64,
                 "tags": tags or ["harness", "draft", "human-gate"],
             },
         )
@@ -140,7 +139,9 @@ class MemTraceClient:
         try:
             return json.loads(response_body)
         except json.JSONDecodeError as exc:
-            raise MemTraceClientError(f"MemTrace returned non-JSON response: {response_body}") from exc
+            raise MemTraceClientError(
+                f"MemTrace returned non-JSON response: {response_body}"
+            ) from exc
 
 
 def _extract_text(result: dict[str, Any]) -> str:

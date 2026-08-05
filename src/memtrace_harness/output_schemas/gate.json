@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "verdict": {"type": "string", "enum": ["PASS", "REJECT", "NEEDS_HUMAN"]},
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "none",
+        "reasoning_gap",
+        "missing_input",
+        "acceptance_gap",
+        "security",
+        "scope_drift",
+        "implementation_gap",
+        "test_gap",
+        "other"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {"type": "string", "maxLength": 100},
+          "description": {"type": "string", "maxLength": 2000},
+          "evidence_ref": {"type": "string", "maxLength": 1000},
+          "requirement_ref": {"type": "string", "maxLength": 1000},
+          "required_action": {"type": "string", "maxLength": 2000}
+        },
+        "required": ["description"],
+        "additionalProperties": false
+      }
+    },
+    "unverified_items": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"type": "string", "maxLength": 1000}
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  },
+  "required": ["verdict", "reason_code", "findings", "unverified_items", "confidence"],
+  "additionalProperties": false
+}

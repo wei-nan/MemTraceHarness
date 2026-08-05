@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "status": {"type": "string", "enum": ["completed", "needs_human", "failed"]},
+    "summary": {"type": "string", "maxLength": 6000},
+    "changed_files": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"type": "string", "maxLength": 1000}
+    },
+    "tests": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"type": "string", "maxLength": 2000}
+    },
+    "gaps": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"type": "string", "maxLength": 2000}
+    }
+  },
+  "required": ["status", "summary", "changed_files", "tests", "gaps"],
+  "additionalProperties": false
+}
