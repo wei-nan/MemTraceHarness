@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from memtrace_harness.adapters.base import ModelAdapter
 from memtrace_harness.memtrace_client import MemTraceClient
-from memtrace_harness.schemas import ConflictRecord, HarnessSummary, ModelResponse, RunMode, TaskEnvelope
+from memtrace_harness.schemas import (
+    ConflictRecord,
+    HarnessSummary,
+    ModelResponse,
+    TaskEnvelope,
+)
 from memtrace_harness.trace_store import TraceStore
 
 
@@ -20,12 +27,18 @@ class HarnessRunner:
 
     def run(self, task: TaskEnvelope, *, writeback: bool = False) -> HarnessSummary:
         trace_id = self.trace_store.create_run(task)
-        responses = [adapter.run(task) for adapter in self.adapters]
+        responses = [adapter.run(task, trace_id) for adapter in self.adapters]
         conflicts = detect_conflicts(responses)
         recommendation = build_recommendation(responses, conflicts)
-        run_mode: RunMode = "draft_write" if writeback else "dry_run"
-        writeback_node_id = None
-
+        summary = HarnessSummary(
+            task=task,
+            responses=responses,
+            conflicts=conflicts,
+            recommendation=recommendation,
+            run_mode="cli_run",
+            trace_id=trace_id,
+        )
+        self.trace_store.save_summary(summary)
         if writeback:
             if not self.memtrace_client:
                 raise RuntimeError("writeback requested, but no MemTrace client is configured")
@@ -35,17 +48,12 @@ class HarnessRunner:
                 body=render_memtrace_draft(task, responses, conflicts, recommendation, trace_id),
                 content_type="inquiry",
             )
-
-        summary = HarnessSummary(
-            task=task,
-            responses=responses,
-            conflicts=conflicts,
-            recommendation=recommendation,
-            run_mode=run_mode,
-            trace_id=trace_id,
-            writeback_node_id=writeback_node_id,
-        )
-        self.trace_store.save_summary(summary)
+            summary = replace(
+                summary,
+                run_mode="cli_run_draft_write",
+                writeback_node_id=writeback_node_id,
+            )
+            self.trace_store.update_run_summary(summary)
         return summary
 
 
@@ -73,7 +81,9 @@ def detect_conflicts(responses: list[ModelResponse]) -> list[ConflictRecord]:
         return [
             ConflictRecord(
                 kind="human_gate",
-                description="Adapters agree this result should remain draft-only until human review.",
+                description=(
+                    "Adapters agree this result should remain draft-only until human review."
+                ),
                 needs_human_decision=True,
             )
         ]
@@ -81,11 +91,21 @@ def detect_conflicts(responses: list[ModelResponse]) -> list[ConflictRecord]:
 
 
 def build_recommendation(responses: list[ModelResponse], conflicts: list[ConflictRecord]) -> str:
+    failed = [
+        response.adapter_id
+        for response in responses
+        if response.execution.status != "succeeded"
+    ]
+    if failed:
+        return (
+            "Keep the run open: CLI execution failed or was unavailable for "
+            f"{', '.join(failed)}."
+        )
     if conflicts:
         return "Write a draft summary and keep the issue open for human review."
     if all(not response.requires_human_decision for response in responses):
         return "Adapters converged without known blockers; still prefer draft writeback for v1."
-    return "Keep as draft-first output."
+    return "Keep as draft-first output for human review."
 
 
 def render_memtrace_draft(
@@ -121,6 +141,19 @@ def render_memtrace_draft(
     lines.extend(["", "## Claims", ""])
     for response in responses:
         lines.append(f"### {response.adapter_id} ({response.role})")
+        usage = response.execution.usage
+        lines.extend(
+            [
+                f"- Status: `{response.execution.status}`; exit: `{response.execution.exit_code}`",
+                (
+                    "- Usage: "
+                    f"input={usage.input_tokens}, cached={usage.cached_input_tokens}, "
+                    f"output={usage.output_tokens}, reasoning={usage.reasoning_output_tokens}; "
+                    f"completeness={usage.completeness}"
+                ),
+                f"- Raw trace: `{response.execution.raw_trace_ref or 'unavailable'}`",
+            ]
+        )
         for claim in response.claims:
             refs = ", ".join(f"`{ref}`" for ref in claim.evidence_refs) or "none"
             lines.extend(
@@ -148,7 +181,10 @@ def render_memtrace_draft(
             "",
             "## Status",
             "",
-            "Draft-only harness output. Do not treat as formal MemTrace knowledge until human review.",
+            (
+                "Draft-only harness output. Do not treat as formal MemTrace knowledge "
+                "until human review."
+            ),
         ]
     )
     return "\n".join(lines)

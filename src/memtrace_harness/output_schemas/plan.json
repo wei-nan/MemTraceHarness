@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "status": {"type": "string", "enum": ["ready", "needs_human"]},
+    "plan": {"type": "string", "maxLength": 12000},
+    "acceptance_criteria": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"type": "string", "maxLength": 1000}
+    },
+    "open_questions": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "maxLength": 1000}
+    },
+    "scope_exclusions": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {"type": "string", "maxLength": 1000}
+    }
+  },
+  "required": [
+    "status",
+    "plan",
+    "acceptance_criteria",
+    "open_questions",
+    "scope_exclusions"
+  ],
+  "additionalProperties": false
+}
