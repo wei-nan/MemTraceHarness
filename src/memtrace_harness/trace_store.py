@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 from pathlib import Path
 from typing import Iterator
 from uuid import uuid4
 
-from memtrace_harness.schemas import HarnessSummary, TaskEnvelope, utc_now_iso
+from memtrace_harness.schemas import (
+    HarnessSummary,
+    LoopStageResult,
+    LoopSummary,
+    ModelResponse,
+    ResumeEnvelope,
+    TaskEnvelope,
+    utc_now_iso,
+)
 
 
 class TraceStore:
@@ -16,22 +25,84 @@ class TraceStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def create_run(self, task: TaskEnvelope) -> str:
+    def create_conversation(
+        self, task: TaskEnvelope, conversation_id: str | None = None
+    ) -> str:
+        conversation_id = conversation_id or f"conv_{uuid4().hex[:12]}"
+        now = utc_now_iso()
+        with self._connection() as conn:
+            existing = conn.execute(
+                "SELECT workspace_id, task_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if existing and existing[0] != task.workspace_id:
+                raise ValueError(
+                    f"Conversation {conversation_id!r} belongs to another workspace"
+                )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO conversations (
+                    id, task_id, workspace_id, state, cumulative_tokens,
+                    compaction_generation, created_at, updated_at, last_activity_at
+                ) VALUES (?, ?, ?, 'active', 0, 0, ?, ?, ?)
+                """,
+                (conversation_id, task.task_id, task.workspace_id, now, now, now),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ?, last_activity_at = ? WHERE id = ?",
+                (now, now, conversation_id),
+            )
+            for ref in task.context_refs:
+                workspace_id, node_id = _split_memory_ref(task.workspace_id, ref)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO memory_refs (
+                        conversation_id, checkpoint_id, workspace_id, node_id,
+                        ref, purpose, created_at
+                    ) VALUES (?, NULL, ?, ?, ?, 'task-context', ?)
+                    """,
+                    (conversation_id, workspace_id, node_id, ref, now),
+                )
+        return conversation_id
+
+    def conversation_task_id(self, conversation_id: str) -> str:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT task_id FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+        if not row:
+            raise ValueError(f"Unknown conversation: {conversation_id}")
+        return str(row[0])
+
+    def create_run(
+        self, task: TaskEnvelope, *, conversation_id: str | None = None
+    ) -> str:
         trace_id = f"run_{uuid4().hex[:12]}"
         with self._connection() as conn:
             conn.execute(
                 """
-                INSERT INTO runs (id, workspace_id, goal, task_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO runs (
+                    id, workspace_id, goal, task_json, conversation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     trace_id,
                     task.workspace_id,
                     task.goal,
                     json.dumps(task.to_dict(), ensure_ascii=False),
+                    conversation_id,
                     utc_now_iso(),
                 ),
             )
+            if conversation_id:
+                conn.execute(
+                    """
+                    UPDATE conversations
+                    SET active_run_id = ?, updated_at = ?, last_activity_at = ?
+                    WHERE id = ?
+                    """,
+                    (trace_id, utc_now_iso(), utc_now_iso(), conversation_id),
+                )
         return trace_id
 
     def save_summary(self, summary: HarnessSummary) -> None:
@@ -50,18 +121,7 @@ class TraceStore:
                 ),
             )
             for response in summary.responses:
-                conn.execute(
-                    """
-                    INSERT INTO model_responses (run_id, adapter_id, role, response_json)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        summary.trace_id,
-                        response.adapter_id,
-                        response.role,
-                        json.dumps(response.to_dict(), ensure_ascii=False),
-                    ),
-                )
+                self._insert_response(conn, summary.trace_id, response)
             for conflict in summary.conflicts:
                 conn.execute(
                     """
@@ -74,6 +134,423 @@ class TraceStore:
                         json.dumps(conflict.to_dict(), ensure_ascii=False),
                     ),
                 )
+
+    def save_loop_summary(self, summary: LoopSummary) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET summary_json = ?, writeback_node_id = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(summary.to_dict(), ensure_ascii=False),
+                    summary.writeback_node_id,
+                    utc_now_iso(),
+                    summary.trace_id,
+                ),
+            )
+            if summary.conversation_id:
+                conn.execute(
+                    """
+                    UPDATE conversations
+                    SET state = ?, active_checkpoint_id = ?,
+                        updated_at = ?, last_activity_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        summary.status,
+                        summary.active_checkpoint_id,
+                        utc_now_iso(),
+                        utc_now_iso(),
+                        summary.conversation_id,
+                    ),
+                )
+
+    def save_stage_result(
+        self,
+        *,
+        conversation_id: str,
+        run_id: str,
+        result: LoopStageResult,
+    ) -> None:
+        """Durably append one attempt before another provider may be invoked."""
+        now = utc_now_iso()
+        execution = result.response.execution
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO loop_stages (
+                    run_id, sequence, stage, profile_id, state, artifact_json,
+                    attempt_index, fallback_from_model, checkpoint_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    result.sequence,
+                    result.stage,
+                    result.profile_id,
+                    result.state,
+                    json.dumps(result.artifact, ensure_ascii=False)
+                    if result.artifact is not None
+                    else None,
+                    result.attempt_index,
+                    result.fallback_from_model,
+                    result.checkpoint_id,
+                ),
+            )
+            self._insert_response(
+                conn,
+                run_id,
+                result.response,
+                stage=result.stage,
+                profile_id=result.profile_id,
+                sequence=result.sequence,
+                attempt_index=result.attempt_index,
+            )
+            conn.execute(
+                """
+                INSERT INTO turns (
+                    conversation_id, run_id, sequence, stage, profile_id,
+                    attempt_index, provider, model, provider_session_id, state,
+                    usage_json, artifact_json, raw_trace_ref, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    run_id,
+                    result.sequence,
+                    result.stage,
+                    result.profile_id,
+                    result.attempt_index,
+                    execution.provider,
+                    execution.resolved_model or execution.requested_model,
+                    execution.provider_run_id,
+                    result.state,
+                    json.dumps(execution.usage.to_dict(), ensure_ascii=False),
+                    json.dumps(result.artifact, ensure_ascii=False)
+                    if result.artifact is not None
+                    else None,
+                    execution.raw_trace_ref,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO provider_sessions (
+                    conversation_id, run_id, provider, model, profile_id,
+                    provider_session_id, status, started_at, ended_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    conversation_id,
+                    run_id,
+                    execution.provider,
+                    execution.resolved_model or execution.requested_model,
+                    result.profile_id,
+                    execution.provider_run_id,
+                    execution.status,
+                    execution.started_at or now,
+                    execution.completed_at or now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE conversations
+                SET cumulative_tokens = cumulative_tokens + ?,
+                    updated_at = ?, last_activity_at = ?
+                WHERE id = ?
+                """,
+                (_usage_units(execution.usage), now, now, conversation_id),
+            )
+
+    def next_checkpoint_identity(self, conversation_id: str) -> tuple[str, int]:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT compaction_generation FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            raise ValueError(f"Unknown conversation: {conversation_id}")
+        generation = int(row[0]) + 1
+        return f"cp_{uuid4().hex[:12]}", generation
+
+    def save_checkpoint(self, envelope: ResumeEnvelope) -> None:
+        payload = json.dumps(envelope.to_dict(), ensure_ascii=False)
+        token_before = int(envelope.runtime_context.get("token_spent", 0))
+        completeness = str(
+            envelope.runtime_context.get("usage_completeness", "unavailable")
+        )
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO checkpoints (
+                    id, conversation_id, run_id, generation, stage, reason,
+                    next_action, envelope_json, token_before, token_after,
+                    usage_completeness, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    envelope.checkpoint_id,
+                    envelope.conversation_id,
+                    envelope.run_id,
+                    envelope.generation,
+                    envelope.current_stage,
+                    envelope.reason,
+                    envelope.next_action,
+                    payload,
+                    token_before,
+                    completeness,
+                    envelope.created_at,
+                ),
+            )
+            default_workspace = str(
+                envelope.spec_context.get("workspace_id") or ""
+            )
+            refs = envelope.spec_context.get("context_refs", [])
+            if isinstance(refs, list):
+                for ref in refs:
+                    if not isinstance(ref, str):
+                        continue
+                    workspace_id, node_id = _split_memory_ref(default_workspace, ref)
+                    conn.execute(
+                        """
+                        INSERT INTO memory_refs (
+                            conversation_id, checkpoint_id, workspace_id, node_id,
+                            ref, purpose, created_at
+                        ) VALUES (?, ?, ?, ?, ?, 'checkpoint-source', ?)
+                        ON CONFLICT(conversation_id, ref, purpose) DO UPDATE SET
+                            checkpoint_id = excluded.checkpoint_id,
+                            workspace_id = excluded.workspace_id,
+                            node_id = excluded.node_id
+                        """,
+                        (
+                            envelope.conversation_id,
+                            envelope.checkpoint_id,
+                            workspace_id,
+                            node_id,
+                            ref,
+                            envelope.created_at,
+                        ),
+                    )
+            conn.execute(
+                """
+                UPDATE conversations
+                SET active_checkpoint_id = ?, compaction_generation = ?,
+                    updated_at = ?, last_activity_at = ?
+                WHERE id = ?
+                """,
+                (
+                    envelope.checkpoint_id,
+                    envelope.generation,
+                    utc_now_iso(),
+                    utc_now_iso(),
+                    envelope.conversation_id,
+                ),
+            )
+
+    def latest_resume_envelope(self, conversation_id: str) -> ResumeEnvelope | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT envelope_json FROM checkpoints
+                WHERE conversation_id = ?
+                ORDER BY generation DESC LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return ResumeEnvelope(**json.loads(row[0]))
+
+    def quota_bucket_available(self, quota_bucket: str) -> bool:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT status, cooldown_until FROM provider_availability
+                WHERE quota_bucket = ?
+                """,
+                (quota_bucket,),
+            ).fetchone()
+        if (
+            not row
+            or row[0] not in {"quota_exhausted", "rate_limit", "provider_overloaded"}
+            or not row[1]
+        ):
+            return True
+        try:
+            return datetime.fromisoformat(row[1]) <= datetime.now(timezone.utc)
+        except ValueError:
+            return False
+
+    def record_provider_availability(
+        self,
+        *,
+        provider: str,
+        model: str | None,
+        quota_bucket: str,
+        failure_category: str,
+        error_signature: str | None,
+        cooldown_seconds: int,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        succeeded = failure_category == "none"
+        capacity_failure = failure_category in {
+            "quota_exhausted",
+            "rate_limit",
+            "provider_overloaded",
+        }
+        status = "available" if succeeded else failure_category
+        with self._connection() as conn:
+            previous = conn.execute(
+                "SELECT status, consecutive_failures FROM provider_availability "
+                "WHERE quota_bucket = ?",
+                (quota_bucket,),
+            ).fetchone()
+            failures = (
+                0
+                if succeeded
+                else int(previous[1]) + 1
+                if previous and previous[0] == failure_category
+                else 1
+            )
+            cooldown_delay = min(
+                cooldown_seconds * (2 ** min(max(failures - 1, 0), 8)),
+                7 * 24 * 60 * 60,
+            )
+            cooldown_until = (
+                (now + timedelta(seconds=cooldown_delay)).isoformat()
+                if capacity_failure
+                else None
+            )
+            conn.execute(
+                """
+                INSERT INTO provider_availability (
+                    quota_bucket, provider, model, status, unavailable_since,
+                    cooldown_until, reset_at, reset_at_confidence,
+                    consecutive_failures, last_error_signature, last_success_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)
+                ON CONFLICT(quota_bucket) DO UPDATE SET
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    status = excluded.status,
+                    unavailable_since = excluded.unavailable_since,
+                    cooldown_until = excluded.cooldown_until,
+                    consecutive_failures = excluded.consecutive_failures,
+                    last_error_signature = excluded.last_error_signature,
+                    last_success_at = COALESCE(
+                        excluded.last_success_at,
+                        provider_availability.last_success_at
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    quota_bucket,
+                    provider,
+                    model,
+                    status,
+                    None if succeeded else now.isoformat(),
+                    cooldown_until,
+                    failures,
+                    error_signature,
+                    now.isoformat() if succeeded else None,
+                    now.isoformat(),
+                ),
+            )
+
+    def update_run_summary(self, summary: HarnessSummary | LoopSummary) -> None:
+        """Update summary/writeback metadata without duplicating execution rows."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET summary_json = ?, writeback_node_id = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(summary.to_dict(), ensure_ascii=False),
+                    summary.writeback_node_id,
+                    utc_now_iso(),
+                    summary.trace_id,
+                ),
+            )
+
+    @staticmethod
+    def _insert_response(
+        conn: sqlite3.Connection,
+        run_id: str,
+        response: ModelResponse,
+        *,
+        stage: str | None = None,
+        profile_id: str | None = None,
+        sequence: int | None = None,
+        attempt_index: int = 0,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO model_responses (
+                run_id, adapter_id, role, response_json, stage, sequence, attempt_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                response.adapter_id,
+                response.role,
+                json.dumps(response.to_dict(), ensure_ascii=False),
+                stage,
+                sequence,
+                attempt_index,
+            ),
+        )
+        execution = response.execution
+        conn.execute(
+            """
+            INSERT INTO cli_executions (
+                run_id, adapter_id, provider, status, exit_code, usage_json,
+                provider_run_id, raw_trace_ref, stderr_ref, error,
+                started_at, completed_at, duration_ms, stage, profile_id,
+                requested_model, resolved_model, reasoning_effort, permission,
+                context_policy, cli_version, sequence, attempt_index, quota_bucket,
+                fallback_index, failure_category, retry_after, reset_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                run_id,
+                response.adapter_id,
+                execution.provider,
+                execution.status,
+                execution.exit_code,
+                json.dumps(execution.usage.to_dict(), ensure_ascii=False),
+                execution.provider_run_id,
+                execution.raw_trace_ref,
+                execution.stderr_ref,
+                execution.error,
+                execution.started_at,
+                execution.completed_at,
+                execution.duration_ms,
+                stage,
+                profile_id or execution.role_profile_id,
+                execution.requested_model,
+                execution.resolved_model,
+                execution.reasoning_effort,
+                execution.permission,
+                execution.context_policy,
+                execution.cli_version,
+                sequence,
+                attempt_index,
+                execution.quota_bucket,
+                execution.fallback_index,
+                execution.failure_category,
+                execution.retry_after,
+                execution.reset_at,
+            ),
+        )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -95,6 +572,7 @@ class TraceStore:
                     task_json TEXT NOT NULL,
                     summary_json TEXT,
                     writeback_node_id TEXT,
+                    conversation_id TEXT,
                     created_at TEXT NOT NULL,
                     completed_at TEXT
                 );
@@ -105,6 +583,9 @@ class TraceStore:
                     adapter_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     response_json TEXT NOT NULL,
+                    stage TEXT,
+                    sequence INTEGER,
+                    attempt_index INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
 
@@ -115,5 +596,211 @@ class TraceStore:
                     conflict_json TEXT NOT NULL,
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS cli_executions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    adapter_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    usage_json TEXT NOT NULL,
+                    provider_run_id TEXT,
+                    raw_trace_ref TEXT,
+                    stderr_ref TEXT,
+                    error TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    stage TEXT,
+                    profile_id TEXT,
+                    requested_model TEXT,
+                    resolved_model TEXT,
+                    reasoning_effort TEXT,
+                    permission TEXT,
+                    context_policy TEXT,
+                    cli_version TEXT,
+                    sequence INTEGER,
+                    attempt_index INTEGER NOT NULL DEFAULT 0,
+                    quota_bucket TEXT,
+                    fallback_index INTEGER NOT NULL DEFAULT 0,
+                    failure_category TEXT NOT NULL DEFAULT 'none',
+                    retry_after TEXT,
+                    reset_at TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS loop_stages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    artifact_json TEXT,
+                    attempt_index INTEGER NOT NULL DEFAULT 0,
+                    fallback_from_model TEXT,
+                    checkpoint_id TEXT,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    active_run_id TEXT,
+                    state TEXT NOT NULL,
+                    cumulative_tokens INTEGER NOT NULL DEFAULT 0,
+                    active_checkpoint_id TEXT,
+                    compaction_generation INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    attempt_index INTEGER NOT NULL DEFAULT 0,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    provider_session_id TEXT,
+                    state TEXT NOT NULL,
+                    usage_json TEXT NOT NULL,
+                    artifact_json TEXT,
+                    raw_trace_ref TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    profile_id TEXT NOT NULL,
+                    provider_session_id TEXT,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    stage TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    next_action TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    token_before INTEGER NOT NULL,
+                    token_after INTEGER,
+                    usage_completeness TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(conversation_id, generation),
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_refs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    checkpoint_id TEXT,
+                    workspace_id TEXT,
+                    node_id TEXT,
+                    ref TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(conversation_id, ref, purpose),
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_availability (
+                    quota_bucket TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    model TEXT,
+                    status TEXT NOT NULL,
+                    unavailable_since TEXT,
+                    cooldown_until TEXT,
+                    reset_at TEXT,
+                    reset_at_confidence TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_error_signature TEXT,
+                    last_success_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_turns_conversation
+                    ON turns(conversation_id, id);
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
+                    ON checkpoints(conversation_id, generation);
                 """
             )
+            self._ensure_column(conn, "runs", "conversation_id", "TEXT")
+            self._ensure_column(conn, "model_responses", "stage", "TEXT")
+            self._ensure_column(conn, "model_responses", "sequence", "INTEGER")
+            self._ensure_column(
+                conn, "model_responses", "attempt_index", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(conn, "cli_executions", "stage", "TEXT")
+            self._ensure_column(conn, "cli_executions", "profile_id", "TEXT")
+            self._ensure_column(conn, "cli_executions", "requested_model", "TEXT")
+            self._ensure_column(conn, "cli_executions", "resolved_model", "TEXT")
+            self._ensure_column(conn, "cli_executions", "reasoning_effort", "TEXT")
+            self._ensure_column(conn, "cli_executions", "permission", "TEXT")
+            self._ensure_column(conn, "cli_executions", "context_policy", "TEXT")
+            self._ensure_column(conn, "cli_executions", "cli_version", "TEXT")
+            self._ensure_column(conn, "cli_executions", "sequence", "INTEGER")
+            self._ensure_column(
+                conn, "cli_executions", "attempt_index", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(conn, "cli_executions", "quota_bucket", "TEXT")
+            self._ensure_column(
+                conn, "cli_executions", "fallback_index", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                conn,
+                "cli_executions",
+                "failure_category",
+                "TEXT NOT NULL DEFAULT 'none'",
+            )
+            self._ensure_column(conn, "cli_executions", "retry_after", "TEXT")
+            self._ensure_column(conn, "cli_executions", "reset_at", "TEXT")
+            self._ensure_column(
+                conn, "loop_stages", "attempt_index", "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(conn, "loop_stages", "fallback_from_model", "TEXT")
+            self._ensure_column(conn, "loop_stages", "checkpoint_id", "TEXT")
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection, table: str, column: str, definition: str
+    ) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _usage_units(usage) -> int:
+    if usage.total_tokens is not None:
+        return int(usage.total_tokens)
+    return int(usage.input_tokens + usage.output_tokens)
+
+
+def _split_memory_ref(default_workspace: str, ref: str) -> tuple[str | None, str | None]:
+    if "/" in ref:
+        workspace_id, node_id = ref.split("/", 1)
+        if workspace_id.startswith("ws_") and node_id.startswith("mem_"):
+            return workspace_id, node_id
+    if ref.startswith("mem_"):
+        return default_workspace, ref
+    return None, None

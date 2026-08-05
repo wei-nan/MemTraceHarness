@@ -10,5 +10,5 @@ class ModelAdapter(ABC):
     role: str
 
     @abstractmethod
-    def run(self, task: TaskEnvelope) -> ModelResponse:
+    def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
         """Run the adapter against a normalized task envelope."""
