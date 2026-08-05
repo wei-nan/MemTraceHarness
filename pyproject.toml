@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memtrace-harness"
-version = "0.1.0"
-description = "External harness for MemTrace-backed model workflows"
+version = "0.4.0"
+description = "CLI-only execution and token measurement harness for MemTrace workflows"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
@@ -15,6 +15,9 @@ memtrace-harness = "memtrace_harness.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+memtrace_harness = ["default-role-profiles.toml", "output_schemas/*.json"]
 
 [tool.ruff]
 line-length = 100

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["run_planner", "ask_human", "stop", "finish"]
+    },
+    "reason": {"type": "string", "maxLength": 1000}
+  },
+  "required": ["action", "reason"],
+  "additionalProperties": false
+}
