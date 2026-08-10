@@ -774,6 +774,11 @@ class TraceStore:
                     locked_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS telegram_gateway_state (
+                    bot_token_hash TEXT PRIMARY KEY,
+                    last_offset INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_turns_conversation
                     ON turns(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
@@ -783,6 +788,9 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_approval_conv
                     ON approval_requests(conversation_id, status);
                 """
+            )
+            self._ensure_column(
+                conn, "primary_sessions_hot_log", "consolidated_preference", "INTEGER NOT NULL DEFAULT 0"
             )
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
             self._ensure_column(conn, "model_responses", "stage", "TEXT")
@@ -902,6 +910,51 @@ class TraceStore:
             placeholders = ",".join("?" * len(turn_ids))
             conn.execute(
                 f"UPDATE primary_sessions_hot_log SET consolidated = 1 WHERE id IN ({placeholders})",
+                turn_ids,
+            )
+
+    def get_unconsolidated_turns_for_preference(self, primary_session_id: str) -> list[dict]:
+        """Independent of get_unconsolidated_turns()/consolidated — the goal-oriented axis
+        ("does this matter for the project") and the preference axis ("does this reveal
+        how the human wants to be worked with") are different questions asked of the same
+        turns, so each needs its own pending/done tracking or one pass would silently
+        consume turns the other pass hasn't looked at yet."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, primary_session_id, project, turn_seq, created_at, speaker, provider,
+                       model, turn_type, content, source_work_conversation_id, consolidated
+                FROM primary_sessions_hot_log
+                WHERE primary_session_id = ? AND consolidated_preference = 0
+                ORDER BY turn_seq ASC
+                """,
+                (primary_session_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "primary_session_id": row[1],
+                "project": row[2],
+                "turn_seq": row[3],
+                "created_at": row[4],
+                "speaker": row[5],
+                "provider": row[6],
+                "model": row[7],
+                "turn_type": row[8],
+                "content": row[9],
+                "source_work_conversation_id": row[10],
+                "consolidated": bool(row[11]),
+            }
+            for row in rows
+        ]
+
+    def mark_turns_consolidated_preference(self, turn_ids: list[int]) -> None:
+        if not turn_ids:
+            return
+        with self._connection() as conn:
+            placeholders = ",".join("?" * len(turn_ids))
+            conn.execute(
+                f"UPDATE primary_sessions_hot_log SET consolidated_preference = 1 WHERE id IN ({placeholders})",
                 turn_ids,
             )
 
@@ -1036,6 +1089,25 @@ class TraceStore:
         if not row:
             return None
         return {"workspace_id": row[0], "conversation_id": row[1], "locked_at": row[2]}
+
+    def get_telegram_offset(self, bot_token_hash: str) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT last_offset FROM telegram_gateway_state WHERE bot_token_hash = ?",
+                (bot_token_hash,),
+            ).fetchone()
+        return row[0] if row else 0
+
+    def set_telegram_offset(self, bot_token_hash: str, offset: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_gateway_state (bot_token_hash, last_offset)
+                VALUES (?, ?)
+                ON CONFLICT(bot_token_hash) DO UPDATE SET last_offset = excluded.last_offset
+                """,
+                (bot_token_hash, offset),
+            )
 
     @staticmethod
     def _ensure_column(

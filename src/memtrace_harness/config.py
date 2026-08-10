@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,9 @@ class HarnessConfig:
     chat_provider: str
     chat_model: str
     unattended_write_requires_approval: bool
+    harness_memory_workspace_id: str | None = None
+    chat_fallbacks: tuple[tuple[str, str], ...] = ()
+    operator_preference_workspace_id: str | None = None
 
     def command_for(self, provider: str) -> str:
         if provider == "claude":
@@ -31,6 +35,38 @@ class HarnessConfig:
         if provider == "antigravity":
             return self.antigravity_command
         return provider
+
+    def telegram_bot_token_for(self, project_name: str) -> str | None:
+        """Per-project bot token, read from the Harness's own .env — never from the
+        target project's repo, so a project's harness-scope.md never has to carry a
+        secret. Falls back to the shared HARNESS_TELEGRAM_BOT_TOKEN bot."""
+        return os.getenv(project_bot_token_env_var(project_name)) or self.telegram_bot_token
+
+    def chat_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for that project's quick-chat-reply model:
+        that project's own HARNESS_CHAT_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT>
+        if set, else the shared HARNESS_CHAT_PROVIDER/MODEL/FALLBACKS. Chat is cheap and
+        low-stakes (no repo writes), so unlike Agent Loop roles it's fine for a project
+        to just pick whichever model is good enough and cheapest — no vendor lock."""
+        provider = os.getenv(project_chat_provider_env_var(project_name)) or self.chat_provider
+        model = os.getenv(project_chat_model_env_var(project_name), self.chat_model)
+        fallbacks_override = os.getenv(project_chat_fallbacks_env_var(project_name))
+        fallbacks = (
+            _parse_chat_fallbacks(fallbacks_override)
+            if fallbacks_override is not None
+            else self.chat_fallbacks
+        )
+        if not provider:
+            return ()
+        return ((provider, model), *fallbacks)
+
+    def role_profiles_file_for(self, project_name: str) -> Path | None:
+        """Per-project role-profile override (e.g. a different fallback order), read
+        from the Harness's own env — not from harness-scope.md, so the target project's
+        repo never carries Harness-internal routing policy. None means: use the
+        packaged default-role-profiles.toml."""
+        override = os.getenv(project_role_profiles_env_var(project_name))
+        return Path(override) if override else None
 
     @classmethod
     def from_env(cls) -> "HarnessConfig":
@@ -62,7 +98,72 @@ class HarnessConfig:
             chat_provider=os.getenv("HARNESS_CHAT_PROVIDER", "claude"),
             chat_model=os.getenv("HARNESS_CHAT_MODEL", "haiku"),
             unattended_write_requires_approval=unattended_approval_str not in {"false", "0", "no"},
+            harness_memory_workspace_id=os.getenv("HARNESS_MEMORY_WORKSPACE_ID"),
+            chat_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_CHAT_FALLBACKS", "")),
+            operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
         )
+
+    def memory_workspace_id_for(self, project_name: str, project_workspace_id: str) -> str:
+        """Cold-memory consolidation target: a dedicated memory workspace (runtime/
+        conversation memory — what happened) is intentionally separate from a project's
+        own spec/planning workspace (what should be built). Resolution order:
+        1. HARNESS_MEMORY_WORKSPACE_ID_<PROJECT> — that project's own dedicated memory KB
+        2. HARNESS_MEMORY_WORKSPACE_ID — one shared memory KB across every project
+        3. the project's own spec workspace, if neither is set
+        Same per-project-override-over-shared-default shape as telegram_bot_token_for()
+        and role_profiles_file_for() — adding a project with its own memory KB is a
+        one-line .env addition, never a code change."""
+        return (
+            os.getenv(project_memory_workspace_env_var(project_name))
+            or self.harness_memory_workspace_id
+            or project_workspace_id
+        )
+
+
+def _parse_chat_fallbacks(value: str) -> tuple[tuple[str, str], ...]:
+    """HARNESS_CHAT_FALLBACKS=provider/model,provider/model — an ordered fallback list
+    for the quick-chat-reply model, same shape as a role profile's fallback chain
+    (docs/remote-ops-plan.md §5: "the chat model gets its own ordered fallback list")."""
+    pairs = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "/" not in item:
+            raise ValueError(f"HARNESS_CHAT_FALLBACKS entry must be provider/model, got: {item!r}")
+        provider, model = item.split("/", 1)
+        pairs.append((provider.strip(), model.strip()))
+    return tuple(pairs)
+
+
+def project_bot_token_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_TELEGRAM_BOT_TOKEN_{slug}"
+
+
+def project_role_profiles_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_ROLE_PROFILES_FILE_{slug}"
+
+
+def project_memory_workspace_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_MEMORY_WORKSPACE_ID_{slug}"
+
+
+def project_chat_provider_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_CHAT_PROVIDER_{slug}"
+
+
+def project_chat_model_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_CHAT_MODEL_{slug}"
+
+
+def project_chat_fallbacks_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_CHAT_FALLBACKS_{slug}"
 
 
 def _positive_int(value: str | None, default: int) -> int:

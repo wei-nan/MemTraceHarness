@@ -96,7 +96,13 @@ class CliModelAdapter(ModelAdapter):
             duration_ms=process.duration_ms,
             raw_trace_ref=raw_trace_ref,
             stderr_ref=stderr_ref,
-            error=process.error or _stderr_error(process),
+            # process.error only sees subprocess-launch failures. response.execution.error
+            # (set by parse_response(), if the adapter surfaces one) is preferred over
+            # _stderr_error() because a provider CLI can report its failure as a JSON line
+            # on stdout instead of stderr (e.g. Codex's `{"type":"error","message":...}`);
+            # _stderr_error() falls back to a generic "CLI exited with code N" when stderr
+            # is empty, which would otherwise silently win and discard the real message.
+            error=process.error or response.execution.error or _stderr_error(process),
             parse_warnings=[*response.execution.parse_warnings, *parse_warnings],
         )
         return replace(response, execution=execution)
@@ -135,6 +141,7 @@ class CliModelAdapter(ModelAdapter):
         usage: TokenUsage,
         provider_run_id: str | None,
         warnings: list[str] | None = None,
+        error: str | None = None,
     ) -> ModelResponse:
         claim = _claim_from_final_text(final_text, task)
         return ModelResponse(
@@ -155,6 +162,7 @@ class CliModelAdapter(ModelAdapter):
                 usage=usage,
                 provider_run_id=provider_run_id,
                 parse_warnings=warnings or [],
+                error=error,
                 role_profile_id=self.role_profile_id,
                 requested_model=self.model,
                 reasoning_effort=self.reasoning_effort,

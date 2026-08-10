@@ -46,7 +46,7 @@ workspace; `ws_spec_plan` is not a universal default for every project.
 
 ## Role contract
 
-**ENFORCED** packaged primary roles:
+**ENFORCED** packaged primary roles (packaged defaults — see below for what's actually validated):
 
 ```text
 Controller          Codex gpt-5.6-luna        read-only
@@ -56,12 +56,23 @@ Red Team             Codex gpt-5.6-sol         read-only
 Developer            Antigravity Gemini        workspace-write
 ```
 
-Only the Developer profile may write to the workspace. A fallback inherits the Role permission,
-structured-output schema, context policy and stage boundary; selecting another model does not select
-that model's usual role.
+A role's identity is its job in the pipeline, not a vendor pin. Every role's provider/model —
+Controller, Planner, Planning escalation, Red Team, and Developer alike — is project-configurable
+via `HARNESS_ROLE_PROFILES_FILE_<PROJECT>`; the table above is only the packaged default a project
+gets if it doesn't override anything. What **is** hard-validated regardless of vendor choice:
 
-Opus remains a G1 `reasoning_gap` escalation. Sol remains a fail-closed gate verifier. Neither has a
-packaged fallback.
+- only the `developer` profile may hold `workspace-write` — every other role stays `read-only`;
+- each role's `context_policy` shape (Controller only ever gets a compact loop snapshot, Red Team
+  only gate-scoped evidence, Developer the accepted plan plus repo, etc.) — this is an information-
+  flow boundary, independent of which model is behind the role;
+- Red Team and Planning escalation both fail closed with no packaged fallback chain, so a gate
+  verdict or an escalated plan never silently degrades to a different/weaker model mid-stage.
+
+A fallback inherits the Role permission, structured-output schema, context policy and stage
+boundary; selecting another model does not select that model's usual role. The "independent
+reviewer" and "consistent behavior" properties people actually rely on come from every role stage
+already being a fresh, separately-invoked CLI call — never a continued conversation — and from the
+permission/context boundaries above, not from forcing any role onto a specific vendor.
 
 ## Conversation and checkpoint contract
 

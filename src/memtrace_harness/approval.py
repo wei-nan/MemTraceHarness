@@ -34,14 +34,14 @@ class ApprovalRequestData:
 
     def format_telegram_message(self) -> str:
         return (
-            f"⚠️ **Approval Request** [{self.id}]\n"
-            f"**Workspace**: `{self.workspace}`\n"
-            f"**Reason**: {self.reason}\n"
-            f"**Action**: {self.proposed_action}\n\n"
-            f"Reply with:\n"
-            f"`/approve {self.id}` to approve\n"
-            f"`/reject {self.id} <reason>` to reject\n"
-            f"`/clarify {self.id} <answer>` to clarify"
+            f"⚠️ 核准請求 [{self.id}]\n"
+            f"工作區：{self.workspace}\n"
+            f"原因：{self.reason}\n"
+            f"內容：{self.proposed_action}\n\n"
+            f"回覆：\n"
+            f"/approve {self.id} 核准\n"
+            f"/reject {self.id} <原因> 拒絕\n"
+            f"/clarify {self.id} <回答> 補充說明"
         )
 
 
@@ -95,14 +95,14 @@ class ApprovalManager:
         self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None = None
     ) -> tuple[bool, str, ApprovalRequestData | None]:
         if not self.is_chat_id_allowed(chat_id):
-            return False, "Chat ID not authorized", None
+            return False, "此 chat ID 未經授權", None
 
         req = self.get_request(request_id)
         if not req:
-            return False, f"Approval request {request_id} not found", None
+            return False, f"找不到核准請求 {request_id}", None
 
         if req.status != "pending":
-            return False, f"Approval request {request_id} is already in state '{req.status}'", None
+            return False, f"核准請求 {request_id} 已經是「{req.status}」狀態", None
 
         status_map = {
             "approve": "approved",
@@ -111,13 +111,13 @@ class ApprovalManager:
         }
         new_status = status_map.get(action.lower())
         if not new_status:
-            return False, f"Unknown action '{action}'", None
+            return False, f"未知的操作「{action}」", None
 
         success = self.trace_store.resolve_approval_request(
             request_id, new_status, responded_by_chat_id=chat_id
         )
         if not success:
-            return False, "Failed to update approval request state", None
+            return False, "更新核准請求狀態失敗", None
 
         updated_req = self.get_request(request_id)
-        return True, f"Request {request_id} updated to {new_status}", updated_req
+        return True, f"請求 {request_id} 已更新為「{new_status}」", updated_req

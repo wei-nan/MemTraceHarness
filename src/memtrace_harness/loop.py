@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from pathlib import Path
 from typing import Any
 
 from memtrace_harness.adapters import ModelAdapter
@@ -40,6 +41,7 @@ class AgentLoopRunner:
         memtrace_client: MemTraceClient | None = None,
         max_total_tokens: int | None = None,
         approval_manager: Any | None = None,
+        working_directory: Path | None = None,
     ) -> None:
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
@@ -48,6 +50,7 @@ class AgentLoopRunner:
         self.memtrace_client = memtrace_client
         self.max_total_tokens = max_total_tokens
         self.approval_manager = approval_manager
+        self.working_directory = working_directory
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -200,7 +203,7 @@ class AgentLoopRunner:
                 self.approval_manager.request_approval(
                     conversation_id=self._required_conversation_id(),
                     workspace=task.workspace_id,
-                    working_directory=str(task.working_directory or ""),
+                    working_directory=str(self.working_directory or ""),
                     reason="git_push",
                     proposed_action=f"Execute git push for task: {task.goal[:80]}",
                 )
@@ -697,7 +700,7 @@ class AgentLoopRunner:
             self.approval_manager.request_approval(
                 conversation_id=summary.conversation_id or self._required_conversation_id(),
                 workspace=summary.task.workspace_id,
-                working_directory=str(summary.task.working_directory or ""),
+                working_directory=str(self.working_directory or ""),
                 reason=reason,
                 proposed_action=summary.recommendation,
             )

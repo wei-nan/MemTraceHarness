@@ -124,9 +124,10 @@ Controller with the latest bounded envelope; exact stage-machine resume and sema
 not yet implemented.
 
 The packaged profile policy lives in
-[`src/memtrace_harness/default-role-profiles.toml`](src/memtrace_harness/default-role-profiles.toml):
+[`src/memtrace_harness/default-role-profiles.toml`](src/memtrace_harness/default-role-profiles.toml)
+— this is only the default a project gets if it doesn't override anything:
 
-| Profile | Provider/model | Permission | Purpose |
+| Profile | Provider/model (packaged default) | Permission | Purpose |
 | --- | --- | --- | --- |
 | `controller` | Codex `gpt-5.6-luna` | read-only | Start routing and convergence; quota fallback to Sonnet then Gemini 3.6 |
 | `planner` | Claude `sonnet` | read-only | Default planning for every risk level |
@@ -134,9 +135,15 @@ The packaged profile policy lives in
 | `red-team` | Codex `gpt-5.6-sol` | read-only | G1/G2 adversarial review |
 | `developer` | Antigravity `gemini-3.1-pro-high` | workspace-write | Accepted-plan implementation and one bounded correction |
 
-Use `--profiles-file <path.toml>` to load another file. Validation keeps Luna, Sonnet, Opus, and
-Sol in their accepted roles, requires the developer to use a `gemini-*` model through Antigravity,
-and rejects any profile set that grants write access to a role other than `developer`.
+Use `--profiles-file <path.toml>` to load another file, or `HARNESS_ROLE_PROFILES_FILE_<PROJECT>`
+for a per-project override — every role's provider/model is project-configurable, including
+Controller and Developer, not just the packaged defaults above. What validation actually enforces,
+independent of vendor choice: only `developer` may hold `workspace-write` (every other role stays
+`read-only`); each role's `context_policy` shape (Controller only a compact loop snapshot, Red Team
+only gate-scoped evidence, Developer the accepted plan plus repo); and Red Team / Planning
+escalation both fail closed with no packaged fallback chain. Each role stage is already a fresh,
+independently-invoked CLI call — that's what makes a reviewer distinct from the role it's
+reviewing, not a forced vendor split.
 
 Each role also receives a packaged JSON Schema through the provider's structured-output flag. An
 invalid or missing final JSON object stops the loop; the Harness never infers a PASS from prose.

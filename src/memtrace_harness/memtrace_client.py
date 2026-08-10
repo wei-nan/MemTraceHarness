@@ -118,6 +118,25 @@ class MemTraceClient:
             raise MemTraceClientError(f"create_node response did not include id: {data}")
         return str(node_id)
 
+    def update_node(self, *, workspace_id: str, node_id: str, body: str) -> None:
+        self.call_tool(
+            "update_node",
+            {"workspace_id": workspace_id, "node_id": node_id, "body": body},
+        )
+
+    def search_nodes(
+        self, *, workspace_id: str, query: str, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        result = self.call_tool(
+            "search_nodes", {"workspace_id": workspace_id, "query": query, "limit": limit}
+        )
+        text = _extract_text(result)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise MemTraceClientError(f"search_nodes returned non-JSON content: {text}") from exc
+        return data if isinstance(data, list) else []
+
     def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         headers = {

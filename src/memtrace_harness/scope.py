@@ -14,6 +14,7 @@ class ProjectScope:
     default_risk_level: str = "medium"
     off_limits: list[str] | None = None
     raw_markdown: str = ""
+    telegram_bot_token: str | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:
@@ -39,6 +40,8 @@ class ProjectScope:
         off_limits_str = _extract_field(content, "off_limits")
         off_limits = [s.strip() for s in off_limits_str.split(",") if s.strip()] if off_limits_str else []
 
+        telegram_bot_token = _extract_field(content, "telegram_bot_token", "bot_token")
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -47,6 +50,7 @@ class ProjectScope:
             default_risk_level=default_risk,
             off_limits=off_limits,
             raw_markdown=content,
+            telegram_bot_token=telegram_bot_token,
         )
 
 

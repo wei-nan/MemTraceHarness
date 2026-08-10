@@ -82,12 +82,12 @@ class RedTeamAcceptanceTests(TestCase):
             # Request to open PR (out of scope for Harness remote ops)
             res1 = triage.triage_message("Open a PR on GitHub for feature X")
             self.assertEqual(res1.kind, "out_of_scope")
-            self.assertIn("out of Harness remote operations scope", res1.rejection_message or "")
+            self.assertIn("超出 Harness 遠端操作的範圍", res1.rejection_message or "")
 
             # Request touching off-limits area
             res2 = triage.triage_message("Migrate the production database now", default_project="secure_project")
             self.assertEqual(res2.kind, "out_of_scope")
-            self.assertIn("off-limits rule", res2.rejection_message or "")
+            self.assertIn("禁區規則", res2.rejection_message or "")
 
     def test_red_team_acceptance_approval_request_guarantees(self) -> None:
         """Red Team Verification 3: Approval Request Policy Guarantees"""
@@ -117,7 +117,7 @@ class RedTeamAcceptanceTests(TestCase):
 
             ok2, msg2, _ = appr_mgr.respond(req.id, "reject", chat_id=10001)
             self.assertFalse(ok2)
-            self.assertIn("already in state", msg2)
+            self.assertIn("已經是", msg2)
 
     def test_red_team_acceptance_llm_chat_triage(self) -> None:
         """Red Team Verification 4: LLM Chat Triage Integration"""
@@ -168,7 +168,13 @@ class RedTeamAcceptanceTests(TestCase):
                 duration_ms=10,
             )
             with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=fake_res):
+                # No "!" prefix: plain messages route to "chat" (a quick, no-approval
+                # reply), not "task" — project classification for routing is unaffected.
                 res = triage.triage_message("Help me fix the auth issue in the second system")
-                self.assertEqual(res.kind, "task")
+                self.assertEqual(res.kind, "chat")
                 self.assertIsNotNone(res.project_scope)
                 self.assertEqual(res.project_scope.name, "proj_beta")
+
+                res_task = triage.triage_message("!Help me fix the auth issue in the second system")
+                self.assertEqual(res_task.kind, "task")
+                self.assertEqual(res_task.project_scope.name, "proj_beta")
