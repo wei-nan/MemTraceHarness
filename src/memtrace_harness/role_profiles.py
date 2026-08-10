@@ -223,51 +223,36 @@ def load_role_profiles(path: Path | None = None) -> dict[str, RoleProfile]:
 
 
 def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
-    expected = {
-        "controller": ("codex", "gpt-5.6-luna", "read-only", "loop-snapshot"),
-        "planner": (
-            "claude",
-            "sonnet",
-            "read-only",
-            "task-and-targeted-evidence",
-        ),
-        "planner-escalation": (
-            "claude",
-            "opus",
-            "read-only",
-            "task-and-targeted-evidence",
-        ),
-        "red-team": (
-            "codex",
-            "gpt-5.6-sol",
-            "read-only",
-            "gate-evidence-only",
-        ),
+    """Provider/model choice is fully project-configurable for every role — Controller,
+    Planner, Planner-escalation, Red Team, and Developer alike. A role's identity is its
+    job in the pipeline (route, plan, escalate, verify, implement), not a vendor pin; the
+    "independent reviewer" and "consistent behavior" properties people actually rely on
+    come from each stage being a fresh, separately-invoked CLI call and from the
+    permission/context boundaries below, not from forcing a specific model onto a role.
+
+    What stays enforced, because these are safety/architecture properties independent of
+    which vendor executes a role:
+    - each role's permission level (only Developer may hold workspace-write — every
+      other role must stay read-only);
+    - each role's context_policy (how much of the repo/evidence it is allowed to see —
+      e.g. Controller only ever gets a loop snapshot, Red Team only gate-scoped
+      evidence, regardless of which model is behind it);
+    - Red Team and Planner-escalation both fail closed with no fallback chain, so a gate
+      verdict or an escalated plan never silently degrades to a weaker/different model
+      mid-stage without a human noticing."""
+    expected_shape = {
+        "controller": ("read-only", "loop-snapshot"),
+        "planner": ("read-only", "task-and-targeted-evidence"),
+        "planner-escalation": ("read-only", "task-and-targeted-evidence"),
+        "red-team": ("read-only", "gate-evidence-only"),
+        "developer": ("workspace-write", "accepted-plan-and-repo"),
     }
-    for profile_id, (provider, model_family, permission, context_policy) in expected.items():
+    for profile_id, (permission, context_policy) in expected_shape.items():
         profile = profiles[profile_id]
-        model_matches = (
-            profile.model == model_family
-            if provider == "codex"
-            else model_family in profile.model.lower()
-        )
-        if (
-            profile.provider != provider
-            or not model_matches
-            or profile.permission != permission
-            or profile.context_policy != context_policy
-        ):
+        if profile.permission != permission or profile.context_policy != context_policy:
             raise ValueError(
-                f"Role profile {profile_id!r} must remain {provider}/{model_family}/"
-                f"{permission}/{context_policy}"
+                f"Role profile {profile_id!r} must remain {permission}/{context_policy}"
             )
-    developer = profiles["developer"]
-    if (
-        developer.provider != "antigravity"
-        or not developer.model.startswith("gemini-")
-        or developer.context_policy != "accepted-plan-and-repo"
-    ):
-        raise ValueError("Developer profile must use a Gemini model through Antigravity CLI")
     writable = [
         item.profile_id
         for item in profiles.values()
@@ -278,7 +263,7 @@ def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
     if profiles["red-team"].fallbacks:
         raise ValueError("Red Team must fail closed unless a future policy explicitly changes it")
     if profiles["planner-escalation"].fallbacks:
-        raise ValueError("Planning escalation must not silently downgrade from Opus")
+        raise ValueError("Planning escalation must not silently downgrade to a different model")
 
 
 def _validate_provider_effort(label: str, provider: str, reasoning_effort: str) -> None:

@@ -31,7 +31,7 @@ class ApprovalTests(TestCase):
             # 2. Reject response from non-allowed chat ID
             ok, msg, req_updated = mgr.respond(req.id, "approve", chat_id=99999)
             self.assertFalse(ok)
-            self.assertIn("not authorized", msg.lower())
+            self.assertIn("未經授權", msg)
 
             # 3. Approve response from allowed chat ID
             ok, msg, req_updated = mgr.respond(req.id, "approve", chat_id=12345)
@@ -43,4 +43,4 @@ class ApprovalTests(TestCase):
             # 4. Single terminal response constraint (cannot double-spend or re-respond)
             ok_second, msg_second, _ = mgr.respond(req.id, "reject", chat_id=12345)
             self.assertFalse(ok_second)
-            self.assertIn("already in state", msg_second)
+            self.assertIn("已經是", msg_second)

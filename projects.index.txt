@@ -1,0 +1,3 @@
+# projects.index.txt
+/Users/shiweinan/Workspace/Beri/harness-scope.md
+/Users/shiweinan/Workspace/MemTrace/harness-scope.md

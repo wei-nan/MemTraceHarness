@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class TriageResult:
-    kind: str  # "approval_response", "task", "status", "out_of_scope", "unrecognized"
+    kind: str  # "approval_response", "task", "chat", "status", "out_of_scope", "unrecognized"
     project_scope: ProjectScope | None
     approval_id: str | None = None
     approval_action: str | None = None  # "approve", "reject", "clarify"
@@ -38,7 +38,7 @@ class ChatTriage:
                 return TriageResult(
                     kind="out_of_scope",
                     project_scope=None,
-                    rejection_message=f"Command {parts[0]} requires an approval ID (e.g. {parts[0]} appr_123456)",
+                    rejection_message=f"指令 {parts[0]} 需要核准請求 ID（例如 {parts[0]} appr_123456）",
                 )
             appr_id = parts[1]
             reason = parts[2] if len(parts) > 2 else None
@@ -56,7 +56,7 @@ class ChatTriage:
             return TriageResult(
                 kind="out_of_scope",
                 project_scope=None,
-                rejection_message="Request is out of Harness remote operations scope (e.g. GitHub PRs and external services beyond git push are unsupported).",
+                rejection_message="這個請求超出 Harness 遠端操作的範圍（例如開 GitHub PR、git push 以外的外部服務都不支援）。",
             )
 
         # Match project
@@ -68,7 +68,7 @@ class ChatTriage:
             return TriageResult(
                 kind="unrecognized",
                 project_scope=None,
-                rejection_message="Could not resolve request to a registered project scope (no harness-scope.md found).",
+                rejection_message="無法對應到任何已註冊的專案（找不到符合的 harness-scope.md）。",
             )
 
         # Check off-limits rules in matched_project
@@ -78,14 +78,25 @@ class ChatTriage:
                     return TriageResult(
                         kind="out_of_scope",
                         project_scope=matched_project,
-                        rejection_message=f"Request touches off-limits rule specified in harness-scope.md: '{rule}'",
+                        rejection_message=f"這個請求碰到 harness-scope.md 設定的禁區規則：「{rule}」",
                     )
 
         if lower_text in {"status", "help", "/status", "/help"}:
             return TriageResult(kind="status", project_scope=matched_project)
 
+        # A plain message is just chat: a quick, read-only, no-approval-needed reply.
+        # Only a "!"-prefixed message is a real work request — it creates an approval
+        # request and can trigger the full Controller/Planner/RedTeam/Developer loop.
+        # Without this split, every "你好" would otherwise queue a governed write task.
+        if cleaned.startswith("!"):
+            return TriageResult(
+                kind="task",
+                project_scope=matched_project,
+                task_goal=cleaned[1:].strip() or cleaned,
+            )
+
         return TriageResult(
-            kind="task",
+            kind="chat",
             project_scope=matched_project,
             task_goal=cleaned,
         )

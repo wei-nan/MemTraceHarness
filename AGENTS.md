@@ -16,7 +16,15 @@ Hard project boundaries:
 - Unit tests must inject subprocess output and must not consume model quota.
 - Harness output remains draft evidence; it cannot approve its own Agent Loop gate or Improvement
   Loop proposal.
-- Keep the default role boundary intact: Luna controls, Sonnet plans every risk level, Opus is a
-  reasoning-gap escalation, Sol red-teams read-only, and only Gemini development may write.
+- Role identity is the job in the pipeline (route, plan, escalate, verify, implement), not a vendor
+  pin: every role's provider/model — Controller, Planner, Planner-escalation, Red Team, and
+  Developer alike — is project-configurable via a custom role-profiles file
+  (`HARNESS_ROLE_PROFILES_FILE_<PROJECT>`). What must stay enforced regardless of vendor choice:
+  only the `developer` profile may hold `workspace-write` (every other role stays `read-only`);
+  each role's `context_policy` shape (Controller only gets a loop snapshot, Red Team only
+  gate-scoped evidence, etc.); and Red Team / Planner-escalation both fail closed with no fallback
+  chain. The "independent reviewer" and "consistent behavior" guarantees come from every role stage
+  already being a fresh, separately-invoked CLI call — never a continued conversation — and from
+  those permission/context boundaries, not from forcing any role onto a specific vendor.
 - A local loop status never proves that MemTrace changed gate, blocked, rejected, reject-count, or
   completed state.

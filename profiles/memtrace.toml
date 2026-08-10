@@ -1,0 +1,67 @@
+[profiles.controller]
+role = "Controller"
+provider = "codex"
+model = "gpt-5.6-luna"
+reasoning_effort = "low"
+permission = "read-only"
+context_policy = "loop-snapshot"
+max_attempts = 1
+quota_bucket = "codex-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+fallback_cooldown_seconds = 1800
+
+# Reordered for the MemTrace project: prefer Gemini over Sonnet when Codex Luna
+# (the required primary) is unavailable. The primary itself must stay Codex —
+# role_profiles._validate_role_boundaries() enforces that regardless of this file.
+[[profiles.controller.fallbacks]]
+provider = "antigravity"
+model = "gemini-3.6-flash-high"
+reasoning_effort = "high"
+quota_bucket = "antigravity-account"
+
+[[profiles.controller.fallbacks]]
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"
+
+[profiles.planner]
+role = "Planner"
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+permission = "read-only"
+context_policy = "task-and-targeted-evidence"
+max_attempts = 1
+quota_bucket = "claude-account"
+
+[profiles.planner-escalation]
+role = "Planning Escalation"
+provider = "claude"
+model = "opus"
+reasoning_effort = "high"
+permission = "read-only"
+context_policy = "task-and-targeted-evidence"
+max_attempts = 1
+quota_bucket = "claude-account"
+
+[profiles.red-team]
+role = "Red Team"
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+permission = "read-only"
+context_policy = "gate-evidence-only"
+max_attempts = 1
+quota_bucket = "codex-account"
+
+[profiles.developer]
+role = "Developer"
+provider = "antigravity"
+model = "gemini-3.1-pro-high"
+reasoning_effort = "high"
+permission = "workspace-write"
+context_policy = "accepted-plan-and-repo"
+max_attempts = 1
+quota_bucket = "antigravity-account"

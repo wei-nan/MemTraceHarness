@@ -65,6 +65,7 @@ class CodexCliAdapter(CliModelAdapter):
             usage=usage,
             provider_run_id=provider_run_id,
             warnings=warnings,
+            error=_last_error_message(events),
         )
         resolved_model = _last_model(events)
         if resolved_model:
@@ -82,6 +83,23 @@ def _last_agent_message(events: list[dict[str, Any]]) -> str | None:
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "agent_message" and item.get("text"):
             return str(item["text"])
+    return None
+
+
+def _last_error_message(events: list[dict[str, Any]]) -> str | None:
+    """Codex reports a failed turn as a JSON line on stdout, not stderr — e.g.
+    {"type":"error","message":"You've hit your usage limit..."} or a
+    {"type":"turn.failed","error":{"message":...}} event. Without this, a real quota/
+    rate-limit message is invisible to failure classification and every failure looks
+    like an unrecognized "unknown" error, which fails closed instead of falling back."""
+    for event in reversed(events):
+        event_type = event.get("type")
+        if event_type == "turn.failed":
+            error = event.get("error")
+            if isinstance(error, dict) and error.get("message"):
+                return str(error["message"])
+        elif event_type == "error" and event.get("message"):
+            return str(event["message"])
     return None
 
 

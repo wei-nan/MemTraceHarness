@@ -27,7 +27,7 @@ class UnattendedScanner:
         trace_store: TraceStore,
         projects: list[ProjectScope],
         memtrace_client: MemTraceClient | None = None,
-        gateway: TelegramGateway | None = None,
+        gateway: TelegramGateway | dict[str, TelegramGateway] | None = None,
         approval_mgr: ApprovalManager | None = None,
     ) -> None:
         self.config = config
@@ -36,6 +36,15 @@ class UnattendedScanner:
         self.memtrace_client = memtrace_client
         self.gateway = gateway
         self.approval_mgr = approval_mgr
+
+    def _gateway_for(self, scope: ProjectScope) -> TelegramGateway | None:
+        """Resolve the bot that owns this project. `gateway` may be a single shared
+        TelegramGateway (legacy, one bot for all projects) or a dict keyed by project
+        name (one dedicated bot per project) — notifications must go out on the bot
+        the project's users actually talk to."""
+        if isinstance(self.gateway, dict):
+            return self.gateway.get(scope.name)
+        return self.gateway
 
     def scan_project_backlog(self, scope: ProjectScope) -> list[str]:
         """Query MemTrace for planned but not implemented nodes in project scope."""
@@ -84,10 +93,11 @@ class UnattendedScanner:
                         workspace=ws_id,
                         working_directory=str(scope.working_directory),
                         reason="unattended_write",
-                        proposed_action=f"Scanner discovered {len(backlog)} backlog items ({', '.join(backlog[:3])}). Approve execution?",
+                        proposed_action=f"掃描器發現 {len(backlog)} 項待辦（{', '.join(backlog[:3])}）。是否核准執行？",
                     )
-                    if self.gateway:
-                        self.gateway.notify_all_allowlisted(req.format_telegram_message())
+                    gw = self._gateway_for(scope)
+                    if gw:
+                        gw.notify_all_allowlisted(req.format_telegram_message())
                     # Keep lock active while waiting for approval!
                 else:
                     # Execute loop immediately
@@ -108,7 +118,7 @@ class UnattendedScanner:
             risk_level=scope.default_risk_level,
             source="unattended-scanner",
         )
-        profiles = load_role_profiles()
+        profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
         candidate_adapters = build_role_adapter_candidates(
             profiles=profiles,
             config=self.config,
@@ -122,17 +132,19 @@ class UnattendedScanner:
             trace_store=self.trace_store,
             memtrace_client=self.memtrace_client,
             approval_manager=self.approval_mgr,
+            working_directory=scope.working_directory,
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
-        if self.gateway and self.gateway.primary_session_mgr:
-            self.gateway.primary_session_mgr.record_turn(
+        gw = self._gateway_for(scope)
+        if gw and gw.primary_session_mgr:
+            gw.primary_session_mgr.record_turn(
                 project=scope.name,
                 speaker="work_session_report",
                 turn_type="dev_report",
                 content=f"Scan loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
                 source_work_conversation_id=summary.conversation_id,
             )
-        if self.gateway:
-            self.gateway.notify_all_allowlisted(
-                f"🤖 Unattended scan loop completed for workspace `{scope.workspace_id}`. Status: {summary.status}"
+        if gw:
+            gw.notify_all_allowlisted(
+                f"🤖 工作區 {scope.workspace_id} 的無人值守掃描任務已完成。狀態：{summary.status}"
             )

@@ -135,6 +135,39 @@ class CliAdapterTests(TestCase):
         )
         self.assertEqual(response.execution.command[-1], "-")
 
+    def test_codex_usage_limit_error_is_surfaced_for_failure_classification(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread_codex"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "You've hit your usage limit. Try again at Aug 8th, 2026 9:47 PM.",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.failed",
+                        "error": {
+                            "message": "You've hit your usage limit. Try again at Aug 8th, 2026 9:47 PM."
+                        },
+                    }
+                ),
+            ]
+        )
+        adapter = self._adapter(
+            CodexCliAdapter, StaticProcessRunner(process_result(stdout, return_code=1))
+        )
+
+        response = adapter.run(self.task, "run_codex")
+
+        # A CLI failure reported as a stdout JSON line (not stderr) must still reach
+        # execution.error, otherwise failure classification sees no text at all, calls
+        # it "unknown", and the harness fails closed instead of falling back providers.
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("usage limit", response.execution.error or "")
+
     def test_claude_structured_output_object_is_normalized_to_json_text(self) -> None:
         artifact = {
             "status": "ready",
