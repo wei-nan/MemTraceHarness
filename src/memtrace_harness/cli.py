@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 import sys
@@ -70,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
             return gateway_command(args)
         if args.command == "scan":
             return scan_command(args)
+        if args.command == "init-project":
+            return init_project_command(args)
+        if args.command == "status":
+            return status_command(args)
+        if args.command == "remove-project":
+            return remove_project_command(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -208,6 +216,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "scan", help="Run a single pass of the unattended backlog scanner"
+    )
+
+    subparsers.add_parser(
+        "init-project",
+        help="Interactive wizard to register a new project (harness-scope.md, .env entries)",
+    )
+
+    subparsers.add_parser(
+        "status",
+        help="Show running gateway process(es), registered projects, locks, and pending approvals",
+    )
+
+    remove_project_parser = subparsers.add_parser(
+        "remove-project", help="Unregister a project (does not delete its harness-scope.md)"
+    )
+    remove_project_parser.add_argument(
+        "name", nargs="?", help="Project name to remove; omit to be prompted interactively"
+    )
+    remove_project_parser.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt"
     )
     return parser
 
@@ -689,6 +717,522 @@ def scan_command(args: argparse.Namespace) -> int:
 
 def _deduplicate(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def init_project_command(args: argparse.Namespace) -> int:
+    """Interactive wizard for registering a new project: writes harness-scope.md,
+    adds it to projects.index.txt, and writes any per-project .env overrides the
+    operator chooses (bot token, chat model, memory workspace, role-profiles file).
+    Nothing here is hot-reloaded — see the reminder printed at the end."""
+    from memtrace_harness.config import (
+        project_bot_token_env_var,
+        project_chat_fallbacks_env_var,
+        project_chat_model_env_var,
+        project_chat_provider_env_var,
+        project_memory_workspace_env_var,
+        project_role_profiles_env_var,
+    )
+
+    config = HarnessConfig.from_env()
+
+    print("=== Harness 專案設定精靈 ===")
+    print("走過一輪問答，幫你把新專案要碰的檔案跟 .env 設定都準備好。\n")
+
+    working_dir = _wizard_prompt_path("這個專案的工作目錄（絕對路徑)")
+    default_name = working_dir.name
+    name = _wizard_prompt("專案名稱", default=default_name)
+
+    workspace_id = _wizard_prompt_workspace_id(
+        config, "這個專案的 MemTrace 規格/待辦 workspace_id（產品規劃、決策用)"
+    )
+    off_limits = _wizard_prompt("禁區關鍵字（逗號分隔，沒有就留空)", default="")
+
+    scope_path = working_dir / "harness-scope.md"
+    if scope_path.exists():
+        overwrite = _wizard_prompt_yes_no(
+            f"{scope_path} 已經存在，要覆蓋嗎？", default=False
+        )
+        if not overwrite:
+            print("保留現有的 harness-scope.md，跳過這一步。")
+        else:
+            _write_harness_scope(scope_path, name, workspace_id, off_limits)
+            print(f"已寫入 {scope_path}")
+    else:
+        _write_harness_scope(scope_path, name, workspace_id, off_limits)
+        print(f"已寫入 {scope_path}")
+
+    index_path = config.project_index_path or Path("projects.index.txt")
+    _ensure_in_project_index(index_path, scope_path)
+    print(f"已確認 {index_path} 有列到這個專案。\n")
+
+    env_updates: dict[str, str] = {}
+
+    dedicated_bot = _wizard_prompt_yes_no(
+        f"要幫「{name}」設定專屬 Telegram bot 嗎？（不然會共用全域 bot,訊息要指名專案名才能路由對)",
+        default=True,
+    )
+    if dedicated_bot:
+        print("去 Telegram 找 @BotFather，傳 /newbot 建立一個新 bot，完成後把它給你的 token 貼在這裡。")
+        token = input("Bot token: ").strip()
+        if token:
+            env_updates[project_bot_token_env_var(name)] = token
+    elif not config.telegram_bot_token:
+        print("⚠️  目前沒有全域 HARNESS_TELEGRAM_BOT_TOKEN，這個專案在你設定其中一個之前收不到任何 Telegram 訊息。")
+
+    print("\n聊天模型（快速對話用，走的不是完整 Agent Loop):")
+    print("  1) Gemini（便宜、預設建議）  2) Claude  3) Codex  4) 沿用全域預設，不覆蓋")
+    chat_choice = _wizard_prompt_choice("選擇", ["1", "2", "3", "4"], default="1")
+    if chat_choice == "1":
+        env_updates[project_chat_provider_env_var(name)] = "antigravity"
+        env_updates[project_chat_model_env_var(name)] = "gemini-3.6-flash-high"
+        env_updates[project_chat_fallbacks_env_var(name)] = "claude/haiku"
+    elif chat_choice == "2":
+        env_updates[project_chat_provider_env_var(name)] = "claude"
+        env_updates[project_chat_model_env_var(name)] = "haiku"
+        env_updates[project_chat_fallbacks_env_var(name)] = "antigravity/gemini-3.6-flash-high"
+    elif chat_choice == "3":
+        env_updates[project_chat_provider_env_var(name)] = "codex"
+        env_updates[project_chat_model_env_var(name)] = ""
+
+    dedicated_memory = _wizard_prompt_yes_no(
+        "這個專案要獨立的冷記憶 workspace 嗎？（不要的話沿用全域共用的 Harness Memory)",
+        default=False,
+    )
+    if dedicated_memory:
+        mem_ws = _wizard_prompt_workspace_id(config, "冷記憶（專案決策)要寫進哪個 workspace_id")
+        env_updates[project_memory_workspace_env_var(name)] = mem_ws
+
+    dedicated_profiles = _wizard_prompt_yes_no(
+        "要複製一份可自訂的 role-profiles.toml 給這個專案嗎？（Agent Loop 各角色用的模型)",
+        default=False,
+    )
+    if dedicated_profiles:
+        dest = Path("profiles") / f"{_slugify(name)}.toml"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists():
+            default_toml = Path(__file__).with_name("default-role-profiles.toml")
+            dest.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"已複製一份到 {dest}。")
+        else:
+            print(f"沿用既有的 {dest}。")
+
+        advanced = _wizard_prompt_yes_no(
+            "── 進階設定 ── 要逐一調整 Controller/Planner/Planner-escalation/"
+            "Red Team/Developer 實際用的模型嗎？（不調整就維持該檔案目前內容)",
+            default=False,
+        )
+        if advanced:
+            text = dest.read_text(encoding="utf-8")
+            text = _wizard_configure_roles(text)
+            dest.write_text(text, encoding="utf-8")
+
+        env_updates[project_role_profiles_env_var(name)] = str(dest)
+
+    if env_updates:
+        env_path = Path(".env")
+        _write_env_updates(env_path, env_updates)
+        print(f"\n已把以下設定寫進 {env_path}：")
+        for key, value in env_updates.items():
+            display = f"{value[:6]}..." if "TOKEN" in key and value else value
+            print(f"  {key}={display}")
+    else:
+        print("\n沒有新增任何 .env 設定（都沿用全域預設)。")
+
+    print("\n=== 完成 ===")
+    print("檢查一下上面寫進 .env / harness-scope.md / role-profiles.toml 的內容是否正確。")
+    if env_updates or dedicated_profiles:
+        _wizard_offer_restart()
+    print("設定生效後，傳一句訊息到對應的 bot 測試。")
+    return 0
+
+
+def _wizard_prompt(question: str, *, default: str = "") -> str:
+    suffix = f"（預設：{default}）" if default else ""
+    answer = input(f"{question}{suffix}: ").strip()
+    return answer or default
+
+
+def _wizard_prompt_path(question: str) -> Path:
+    while True:
+        answer = input(f"{question}: ").strip()
+        if not answer:
+            print("這個一定要填。")
+            continue
+        path = Path(answer).expanduser().resolve()
+        if not path.is_dir():
+            create = _wizard_prompt_yes_no(f"{path} 不存在，要建立嗎？", default=False)
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                continue
+        return path
+
+
+def _wizard_prompt_choice(question: str, choices: list[str], *, default: str) -> str:
+    while True:
+        answer = input(f"{question} [{'/'.join(choices)}]（預設：{default}）: ").strip()
+        if not answer:
+            return default
+        if answer in choices:
+            return answer
+        print(f"請輸入其中一個：{', '.join(choices)}")
+
+
+def _wizard_prompt_yes_no(question: str, *, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    answer = input(f"{question} [{hint}]: ").strip().lower()
+    if not answer:
+        return default
+    return answer in {"y", "yes"}
+
+
+def _wizard_prompt_workspace_id(config: HarnessConfig, question: str) -> str:
+    if config.memtrace_mcp_url:
+        try:
+            client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+            result = client.call_tool("list_workspaces", {})
+            text = result.get("content", [{}])[0].get("text", "[]")
+            workspaces = json.loads(text)
+            if isinstance(workspaces, list) and workspaces:
+                print("\n目前 MemTrace 裡看得到的 workspace：")
+                for item in workspaces[:20]:
+                    print(f"  {item.get('id')}  {item.get('name')}")
+                print()
+        except Exception:
+            pass  # listing is a convenience, never block the wizard on it
+    while True:
+        answer = input(f"{question}（ws_ 開頭): ").strip()
+        if answer.startswith("ws_"):
+            return answer
+        print("workspace_id 應該以 ws_ 開頭，再試一次。")
+
+
+_ADVANCED_ROLE_ORDER = [
+    ("controller", "Controller（調度)"),
+    ("planner", "Planner（規劃)"),
+    ("planner-escalation", "Planner-escalation（G1 推理缺口才啟用)"),
+    ("red-team", "Red Team（G1/G2 審查)"),
+    ("developer", "Developer（實際寫程式，唯一能寫入的角色)"),
+]
+
+
+def _wizard_configure_roles(text: str) -> str:
+    """Advanced section: per-role provider/model, one role at a time. Only touches the
+    primary provider/model line for each role — fallback chains and reasoning_effort
+    stay whatever the file already has; edit the TOML directly for those."""
+    for profile_id, label in _ADVANCED_ROLE_ORDER:
+        change = _wizard_prompt_yes_no(f"要調整 {label} 的模型嗎？", default=False)
+        if not change:
+            continue
+        provider_choice = _wizard_prompt_choice(
+            "  廠商 1) codex  2) claude  3) antigravity", ["1", "2", "3"], default="1"
+        )
+        provider = {"1": "codex", "2": "claude", "3": "antigravity"}[provider_choice]
+        model = _wizard_prompt(
+            "  模型名稱（例如 gpt-5.6-sol / sonnet / gemini-3.6-flash-high)", default=""
+        )
+        if not model:
+            print("  沒填模型名稱，跳過。")
+            continue
+        updated = _set_role_model_in_toml(text, profile_id, provider, model)
+        if updated == text:
+            print(f"  ⚠️  在檔案裡找不到 [profiles.{profile_id}] 區塊，跳過。")
+        else:
+            text = updated
+            print(f"  已設定 {profile_id} = {provider}/{model}")
+    return text
+
+
+def _set_role_model_in_toml(text: str, profile_id: str, provider: str, model: str) -> str:
+    """Replace only the primary provider/model lines inside one [profiles.<id>] block —
+    stops at the next top-level [profiles.X] header, but a role's own
+    [[profiles.<id>.fallbacks]] sub-blocks stay part of the same section since they
+    don't match that boundary."""
+    import re
+
+    pattern = re.compile(
+        rf'(\[profiles\.{re.escape(profile_id)}\]\n(?:(?!\[profiles\.).)*)', re.DOTALL
+    )
+    match = pattern.search(text)
+    if not match:
+        return text
+    section = match.group(1)
+    updated_section = re.sub(r'provider = "[^"]*"', f'provider = "{provider}"', section, count=1)
+    updated_section = re.sub(r'model = "[^"]*"', f'model = "{model}"', updated_section, count=1)
+    # Keep quota_bucket consistent with the new provider — the fallback-cooldown ledger
+    # groups by this label, and leaving it pointing at the old vendor's bucket would
+    # make cooldown accounting silently wrong, not just cosmetically stale.
+    updated_section = re.sub(
+        r'quota_bucket = "[^"]*"', f'quota_bucket = "{provider}-account"', updated_section, count=1
+    )
+    return text[: match.start()] + updated_section + text[match.end() :]
+
+
+def _wizard_offer_restart() -> None:
+    label = f"gui/{os.getuid()}/com.memtraceharness.gateway"
+    restart = _wizard_prompt_yes_no("要現在重啟常駐服務讓設定生效嗎？", default=True)
+    if not restart:
+        print(f"記得之後手動重啟：launchctl kickstart -k {label}")
+        return
+    try:
+        result = subprocess.run(
+            ["launchctl", "kickstart", "-k", label], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print("已重啟常駐服務。")
+        else:
+            detail = result.stderr.strip() or f"exit code {result.returncode}"
+            print(f"重啟失敗（{detail}）。可以自己手動跑：launchctl kickstart -k {label}")
+    except Exception as exc:
+        print(f"重啟失敗：{exc}。可以自己手動跑：launchctl kickstart -k {label}")
+
+
+def _write_harness_scope(path: Path, name: str, workspace_id: str, off_limits: str) -> None:
+    # default_risk_level intentionally not asked/written here: risk-level-driven
+    # behavior belongs to the Agent Loop policy/KB layer, not something the wizard
+    # should ask the operator to configure — see ProjectScope's own "medium" fallback.
+    lines = [
+        f"# Harness scope — {name}",
+        "",
+        f"- workspace_id: {workspace_id}",
+        f"- working_directory: {path.parent}",
+    ]
+    if off_limits.strip():
+        lines.append(f"- off_limits: {off_limits.strip()}")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _ensure_in_project_index(index_path: Path, scope_path: Path) -> None:
+    existing_lines = (
+        index_path.read_text(encoding="utf-8").splitlines() if index_path.is_file() else []
+    )
+    target = scope_path.resolve()
+    already_present = any(
+        line.strip() and not line.strip().startswith("#") and Path(line.strip()).resolve() == target
+        for line in existing_lines
+    )
+    if already_present:
+        return
+    existing_lines.append(str(target))
+    index_path.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
+
+
+def _write_env_updates(env_path: Path, updates: dict[str, str]) -> None:
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
+    remaining = dict(updates)
+    for i, line in enumerate(lines):
+        if "=" not in line or line.strip().startswith("#"):
+            continue
+        key = line.split("=", 1)[0]
+        if key in remaining:
+            lines[i] = f"{key}={remaining.pop(key)}"
+    for key, value in remaining.items():
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _slugify(name: str) -> str:
+    import re
+
+    return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "project"
+
+
+def status_command(args: argparse.Namespace) -> int:
+    """One-shot diagnostic: what's actually running, what's registered, and what's
+    stuck. Read-only — never modifies process state, files, or the trace store."""
+    from memtrace_harness.config import (
+        project_bot_token_env_var,
+        project_chat_provider_env_var,
+        project_memory_workspace_env_var,
+        project_role_profiles_env_var,
+    )
+
+    config = HarnessConfig.from_env()
+    trace_store = TraceStore(config.trace_db_path)
+    projects = load_project_index(config.project_index_path)
+
+    print("=== 常駐行程 ===")
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", "memtrace_harness gateway --serve"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = result.stdout.strip().splitlines()
+        if pids:
+            for line in pids:
+                print(f"  {line}")
+            if len(pids) > 1:
+                print("  ⚠️  找到不只一個 --serve 行程，同一個 bot 會搶 getUpdates 連線（409 Conflict）。")
+        else:
+            print("  沒有正在跑的 gateway --serve 行程")
+    except Exception as exc:
+        print(f"  無法查詢行程：{exc}")
+
+    try:
+        result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
+        matched = [line for line in result.stdout.splitlines() if "memtraceharness" in line]
+        print("  launchd 註冊：" + (matched[0] if matched else "沒有註冊 com.memtraceharness.gateway"))
+    except Exception as exc:
+        print(f"  無法查詢 launchd：{exc}")
+
+    print(f"\n=== 已註冊專案（{len(projects)} 個，來自 {config.project_index_path}）===")
+    if not projects:
+        print("  （空的，或 HARNESS_PROJECT_INDEX 沒設定/找不到)")
+
+    for scope in projects:
+        dedicated_bot = bool(os.getenv(project_bot_token_env_var(scope.name)))
+        dedicated_chat = bool(os.getenv(project_chat_provider_env_var(scope.name)))
+        dedicated_memory = bool(os.getenv(project_memory_workspace_env_var(scope.name)))
+        dedicated_profiles = bool(os.getenv(project_role_profiles_env_var(scope.name)))
+
+        session_id = f"psess_{scope.name}"
+        turn_count = len(trace_store.get_primary_session_turns(session_id))
+        pending_goal = len(trace_store.get_unconsolidated_turns(session_id))
+        pending_pref = len(trace_store.get_unconsolidated_turns_for_preference(session_id))
+        lock = trace_store.get_workspace_lock(scope.workspace_id)
+        pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
+
+        print(f"\n  【{scope.name}】 workspace_id={scope.workspace_id}")
+        print(f"    working_directory: {scope.working_directory}")
+        print(
+            "    專屬設定："
+            f"bot={'有' if dedicated_bot else '共用全域'}, "
+            f"chat model={'有' if dedicated_chat else '共用全域'}, "
+            f"memory workspace={'有' if dedicated_memory else '共用全域'}, "
+            f"role-profiles={'有' if dedicated_profiles else '用預設'}"
+        )
+
+        chat_candidates = config.chat_candidates_for(scope.name)
+        if chat_candidates:
+            chat_line = " -> ".join(f"{p}/{m or '(預設)'}" for p, m in chat_candidates)
+            print(f"    聊天模型：{chat_line}")
+        else:
+            print("    聊天模型：（未設定 HARNESS_CHAT_PROVIDER）")
+
+        try:
+            role_profiles = load_role_profiles(config.role_profiles_file_for(scope.name))
+            print("    Agent Loop 角色模型：")
+            for profile_id, profile in role_profiles.items():
+                entry = f"      {profile_id}: {profile.provider}/{profile.model}"
+                if profile.fallbacks:
+                    fb = ", ".join(f"{f.provider}/{f.model}" for f in profile.fallbacks)
+                    entry += f"（fallback: {fb}）"
+                print(entry)
+        except Exception as exc:
+            print(f"    ⚠️  role-profiles 讀取失敗：{exc}")
+
+        print(f"    對話記錄：{turn_count} 則（目標分類待處理 {pending_goal}、偏好分類待處理 {pending_pref}）")
+        if lock:
+            print(f"    ⚠️  workspace 鎖定中：conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
+        if pending_approvals:
+            print(f"    ⚠️  待核准請求 {len(pending_approvals)} 筆：")
+            for req in pending_approvals:
+                print(f"       {req['id']} — {req['reason']} — {req['proposed_action'][:60]}")
+
+    return 0
+
+
+def remove_project_command(args: argparse.Namespace) -> int:
+    """Unregister a project: remove it from projects.index.txt and, if the operator
+    confirms, its per-project .env overrides. Deliberately never touches the target
+    project's own harness-scope.md (that file belongs to that repo, not the Harness),
+    and never deletes trace_store history (that's an audit trail, not live state)."""
+    from memtrace_harness.config import (
+        project_bot_token_env_var,
+        project_chat_fallbacks_env_var,
+        project_chat_model_env_var,
+        project_chat_provider_env_var,
+        project_memory_workspace_env_var,
+        project_role_profiles_env_var,
+    )
+
+    config = HarnessConfig.from_env()
+    trace_store = TraceStore(config.trace_db_path)
+    projects = load_project_index(config.project_index_path)
+    if not projects:
+        print("沒有已註冊的專案可以移除。")
+        return 1
+
+    name = args.name
+    if not name:
+        print("已註冊的專案：")
+        for scope in projects:
+            print(f"  {scope.name}  (workspace_id={scope.workspace_id})")
+        name = input("要移除哪一個？輸入專案名稱: ").strip()
+
+    matched = next((s for s in projects if s.name == name), None)
+    if not matched:
+        print(f"找不到專案 {name!r}。", file=sys.stderr)
+        return 1
+
+    lock = trace_store.get_workspace_lock(matched.workspace_id)
+    pending_approvals = trace_store.list_pending_approvals_for_workspace(matched.workspace_id)
+    if lock or pending_approvals:
+        print(f"⚠️  「{name}」目前還有進行中的狀態：")
+        if lock:
+            print(f"  - workspace 鎖定中：conversation_id={lock['conversation_id']}")
+        if pending_approvals:
+            print(f"  - {len(pending_approvals)} 筆待核准請求")
+        print("移除註冊不會清掉這些狀態，之後如果又用同一個 workspace_id 註冊回來，鎖定/待核准可能還在。")
+
+    if not args.yes:
+        confirm = input(f"確定要移除「{name}」的註冊嗎？(y/N): ").strip().lower()
+        if confirm not in {"y", "yes"}:
+            print("已取消。")
+            return 0
+
+    index_path = config.project_index_path or Path("projects.index.txt")
+    _remove_from_project_index(index_path, matched.scope_file_path)
+    print(f"已從 {index_path} 移除。")
+    print(f"（{matched.scope_file_path} 本身沒有被刪除——那是該專案 repo 自己的檔案。)")
+
+    env_keys = [
+        project_bot_token_env_var(name),
+        project_chat_provider_env_var(name),
+        project_chat_model_env_var(name),
+        project_chat_fallbacks_env_var(name),
+        project_memory_workspace_env_var(name),
+        project_role_profiles_env_var(name),
+    ]
+    env_path = Path(".env")
+    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
+    present_keys = [
+        key for key in env_keys if any(line.split("=", 1)[0] == key for line in existing_lines if "=" in line)
+    ]
+    if present_keys:
+        print(f"\n{env_path} 裡還有這個專案的專屬設定：")
+        for key in present_keys:
+            print(f"  {key}")
+        remove_env = args.yes or input("要一併移除嗎？(y/N): ").strip().lower() in {"y", "yes"}
+        if remove_env:
+            _remove_env_keys(env_path, present_keys)
+            print("已移除。")
+        else:
+            print("保留不動。")
+
+    print()
+    _wizard_offer_restart()
+    return 0
+
+
+def _remove_from_project_index(index_path: Path, scope_file_path: Path) -> None:
+    if not index_path.is_file():
+        return
+    target = scope_file_path.resolve()
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    kept = [
+        line
+        for line in lines
+        if not (line.strip() and not line.strip().startswith("#") and Path(line.strip()).resolve() == target)
+    ]
+    index_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+def _remove_env_keys(env_path: Path, keys: list[str]) -> None:
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if not ("=" in line and line.split("=", 1)[0] in keys)]
+    env_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
 
 
 if __name__ == "__main__":
