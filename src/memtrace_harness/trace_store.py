@@ -1044,6 +1044,34 @@ class TraceStore:
             "responded_by_chat_id": row[10],
         }
 
+    def list_pending_approvals_for_workspace(self, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, conversation_id, workspace, working_directory, stage_ref,
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                FROM approval_requests WHERE workspace = ? AND status = 'pending'
+                ORDER BY created_at ASC
+                """,
+                (workspace_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "conversation_id": row[1],
+                "workspace": row[2],
+                "working_directory": row[3],
+                "stage_ref": row[4],
+                "reason": row[5],
+                "proposed_action": row[6],
+                "status": row[7],
+                "created_at": row[8],
+                "responded_at": row[9],
+                "responded_by_chat_id": row[10],
+            }
+            for row in rows
+        ]
+
     def resolve_approval_request(
         self, request_id: str, status: str, responded_by_chat_id: int | None = None
     ) -> bool:

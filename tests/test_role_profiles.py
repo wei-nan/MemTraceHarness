@@ -144,6 +144,44 @@ class RoleProfileTests(TestCase):
             ["developer"],
         )
 
+    def test_custom_profile_can_give_red_team_and_planner_escalation_a_fallback(self) -> None:
+        # Previously hard-blocked ("must fail closed"). Relaxed once fallback usage
+        # became visible in the completion summary — no longer a silent downgrade.
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.toml"
+            original = (
+                Path(__file__).parents[1]
+                / "src"
+                / "memtrace_harness"
+                / "default-role-profiles.toml"
+            )
+            # [profiles.red-team] is redefined below — tomllib rejects duplicate
+            # tables, so strip the original block first rather than appending.
+            import re
+
+            original_text = original.read_text(encoding="utf-8")
+            stripped = re.sub(
+                r'\[profiles\.red-team\]\n(?:(?!\[profiles\.).)*', "", original_text, count=1, flags=re.DOTALL
+            )
+            text = stripped + (
+                '[profiles.red-team]\nrole = "Red Team"\nprovider = "antigravity"\n'
+                'model = "claude-sonnet-4-6"\nreasoning_effort = "high"\n'
+                'permission = "read-only"\ncontext_policy = "gate-evidence-only"\n'
+                'max_attempts = 1\nquota_bucket = "antigravity-account"\n'
+                'fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]\n'
+                'max_fallback_hops = 1\n\n'
+                '[[profiles.red-team.fallbacks]]\nprovider = "antigravity"\n'
+                'model = "gemini-3.6-flash-high"\nreasoning_effort = "high"\n'
+                'quota_bucket = "antigravity-account"\n'
+            )
+            path.write_text(text, encoding="utf-8")
+
+            profiles = load_role_profiles(path)
+
+        self.assertEqual(profiles["red-team"].provider, "antigravity")
+        self.assertEqual(len(profiles["red-team"].fallbacks), 1)
+        self.assertEqual(profiles["red-team"].fallbacks[0].model, "gemini-3.6-flash-high")
+
     def test_custom_profile_can_pin_a_full_sonnet_model_id(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"

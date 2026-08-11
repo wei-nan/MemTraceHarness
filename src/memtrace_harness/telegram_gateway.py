@@ -276,7 +276,34 @@ class TelegramGateway:
                 "them, learned from prior conversations across every project, not just "
                 f"this one. Follow it same as any explicit instruction:\n\n{operator_profile}"
             )
+        role_summary = self._role_profiles_summary(scope)
+        if role_summary:
+            parts.append(
+                "Agent Loop role -> provider/model configuration for this project (this "
+                "IS the authoritative, current answer to \"which model does each stage "
+                "use\" — don't guess, don't offer to go query MemTrace for this, it isn't "
+                "stored there):\n\n" + role_summary
+            )
         return "\n\n---\n\n".join(parts)
+
+    def _role_profiles_summary(self, scope: ProjectScope) -> str:
+        """So a chat question like "what models does Controller/Developer use" can be
+        answered from what the Harness actually has locally, instead of the model
+        guessing or conflating it with an unrelated MemTrace workspace mentioned in
+        harness-scope.md. Best-effort: a broken profiles file must not break chat."""
+        try:
+            profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
+        except Exception:
+            logger.exception(f"Failed to load role profiles for '{scope.name}'; omitting from context")
+            return ""
+        lines = []
+        for profile_id, profile in profiles.items():
+            entry = f"- {profile_id}: {profile.provider}/{profile.model} ({profile.permission})"
+            if profile.fallbacks:
+                fb = ", ".join(f"{f.provider}/{f.model}" for f in profile.fallbacks)
+                entry += f" — fallback: {fb}"
+            lines.append(entry)
+        return "\n".join(lines)
 
     def _operator_profile_context(self) -> str:
         """Cross-project: the operator's own preference profile, not scoped to any one
@@ -348,6 +375,11 @@ class TelegramGateway:
             cmd.extend(["--print", prompt])
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():
+                if failures:
+                    logger.warning(
+                        f"quick chat reply fell back to {provider}/{model} for project "
+                        f"'{scope.name}' after: {'; '.join(failures)}"
+                    )
                 return f"{result.stdout.strip()}\n\n🧩 {provider}/{model or '預設模型'}"
             detail = result.error or result.stderr.strip() or f"exit code {result.return_code}"
             failures.append(f"{provider}/{model or '預設模型'}：{detail}")
