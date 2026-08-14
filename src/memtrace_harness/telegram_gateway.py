@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -12,14 +13,16 @@ from uuid import uuid4
 from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.approval import ApprovalRequestData
+from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.primary_session import OPERATOR_PROFILE_TITLE
 from memtrace_harness.role_profiles import load_role_profiles
-from memtrace_harness.schemas import TaskEnvelope
+from memtrace_harness.schemas import ContextItem, TaskEnvelope
 from memtrace_harness.trace_store import TraceStore
 
 if TYPE_CHECKING:
-    from memtrace_harness.approval import ApprovalManager, ApprovalRequestData
+    from memtrace_harness.approval import ApprovalManager
     from memtrace_harness.chat_triage import ChatTriage
     from memtrace_harness.config import HarnessConfig
     from memtrace_harness.memtrace_client import MemTraceClient
@@ -89,6 +92,101 @@ class TelegramGateway:
             logger.error(f"Telegram sendMessage failed: {exc}")
             return False
 
+    def send_message_with_keyboard(
+        self, chat_id: int, text: str, keyboard: list[list[dict[str, str]]]
+    ) -> int | None:
+        """Same as send_message() but attaches a Telegram inline keyboard and returns
+        the sent message's id (or None on failure) so the caller can remember which
+        message a button/reply is about — see record_telegram_message()."""
+        if not self.is_enabled() or chat_id not in self.allowed_chat_ids:
+            return None
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": {"inline_keyboard": keyboard},
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                result = data.get("result")
+                if data.get("ok") and isinstance(result, dict):
+                    return result.get("message_id")
+                return None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.error(f"Telegram sendMessage (with keyboard) failed: {exc}")
+            return None
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+        """Required after handling a button tap — until this is called, Telegram keeps
+        showing a loading spinner on the button the user just pressed."""
+        if not self.is_enabled():
+            return
+        url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.error(f"Telegram answerCallbackQuery failed: {exc}")
+
+    def clear_message_keyboard(self, chat_id: int, message_id: int) -> None:
+        """Best-effort: remove the approve/reject buttons once a request is resolved,
+        so a stale button can't be tapped again after the request is no longer pending."""
+        if not self.is_enabled():
+            return
+        url = f"https://api.telegram.org/bot{self.bot_token}/editMessageReplyMarkup"
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.error(f"Telegram editMessageReplyMarkup failed: {exc}")
+
+    @staticmethod
+    def _approval_keyboard(request_id: str) -> list[list[dict[str, str]]]:
+        return [
+            [
+                {"text": "✅ 核准", "callback_data": f"approve:{request_id}"},
+                {"text": "❌ 拒絕", "callback_data": f"reject:{request_id}"},
+            ]
+        ]
+
+    def notify_approval_request(self, req: ApprovalRequestData) -> None:
+        """Send an approval request with tappable buttons to every allowlisted chat,
+        and remember the (chat_id, message_id) so a swipe-reply to it later resolves
+        unambiguously back to this request. Note: with more than one allowlisted chat,
+        only the last chat's message_id is kept for reply-matching — the common case
+        here is a single operator/single chat, so this isn't built out further."""
+        for cid in self.allowed_chat_ids:
+            message_id = self.send_message_with_keyboard(
+                cid, req.format_telegram_message(), self._approval_keyboard(req.id)
+            )
+            if message_id is not None:
+                self.approval_manager.record_telegram_message(
+                    req.id, chat_id=cid, message_id=message_id
+                )
+
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         """Best-effort "typing..." indicator. Telegram only shows it for ~5s per call
         and there's no long-running work happening on this thread to refresh it from,
@@ -133,6 +231,10 @@ class TelegramGateway:
         update_id = update.get("update_id", 0)
         self.offset = max(self.offset, update_id + 1)
 
+        callback_query = update.get("callback_query")
+        if callback_query:
+            return self._handle_callback_query(callback_query)
+
         message = update.get("message")
         if not message:
             return None
@@ -146,24 +248,28 @@ class TelegramGateway:
         if not text:
             return None
 
+        # Plain free-text (not a "/" command, not a "!" task trigger) gets one chance
+        # to resolve as an answer to a pending approval before falling through to
+        # ordinary chat — either because it's a native swipe-reply to the approval
+        # message (unambiguous), or because there's exactly one pending approval for
+        # this bot's projects (still unambiguous — nothing to disambiguate). This is
+        # deliberately scoped to "clarify" only, never "approve"/"reject": clarify just
+        # feeds the answer back into the loop and can't by itself authorize a write,
+        # so treating free text as clarify by default carries none of the risk that
+        # inferring "approve" from casual wording would.
+        if not text.startswith("/") and not text.startswith("!"):
+            clarify_target = self._find_clarify_target(message, chat_id)
+            if clarify_target:
+                return self._resolve_approval_action(clarify_target.id, "clarify", chat_id, text)
+
         result = self.triage.triage_message(text)
 
         if result.kind == "approval_response":
             assert result.approval_id is not None
             assert result.approval_action is not None
-            success, msg, req_data = self.approval_manager.respond(
-                request_id=result.approval_id,
-                action=result.approval_action,
-                chat_id=chat_id,
-                reason_or_answer=result.approval_reason,
+            return self._resolve_approval_action(
+                result.approval_id, result.approval_action, chat_id, result.approval_reason
             )
-            self.send_message(chat_id, f"核准狀態更新：{msg}")
-            if success and req_data:
-                if req_data.status == "approved":
-                    self._resume_approved_conversation(req_data, result.approval_reason)
-                elif req_data.status in {"rejected", "expired"}:
-                    self.approval_manager.trace_store.release_workspace_lock(req_data.workspace)
-            return msg
 
         if result.kind == "out_of_scope" or result.kind == "unrecognized":
             rejection = result.rejection_message or "已拒絕（超出範圍）。"
@@ -206,6 +312,74 @@ class TelegramGateway:
             goal = result.task_goal or text
             return self._start_or_queue_task(scope, goal, chat_id)
 
+    def _resolve_approval_action(
+        self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None
+    ) -> str:
+        """Shared by the /approve|/reject|/clarify text commands, the inline-keyboard
+        button callbacks, and the swipe-reply/single-pending clarify fallback — one
+        place that resolves an approval and reacts to the outcome, so those three
+        entry points can't drift out of sync with each other."""
+        success, msg, req_data = self.approval_manager.respond(
+            request_id=request_id, action=action, chat_id=chat_id, reason_or_answer=reason_or_answer
+        )
+        self.send_message(chat_id, f"核准狀態更新：{msg}")
+        if success and req_data:
+            if req_data.telegram_chat_id is not None and req_data.telegram_message_id is not None:
+                self.clear_message_keyboard(req_data.telegram_chat_id, req_data.telegram_message_id)
+            if req_data.status == "approved":
+                self._resume_approved_conversation(req_data, reason_or_answer)
+            elif req_data.status in {"rejected", "expired"}:
+                self.approval_manager.trace_store.release_workspace_lock(req_data.workspace)
+        return msg
+
+    def _find_clarify_target(
+        self, message: dict[str, Any], chat_id: int
+    ) -> ApprovalRequestData | None:
+        """Resolve free text to the pending approval it's answering, without the human
+        ever typing an ID. Two ways, both unambiguous by construction (never a guess):
+        1. A native swipe-reply to the approval's own message — Telegram's
+           reply_to_message tells us exactly which one.
+        2. Exactly one pending approval exists across this bot's projects — there's
+           nothing to disambiguate, so any plain message can only be about that one.
+        Returns None (falls through to ordinary chat/task routing) whenever more than
+        one approval is pending and there's no reply match — guessing among several
+        would risk answering the wrong one."""
+        reply_to = message.get("reply_to_message")
+        if reply_to and reply_to.get("message_id") is not None:
+            req = self.approval_manager.get_by_telegram_message(chat_id, reply_to["message_id"])
+            if req and req.status == "pending":
+                return req
+        pending: list[ApprovalRequestData] = []
+        for scope in self.projects:
+            pending.extend(
+                ApprovalRequestData(**data)
+                for data in self.approval_manager.trace_store.list_pending_approvals_for_workspace(
+                    scope.workspace_id
+                )
+            )
+        return pending[0] if len(pending) == 1 else None
+
+    def _handle_callback_query(self, callback_query: dict[str, Any]) -> str | None:
+        """A tap on an approve/reject inline-keyboard button. Telegram delivers this as
+        its own update type (not a "message"), separate from ordinary text updates."""
+        callback_id = callback_query.get("id")
+        data = callback_query.get("data") or ""
+        source_message = callback_query.get("message") or {}
+        chat_id = source_message.get("chat", {}).get("id")
+        if chat_id is None or chat_id not in self.allowed_chat_ids:
+            if callback_id:
+                self.answer_callback_query(callback_id)
+            return None
+        action, _, request_id = data.partition(":")
+        if not action or not request_id:
+            if callback_id:
+                self.answer_callback_query(callback_id, text="無法辨識的按鈕")
+            return None
+        result = self._resolve_approval_action(request_id, action, chat_id, None)
+        if callback_id:
+            self.answer_callback_query(callback_id, text=result[:200])
+        return result
+
     def _start_or_queue_task(self, scope: ProjectScope, goal: str, chat_id: int) -> str:
         ws_id = scope.workspace_id
         trace_store = self.approval_manager.trace_store
@@ -227,25 +401,44 @@ class TelegramGateway:
                 working_directory=str(scope.working_directory),
                 reason="unattended_write",
                 proposed_action=goal,
+                resume_goal=goal,
             )
-            msg = req.format_telegram_message()
-            self.send_message(chat_id, msg)
-            # Lock stays held until /approve or /reject resolves the request.
-            return msg
+            self.notify_approval_request(req)
+            # Lock stays held until the approve/reject button (or /approve, /reject)
+            # resolves the request.
+            return req.format_telegram_message()
 
-        # This runs the full governed loop synchronously and can take minutes — tell
-        # the user up front so a long silence doesn't read as "nothing is happening".
-        self.send_message(chat_id, f"🔧 已開始執行「{scope.name}」的任務，可能需要幾分鐘，完成後會通知你。")
-        try:
-            summary = self._run_new_task(scope, conv_id, goal)
-        finally:
-            trace_store.release_workspace_lock(ws_id)
-        msg = (
-            f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation[:200]}\n\n"
-            f"🧩 {self._model_summary(summary)}"
+        # Runs in a background thread so this bot's poll loop — and therefore ordinary
+        # chat on it — isn't blocked for the minutes a governed loop can take. The
+        # workspace lock (already acquired above) is what actually prevents a second
+        # task from starting on the same workspace while this one runs; it's released
+        # inside the thread once the run finishes, not here.
+        self.send_message(
+            chat_id,
+            f"🔧 已開始執行「{scope.name}」的任務，可能需要幾分鐘，完成後會通知你（這段期間仍可以正常對話）。",
         )
-        self.send_message(chat_id, msg)
-        return msg
+
+        def _run() -> None:
+            try:
+                summary = self._run_new_task(scope, conv_id, goal)
+                msg = (
+                    f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation[:200]}\n\n"
+                    f"🧩 {self._model_summary(summary)}"
+                )
+                self.send_message(chat_id, msg)
+            except Exception:
+                logger.exception(f"background agent loop for '{scope.name}' ({conv_id}) failed")
+                self.send_message(chat_id, f"⚠️「{scope.name}」的任務執行時發生未預期錯誤，請查看日誌。")
+            finally:
+                trace_store.release_workspace_lock(ws_id)
+                default_tracker.unregister(thread)
+
+        thread = threading.Thread(target=_run, name=f"agent-loop-{conv_id}", daemon=True)
+        thread.start()
+        default_tracker.register(
+            thread, workspace_id=ws_id, conversation_id=conv_id, trace_store=trace_store
+        )
+        return f"任務已在背景開始執行：{goal[:80]}"
 
     def _identity_context(self, scope: ProjectScope) -> str:
         memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
@@ -330,8 +523,41 @@ class TelegramGateway:
             logger.exception("Failed to fetch operator preference profile; continuing without it")
             return ""
 
-    def _augment_goal(self, scope: ProjectScope, goal: str) -> str:
-        return f"{self._identity_context(scope)}\n\n---\n\nUser request:\n{goal}"
+    def _project_context_items(self, scope: ProjectScope) -> list[ContextItem]:
+        """What the Agent Loop actually needs to do its job, carried through the
+        TaskEnvelope's structured context_items (respecting each role's
+        context_policy — see adapter_factory.py/loop.py's per-stage filtering) instead
+        of concatenated into `goal` text. Deliberately excludes the operator
+        preference profile and the role->model summary: those describe how *Harness*
+        should talk to the human (quick-chat replies, approval messages), not
+        information Controller/Planner/Red Team/Developer need to do technical work —
+        see _identity_context(), still used as-is for _quick_chat_reply(). Off-limits
+        rules travel via TaskEnvelope.constraints (scope.off_limits), not here.
+
+        Fixes the same bug class as the resume_goal-augmentation-nesting fix, at the
+        root instead of patching around it: since `goal` no longer carries any of
+        this, there is nothing for a resumed conversation to re-wrap or duplicate."""
+        items = [
+            ContextItem(
+                ref=f"harness:project-scope:{scope.name}",
+                title="Project scope",
+                body=scope.raw_markdown.strip(),
+                content_type="context",
+                source="harness",
+            )
+        ]
+        rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
+        if rehydration:
+            items.append(
+                ContextItem(
+                    ref=f"harness:prior-discussion:{scope.name}",
+                    title="Prior discussion (open items may still need action)",
+                    body=rehydration,
+                    content_type="context",
+                    source="harness",
+                )
+            )
+        return items
 
     @staticmethod
     def _model_summary(summary) -> str:
@@ -391,9 +617,10 @@ class TelegramGateway:
         task = TaskEnvelope(
             task_id=f"task_{conv_id}",
             workspace_id=scope.workspace_id,
-            goal=self._augment_goal(scope, goal),
+            goal=goal,
             context_refs=[],
-            context_items=[],
+            context_items=self._project_context_items(scope),
+            constraints=list(scope.off_limits or []),
             risk_level=scope.default_risk_level,
             source="telegram-chat",
         )
@@ -430,71 +657,101 @@ class TelegramGateway:
         if not working_dir.is_dir():
             logger.error(f"Cannot resume conversation {req_data.conversation_id}: working dir {working_dir} invalid")
             return
-        trace_store = TraceStore(self.config.trace_db_path)
         matching_scope = next(
             (s for s in self.projects if s.workspace_id == req_data.workspace or s.working_directory.resolve() == working_dir),
             None,
         )
-        # Runs synchronously and can take minutes — say so up front rather than leaving
-        # the user staring at silence after the "Approval update: approved" message.
+        # Runs in a background thread — see _run() below — so this doesn't block the
+        # poll loop for the minutes a governed run can take; say so up front rather
+        # than leaving the user staring at silence after the "Approval update:
+        # approved" message.
         self.notify_all_allowlisted(
             f"🔧 已核准，開始執行「{matching_scope.name if matching_scope else req_data.workspace}」，"
-            "可能需要幾分鐘，完成後會通知你。"
+            "可能需要幾分鐘，完成後會通知你（這段期間仍可以正常對話）。"
         )
-        goal = req_data.proposed_action or req_data.reason
+        # resume_goal (the original request) beats proposed_action (a human-readable
+        # summary of why it stopped) — approving must continue the actual task, not
+        # re-run with the stop reason as the new goal. Older rows predating this field
+        # fall back to the old behavior.
+        goal = req_data.resume_goal or req_data.proposed_action or req_data.reason
         if answer:
             goal = f"{goal}\n\nHuman clarification: {answer}"
-        if matching_scope:
-            goal = self._augment_goal(matching_scope, goal)
-        task = TaskEnvelope(
-            task_id=f"task_{req_data.conversation_id}",
-            workspace_id=req_data.workspace,
-            goal=goal,
-            context_refs=[],
-            context_items=[],
-            risk_level="medium",
-            source="telegram-approval-resume",
-        )
-        profiles_file = (
-            self.config.role_profiles_file_for(matching_scope.name) if matching_scope else None
-        )
-        profiles = load_role_profiles(profiles_file)
-        candidate_adapters = build_role_adapter_candidates(
-            profiles=profiles,
-            config=self.config,
-            working_directory=working_dir,
-            timeout_seconds=self.config.cli_timeout_seconds,
-        )
-        runner = AgentLoopRunner(
-            adapters={p_id: items[0] for p_id, items in candidate_adapters.items()},
-            fallback_adapters={p_id: items[1:] for p_id, items in candidate_adapters.items()},
-            role_profiles=profiles,
-            trace_store=trace_store,
-            memtrace_client=self.memtrace_client,
-            approval_manager=self.approval_manager,
-            working_directory=working_dir,
-        )
-        try:
-            summary = runner.run(
-                task,
-                writeback=True,
-                conversation_id=req_data.conversation_id,
-            )
-            project_name = matching_scope.name if matching_scope else req_data.workspace
 
-            self.primary_session_mgr.record_turn(
-                project=project_name,
-                speaker="work_session_report",
-                turn_type="dev_report",
-                content=f"Resumed loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
-                source_work_conversation_id=summary.conversation_id,
-            )
-            self.notify_all_allowlisted(
-                f"🔄 對話 {req_data.conversation_id} 已繼續執行。結果：{summary.status}"
-                f"（{summary.recommendation[:120]}）\n\n🧩 {self._model_summary(summary)}"
-            )
-        finally:
-            trace_store.release_workspace_lock(req_data.workspace)
+        def _run() -> None:
+            # A fresh TraceStore/connection per background thread — sqlite3
+            # connections aren't safe to share across threads, and each call already
+            # opens/closes its own connection, so this just avoids the main thread's
+            # instance being touched concurrently.
+            trace_store = TraceStore(self.config.trace_db_path)
+            try:
+                task = TaskEnvelope(
+                    task_id=f"task_{req_data.conversation_id}",
+                    workspace_id=req_data.workspace,
+                    goal=goal,
+                    context_refs=[],
+                    context_items=(
+                        self._project_context_items(matching_scope) if matching_scope else []
+                    ),
+                    constraints=list(matching_scope.off_limits or []) if matching_scope else [],
+                    risk_level="medium",
+                    source="telegram-approval-resume",
+                )
+                profiles_file = (
+                    self.config.role_profiles_file_for(matching_scope.name) if matching_scope else None
+                )
+                profiles = load_role_profiles(profiles_file)
+                candidate_adapters = build_role_adapter_candidates(
+                    profiles=profiles,
+                    config=self.config,
+                    working_directory=working_dir,
+                    timeout_seconds=self.config.cli_timeout_seconds,
+                )
+                runner = AgentLoopRunner(
+                    adapters={p_id: items[0] for p_id, items in candidate_adapters.items()},
+                    fallback_adapters={p_id: items[1:] for p_id, items in candidate_adapters.items()},
+                    role_profiles=profiles,
+                    trace_store=trace_store,
+                    memtrace_client=self.memtrace_client,
+                    approval_manager=self.approval_manager,
+                    working_directory=working_dir,
+                )
+                summary = runner.run(
+                    task,
+                    writeback=True,
+                    conversation_id=req_data.conversation_id,
+                )
+                project_name = matching_scope.name if matching_scope else req_data.workspace
+
+                self.primary_session_mgr.record_turn(
+                    project=project_name,
+                    speaker="work_session_report",
+                    turn_type="dev_report",
+                    content=f"Resumed loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
+                    source_work_conversation_id=summary.conversation_id,
+                )
+                self.notify_all_allowlisted(
+                    f"🔄 對話 {req_data.conversation_id} 已繼續執行。結果：{summary.status}"
+                    f"（{summary.recommendation[:120]}）\n\n🧩 {self._model_summary(summary)}"
+                )
+            except Exception:
+                logger.exception(f"background resume for conversation {req_data.conversation_id} failed")
+                self.notify_all_allowlisted(
+                    f"⚠️ 對話 {req_data.conversation_id} 恢復執行時發生未預期錯誤，請查看日誌。"
+                )
+            finally:
+                trace_store.release_workspace_lock(req_data.workspace)
+                default_tracker.unregister(thread)
+
+        thread = threading.Thread(
+            target=_run, name=f"agent-loop-resume-{req_data.conversation_id}", daemon=True
+        )
+        thread.start()
+        default_tracker.register(
+            thread,
+            workspace_id=req_data.workspace,
+            conversation_id=req_data.conversation_id,
+            trace_store=self.approval_manager.trace_store,
+        )
 
     def poll_once(self, timeout: int = 1) -> int:
         updates = self.get_updates(timeout=timeout)

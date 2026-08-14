@@ -1,59 +1,75 @@
 [profiles.controller]
 role = "Controller"
-provider = "codex"
-model = "gpt-5.6-luna"
-reasoning_effort = "low"
+provider = "antigravity"
+model = "claude-opus-4-6-thinking"
+reasoning_effort = "high"
 permission = "read-only"
 context_policy = "loop-snapshot"
 max_attempts = 1
-quota_bucket = "codex-account"
+quota_bucket = "antigravity-account"
 fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
-max_fallback_hops = 2
+max_fallback_hops = 1
 fallback_cooldown_seconds = 1800
 
-# Reordered for Beri, same as MemTrace's profile: prefer Gemini over Sonnet when
-# Codex Luna (the primary) is unavailable.
+# 2026-08-13: Antigravity is usable for read-only roles again — adapters/cli.py's
+# CliModelAdapter.run() now independently diffs git status before/after any
+# permission="read-only" call and fails closed if anything changed, so the safety
+# property no longer depends on Antigravity's own (headlessly non-functional)
+# --mode plan gate. See the antigravity-headless-command-permission memory note.
+# Also serves the Converge stage (same "controller" profile, no separate config).
 [[profiles.controller.fallbacks]]
-provider = "antigravity"
-model = "gemini-3.6-flash-high"
-reasoning_effort = "high"
-quota_bucket = "antigravity-account"
+provider = "codex"
+model = "gpt-5.6-luna"
+reasoning_effort = "low"
+quota_bucket = "codex-account"
 
-[[profiles.controller.fallbacks]]
+[profiles.planner]
+role = "Planner"
+provider = "antigravity"
+model = "gemini-3.6-flash-medium"
+reasoning_effort = "high"
+permission = "read-only"
+context_policy = "task-and-targeted-evidence"
+max_attempts = 1
+quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
+
+# Switched from Codex to direct Claude (2026-08-14, same reasoning as Red Team's
+# fallback change): a real Antigravity quota event fell back to Codex, and Codex's
+# Planner call couldn't complete Beri's own MemTrace-usage house rules in that run.
+# User is separately investigating why (Codex normally has MCP mounted and works
+# fine outside Harness) — this is the immediate mitigation while that's pending.
+[[profiles.planner.fallbacks]]
 provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
 quota_bucket = "claude-account"
 
-[profiles.planner]
-role = "Planner"
+[profiles.planner-escalation]
+role = "Planning Escalation"
 provider = "antigravity"
-model = "gemini-3.6-flash-high"
+model = "claude-opus-4-6-thinking"
 reasoning_effort = "high"
 permission = "read-only"
 context_policy = "task-and-targeted-evidence"
 max_attempts = 1
 quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
 
-[profiles.planner-escalation]
-role = "Planning Escalation"
-provider = "claude"
-model = "opus"
+[[profiles.planner-escalation.fallbacks]]
+provider = "codex"
+model = "gpt-5.6-sol"
 reasoning_effort = "high"
-permission = "read-only"
-context_policy = "task-and-targeted-evidence"
-max_attempts = 1
-quota_bucket = "claude-account"
+quota_bucket = "codex-account"
 
-# Red Team: Claude via Antigravity (not the direct `claude` CLI — an independent auth
-# path, and a different vendor from Developer's Gemini). Fallback chain now allowed
-# (role_profiles._validate_role_boundaries no longer hard-blocks it): if the primary
-# model is unavailable, the completion summary will show it fell back, so this is a
-# visible degrade, not a silent one.
 [profiles.red-team]
 role = "Red Team"
 provider = "antigravity"
-model = "claude-sonnet-4-6"
+model = "claude-opus-4-6-thinking"
 reasoning_effort = "high"
 permission = "read-only"
 context_policy = "gate-evidence-only"
@@ -61,19 +77,42 @@ max_attempts = 1
 quota_bucket = "antigravity-account"
 fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
 max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
 
+# Used for both G1 (plan audit) and G2 (post-dev recheck) — one role profile, one
+# model, per the user's own "統一用同一個模型" decision (2026-08-13). Fallback switched
+# from Codex to direct Claude (2026-08-14, user's explicit request) after a real
+# Antigravity quota exhaustion fell back to Codex mid-run and Codex's Planner call
+# couldn't complete Beri's own MemTrace-usage house rules — a genuinely different
+# provider/account from Antigravity (true redundancy against an Antigravity-side
+# quota event, which is what actually triggered this fallback in the first place).
 [[profiles.red-team.fallbacks]]
-provider = "antigravity"
-model = "gemini-3.6-flash-high"
-reasoning_effort = "high"
-quota_bucket = "antigravity-account"
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"
 
 [profiles.developer]
 role = "Developer"
 provider = "antigravity"
-model = "gemini-3.1-pro-high"
+model = "gemini-3.6-flash-medium"
 reasoning_effort = "high"
 permission = "workspace-write"
 context_policy = "accepted-plan-and-repo"
 max_attempts = 1
 quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+fallback_cooldown_seconds = 1800
+
+[[profiles.developer.fallbacks]]
+provider = "antigravity"
+model = "claude-sonnet-4-6"
+reasoning_effort = "high"
+quota_bucket = "antigravity-account"
+
+[[profiles.developer.fallbacks]]
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"

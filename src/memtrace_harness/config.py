@@ -26,6 +26,11 @@ class HarnessConfig:
     harness_memory_workspace_id: str | None = None
     chat_fallbacks: tuple[tuple[str, str], ...] = ()
     operator_preference_workspace_id: str | None = None
+    status_server_enabled: bool = True
+    status_server_host: str = "127.0.0.1"
+    status_server_port: int = 8787
+    shutdown_grace_seconds: int = 120
+    reply_language: str | None = "Traditional Chinese (繁體中文，台灣用語與正體字)"
 
     def command_for(self, provider: str) -> str:
         if provider == "claude":
@@ -101,6 +106,17 @@ class HarnessConfig:
             harness_memory_workspace_id=os.getenv("HARNESS_MEMORY_WORKSPACE_ID"),
             chat_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_CHAT_FALLBACKS", "")),
             operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
+            status_server_enabled=os.getenv("HARNESS_STATUS_SERVER_ENABLED", "true").lower()
+            not in {"false", "0", "no"},
+            status_server_host=os.getenv("HARNESS_STATUS_SERVER_HOST", "127.0.0.1"),
+            status_server_port=_positive_int(os.getenv("HARNESS_STATUS_SERVER_PORT"), 8787),
+            shutdown_grace_seconds=_positive_int(os.getenv("HARNESS_SHUTDOWN_GRACE_SECONDS"), 120),
+            reply_language=(
+                os.getenv("HARNESS_REPLY_LANGUAGE")
+                if "HARNESS_REPLY_LANGUAGE" in os.environ
+                else "Traditional Chinese (繁體中文，台灣用語與正體字)"
+            )
+            or None,
         )
 
     def memory_workspace_id_for(self, project_name: str, project_workspace_id: str) -> str:
@@ -171,7 +187,7 @@ def _positive_int(value: str | None, default: int) -> int:
         return default
     parsed = int(value)
     if parsed <= 0:
-        raise ValueError("HARNESS_CLI_TIMEOUT_SECONDS must be greater than zero")
+        raise ValueError("expected a positive integer, got: " + value)
     return parsed
 
 

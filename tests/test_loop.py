@@ -144,6 +144,128 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(stage_count, 6)
         self.assertEqual(planner_execution, ("sonnet", "claude-test-version", "read-only"))
 
+    def test_developer_needs_human_still_flows_to_g2_for_review(self) -> None:
+        # A developer's own "needs_human"/"failed" status must not skip G2 and go
+        # straight to a human — G2 is the reviewer built to catch exactly the kind of
+        # gap a developer would self-report (missing compile evidence, expanded
+        # scope), via the same REJECT verdict it already renders for a "completed"
+        # development.
+        adapters = self._adapters()
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "needs_human",
+                    "summary": "blocked on tool permission denials, could not verify build",
+                    "changed_files": ["src/example.py"],
+                    "tests": ["written but not executed"],
+                    "gaps": ["no compiler evidence available this session"],
+                }
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(len(adapters["red-team"].calls), 2)
+        self.assertEqual(summary.status, "succeeded")
+
+    def test_developer_needs_human_g2_reject_triggers_one_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "needs_human",
+                    "summary": "wrote the change but could not run tests",
+                    "changed_files": ["src/example.py"],
+                    "tests": ["written but not executed"],
+                    "gaps": ["no compiler evidence available this session"],
+                },
+                completed_development(),
+            ],
+        )
+        adapters["red-team"] = QueueAdapter(
+            "red-team",
+            "codex",
+            "gpt-5.6-sol",
+            [
+                passed_gate(),
+                {
+                    "verdict": "REJECT",
+                    "reason_code": "test_gap",
+                    "findings": [{"description": "no compiler/test evidence provided"}],
+                    "unverified_items": [],
+                    "confidence": 0.9,
+                },
+                passed_gate(),
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["developer"].calls), 2)
+        self.assertIn("develop-revision", [stage.stage for stage in summary.stages])
+
+    def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
+        self,
+    ) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [
+                {"action": "run_planner", "reason": "ready"},
+                {"action": "run_planner", "reason": "still ready after clarification"},
+                {"action": "finish", "reason": "complete"},
+            ],
+        )
+        adapters["red-team"] = QueueAdapter(
+            "red-team",
+            "codex",
+            "gpt-5.6-sol",
+            [
+                {
+                    "verdict": "NEEDS_HUMAN",
+                    "reason_code": "acceptance_gap",
+                    "findings": [{"description": "needs a human call on scope"}],
+                    "unverified_items": [],
+                    "confidence": 0.6,
+                },
+                passed_gate(),
+                passed_gate(),
+            ],
+        )
+        trace_store = TraceStore(self.db_path)
+
+        first = AgentLoopRunner(adapters=adapters, trace_store=trace_store).run(
+            self.task, conversation_id="chat_resume_test"
+        )
+        self.assertEqual(first.status, "needs_human")
+        self.assertEqual(len(adapters["planner"].calls), 1)
+        self.assertEqual(len(adapters["red-team"].calls), 1)
+
+        second = AgentLoopRunner(adapters=adapters, trace_store=trace_store).run(
+            self.task, conversation_id="chat_resume_test"
+        )
+        self.assertEqual(second.status, "succeeded")
+        # The settled plan from the first run is reused, not regenerated.
+        self.assertEqual(len(adapters["planner"].calls), 1)
+        # G1 had not PASSed yet, so it (and everything after it) reruns.
+        self.assertEqual(len(adapters["red-team"].calls), 3)
+        self.assertEqual(len(adapters["developer"].calls), 1)
+
     def test_opus_is_used_only_after_g1_reasoning_gap(self) -> None:
         adapters = self._adapters()
         adapters["red-team"] = QueueAdapter(

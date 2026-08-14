@@ -64,6 +64,7 @@ def build_provider_adapter(
             else f"{effective_provider}-account"
         ),
         "fallback_index": fallback_index,
+        "reply_language": config.reply_language,
     }
     if effective_provider == "claude":
         return ClaudeCliAdapter(**common)

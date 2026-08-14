@@ -630,6 +630,13 @@ def _serve_gateway_loop(
         f"poll_timeout={poll_timeout}s scan_interval={scan_interval}s "
         f"consolidation_interval={consolidation_interval}s. Ctrl-C to stop."
     )
+
+    from memtrace_harness.status_server import start_status_server
+
+    status_server, status_bus = start_status_server(config)
+    if status_server is not None:
+        print(f"Status dashboard: http://{config.status_server_host}:{config.status_server_port}")
+
     stop_requested = False
 
     def _handle_stop(signum: int, frame: object) -> None:
@@ -650,6 +657,8 @@ def _serve_gateway_loop(
                 processed = gw.poll_once(timeout=poll_timeout)
                 if processed:
                     print(f"[{label}] processed {processed} update(s)")
+                    if status_bus is not None:
+                        status_bus.publish()
             except Exception:
                 logger.exception(f"[{label}] gateway poll cycle failed; continuing")
 
@@ -665,6 +674,8 @@ def _serve_gateway_loop(
                 }
                 if noteworthy:
                     print(f"scan pass: {noteworthy}")
+                    if status_bus is not None:
+                        status_bus.publish()
             except Exception:
                 logger.exception("scan pass failed; continuing")
             last_scan = now
@@ -679,6 +690,8 @@ def _serve_gateway_loop(
                     )
                     if written:
                         print(f"[{scope.name}] consolidated {len(written)} turn(s) to MemTrace as draft evidence")
+                        if status_bus is not None:
+                            status_bus.publish()
                 except Exception:
                     logger.exception(f"[{scope.name}] cold-memory consolidation failed; will retry next cycle")
 
@@ -697,8 +710,54 @@ def _serve_gateway_loop(
                         logger.exception(f"[{scope.name}] preference consolidation failed; will retry next cycle")
             last_consolidation = now
 
+    _drain_inflight_agent_loops(config.shutdown_grace_seconds)
+
+    if status_server is not None:
+        status_server.shutdown()
+
     print("Gateway serve loop stopped.")
     return 0
+
+
+def _drain_inflight_agent_loops(grace_seconds: int) -> None:
+    """Background Agent Loop threads (Telegram tasks, approval resumes, unattended
+    scan backlog runs) are daemon threads — the interpreter doesn't wait for them or
+    guarantee their `finally` blocks run on exit, so without this, killing the process
+    mid-run leaves that workspace's lock stuck forever. Wait up to grace_seconds for
+    any in-flight runs to finish normally; if they don't, force-kill the underlying CLI
+    subprocess that thread is currently blocked on (via cli_process.py's thread-keyed
+    process registry — closes the gap noted in the shutdown-safety work: killing the
+    Harness process alone left the CLI subprocess running as an orphan, bounded only
+    by its own cli_timeout_seconds, not by this grace period) and force-release the
+    workspace lock so the next start isn't blocked. The interrupted run's outcome is
+    still unknown either way — this makes shutdown bounded and clean, not silent."""
+    from memtrace_harness.cli_process import kill_process_for_thread
+    from memtrace_harness.inflight import default_tracker
+
+    remaining = default_tracker.snapshot()
+    if not remaining:
+        return
+    print(
+        f"Waiting up to {grace_seconds}s for {len(remaining)} in-flight Agent Loop "
+        "run(s) to finish before exiting..."
+    )
+    if default_tracker.wait_for_drain(grace_seconds):
+        return
+    stuck = default_tracker.snapshot()
+    for entry in stuck:
+        thread_ident = entry["thread"].ident
+        killed = thread_ident is not None and kill_process_for_thread(thread_ident)
+        logger.warning(
+            f"Shutdown grace period exceeded; {'killed the CLI subprocess and ' if killed else ''}"
+            f"force-releasing workspace lock for {entry['workspace_id']} "
+            f"(conversation {entry['conversation_id']}) — its Agent Loop run was "
+            "interrupted mid-flight and its outcome is unknown. Check the trace store "
+            "/ raw trace logs once the new process is up."
+        )
+        try:
+            entry["trace_store"].release_workspace_lock(entry["workspace_id"])
+        except Exception:
+            logger.exception("failed to force-release workspace lock during shutdown")
 
 
 def scan_command(args: argparse.Namespace) -> int:
@@ -1038,9 +1097,13 @@ def _slugify(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "project"
 
 
-def status_command(args: argparse.Namespace) -> int:
-    """One-shot diagnostic: what's actually running, what's registered, and what's
-    stuck. Read-only — never modifies process state, files, or the trace store."""
+def _collect_status_data(config: "HarnessConfig") -> dict:
+    """Gather the harness's current diagnostic state as plain structured data (JSON-
+    safe: only str/int/bool/list/dict). Read-only — never modifies process state,
+    files, or the trace store. This is the single source of truth for both the CLI
+    `status` command (rendered as text by _collect_status_text) and the web status
+    dashboard (rendered as cards, pushed live over SSE as JSON) — they read the same
+    shape so they never drift apart."""
     from memtrace_harness.config import (
         project_bot_token_env_var,
         project_chat_provider_env_var,
@@ -1048,38 +1111,28 @@ def status_command(args: argparse.Namespace) -> int:
         project_role_profiles_env_var,
     )
 
-    config = HarnessConfig.from_env()
     trace_store = TraceStore(config.trace_db_path)
     projects = load_project_index(config.project_index_path)
 
-    print("=== 常駐行程 ===")
+    daemon: dict = {"pids": [], "multiple_warning": False, "pgrep_error": None, "launchd": None, "launchd_error": None}
     try:
         result = subprocess.run(
             ["pgrep", "-fl", "memtrace_harness gateway --serve"],
             capture_output=True, text=True, timeout=5,
         )
-        pids = result.stdout.strip().splitlines()
-        if pids:
-            for line in pids:
-                print(f"  {line}")
-            if len(pids) > 1:
-                print("  ⚠️  找到不只一個 --serve 行程，同一個 bot 會搶 getUpdates 連線（409 Conflict）。")
-        else:
-            print("  沒有正在跑的 gateway --serve 行程")
+        daemon["pids"] = result.stdout.strip().splitlines()
+        daemon["multiple_warning"] = len(daemon["pids"]) > 1
     except Exception as exc:
-        print(f"  無法查詢行程：{exc}")
+        daemon["pgrep_error"] = str(exc)
 
     try:
         result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
         matched = [line for line in result.stdout.splitlines() if "memtraceharness" in line]
-        print("  launchd 註冊：" + (matched[0] if matched else "沒有註冊 com.memtraceharness.gateway"))
+        daemon["launchd"] = matched[0] if matched else None
     except Exception as exc:
-        print(f"  無法查詢 launchd：{exc}")
+        daemon["launchd_error"] = str(exc)
 
-    print(f"\n=== 已註冊專案（{len(projects)} 個，來自 {config.project_index_path}）===")
-    if not projects:
-        print("  （空的，或 HARNESS_PROJECT_INDEX 沒設定/找不到)")
-
+    project_entries = []
     for scope in projects:
         dedicated_bot = bool(os.getenv(project_bot_token_env_var(scope.name)))
         dedicated_chat = bool(os.getenv(project_chat_provider_env_var(scope.name)))
@@ -1092,44 +1145,215 @@ def status_command(args: argparse.Namespace) -> int:
         pending_pref = len(trace_store.get_unconsolidated_turns_for_preference(session_id))
         lock = trace_store.get_workspace_lock(scope.workspace_id)
         pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
+        recent_turns = trace_store.get_recent_primary_session_turns(session_id, limit=5)
 
-        print(f"\n  【{scope.name}】 workspace_id={scope.workspace_id}")
-        print(f"    working_directory: {scope.working_directory}")
-        print(
-            "    專屬設定："
-            f"bot={'有' if dedicated_bot else '共用全域'}, "
-            f"chat model={'有' if dedicated_chat else '共用全域'}, "
-            f"memory workspace={'有' if dedicated_memory else '共用全域'}, "
-            f"role-profiles={'有' if dedicated_profiles else '用預設'}"
+        # A needs_human stop releases the workspace lock (approving doesn't need to
+        # hold it — see agent_loop_background_execution memory note) even though the
+        # conversation is very much unfinished: there's a pending approval sitting on
+        # it. Without this fallback, the pipeline stepper would disappear the moment a
+        # gate stops, which is exactly when a human most wants to see it. Prefer the
+        # lock's conversation when actually locked (mid-run); otherwise fall back to
+        # the oldest pending approval's conversation.
+        pipeline_conversation_id = (
+            lock["conversation_id"]
+            if lock
+            else (pending_approvals[0]["conversation_id"] if pending_approvals else None)
+        )
+        pipeline = (
+            trace_store.get_conversation_pipeline(pipeline_conversation_id)
+            if pipeline_conversation_id
+            else []
         )
 
         chat_candidates = config.chat_candidates_for(scope.name)
-        if chat_candidates:
-            chat_line = " -> ".join(f"{p}/{m or '(預設)'}" for p, m in chat_candidates)
-            print(f"    聊天模型：{chat_line}")
-        else:
-            print("    聊天模型：（未設定 HARNESS_CHAT_PROVIDER）")
 
+        role_profiles_entries: list[dict] | None = None
+        role_profiles_error: str | None = None
         try:
             role_profiles = load_role_profiles(config.role_profiles_file_for(scope.name))
-            print("    Agent Loop 角色模型：")
-            for profile_id, profile in role_profiles.items():
-                entry = f"      {profile_id}: {profile.provider}/{profile.model}"
-                if profile.fallbacks:
-                    fb = ", ".join(f"{f.provider}/{f.model}" for f in profile.fallbacks)
-                    entry += f"（fallback: {fb}）"
-                print(entry)
+            role_profiles_entries = [
+                {
+                    "id": profile_id,
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "fallbacks": [
+                        {"provider": f.provider, "model": f.model} for f in profile.fallbacks
+                    ],
+                }
+                for profile_id, profile in role_profiles.items()
+            ]
         except Exception as exc:
-            print(f"    ⚠️  role-profiles 讀取失敗：{exc}")
+            role_profiles_error = str(exc)
 
-        print(f"    對話記錄：{turn_count} 則（目標分類待處理 {pending_goal}、偏好分類待處理 {pending_pref}）")
-        if lock:
-            print(f"    ⚠️  workspace 鎖定中：conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
-        if pending_approvals:
-            print(f"    ⚠️  待核准請求 {len(pending_approvals)} 筆：")
-            for req in pending_approvals:
-                print(f"       {req['id']} — {req['reason']} — {req['proposed_action'][:60]}")
+        project_entries.append(
+            {
+                "name": scope.name,
+                "workspace_id": scope.workspace_id,
+                "working_directory": str(scope.working_directory),
+                "dedicated": {
+                    "bot": dedicated_bot,
+                    "chat_model": dedicated_chat,
+                    "memory": dedicated_memory,
+                    "role_profiles": dedicated_profiles,
+                },
+                "chat_candidates": [
+                    {"provider": p, "model": m or None} for p, m in chat_candidates
+                ],
+                "role_profiles": role_profiles_entries,
+                "role_profiles_error": role_profiles_error,
+                "turn_count": turn_count,
+                "pending_goal": pending_goal,
+                "pending_pref": pending_pref,
+                "recent_turns": [
+                    {
+                        "created_at": turn["created_at"],
+                        "speaker": turn["speaker"],
+                        "content": turn["content"],
+                    }
+                    for turn in recent_turns
+                ],
+                "lock": (
+                    {
+                        "conversation_id": lock["conversation_id"],
+                        "locked_at": lock["locked_at"],
+                        "latest_turn": trace_store.get_latest_turn(lock["conversation_id"]),
+                    }
+                    if lock
+                    else None
+                ),
+                "pipeline_conversation_id": pipeline_conversation_id,
+                "pipeline": pipeline,
+                "pending_approvals": [
+                    {
+                        "id": req["id"],
+                        "reason": req["reason"],
+                        "proposed_action": req["proposed_action"],
+                    }
+                    for req in pending_approvals
+                ],
+            }
+        )
 
+    return {
+        "daemon": daemon,
+        "project_index_path": str(config.project_index_path) if config.project_index_path else None,
+        "projects": project_entries,
+    }
+
+
+def _render_status_text(data: dict) -> str:
+    """Render _collect_status_data()'s structure as the plain-text report the CLI
+    `status` command prints."""
+    lines: list[str] = []
+    daemon = data["daemon"]
+
+    lines.append("=== 常駐行程 ===")
+    if daemon["pgrep_error"]:
+        lines.append(f"  無法查詢行程：{daemon['pgrep_error']}")
+    elif daemon["pids"]:
+        for line in daemon["pids"]:
+            lines.append(f"  {line}")
+        if daemon["multiple_warning"]:
+            lines.append("  ⚠️  找到不只一個 --serve 行程，同一個 bot 會搶 getUpdates 連線（409 Conflict）。")
+    else:
+        lines.append("  沒有正在跑的 gateway --serve 行程")
+
+    if daemon["launchd_error"]:
+        lines.append(f"  無法查詢 launchd：{daemon['launchd_error']}")
+    else:
+        lines.append("  launchd 註冊：" + (daemon["launchd"] or "沒有註冊 com.memtraceharness.gateway"))
+
+    lines.append(f"\n=== 已註冊專案（{len(data['projects'])} 個，來自 {data['project_index_path']}）===")
+    if not data["projects"]:
+        lines.append("  （空的，或 HARNESS_PROJECT_INDEX 沒設定/找不到)")
+
+    for project in data["projects"]:
+        lines.append(f"\n  【{project['name']}】 workspace_id={project['workspace_id']}")
+        lines.append(f"    working_directory: {project['working_directory']}")
+        dedicated = project["dedicated"]
+        lines.append(
+            "    專屬設定："
+            f"bot={'有' if dedicated['bot'] else '共用全域'}, "
+            f"chat model={'有' if dedicated['chat_model'] else '共用全域'}, "
+            f"memory workspace={'有' if dedicated['memory'] else '共用全域'}, "
+            f"role-profiles={'有' if dedicated['role_profiles'] else '用預設'}"
+        )
+
+        if project["chat_candidates"]:
+            chat_line = " -> ".join(
+                f"{c['provider']}/{c['model'] or '(預設)'}" for c in project["chat_candidates"]
+            )
+            lines.append(f"    聊天模型：{chat_line}")
+        else:
+            lines.append("    聊天模型：（未設定 HARNESS_CHAT_PROVIDER）")
+
+        if project["role_profiles_error"]:
+            lines.append(f"    ⚠️  role-profiles 讀取失敗：{project['role_profiles_error']}")
+        else:
+            lines.append("    Agent Loop 角色模型：")
+            for profile in project["role_profiles"] or []:
+                entry = f"      {profile['id']}: {profile['provider']}/{profile['model']}"
+                if profile["fallbacks"]:
+                    fb = ", ".join(f"{f['provider']}/{f['model']}" for f in profile["fallbacks"])
+                    entry += f"（fallback: {fb}）"
+                lines.append(entry)
+
+        lines.append(
+            f"    對話記錄：{project['turn_count']} 則"
+            f"（目標分類待處理 {project['pending_goal']}、偏好分類待處理 {project['pending_pref']}）"
+        )
+        if project["recent_turns"]:
+            lines.append("    最近對話：")
+            for turn in project["recent_turns"]:
+                content_preview = turn["content"].replace("\n", " ")[:80]
+                lines.append(f"      [{turn['created_at']}] {turn['speaker']}: {content_preview}")
+        if project["lock"]:
+            lock = project["lock"]
+            lines.append(f"    ⚠️  workspace 鎖定中：conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
+            turn = lock["latest_turn"]
+            if turn:
+                lines.append(
+                    f"       最新進度：{turn['stage']}/{turn['profile_id']} "
+                    f"({turn['provider']}/{turn['model'] or '?'}) state={turn['state']} @ {turn['created_at']}"
+                )
+            else:
+                lines.append("       最新進度：尚未有階段完成（可能剛啟動或卡在第一個階段）")
+        if project["pending_approvals"]:
+            lines.append(f"    ⚠️  待核准請求 {len(project['pending_approvals'])} 筆：")
+            for req in project["pending_approvals"]:
+                lines.append(f"       {req['id']} — {req['reason']} — {req['proposed_action'][:60]}")
+        if project["pipeline"]:
+            lines.append(f"    Agent Loop 進度（conversation_id={project['pipeline_conversation_id']}）：")
+            for stage in project["pipeline"]:
+                retry = f" (重試 #{stage['attempt_index']})" if stage["attempt_index"] else ""
+                lines.append(
+                    f"       {stage['stage']}/{stage['profile_id']}{retry} "
+                    f"({stage['provider']}/{stage['model'] or '?'}) state={stage['state']} @ {stage['created_at']}"
+                )
+
+    return "\n".join(lines)
+
+
+def _collect_status_text(config: "HarnessConfig") -> str:
+    """Gather the same diagnostic report status_command prints, as plain text.
+    Read-only — never modifies process state, files, or the trace store."""
+    return _render_status_text(_collect_status_data(config))
+
+
+def _collect_turn_detail(config: "HarnessConfig", turn_id: int) -> dict | None:
+    """One Agent Loop stage attempt's full detail (artifact + model's final text) for
+    the status dashboard's on-demand "click a stage" view — deliberately not part of
+    _collect_status_data()/the SSE push, since artifact/final_text bodies can be large
+    and most stages in a pipeline are never clicked. Read-only."""
+    trace_store = TraceStore(config.trace_db_path)
+    return trace_store.get_turn_detail(turn_id)
+
+
+def status_command(args: argparse.Namespace) -> int:
+    """One-shot diagnostic: what's actually running, what's registered, and what's
+    stuck. Read-only — never modifies process state, files, or the trace store."""
+    config = HarnessConfig.from_env()
+    print(_collect_status_text(config))
     return 0
 
 
