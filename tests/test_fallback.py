@@ -26,6 +26,8 @@ class FailureClassifierTests(TestCase):
             "Quota exhausted for this weekly limit": "quota_exhausted",
             "429 too many requests": "rate_limit",
             "Provider overloaded; try later": "provider_overloaded",
+            "Eligibility check failed: UNAVAILABLE (code 503): The service is currently unavailable.": "provider_overloaded",
+            "timeout waiting for response": "provider_overloaded",
             "maximum context length exceeded": "context_limit",
             "Access denied": "permission",
             "login required": "authentication",

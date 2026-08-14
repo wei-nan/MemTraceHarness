@@ -31,17 +31,22 @@ class ApprovalRequestData:
     created_at: str
     responded_at: str | None = None
     responded_by_chat_id: int | None = None
+    resume_goal: str | None = None
+    telegram_chat_id: int | None = None
+    telegram_message_id: int | None = None
 
     def format_telegram_message(self) -> str:
+        # No /approve or /reject lines: those are now inline-keyboard buttons attached
+        # to this message (see TelegramGateway's approval-send path) — typing an ID is
+        # no longer required for either. A direct reply to this message (Telegram's
+        # native swipe-to-reply) is treated as a /clarify answer automatically; typing
+        # /clarify explicitly still works too, for anyone not on a client with swipe-reply.
         return (
             f"⚠️ 核准請求 [{self.id}]\n"
             f"工作區：{self.workspace}\n"
             f"原因：{self.reason}\n"
             f"內容：{self.proposed_action}\n\n"
-            f"回覆：\n"
-            f"/approve {self.id} 核准\n"
-            f"/reject {self.id} <原因> 拒絕\n"
-            f"/clarify {self.id} <回答> 補充說明"
+            f"可以直接點下方按鈕核准/拒絕，或直接回覆這則訊息說明你的想法（會當作補充說明繼續執行）。"
         )
 
 
@@ -64,6 +69,7 @@ class ApprovalManager:
         reason: str,
         proposed_action: str,
         stage_ref: str | None = None,
+        resume_goal: str | None = None,
     ) -> ApprovalRequestData:
         if reason not in VALID_REASONS:
             raise ValueError(f"Invalid approval reason: {reason}")
@@ -74,6 +80,7 @@ class ApprovalManager:
             reason=reason,
             proposed_action=proposed_action,
             stage_ref=stage_ref,
+            resume_goal=resume_goal,
         )
         data = self.trace_store.get_approval_request(req_id)
         assert data is not None
@@ -87,6 +94,19 @@ class ApprovalManager:
 
     def get_pending_for_conversation(self, conversation_id: str) -> ApprovalRequestData | None:
         data = self.trace_store.get_pending_approval_request(conversation_id)
+        if not data:
+            return None
+        return ApprovalRequestData(**data)
+
+    def record_telegram_message(self, request_id: str, *, chat_id: int, message_id: int) -> None:
+        self.trace_store.set_approval_telegram_message(
+            request_id, chat_id=chat_id, message_id=message_id
+        )
+
+    def get_by_telegram_message(self, chat_id: int, message_id: int) -> ApprovalRequestData | None:
+        """Resolve a swipe-reply back to the approval it's replying to — unambiguous,
+        no ID typing or guessing required."""
+        data = self.trace_store.get_approval_request_by_message_id(chat_id, message_id)
         if not data:
             return None
         return ApprovalRequestData(**data)

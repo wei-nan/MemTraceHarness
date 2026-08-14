@@ -14,6 +14,21 @@ class MemTraceClientError(RuntimeError):
     pass
 
 
+class MemTraceDuplicateError(MemTraceClientError):
+    """create_node was rejected because the body is >0.95 similar to an existing node.
+    Distinct from other MemTraceClientErrors so callers can choose to retry with
+    force_create=True, fall back to the existing node, or skip — instead of that
+    choice being made implicitly by whether an exception handler happens to catch
+    the generic error type."""
+
+    def __init__(self, *, existing_node_id: str, similarity: float) -> None:
+        self.existing_node_id = existing_node_id
+        self.similarity = similarity
+        super().__init__(
+            f"create_node found a near-duplicate ({similarity:.3f} similarity): {existing_node_id}"
+        )
+
+
 @dataclass(frozen=True)
 class MemTraceClient:
     mcp_url: str
@@ -94,7 +109,14 @@ class MemTraceClient:
         body: str,
         content_type: str = "inquiry",
         tags: list[str] | None = None,
+        force_create: bool = False,
     ) -> str:
+        # MemTrace rejects a create_node whose body is >0.95 similar to an existing
+        # node with {"action": "duplicate_found", ...} instead of an id — no exception
+        # is raised by call_tool() for this (it's a 200, not an "error" field), but the
+        # caller-facing contract of create_node() is "returns an id or raises", so
+        # surface it as a distinct, catchable error rather than the generic "no id"
+        # MemTraceClientError a caller can't distinguish from a real API problem.
         result = self.call_tool(
             "create_node",
             {
@@ -106,6 +128,7 @@ class MemTraceClient:
                 "source_type": "ai",
                 "visibility": "private",
                 "tags": tags or ["harness", "draft", "human-gate"],
+                "force_create": force_create,
             },
         )
         text = _extract_text(result)
@@ -115,6 +138,11 @@ class MemTraceClient:
             raise MemTraceClientError(f"create_node returned non-JSON content: {text}") from exc
         node_id = data.get("id")
         if not node_id:
+            if data.get("action") == "duplicate_found":
+                raise MemTraceDuplicateError(
+                    existing_node_id=str(data.get("existing_node_id") or ""),
+                    similarity=float(data.get("similarity") or 0.0),
+                )
             raise MemTraceClientError(f"create_node response did not include id: {data}")
         return str(node_id)
 

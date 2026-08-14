@@ -20,19 +20,42 @@ class AntigravityCliAdapter(CliModelAdapter):
         super().__init__(executable=executable, **kwargs)
 
     def build_command(self, prompt: str) -> list[str]:
-        command = [self.executable, "--print"]
+        command = [self.executable]
         if self.structured_output:
             command.extend(["--output-format", "stream-json"])
         if self.model:
             command.extend(["--model", self.model])
-        if self.reasoning_effort:
+        # Some Antigravity model names already bake an effort tier into the name itself
+        # (e.g. "gemini-3.6-flash-high", "gpt-oss-120b-medium") — passing --effort
+        # alongside one of these is a hard CLI error ("--model X conflicts with
+        # --effort=Y"), not a warning.
+        if self.reasoning_effort and not _model_has_builtin_effort(self.model):
             command.extend(["--effort", self.reasoning_effort])
         if self.output_schema_path:
             command.extend(["--json-schema", str(self.output_schema_path)])
-        command.extend(
-            ["--mode", "plan" if self.permission == "read-only" else "accept-edits"]
-        )
-        command.extend(["--sandbox", prompt])
+        # Always accept-edits, even for read-only roles: --mode plan is semantically
+        # correct (it never writes) but structurally requires an interactive "Proceed"
+        # confirmation with no headless bypass — confirmed even with
+        # --dangerously-skip-permissions, so it simply never completes unattended (see
+        # the antigravity-headless-command-permission memory note). Plan mode's actual
+        # safety property — a read-only role never truly writes — is no longer this
+        # flag's job: CliModelAdapter.run() in cli.py independently diffs git status
+        # before/after any permission="read-only" call and fails closed if anything
+        # changed, regardless of provider or CLI mode. That backstop is what makes it
+        # safe to stop depending on Antigravity's own (non-functional, headlessly) gate.
+        command.extend(["--mode", "accept-edits"])
+        # --project does NOT bind the working directory despite its name/description
+        # (verified empirically: commands still ran against agy's own install dir).
+        # --add-dir is what actually does. --sandbox was dropped: every successful
+        # manual verification this session omitted it, and it's undetermined whether it
+        # contributed to the workdir/prompt-delivery failures seen before this fix.
+        command.extend(["--add-dir", str(self.working_directory)])
+        # --prompt "<text>" (the flag's own value) must come last: `--print` (bare) with
+        # the prompt as a trailing positional does not reliably deliver it to the model
+        # (verified empirically, 2026-08-12 — it fell back to answering generic questions
+        # about its own flags instead). This also keeps the prompt as the command list's
+        # last element, which redact_command() in cli.py assumes when scrubbing traces.
+        command.extend(["--prompt", prompt])
         return command
 
     def parse_response(
@@ -79,6 +102,7 @@ class AntigravityCliAdapter(CliModelAdapter):
             usage=usage,
             provider_run_id=provider_run_id,
             warnings=warnings,
+            error=_last_error(events),
         )
         resolved_model = _last_model(events)
         if resolved_model:
@@ -87,6 +111,19 @@ class AntigravityCliAdapter(CliModelAdapter):
                 execution=replace(response.execution, resolved_model=resolved_model),
             )
         return response
+
+
+def _model_has_builtin_effort(model: str | None) -> bool:
+    if not model:
+        return False
+    suffix = model.rsplit("-", 1)[-1].lower()
+    # "-high"/"-medium"/"-low" (e.g. gemini-3.6-flash-high) bake in an effort tier.
+    # "-thinking" (e.g. claude-opus-4-6-thinking) isn't an effort tier at all — it's a
+    # fixed reasoning mode — but the CLI rejects --effort for it just the same
+    # ("--effort is not supported for model ..."), confirmed directly against `agy`
+    # 2026-08-13. Same fix, same reasoning: don't pass a flag the CLI will reject for
+    # this specific model name shape.
+    return suffix in {"high", "medium", "low", "thinking"}
 
 
 def _last_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
@@ -123,6 +160,32 @@ def _last_text(events: list[dict[str, Any]]) -> str | None:
                 value = _json_text(message.get("content"))
                 if value:
                     return value
+    return None
+
+
+def _last_error(events: list[dict[str, Any]]) -> str | None:
+    """Antigravity's stream-json protocol reports errors (quota exhaustion, safety
+    refusals, subagent cancellation, etc.) as data inside a normal `{"event":"result"}`
+    JSON line, not necessarily via a nonzero process exit code — confirmed 2026-08-14:
+    a real quota-exhaustion mid-call ("Individual quota reached... Resets in
+    4h33m10s") returned exit code 0 with a "status":"ERROR" result event, which this
+    adapter previously ignored entirely, so the failure surfaced as a generic schema
+    validation error instead of the quota_exhausted category it actually was —
+    silently defeating the loop's own cross-provider fallback (which only triggers for
+    quota/rate-limit/overload categories). Surfacing this here lets
+    classify_execution_failure() in fallback.py see the real error text and
+    CliModelAdapter.run() in cli.py override status to "failed" even when the process
+    exit code alone would say "succeeded"."""
+    for event in reversed(events):
+        result = event.get("result") if isinstance(event.get("result"), dict) else None
+        for container in (result, event):
+            if not isinstance(container, dict):
+                continue
+            if container.get("status") == "ERROR" or container.get("error"):
+                error = container.get("error")
+                if isinstance(error, str) and error.strip():
+                    return error.strip()
+                return "Antigravity reported an error result with no error message"
     return None
 
 

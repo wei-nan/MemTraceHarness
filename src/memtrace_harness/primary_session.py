@@ -146,12 +146,25 @@ class PrimarySessionManager:
             # Write draft evidence via MemTrace Client create_node. Left uncaught: a
             # failed write (e.g. MemTrace unreachable) must not mark these consolidated
             # either — the caller decides whether to log-and-retry-later or propagate.
+            # content_type must be one of MemTrace's fixed enum (context, document,
+            # factual, gap, inquiry, preference, procedural) — "evidence" isn't a
+            # member and was silently rejected with a 400 on every attempt (bug fixed
+            # 2026-08-12; see the agent-loop-background-execution/memory investigation
+            # that surfaced it). "context" is the closest fit: this is background
+            # information about what happened, not a settled fact or a procedure.
+            # force_create=True: this writes a new append-only draft note each cycle,
+            # titled the same for every batch of a given project — expected to recur
+            # with similar wording as consolidation runs repeatedly, which is exactly
+            # what MemTrace's similarity-based duplicate detection would otherwise
+            # reject (observed for real against the MemTrace project's own
+            # consolidation; see the beri-consolidation-content_type-bug memory note).
             self.memtrace_client.create_node(
                 workspace_id=workspace_id,
                 title=f"Draft primary session consolidation: {project}",
                 body=summary_content,
-                content_type="evidence",
+                content_type="context",
                 tags=["harness", "draft", "primary-session"],
+                force_create=True,
             )
 
         self.trace_store.mark_turns_consolidated([t.id for t in turns])

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schemas import TaskEnvelope
@@ -94,17 +96,44 @@ class UnattendedScanner:
                         working_directory=str(scope.working_directory),
                         reason="unattended_write",
                         proposed_action=f"掃描器發現 {len(backlog)} 項待辦（{', '.join(backlog[:3])}）。是否核准執行？",
+                        # Must match run_loop_for_backlog()'s own goal construction —
+                        # otherwise approving resumes with this human-readable summary
+                        # as the goal instead of the actual backlog implementation task.
+                        resume_goal=f"Implement planned backlog items: {', '.join(backlog)}",
                     )
                     gw = self._gateway_for(scope)
                     if gw:
-                        gw.notify_all_allowlisted(req.format_telegram_message())
+                        gw.notify_approval_request(req)
                     # Keep lock active while waiting for approval!
                 else:
-                    # Execute loop immediately
-                    try:
-                        self.run_loop_for_backlog(scope, conv_id, backlog)
-                    finally:
-                        self.trace_store.release_workspace_lock(ws_id)
+                    # Runs in a background thread — same reasoning as the Telegram
+                    # gateway's task execution — so a long backlog run on one project
+                    # doesn't hold up the serve loop's polling of every bot/scan/
+                    # consolidation pass for the minutes it can take. The lock
+                    # (acquired above) is released inside the thread once it finishes.
+                    def _run(scope=scope, conv_id=conv_id, backlog=backlog, ws_id=ws_id) -> None:
+                        try:
+                            self.run_loop_for_backlog(scope, conv_id, backlog)
+                        except Exception:
+                            logger.exception(
+                                f"background scan-triggered loop for workspace {ws_id} failed"
+                            )
+                            gw = self._gateway_for(scope)
+                            if gw:
+                                gw.notify_all_allowlisted(
+                                    f"⚠️ 工作區 {ws_id} 的無人值守掃描任務執行時發生未預期錯誤，請查看日誌。"
+                                )
+                        finally:
+                            self.trace_store.release_workspace_lock(ws_id)
+                            default_tracker.unregister(thread)
+
+                    thread = threading.Thread(
+                        target=_run, name=f"agent-loop-scan-{conv_id}", daemon=True
+                    )
+                    thread.start()
+                    default_tracker.register(
+                        thread, workspace_id=ws_id, conversation_id=conv_id, trace_store=self.trace_store
+                    )
         return results
 
     def run_loop_for_backlog(self, scope: ProjectScope, conv_id: str, backlog: list[str]) -> None:

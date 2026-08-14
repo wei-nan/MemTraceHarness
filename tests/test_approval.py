@@ -44,3 +44,47 @@ class ApprovalTests(TestCase):
             ok_second, msg_second, _ = mgr.respond(req.id, "reject", chat_id=12345)
             self.assertFalse(ok_second)
             self.assertIn("已經是", msg_second)
+
+    def test_resume_goal_is_separate_from_the_human_facing_proposed_action(self) -> None:
+        # proposed_action is what a human reads to decide whether to approve; resume_goal
+        # is what actually gets re-run once they do. A needs_human stop shows the human
+        # the failure summary but must resume the *original* request, not the summary.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_approval_resume_goal.sqlite3"
+            trace_store = TraceStore(db_path)
+            mgr = ApprovalManager(trace_store, {12345})
+
+            req = mgr.request_approval(
+                conversation_id="conv_002",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="ambiguous_requirement",
+                proposed_action="controller returned invalid structured output; no stage advanced.",
+                resume_goal="幫我建立工作樹，依照agent loop 流程來開發上述四個功能",
+            )
+            self.assertEqual(
+                req.proposed_action,
+                "controller returned invalid structured output; no stage advanced.",
+            )
+            self.assertEqual(req.resume_goal, "幫我建立工作樹，依照agent loop 流程來開發上述四個功能")
+
+            fetched = mgr.get_request(req.id)
+            assert fetched is not None
+            self.assertEqual(fetched.resume_goal, req.resume_goal)
+
+    def test_resume_goal_defaults_to_none_for_backward_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_approval_no_resume_goal.sqlite3"
+            trace_store = TraceStore(db_path)
+            mgr = ApprovalManager(trace_store, {12345})
+
+            req = mgr.request_approval(
+                conversation_id="conv_003",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="git_push",
+                proposed_action="git push origin main",
+            )
+            self.assertIsNone(req.resume_goal)

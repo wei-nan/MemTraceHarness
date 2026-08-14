@@ -31,12 +31,28 @@ class ClaudeCliAdapter(CliModelAdapter):
         if self.output_schema_path:
             schema = json.loads(self.output_schema_path.read_text(encoding="utf-8"))
             command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
-        command.extend(
-            [
-                "--permission-mode",
-                "plan" if self.permission == "read-only" else "acceptEdits",
-            ]
-        )
+        if self.permission == "read-only":
+            # NOT --permission-mode plan: that mode is built for an interactive human
+            # session (it can hand off to ExitPlanMode, or — observed 2026-08-12 on a
+            # real Red Team run — fall back to writing the model's full analysis and
+            # JSON verdict into a ~/.claude/plans/*.md file instead of returning it as
+            # the turn's final text). Headlessly, Harness never sees that file; it
+            # only sees a prose "I wrote the plan to a file" summary, which fails the
+            # "final text is exactly one JSON object" contract every stage relies on.
+            # --permission-mode default + explicitly disallowing the write-capable
+            # tools gets the same "cannot modify the repo" guarantee without route-ing
+            # through that plan-mode UX. Read-only tool use (Bash for grep-style
+            # queries, Read, etc.) is unaffected.
+            command.extend(
+                [
+                    "--permission-mode",
+                    "default",
+                    "--disallowedTools",
+                    "Write,Edit,NotebookEdit",
+                ]
+            )
+        else:
+            command.extend(["--permission-mode", "acceptEdits"])
         return command
 
     def parse_response(
