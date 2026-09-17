@@ -1,6 +1,9 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from memtrace_harness.cli import build_parser
+from memtrace_harness.cli import build_parser, update_role_profile_for_project
+from memtrace_harness.config import HarnessConfig
 
 
 class CliTests(TestCase):
@@ -215,3 +218,112 @@ class CliTests(TestCase):
         trace_store.mark_schedule_ran.assert_called_once()
         _args, kwargs = trace_store.mark_schedule_ran.call_args
         self.assertEqual(kwargs["status"], "triggered")
+
+
+class UpdateRoleProfileForProjectTests(TestCase):
+    """Covers the status dashboard's one write endpoint (POST /api/role-profile) at
+    the level that actually matters: does the TOML file end up correct and are the
+    guardrails (unknown provider, shared-default project, unknown profile) real."""
+
+    def _build_project(self, tmp_path: Path, *, dedicated_profiles: bool):
+        import os
+
+        scope_dir = tmp_path / "TestProj"
+        scope_dir.mkdir()
+        scope_path = scope_dir / "harness-scope.md"
+        scope_path.write_text(
+            "# Harness scope — TestProj\n\n- workspace_id: ws_test\n", encoding="utf-8"
+        )
+        index_path = tmp_path / "projects.index.txt"
+        index_path.write_text(str(scope_path) + "\n", encoding="utf-8")
+
+        profiles_path = tmp_path / "profiles.toml"
+        profiles_path.write_text(
+            '[profiles.controller]\n'
+            'role = "Controller"\n'
+            'provider = "codex"\n'
+            'model = "gpt-5.6-luna"\n'
+            'reasoning_effort = "medium"\n'
+            '\n'
+            '# A decision-rationale comment that must survive the edit untouched.\n'
+            '[[profiles.controller.fallbacks]]\n'
+            'provider = "claude"\n'
+            'model = "sonnet"\n'
+            '\n'
+            '[profiles.planner]\n'
+            'role = "Planner"\n'
+            'provider = "claude"\n'
+            'model = "sonnet"\n',
+            encoding="utf-8",
+        )
+        env_var = "HARNESS_ROLE_PROFILES_FILE_TESTPROJ"
+        if dedicated_profiles:
+            os.environ[env_var] = str(profiles_path)
+        else:
+            os.environ.pop(env_var, None)
+        self.addCleanup(os.environ.pop, env_var, None)
+
+        config = HarnessConfig(
+            memtrace_mcp_url=None, memtrace_api_token=None,
+            trace_db_path=tmp_path / "trace.sqlite3", trace_root=tmp_path,
+            claude_command="claude", codex_command="codex", antigravity_command="agy",
+            antigravity_output_mode="auto", cli_timeout_seconds=900,
+            telegram_bot_token=None, telegram_allowed_chat_ids=set(),
+            project_index_path=index_path, chat_provider="claude", chat_model="haiku",
+            unattended_write_requires_approval=True,
+        )
+        return config, profiles_path
+
+    def test_updates_provider_and_model_preserving_comments_and_fallback(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
+
+            update_role_profile_for_project(config, "TestProj", "controller", "claude", "opus")
+
+            text = profiles_path.read_text(encoding="utf-8")
+            self.assertIn('provider = "claude"', text.splitlines()[2])
+            self.assertIn('model = "opus"', text.splitlines()[3])
+            self.assertIn("decision-rationale comment that must survive", text)
+            # The fallback's own provider/model must be untouched.
+            self.assertIn('[[profiles.controller.fallbacks]]\nprovider = "claude"\nmodel = "sonnet"', text)
+            # A different profile in the same file is untouched.
+            self.assertIn('[profiles.planner]\nrole = "Planner"\nprovider = "claude"\nmodel = "sonnet"', text)
+
+    def test_rejects_unknown_provider(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, _profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
+            with self.assertRaises(ValueError):
+                update_role_profile_for_project(config, "TestProj", "controller", "openai", "gpt-5")
+
+    def test_rejects_model_with_a_quote(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, _profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
+            with self.assertRaises(ValueError):
+                update_role_profile_for_project(config, "TestProj", "controller", "claude", 'sonnet"; x=1')
+
+    def test_refuses_project_still_on_shared_default(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, profiles_path = self._build_project(tmp_path, dedicated_profiles=False)
+            with self.assertRaises(ValueError) as ctx:
+                update_role_profile_for_project(config, "TestProj", "controller", "claude", "opus")
+            self.assertIn("shared default", str(ctx.exception))
+            # Nothing written anywhere — the shared file isn't even touched.
+            self.assertNotIn('provider = "claude"\nmodel = "opus"', profiles_path.read_text())
+
+    def test_rejects_unknown_project(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, _profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
+            with self.assertRaises(ValueError):
+                update_role_profile_for_project(config, "NoSuchProject", "controller", "claude", "opus")
+
+    def test_rejects_unknown_profile_id(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            config, _profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
+            with self.assertRaises(ValueError):
+                update_role_profile_for_project(config, "TestProj", "red-team", "claude", "opus")

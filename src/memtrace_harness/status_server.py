@@ -39,10 +39,14 @@ class StatusEventBus:
 
 # Frontend-only interactivity — everything below runs against data already pushed over
 # SSE, no new endpoints: expand/collapse per-project cards, filter by project name, and
-# search recent-conversation content. Nothing here writes anything back to the harness;
-# see the status-web-dashboard memory note for why write actions (approve/reject,
-# trigger a scan) are deliberately deferred until there's an auth story matching
-# Telegram's allowed_chat_ids gate.
+# search recent-conversation content. Approve/reject/trigger-a-scan style actions still
+# stay deferred until there's an auth story matching Telegram's allowed_chat_ids gate
+# (see the status-web-dashboard memory note) — those are IRREVERSIBLE remote actions.
+# The one exception (2026-09-17, explicit user request): editing a role's provider/
+# model is a local config change, not a remote action, so it's exposed via POST
+# /api/role-profile (see _StatusRequestHandler.do_POST()) even without that auth
+# story — its only real gate is the dashboard's own bind address (127.0.0.1 unless
+# the operator widens it).
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -141,12 +145,31 @@ _PAGE_TEMPLATE = """<!doctype html>
   .empty { color: var(--muted); font-style: italic; }
   .approval { padding: 0.25rem 0; }
   .approval .id { color: var(--accent); }
+  .rp-row { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.2rem; flex-wrap: wrap; }
+  .rp-row select, .rp-row input {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 0.3rem; padding: 0.15rem 0.35rem; font-size: 0.75rem;
+  }
+  .rp-row input { width: 9rem; }
+  .rp-row button {
+    background: var(--accent); color: #16181d; border: none; border-radius: 0.3rem;
+    padding: 0.18rem 0.6rem; font-size: 0.75rem; cursor: pointer; font-weight: 600;
+  }
+  .rp-row button:hover { opacity: 0.85; }
+  .rp-status { font-size: 0.72rem; }
+  .rp-status.ok { color: var(--live); }
+  .rp-status.err { color: #e05555; }
+  .rp-disabled-note { color: var(--muted); font-size: 0.75rem; margin-bottom: 0.4rem; }
+  .schedule { padding: 0.25rem 0; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
+  .schedule:last-child { border-bottom: none; }
+  .schedule .id { color: var(--accent); }
+  .schedule .meta { color: var(--muted); font-size: 0.72rem; }
 </style>
 </head>
 <body>
 <header>
   <h1>MemTrace Harness — 運行狀態</h1>
-  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 純檢視，不會修改任何狀態</div>
+  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 只有「Agent Loop 角色模型」可以編輯，其餘純檢視</div>
 </header>
 <div class="toolbar">
   <input id="search" type="text" placeholder="搜尋專案名稱或對話內容…">
@@ -195,16 +218,85 @@ function renderChatCandidates(list) {
   }).join(" -> ") + "</div>";
 }
 
+var PROVIDERS = ["claude", "codex", "antigravity"];
+
+function providerOptions(selected) {
+  return PROVIDERS.map(function (p) {
+    return '<option value="' + p + '"' + (p === selected ? " selected" : "") + ">" + p + "</option>";
+  }).join("");
+}
+
 function renderRoleProfiles(project) {
   if (project.role_profiles_error) {
     return '<div class="warn">⚠️ role-profiles 讀取失敗：' + esc(project.role_profiles_error) + "</div>";
   }
+  var editable = !!(project.dedicated && project.dedicated.role_profiles);
+  var note = editable ? "" : '<div class="rp-disabled-note">此專案共用全域預設 role-profiles，' +
+    "要先給它一份專屬設定檔（memtrace-harness init-project，或手動複製 default-role-profiles.toml 並設定對應 .env）才能在這裡調整。</div>";
   var rows = (project.role_profiles || []).map(function (p) {
     var fb = p.fallbacks.length ? p.fallbacks.map(function (f) { return f.provider + "/" + f.model; }).join(", ") : "";
-    return "<tr><td>" + esc(p.id) + "</td><td>" + esc(p.provider + "/" + p.model) + (fb ? " <span class='chip'>fallback: " + esc(fb) + "</span>" : "") + "</td></tr>";
+    var current = "<tr><td>" + esc(p.id) + "</td><td>" + esc(p.provider + "/" + p.model) +
+      (fb ? " <span class='chip'>fallback: " + esc(fb) + "</span>" : "");
+    if (editable) {
+      current += '<div class="rp-row">' +
+        '<select class="rp-provider">' + providerOptions(p.provider) + "</select>" +
+        '<input class="rp-model" type="text" value="' + esc(p.model) + '">' +
+        '<button class="rp-save" data-project="' + esc(project.name) + '" data-profile="' + esc(p.id) + '">儲存</button>' +
+        '<span class="rp-status"></span>' +
+        "</div>";
+    }
+    return current + "</td></tr>";
   }).join("");
-  return "<table>" + rows + "</table>";
+  return note + "<table>" + rows + "</table>";
 }
+
+function renderSchedules(project) {
+  var list = project.schedules || [];
+  if (!list.length) return "";
+  var rows = list.map(function (s) {
+    var freq = s.kind === "interval"
+      ? "每 " + s.interval_seconds + " 秒"
+      : (s.kind === "daily" ? "每天 " : "每個工作日 ") + s.time_of_day;
+    return '<div class="schedule"><span class="id">' + esc(s.id) + "</span> — " + esc(freq) +
+      '<div class="meta">下次 ' + esc(s.next_run_at) + " · " + esc(s.goal.slice(0, 60)) + "</div></div>";
+  }).join("");
+  return '<div class="section-label">排程 <span class="badge">' + list.length + "</span></div>" + rows;
+}
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("rp-save")) return;
+  var btn = e.target;
+  var row = btn.closest(".rp-row");
+  var project = btn.getAttribute("data-project");
+  var profileId = btn.getAttribute("data-profile");
+  var provider = row.querySelector(".rp-provider").value;
+  var model = row.querySelector(".rp-model").value;
+  var statusEl = row.querySelector(".rp-status");
+  statusEl.className = "rp-status";
+  statusEl.textContent = "儲存中…";
+  btn.disabled = true;
+  fetch("/api/role-profile", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: project, profile_id: profileId, provider: provider, model: model })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      if (res.ok) {
+        statusEl.className = "rp-status ok";
+        statusEl.textContent = "已儲存，下次執行生效";
+      } else {
+        statusEl.className = "rp-status err";
+        statusEl.textContent = res.body.error || "儲存失敗";
+      }
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "rp-status err";
+      statusEl.textContent = "儲存失敗（連線問題）";
+    });
+});
 
 function renderTurns(turns, q) {
   if (!turns || !turns.length) return '<div class="empty">尚無對話紀錄</div>';
@@ -324,9 +416,11 @@ function renderProject(project, q) {
     '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "專屬" : "共用") + "</span>" +
     '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "共用") + "</span>" +
     '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "專屬" : "預設") + "</span>" +
+    '<span class="chip' + ((project.schedules || []).length ? " on" : "") + '">排程: ' + (project.schedules || []).length + "</span>" +
     "</div>" +
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project.chat_candidates) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
+    renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + '、偏好待處理 ' + project.pending_pref + ')</div>' +
     renderTurns(project.recent_turns, q) +
     lock + pipelineSection + renderApprovals(project.pending_approvals) +
@@ -380,6 +474,55 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802 (stdlib method name)
+        # The one write action this dashboard offers (2026-09-17, explicit user
+        # request) — everything else stays read-only by design (see the module
+        # docstring above). Still only reachable at all when the dashboard itself is:
+        # bound to config.status_server_host (127.0.0.1 by default, never exposed off
+        # the machine unless the operator explicitly widens it, e.g. via Tailscale —
+        # there is no separate auth on this endpoint, so widening exposure widens who
+        # can change a project's models too).
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/api/role-profile":
+            self._handle_update_role_profile()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_update_role_profile(self) -> None:
+        from memtrace_harness.cli import update_role_profile_for_project
+
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+            project = str(payload["project"])
+            profile_id = str(payload["profile_id"])
+            provider = str(payload["provider"])
+            model = str(payload["model"])
+        except Exception:
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            update_role_profile_for_project(self.config, project, profile_id, provider, model)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to update a role profile")
+            self._send_json(500, {"error": "internal error updating the role profile"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True})
+
+    def _send_json(self, status: int, data: dict) -> None:
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _collect_data(self) -> dict:
         from memtrace_harness.cli import _collect_status_data

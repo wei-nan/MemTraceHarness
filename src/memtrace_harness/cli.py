@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -1224,6 +1225,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         lock = trace_store.get_workspace_lock(scope.workspace_id)
         pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
         recent_turns = trace_store.get_recent_primary_session_turns(session_id, limit=5)
+        schedules = trace_store.list_schedules(scope.name)
 
         # A needs_human stop releases the workspace lock (approving doesn't need to
         # hold it — see agent_loop_background_execution memory note) even though the
@@ -1309,6 +1311,18 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                     }
                     for req in pending_approvals
                 ],
+                "schedules": [
+                    {
+                        "id": s["id"],
+                        "kind": s["kind"],
+                        "interval_seconds": s["interval_seconds"],
+                        "time_of_day": s["time_of_day"],
+                        "next_run_at": s["next_run_at"],
+                        "last_run_at": s["last_run_at"],
+                        "goal": s["goal"],
+                    }
+                    for s in schedules
+                ],
             }
         )
 
@@ -1317,6 +1331,73 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         "project_index_path": str(config.project_index_path) if config.project_index_path else None,
         "projects": project_entries,
     }
+
+
+def update_role_profile_for_project(
+    config: "HarnessConfig", project_name: str, profile_id: str, provider: str, model: str
+) -> None:
+    """Surgical, comment-preserving edit of one role's primary provider/model line in
+    its role-profiles TOML file — a targeted text patch (same spirit as
+    harness-scope.md's own field parsing in scope.py), not a full TOML parse+rewrite,
+    since these files carry load-bearing decision-rationale comments (see
+    profiles/beri.toml) a round-trip writer would silently discard. Called from the
+    status dashboard's /api/role-profile endpoint (status_server.py).
+
+    Only touches projects that already have a DEDICATED role-profiles file
+    (HARNESS_ROLE_PROFILES_FILE_<PROJECT> set) — a project still on the shared
+    packaged default-role-profiles.toml is refused, since editing that file in place
+    would silently change every project still sharing it. Only the role's own
+    primary provider/model is touched, never its [[...fallbacks]] sub-tables."""
+    from memtrace_harness.config import project_role_profiles_env_var
+
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+    if not model.strip() or '"' in model or "\n" in model:
+        raise ValueError("model must be a non-empty string with no quotes or newlines")
+
+    projects = load_project_index(config.project_index_path)
+    scope = next((p for p in projects if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+
+    path = config.role_profiles_file_for(scope.name)
+    if path is None:
+        env_var = project_role_profiles_env_var(scope.name)
+        raise ValueError(
+            f"'{project_name}' has no dedicated role-profiles file yet (uses the "
+            "shared default) — editing it here would silently change every project "
+            f"still sharing that default. Give it its own file first: `memtrace-"
+            f"harness init-project`, or manually copy default-role-profiles.toml and "
+            f"set {env_var} in .env, then restart the gateway."
+        )
+    if not path.is_file():
+        raise ValueError(f"role-profiles file for '{project_name}' does not exist: {path}")
+
+    text = path.read_text(encoding="utf-8")
+    header = f"[profiles.{profile_id}]"
+    start = text.find(header)
+    if start == -1:
+        raise ValueError(f"profile {profile_id!r} not found in {path}")
+    body_start = start + len(header)
+    # Bound this profile's own primary block at the next section header of any kind
+    # (a later [profiles.X] or this role's own [[profiles.X.fallbacks]]) — the
+    # primary provider/model lines always appear once, before any such header.
+    next_header = re.search(r"\n\[", text[body_start:])
+    body_end = body_start + next_header.start() if next_header else len(text)
+    block = text[body_start:body_end]
+
+    new_block, replaced_provider = re.subn(
+        r'(?m)^provider\s*=\s*"[^"]*"', f'provider = "{provider}"', block, count=1
+    )
+    if not replaced_provider:
+        raise ValueError(f"profile {profile_id!r} in {path} has no provider line to update")
+    new_block, replaced_model = re.subn(
+        r'(?m)^model\s*=\s*"[^"]*"', f'model = "{model}"', new_block, count=1
+    )
+    if not replaced_model:
+        raise ValueError(f"profile {profile_id!r} in {path} has no model line to update")
+
+    path.write_text(text[:body_start] + new_block + text[body_end:], encoding="utf-8")
 
 
 def _render_status_text(data: dict) -> str:
