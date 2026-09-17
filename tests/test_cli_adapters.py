@@ -130,10 +130,56 @@ class CliAdapterTests(TestCase):
         self.assertEqual(response.execution.usage.cached_input_tokens, 11)
         self.assertEqual(response.execution.usage.reasoning_output_tokens, 5)
         self.assertEqual(response.execution.usage.completeness, "complete")
+        self.assertEqual(response.execution.command[1:3], ["exec", "--json"])
+        self.assertEqual(response.execution.command[3], "--cd")
+        self.assertIn("--sandbox", response.execution.command)
         self.assertEqual(
-            response.execution.command[1:5], ["exec", "--json", "--sandbox", "workspace-write"]
+            response.execution.command[
+                response.execution.command.index("--sandbox") + 1
+            ],
+            "workspace-write",
         )
         self.assertEqual(response.execution.command[-1], "-")
+
+    def test_codex_explicitly_passes_cd_matching_working_directory(self) -> None:
+        # Belt-and-suspenders alongside subprocess cwd=: a HARNESS_CODEX_COMMAND
+        # that switches CODEX_HOME to a different account (e.g. scripts/codex-will)
+        # must never be ambiguous about which directory it's operating on.
+        adapter = self._adapter(CodexCliAdapter, StaticProcessRunner(process_result("")))
+        command = adapter.build_command("prompt")
+        self.assertIn("--cd", command)
+        self.assertEqual(command[command.index("--cd") + 1], str(self.root))
+
+    def test_claude_read_only_allowlists_memtrace_read_tools_but_not_write_by_default(self) -> None:
+        # 2026-09-05: --permission-mode default requires per-tool approval with no
+        # human present headlessly — a real G1 run got its own get_node call denied
+        # outright. MemTrace read tools must be pre-allowlisted for every role.
+        adapter = self._adapter(
+            ClaudeCliAdapter,
+            StaticProcessRunner(process_result("")),
+            permission="read-only",
+            role_profile_id="red-team",
+        )
+        command = adapter.build_command("prompt")
+        allowed = command[command.index("--allowedTools") + 1]
+        self.assertIn("mcp__memtrace__search_nodes", allowed)
+        self.assertIn("mcp__memtrace__get_node", allowed)
+        self.assertNotIn("mcp__memtrace__update_node", allowed)
+        self.assertNotIn("mcp__memtrace__create_node", allowed)
+
+    def test_claude_controller_role_also_allowlists_memtrace_write_tools(self) -> None:
+        # Only Controller (converge stage) may update/create MemTrace nodes — see
+        # controller_task()'s write_permission note.
+        adapter = self._adapter(
+            ClaudeCliAdapter,
+            StaticProcessRunner(process_result("")),
+            permission="read-only",
+            role_profile_id="controller",
+        )
+        command = adapter.build_command("prompt")
+        allowed = command[command.index("--allowedTools") + 1]
+        self.assertIn("mcp__memtrace__update_node", allowed)
+        self.assertIn("mcp__memtrace__create_node", allowed)
 
     def test_codex_usage_limit_error_is_surfaced_for_failure_classification(self) -> None:
         stdout = "\n".join(

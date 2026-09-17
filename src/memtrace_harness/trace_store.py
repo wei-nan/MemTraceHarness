@@ -1128,6 +1128,21 @@ class TraceStore:
             for row in rows
         ]
 
+    def list_recently_declined_stage_refs(self, workspace_id: str, reason: str) -> set[str]:
+        """stage_ref values of rejected approval_requests for this workspace+reason —
+        lets the unattended scanner skip a Task Node the operator already said "not
+        this one" to and propose the next one in queue order instead, rather than
+        re-proposing the same declined node on every subsequent scan pass."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT stage_ref FROM approval_requests
+                WHERE workspace = ? AND reason = ? AND status = 'rejected' AND stage_ref IS NOT NULL
+                """,
+                (workspace_id, reason),
+            ).fetchall()
+        return {row[0] for row in rows}
+
     def set_approval_telegram_message(
         self, request_id: str, *, chat_id: int, message_id: int
     ) -> None:

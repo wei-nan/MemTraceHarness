@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class TriageResult:
-    kind: str  # "approval_response", "task", "chat", "status", "out_of_scope", "unrecognized"
+    kind: str  # "approval_response", "chat", "status", "out_of_scope", "unrecognized"
     project_scope: ProjectScope | None
     approval_id: str | None = None
     approval_action: str | None = None  # "approve", "reject", "clarify"
@@ -84,17 +84,13 @@ class ChatTriage:
         if lower_text in {"status", "help", "/status", "/help"}:
             return TriageResult(kind="status", project_scope=matched_project)
 
-        # A plain message is just chat: a quick, read-only, no-approval-needed reply.
-        # Only a "!"-prefixed message is a real work request — it creates an approval
-        # request and can trigger the full Controller/Planner/RedTeam/Developer loop.
-        # Without this split, every "你好" would otherwise queue a governed write task.
-        if cleaned.startswith("!"):
-            return TriageResult(
-                kind="task",
-                project_scope=matched_project,
-                task_goal=cleaned[1:].strip() or cleaned,
-            )
-
+        # Every other plain message is just chat: it goes straight to the model,
+        # with no prefix/slash-command marker and no separate classification step.
+        # There is no more "!"/"/task" trigger that mechanically queues a governed
+        # write task — whether to actually start development work is now a
+        # judgment call the model makes inside the conversation itself (see
+        # TelegramGateway._chat_reply_and_maybe_start_task()), same conversation
+        # the human is already having with it, not a separate command.
         return TriageResult(
             kind="chat",
             project_scope=matched_project,

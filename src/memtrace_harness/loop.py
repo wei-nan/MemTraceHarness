@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
-from typing import Any
+import subprocess
+import time
+from typing import Any, TYPE_CHECKING
 
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
@@ -13,6 +15,7 @@ from memtrace_harness.fallback import (
     permits_cross_provider_fallback,
 )
 from memtrace_harness.memtrace_client import MemTraceClient
+from memtrace_harness.output_contracts import output_schema_path
 from memtrace_harness.role_profiles import RoleProfile
 from memtrace_harness.schemas import (
     ContextItem,
@@ -26,6 +29,9 @@ from memtrace_harness.schemas import (
     utc_now_iso,
 )
 from memtrace_harness.trace_store import TraceStore
+
+if TYPE_CHECKING:
+    from memtrace_harness.config import HarnessConfig
 
 
 class AgentLoopRunner:
@@ -42,6 +48,9 @@ class AgentLoopRunner:
         max_total_tokens: int | None = None,
         approval_manager: Any | None = None,
         working_directory: Path | None = None,
+        verify_command: str | None = None,
+        verify_timeout_seconds: int = 1200,
+        config: "HarnessConfig | None" = None,
     ) -> None:
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
@@ -51,6 +60,9 @@ class AgentLoopRunner:
         self.max_total_tokens = max_total_tokens
         self.approval_manager = approval_manager
         self.working_directory = working_directory
+        self.verify_command = verify_command
+        self.verify_timeout_seconds = verify_timeout_seconds
+        self.config = config
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -137,14 +149,14 @@ class AgentLoopRunner:
             if stopped:
                 return self._persist(stopped, writeback=writeback)
             if not valid_plan(plan.artifact):
+                artifact = plan.artifact or {}
+                detail = (
+                    summarize_plan_needs_human("Planner", artifact)
+                    if artifact.get("status") == "needs_human" and _plan_structure_ok(artifact)
+                    else summarize_invalid_artifact("Planner", artifact)
+                )
                 return self._persist(
-                    self._summary(
-                        task,
-                        trace_id,
-                        stages,
-                        "needs_human",
-                        summarize_invalid_artifact("Planner", plan.artifact),
-                    ),
+                    self._summary(task, trace_id, stages, "needs_human", detail),
                     writeback=writeback,
                 )
 
@@ -184,14 +196,14 @@ class AgentLoopRunner:
                     return self._persist(stopped, writeback=writeback)
                 if not valid_plan(revised_plan.artifact):
                     planner_name = "Opus escalation" if use_opus else "Sonnet revision"
+                    artifact = revised_plan.artifact or {}
+                    detail = (
+                        summarize_plan_needs_human(planner_name, artifact)
+                        if artifact.get("status") == "needs_human" and _plan_structure_ok(artifact)
+                        else summarize_invalid_artifact(planner_name, artifact)
+                    )
                     return self._persist(
-                        self._summary(
-                            task,
-                            trace_id,
-                            stages,
-                            "needs_human",
-                            summarize_invalid_artifact(planner_name, revised_plan.artifact),
-                        ),
+                        self._summary(task, trace_id, stages, "needs_human", detail),
                         writeback=writeback,
                     )
                 plan = revised_plan
@@ -273,16 +285,29 @@ class AgentLoopRunner:
             g2 = reused_g2
             g2_verdict = "PASS"
         else:
-            g2 = self._execute(
-                task=gate_task(task, "G2", development.artifact or {}, plan.artifact or {}),
-                trace_id=trace_id,
-                stages=stages,
-                stage="g2",
-                profile_id="red-team",
-            )
-            stopped = self._stop_after_execution(task, trace_id, stages, g2)
-            if stopped:
-                return self._persist(stopped, writeback=writeback)
+            verification = self._run_deterministic_verification()
+            if verification is not None and not verification["passed"]:
+                g2 = self._deterministic_reject_result(
+                    stages=stages,
+                    trace_id=trace_id,
+                    stage="g2",
+                    profile_id="red-team",
+                    verification=verification,
+                )
+            else:
+                g2 = self._execute(
+                    task=gate_task(
+                        task, "G2", development.artifact or {}, plan.artifact or {},
+                        verification=verification,
+                    ),
+                    trace_id=trace_id,
+                    stages=stages,
+                    stage="g2",
+                    profile_id="red-team",
+                )
+                stopped = self._stop_after_execution(task, trace_id, stages, g2)
+                if stopped:
+                    return self._persist(stopped, writeback=writeback)
             g2_verdict = normalized_gate(g2.artifact)
             g2_reason = str((g2.artifact or {}).get("reason_code", "other"))
             if g2_verdict == "REJECT" and g2_reason != "missing_input":
@@ -317,18 +342,29 @@ class AgentLoopRunner:
                 # Same reasoning as the first Developer stage above: a "needs_human"/
                 # "failed" revision still goes to the g2-recheck below rather than an
                 # immediate human stop — the recheck's own verdict is what's final here.
-                g2 = self._execute(
-                    task=gate_task(
-                        task, "G2", development.artifact or {}, plan.artifact or {}
-                    ),
-                    trace_id=trace_id,
-                    stages=stages,
-                    stage="g2-recheck",
-                    profile_id="red-team",
-                )
-                stopped = self._stop_after_execution(task, trace_id, stages, g2)
-                if stopped:
-                    return self._persist(stopped, writeback=writeback)
+                recheck_verification = self._run_deterministic_verification()
+                if recheck_verification is not None and not recheck_verification["passed"]:
+                    g2 = self._deterministic_reject_result(
+                        stages=stages,
+                        trace_id=trace_id,
+                        stage="g2-recheck",
+                        profile_id="red-team",
+                        verification=recheck_verification,
+                    )
+                else:
+                    g2 = self._execute(
+                        task=gate_task(
+                            task, "G2", development.artifact or {}, plan.artifact or {},
+                            verification=recheck_verification,
+                        ),
+                        trace_id=trace_id,
+                        stages=stages,
+                        stage="g2-recheck",
+                        profile_id="red-team",
+                    )
+                    stopped = self._stop_after_execution(task, trace_id, stages, g2)
+                    if stopped:
+                        return self._persist(stopped, writeback=writeback)
                 g2_verdict = normalized_gate(g2.artifact)
 
             if g2_verdict != "PASS":
@@ -459,6 +495,29 @@ class AgentLoopRunner:
                 if response.execution.status == "succeeded"
                 else None
             )
+            if response.execution.status == "succeeded" and artifact is None:
+                # The agent's answer may be entirely sound in substance and only
+                # fail to come back as a bare JSON object (prose wrapper, markdown,
+                # a slightly different shape) — that is a formatting slip, not a
+                # reason to stop the loop and page a human. Ask a cheap, fixed
+                # model to re-express the SAME content against this stage's
+                # schema before falling back to invalid_output/needs_human. The
+                # repaired artifact still goes through this stage's own
+                # valid_*() check below, so a repair that can't actually recover
+                # the intended fields is still caught, not silently trusted.
+                repaired = self._repair_malformed_output(
+                    profile_id=profile_id, raw_text=response.final_text
+                )
+                if repaired is not None:
+                    artifact = repaired
+                    execution = replace(
+                        response.execution,
+                        parse_warnings=[
+                            *response.execution.parse_warnings,
+                            "final_text was not valid JSON; repaired via chat-model reformatting",
+                        ],
+                    )
+                    response = replace(response, execution=execution)
             state = response.execution.status
             if response.execution.status == "succeeded" and artifact is None:
                 state = "invalid_output"
@@ -527,6 +586,51 @@ class AgentLoopRunner:
         if last_result is None:
             raise RuntimeError(f"No available execution candidate for profile {profile_id}")
         return last_result
+
+    def _repair_malformed_output(
+        self, *, profile_id: str, raw_text: str
+    ) -> dict[str, Any] | None:
+        """Best-effort reformatting of a response that succeeded but didn't come
+        back as a bare JSON object. Uses the same lightweight, fixed chat-provider
+        already configured for cheap utility calls (see HarnessConfig.chat_provider/
+        chat_model) — not the stage's own role provider, since the point is a plain
+        reformatting pass, not a second opinion. Returns None (never raises) on any
+        failure so the caller falls through to the existing invalid_output path."""
+        if not self.config or not self.config.chat_provider or not raw_text.strip():
+            return None
+        try:
+            schema_text = output_schema_path(profile_id).read_text(encoding="utf-8")
+        except (ValueError, RuntimeError):
+            return None
+        prompt = (
+            "An AI agent was supposed to reply with ONLY a single JSON object matching "
+            "the JSON Schema below, but its response did not come back as a bare JSON "
+            "object (extra prose, markdown fences, wrong shape, etc). Re-express the "
+            "SAME information the agent already gave as a single JSON object that "
+            "matches the schema. Do not invent facts or values the agent's response "
+            "doesn't support — if a required field genuinely can't be determined from "
+            "the response, use an honest empty/neutral value for it rather than "
+            "fabricating one. Reply with ONLY the JSON object: no commentary, no "
+            "markdown fences.\n\n"
+            f"Schema:\n{schema_text}\n\nAgent's response:\n{raw_text[:20_000]}"
+        )
+        from memtrace_harness.cli_process import CliProcessRunner
+
+        command = [self.config.command_for(self.config.chat_provider)]
+        if self.config.chat_model:
+            command.extend(["--model", self.config.chat_model])
+        command.extend(["--print", prompt])
+        try:
+            result = CliProcessRunner().run(
+                command,
+                cwd=self.working_directory or Path.cwd(),
+                timeout_seconds=30,
+            )
+        except Exception:
+            return None
+        if result.return_code != 0 or not result.stdout:
+            return None
+        return parse_json_object(result.stdout)
 
     def _record_quota_cooldown(
         self,
@@ -653,6 +757,113 @@ class AgentLoopRunner:
                 attempt_index=int(row.get("attempt_index") or 0),
             )
         return found
+
+    def _run_deterministic_verification(self) -> dict[str, Any] | None:
+        """Ground G2's review in a real build/test result instead of relying solely
+        on the Developer's own self-reported evidence. A model claiming "I compiled
+        this" (or a model that couldn't get tool permission to try) is not the same
+        as it actually having happened — see the 2026-08-14 Beri stopSharing bug,
+        which shipped with green unit tests but broken CloudKit runtime behavior.
+        Returns None (no gating imposed) if this project has no verify_command
+        configured; otherwise runs it directly via the harness, not the model, so its
+        exit code is a hard precondition, not something an LLM can talk its way past."""
+        if not self.verify_command or not self.working_directory:
+            return None
+        started = time.monotonic()
+        timed_out = False
+        try:
+            completed = subprocess.run(
+                ["/bin/sh", "-c", self.verify_command],
+                cwd=self.working_directory,
+                capture_output=True,
+                text=True,
+                timeout=self.verify_timeout_seconds,
+            )
+            exit_code: int | None = completed.returncode
+            stdout, stderr = completed.stdout, completed.stderr
+        except subprocess.TimeoutExpired as exc:
+            exit_code = None
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            timed_out = True
+        return {
+            "command": self.verify_command,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "passed": exit_code == 0,
+            "duration_seconds": round(time.monotonic() - started, 1),
+            "stdout_tail": stdout[-4_000:],
+            "stderr_tail": stderr[-4_000:],
+        }
+
+    def _deterministic_reject_result(
+        self,
+        *,
+        stages: list[LoopStageResult],
+        trace_id: str,
+        stage: str,
+        profile_id: str,
+        verification: dict[str, Any],
+    ) -> LoopStageResult:
+        """A synthetic gate REJECT built from _run_deterministic_verification()'s
+        output, standing in for an actual G2 model call. Reuses the existing
+        REJECT->developer_revision_task machinery unchanged: this only needs to look
+        like a normal gate artifact to the rest of run(), not literally be a model
+        response."""
+        detail = (verification.get("stderr_tail") or verification.get("stdout_tail") or "")[:1_500]
+        reason = (
+            "Verification command timed out"
+            if verification.get("timed_out")
+            else f"Verification command exited {verification.get('exit_code')}"
+        )
+        artifact = {
+            "verdict": "REJECT",
+            "reason_code": "test_gap",
+            "findings": [
+                {
+                    "description": (
+                        f"Deterministic verification failed before G2 review — "
+                        f"{reason}. Command: {verification.get('command')}\n{detail}"
+                    )
+                }
+            ],
+            "unverified_items": [],
+            "confidence": 1.0,
+        }
+        now = utc_now_iso()
+        execution = CliExecution(
+            provider="harness",
+            status="succeeded",
+            command=["/bin/sh", "-c", str(verification.get("command"))],
+            exit_code=verification.get("exit_code"),
+            started_at=now,
+            completed_at=now,
+            duration_ms=int((verification.get("duration_seconds") or 0) * 1000),
+            role_profile_id=profile_id,
+        )
+        response = ModelResponse(
+            adapter_id="harness-verify",
+            role=profile_id,
+            claims=[],
+            execution=execution,
+            requires_human_decision=False,
+            final_text=json.dumps(artifact, ensure_ascii=False),
+        )
+        result = LoopStageResult(
+            sequence=len(stages) + 1,
+            stage=stage,
+            profile_id=profile_id,
+            state="succeeded",
+            response=response,
+            artifact=artifact,
+        )
+        stages.append(result)
+        self.trace_store.save_stage_result(
+            conversation_id=self._required_conversation_id(),
+            run_id=trace_id,
+            result=result,
+        )
+        return result
 
     def _checkpoint(
         self,
@@ -788,7 +999,12 @@ class AgentLoopRunner:
     def _persist(self, summary: LoopSummary, *, writeback: bool) -> LoopSummary:
         self.trace_store.save_loop_summary(summary)
         if summary.status in {"needs_human", "budget_exhausted"} and self.approval_manager:
-            reason = "budget_exhausted" if summary.status == "budget_exhausted" else "ambiguous_requirement"
+            if summary.status == "budget_exhausted":
+                reason = "budget_exhausted"
+            elif _is_technical_output_failure(summary.recommendation):
+                reason = "model_output_invalid"
+            else:
+                reason = "ambiguous_requirement"
             self.approval_manager.request_approval(
                 conversation_id=summary.conversation_id or self._required_conversation_id(),
                 workspace=summary.task.workspace_id,
@@ -817,6 +1033,9 @@ class AgentLoopRunner:
                 body=render_loop_memtrace_draft(summary),
                 content_type="inquiry",
                 force_create=True,
+                run_id=summary.conversation_id,
+                task_id=summary.task.task_id,
+                stage="loop_draft_write",
             )
             summary = replace(
                 summary,
@@ -862,6 +1081,21 @@ def controller_task(
         "finish",
         "ask_human",
     ]
+    # 2026-09-05: only the converge stage (after G2 PASS, right before the loop
+    # reports "succeeded") may write to MemTrace — update_node/create_node are
+    # explicitly disallowed for every other stage/role, so this is the one place
+    # the KB reflects a task actually finishing, decided by the user.
+    write_permission = (
+        "\nThis is the converge stage (the loop finished, G2 already passed): you MAY "
+        "also call MemTrace's update_node (or create_node if no existing node fits) to "
+        "record that this task completed — e.g. updating the originating decision/task "
+        "node's status, or leaving a completion note linked to it. Only do this if you "
+        "already searched and found the actual node(s) to update; never invent an id or "
+        "write to a node you have not just looked at. This is optional, not required — "
+        "skip it if nothing in this run's context makes clear what to update.\n"
+        if stage != "start"
+        else ""
+    )
     return stage_task(
         task,
         suffix=f"controller-{stage}",
@@ -873,18 +1107,32 @@ def controller_task(
             "text above is informational context for later stages (Planner/Developer, "
             "which do have real repo access), not something you can or should verify "
             "yourself.\n"
-            "Do not call any tool for any reason — no file read, no directory listing, no "
-            "git command, no web search, no browser, nothing. This explicitly includes "
-            "AGENTS.md, CLAUDE.md, an \"operating contract\", architecture docs, or any "
-            "other convention you might normally check first: none of that exists in this "
-            "sandbox, none of it is needed for this decision, and attempting to read it "
-            "will only fail (permission denied — the sandbox is intentionally outside any "
-            "granted directory) and waste the whole turn. This is a single-turn, "
-            "zero-tool-call decision: answer directly from the task envelope's goal and "
-            "loop-snapshot context below, nothing else. If any tool call you attempt is "
-            "denied or errors, do not stop or explain what happened — immediately answer "
-            "the JSON decision anyway using whatever you already have; a partial answer is "
-            "always better than none.\n"
+            "Do not call any tool other than MemTrace's own lookup tools "
+            "(search_nodes, get_node, list_nodes, traverse) — no file read, no directory "
+            "listing, no git command, no web search, no browser, nothing else. This "
+            "explicitly includes AGENTS.md, CLAUDE.md, an \"operating contract\", "
+            "architecture docs, or any other convention you might normally check first: "
+            "none of that exists in this sandbox (attempting to read it will only fail — "
+            "permission denied, the sandbox is intentionally outside any granted "
+            "directory — and waste the turn), and MemTrace search is how you'd look up "
+            f"the KB equivalent instead.{write_permission}"
+            "The task envelope's goal, the loop-snapshot context, and (when present) the "
+            "project-scope and prior-discussion context items below are what you start "
+            "from. The prior-discussion item is only a recent rolling window of this "
+            "project's chat/decision history, not a full search — when that isn't enough "
+            "(e.g. the goal references a specific past conversation/task/decision by name "
+            "and it isn't in the window below, or references a KB node id), decide for "
+            "yourself whether a MemTrace search would actually resolve it before asking a "
+            "human — searching is available to you, not banned, but it costs a real call, "
+            "so only reach for it when it would plausibly change your decision, not "
+            "reflexively on every turn. If the goal text itself explicitly instructs you "
+            "to look something up, you must do it, not just note that you could have. "
+            "Whichever way you decide, `searched_history` and `reason` must say honestly "
+            "whether you searched and, if so, what you found (or didn't) — never leave it "
+            "ambiguous, and never claim you searched when you didn't. If any tool call you "
+            "attempt is denied or errors, do not stop or explain what happened — "
+            "immediately answer the JSON decision anyway using whatever you already have; "
+            "a partial answer is always better than none.\n"
             "The JSON schema enforced on this call's output is shared by both controller "
             "stages (start and converge) and therefore lists a wider action enum than is "
             "valid right now — it will not stop you from picking a value that's wrong for "
@@ -904,7 +1152,16 @@ def controller_task(
             *[
                 item
                 for item in task.context_items
-                if item.content_type == "harness_resume_envelope"
+                # harness_resume_envelope: an actual same-conversation resume
+                # checkpoint. "context": project scope + recent prior-discussion
+                # (see TelegramGateway._project_context_items()) — added 2026-09-05
+                # after Controller kept saying "I don't have context" for goals like
+                # "接續 chat_3077a492 的任務" that only make sense with recent
+                # discussion in view (chat_3077a492/chat_621c8bb9, generation 17).
+                # Deliberately still just static text, no tool calls added — keeps
+                # Controller's zero-tool-call sandbox guarantee intact, just gives it
+                # more to read before deciding.
+                if item.content_type in {"harness_resume_envelope", "context"}
             ],
         ],
     )
@@ -987,10 +1244,28 @@ def gate_task(
     gate_name: str,
     evidence: dict[str, Any],
     plan: dict[str, Any] | None = None,
+    verification: dict[str, Any] | None = None,
 ) -> TaskEnvelope:
     items = [artifact_item(f"harness:{gate_name.lower()}-evidence", "Gate evidence", evidence)]
     if plan is not None:
         items.append(artifact_item("harness:accepted-plan", "Accepted plan", plan))
+    verification_note = ""
+    if verification is not None:
+        items.append(
+            artifact_item(
+                "harness:deterministic-verification",
+                "Harness-run build/test verification (not model-reported)",
+                verification,
+            )
+        )
+        verification_note = (
+            "\nA deterministic build/test command was already run by the harness "
+            "itself (see the 'deterministic-verification' context item) and passed "
+            "before this review started — treat its exit code as ground truth over "
+            "any conflicting claim in the evidence about whether it compiles/tests "
+            "clean, but it does not substitute for reviewing scope, correctness, or "
+            "quality."
+        )
     return stage_task(
         task,
         suffix=gate_name.lower(),
@@ -1000,7 +1275,8 @@ def gate_task(
             "'NEEDS_HUMAN'), reason_code ('none', 'reasoning_gap', 'missing_input', "
             "'acceptance_gap', 'security', 'scope_drift', 'implementation_gap', "
             "'test_gap', or 'other'), findings (object array), unverified_items "
-            "(string array), and confidence (number). Do not edit files.\n"
+            "(string array), and confidence (number). Do not edit files."
+            f"{verification_note}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=items,
@@ -1123,8 +1399,17 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def valid_plan(value: dict[str, Any] | None) -> bool:
-    if not value or value.get("status") != "ready":
+def _plan_structure_ok(value: dict[str, Any] | None) -> bool:
+    """Structural checks shared by valid_plan() below, but without the
+    status=='ready' gate — lets a caller tell "genuinely malformed JSON" apart
+    from "well-formed JSON that honestly reports status='needs_human'". See
+    valid_plan()'s note: conflating the two produced a real, reproduced bug
+    (run_3fd1adaf7e8a, 2026-09-05) where a complete, valid Planner-escalation
+    response with real open_questions was misreported as "structured output was
+    returned but failed schema validation" — sounding like a parsing glitch a
+    retry would fix, when the model had already done its job correctly and the
+    human genuinely needed to answer something."""
+    if not value:
         return False
     plan = value.get("plan")
     return (
@@ -1135,6 +1420,27 @@ def valid_plan(value: dict[str, Any] | None) -> bool:
         and valid_string_list(value.get("open_questions"), 20, 1_000)
         and valid_string_list(value.get("scope_exclusions"), 30, 1_000)
     )
+
+
+def valid_plan(value: dict[str, Any] | None) -> bool:
+    return bool(value) and value.get("status") == "ready" and _plan_structure_ok(value)
+
+
+def summarize_plan_needs_human(label: str, value: dict[str, Any]) -> str:
+    """A well-formed plan that honestly says status='needs_human' (structurally
+    valid per _plan_structure_ok(), just not ready) — surfaces its own
+    open_questions directly to the human, instead of being routed through
+    summarize_invalid_artifact()'s "something is malformed" framing. See
+    _plan_structure_ok()'s note for the bug this fixes."""
+    questions = value.get("open_questions") or []
+    lines = [f"{label}: plan needs human input before it's ready."]
+    plan_text = value.get("plan")
+    if isinstance(plan_text, str) and plan_text.strip():
+        lines.append(plan_text.strip()[:2000])
+    if questions:
+        lines.append("Open questions:")
+        lines.extend(f"- {q}" for q in questions[:10])
+    return "\n".join(lines)
 
 
 _DEVELOPMENT_STATUSES = {"completed", "needs_human", "failed"}
@@ -1164,6 +1470,25 @@ def normalized_development(value: dict[str, Any] | None) -> str:
     if not valid_development(value):
         return "INVALID"
     return str((value or {}).get("status")).upper()
+
+
+_TECHNICAL_OUTPUT_FAILURE_MARKERS = (
+    "returned invalid structured output",
+    "failed schema validation",
+    "no structured output was returned",
+)
+
+
+def _is_technical_output_failure(recommendation: str) -> bool:
+    """True for a needs_human stop caused by the MODEL's output not parsing/validating
+    (see summarize_invalid_artifact() and the raw-text fallback above) — a technical
+    glitch a retry can fix, never a genuine question with an answer a human could type.
+    Routed to reason="model_output_invalid" instead of "ambiguous_requirement" so the
+    Telegram message doesn't tell a human to "just answer" something that isn't a
+    question — see the 2026-09-05 appr_4367790a7b70/appr_8daa7ac3707e confusion, where
+    a Controller schema-validation failure was shown with "直接用文字回覆你的答案"
+    and the human correctly couldn't make sense of it."""
+    return any(marker in recommendation for marker in _TECHNICAL_OUTPUT_FAILURE_MARKERS)
 
 
 def summarize_invalid_artifact(label: str, artifact: dict[str, Any] | None) -> str:

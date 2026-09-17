@@ -8,6 +8,57 @@ from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.trace_store import TraceStore
 
 
+class ApprovalMessageTests(TestCase):
+    def test_info_needed_reason_leads_with_answer_not_a_button(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_1",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="ambiguous_requirement",
+                proposed_action="需要澄清「個別存在 commit 內」的意思",
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("需要你回答問題", msg)
+            self.assertIn("不用按鈕", msg)
+
+    def test_model_output_invalid_explains_its_a_technical_glitch_not_a_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_3",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="model_output_invalid",
+                proposed_action='Controller: structured output was returned but failed schema validation.\nRaw output:\n{"action": "finish"}',
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("系統技術性錯誤", msg)
+            self.assertIn("不是要問你問題", msg)
+            self.assertNotIn("需要你回答問題", msg)
+
+    def test_write_action_reason_keeps_approve_reject_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_2",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="unattended_write",
+                proposed_action="掃描器發現待辦，是否核准開始？",
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("核准請求", msg)
+            self.assertNotIn("需要你回答問題", msg)
+
+
 class ApprovalTests(TestCase):
     def test_approval_request_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

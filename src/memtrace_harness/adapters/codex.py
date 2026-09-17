@@ -17,6 +17,16 @@ class CodexCliAdapter(CliModelAdapter):
 
     def build_command(self, prompt: str) -> list[str]:
         command = [self.executable, "exec", "--json"]
+        # -C/--cd explicitly tells Codex which directory is its working root,
+        # rather than relying only on the subprocess's inherited cwd — belt and
+        # suspenders for HARNESS_CODEX_COMMAND executables that switch CODEX_HOME
+        # to a different account (e.g. scripts/codex-will), where a misdirected
+        # invocation would operate as an unrelated account with no local project
+        # trust/config for this directory. Same reasoning as the antigravity
+        # adapter's --add-dir fix (see antigravity_headless_command_permission
+        # memory) — `cwd=` alone worked for that CLI's --project flag not binding
+        # either, so don't assume implicit cwd inheritance is enough here.
+        command.extend(["--cd", str(self.working_directory)])
         if self.model:
             command.extend(["--model", self.model])
         if self.reasoning_effort:
