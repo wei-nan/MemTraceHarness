@@ -2,8 +2,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from memtrace_harness.cli import build_parser, update_role_profile_for_project
-from memtrace_harness.config import HarnessConfig
+from memtrace_harness.cli import (
+    build_parser,
+    create_dedicated_role_profiles_file,
+    update_role_profile_for_project,
+)
+from memtrace_harness.config import HarnessConfig, project_role_profiles_env_var
 
 
 class CliTests(TestCase):
@@ -327,3 +331,77 @@ class UpdateRoleProfileForProjectTests(TestCase):
             config, _profiles_path = self._build_project(tmp_path, dedicated_profiles=True)
             with self.assertRaises(ValueError):
                 update_role_profile_for_project(config, "TestProj", "red-team", "claude", "opus")
+
+
+class CreateDedicatedRoleProfilesFileTests(TestCase):
+    """create_dedicated_role_profiles_file() writes to bare relative "profiles/" and
+    ".env" paths (same as init-project's own wizard code) — every test here runs
+    inside an isolated temp cwd so it can never touch this repo's real profiles/ or
+    .env, restored via addCleanup even if the test body raises."""
+
+    def _chdir_to_temp(self) -> Path:
+        import os
+
+        tmp_dir_ctx = TemporaryDirectory()
+        self.addCleanup(tmp_dir_ctx.cleanup)
+        tmp_path = Path(tmp_dir_ctx.name)
+        original_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        self.addCleanup(os.chdir, original_cwd)
+        return tmp_path
+
+    def _build_config(self, tmp_path: Path):
+        import os
+
+        scope_dir = tmp_path / "TestProj"
+        scope_dir.mkdir()
+        scope_path = scope_dir / "harness-scope.md"
+        scope_path.write_text(
+            "# Harness scope — TestProj\n\n- workspace_id: ws_test\n", encoding="utf-8"
+        )
+        index_path = tmp_path / "projects.index.txt"
+        index_path.write_text(str(scope_path) + "\n", encoding="utf-8")
+        env_var = project_role_profiles_env_var("TestProj")
+        os.environ.pop(env_var, None)
+        self.addCleanup(os.environ.pop, env_var, None)
+
+        return HarnessConfig(
+            memtrace_mcp_url=None, memtrace_api_token=None,
+            trace_db_path=tmp_path / "trace.sqlite3", trace_root=tmp_path,
+            claude_command="claude", codex_command="codex", antigravity_command="agy",
+            antigravity_output_mode="auto", cli_timeout_seconds=900,
+            telegram_bot_token=None, telegram_allowed_chat_ids=set(),
+            project_index_path=index_path, chat_provider="claude", chat_model="haiku",
+            unattended_write_requires_approval=True,
+        )
+
+    def test_copies_default_profiles_and_writes_env_var(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+
+        dest = create_dedicated_role_profiles_file(config, "TestProj")
+
+        self.assertTrue(dest.is_file())
+        self.assertIn("[profiles.controller]", dest.read_text(encoding="utf-8"))
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn(f"{project_role_profiles_env_var('TestProj')}={dest}", env_text)
+
+    def test_refuses_when_already_dedicated(self) -> None:
+        import os
+
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        env_var = project_role_profiles_env_var("TestProj")
+        existing = tmp_path / "already-dedicated.toml"
+        existing.write_text("[profiles.controller]\n", encoding="utf-8")
+        os.environ[env_var] = str(existing)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_dedicated_role_profiles_file(config, "TestProj")
+        self.assertIn("already has", str(ctx.exception))
+
+    def test_rejects_unknown_project(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        with self.assertRaises(ValueError):
+            create_dedicated_role_profiles_file(config, "NoSuchProject")
