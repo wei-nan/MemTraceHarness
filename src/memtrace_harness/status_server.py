@@ -5,6 +5,7 @@ import logging
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from memtrace_harness.config import HarnessConfig
 
@@ -145,6 +146,17 @@ _PAGE_TEMPLATE = """<!doctype html>
   .empty { color: var(--muted); font-style: italic; }
   .approval { padding: 0.25rem 0; }
   .approval .id { color: var(--accent); }
+  .approval-actions { display: flex; align-items: center; gap: 0.4rem; margin: 0.2rem 0 0.4rem; }
+  .approval-btn {
+    border: none; border-radius: 0.3rem; padding: 0.18rem 0.6rem; font-size: 0.75rem;
+    cursor: pointer; font-weight: 600;
+  }
+  .approval-btn.approve { background: var(--live); color: #16181d; }
+  .approval-btn.reject { background: #e05555; color: #fff; }
+  .approval-btn:hover { opacity: 0.85; }
+  .approval-status { font-size: 0.72rem; }
+  .approval-status.ok { color: var(--live); }
+  .approval-status.err { color: #e05555; }
   .rp-row { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.2rem; flex-wrap: wrap; }
   .rp-row select, .rp-row input {
     background: var(--bg); border: 1px solid var(--border); color: var(--text);
@@ -232,7 +244,9 @@ function renderRoleProfiles(project) {
   }
   var editable = !!(project.dedicated && project.dedicated.role_profiles);
   var note = editable ? "" : '<div class="rp-disabled-note">此專案共用全域預設 role-profiles，' +
-    "要先給它一份專屬設定檔（memtrace-harness init-project，或手動複製 default-role-profiles.toml 並設定對應 .env）才能在這裡調整。</div>";
+    "要先給它一份專屬設定檔才能在這裡調整。" +
+    '<div class="rp-row"><button class="rp-independent" data-project="' + esc(project.name) + '">獨立出去</button>' +
+    '<span class="rp-status"></span></div></div>';
   var rows = (project.role_profiles || []).map(function (p) {
     var fb = p.fallbacks.length ? p.fallbacks.map(function (f) { return f.provider + "/" + f.model; }).join(", ") : "";
     var current = "<tr><td>" + esc(p.id) + "</td><td>" + esc(p.provider + "/" + p.model) +
@@ -298,6 +312,72 @@ document.addEventListener("click", function (e) {
     });
 });
 
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("rp-independent")) return;
+  var btn = e.target;
+  var project = btn.getAttribute("data-project");
+  var statusEl = btn.parentElement.querySelector(".rp-status");
+  statusEl.className = "rp-status";
+  statusEl.textContent = "建立中…";
+  btn.disabled = true;
+  fetch("/api/role-profile/independent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: project })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      if (res.ok) {
+        statusEl.className = "rp-status ok";
+        statusEl.textContent = "已建立 " + res.body.path + "，重啟 gateway 後才會生效並可在此編輯";
+      } else {
+        statusEl.className = "rp-status err";
+        statusEl.textContent = res.body.error || "建立失敗";
+      }
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "rp-status err";
+      statusEl.textContent = "建立失敗（連線問題）";
+    });
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("approval-btn")) return;
+  var btn = e.target;
+  var project = btn.getAttribute("data-project");
+  var requestId = btn.getAttribute("data-request");
+  var action = btn.getAttribute("data-action");
+  var group = btn.closest(".approval-actions");
+  var statusEl = group.querySelector(".approval-status");
+  var buttons = group.querySelectorAll(".approval-btn");
+  statusEl.className = "approval-status";
+  statusEl.textContent = (action === "approve" ? "核准中…" : "拒絕中…");
+  buttons.forEach(function (b) { b.disabled = true; });
+  fetch("/api/approval", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: project, request_id: requestId, action: action })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      if (res.ok) {
+        statusEl.className = "approval-status ok";
+        statusEl.textContent = res.body.message || "已更新";
+      } else {
+        buttons.forEach(function (b) { b.disabled = false; });
+        statusEl.className = "approval-status err";
+        statusEl.textContent = res.body.error || "更新失敗";
+      }
+    })
+    .catch(function () {
+      buttons.forEach(function (b) { b.disabled = false; });
+      statusEl.className = "approval-status err";
+      statusEl.textContent = "更新失敗（連線問題）";
+    });
+});
+
 function renderTurns(turns, q) {
   if (!turns || !turns.length) return '<div class="empty">尚無對話紀錄</div>';
   q = (q || "").toLowerCase();
@@ -309,11 +389,17 @@ function renderTurns(turns, q) {
   }).join("");
 }
 
-function renderApprovals(list) {
+function renderApprovals(list, projectName) {
   if (!list || !list.length) return "";
   return '<div class="section-label">待核准 <span class="badge">' + list.length + "</span></div>" +
     list.map(function (a) {
-      return '<div class="approval"><span class="id">' + esc(a.id) + "</span> — " + esc(a.reason) + " — " + esc(a.proposed_action.slice(0, 60)) + "</div>";
+      return '<div class="approval">' +
+        '<div><span class="id">' + esc(a.id) + "</span> — " + esc(a.reason) + " — " + esc(a.proposed_action.slice(0, 60)) + "</div>" +
+        '<div class="approval-actions">' +
+        '<button class="approval-btn approve" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="approve">✅ 核准</button>' +
+        '<button class="approval-btn reject" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="reject">❌ 拒絕</button>' +
+        '<span class="approval-status"></span>' +
+        "</div></div>";
     }).join("");
 }
 
@@ -423,7 +509,7 @@ function renderProject(project, q) {
     renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + '、偏好待處理 ' + project.pending_pref + ')</div>' +
     renderTurns(project.recent_turns, q) +
-    lock + pipelineSection + renderApprovals(project.pending_approvals) +
+    lock + pipelineSection + renderApprovals(project.pending_approvals, project.name) +
     "</div></div>";
 }
 
@@ -462,6 +548,7 @@ es.onmessage = function (evt) { state.data = JSON.parse(evt.data); render(); };
 class _StatusRequestHandler(BaseHTTPRequestHandler):
     config: HarnessConfig
     bus: StatusEventBus
+    gateway_for_project: dict[str, Any]
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         parsed = urllib.parse.urlsplit(self.path)
@@ -476,32 +563,45 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib method name)
-        # The one write action this dashboard offers (2026-09-17, explicit user
+        # The write actions this dashboard offers (2026-09-17, explicit user
         # request) — everything else stays read-only by design (see the module
         # docstring above). Still only reachable at all when the dashboard itself is:
         # bound to config.status_server_host (127.0.0.1 by default, never exposed off
         # the machine unless the operator explicitly widens it, e.g. via Tailscale —
-        # there is no separate auth on this endpoint, so widening exposure widens who
-        # can change a project's models too).
+        # there is no separate auth on any of these endpoints, so widening exposure
+        # widens who can change a project's models or approve/reject its pending work
+        # too). approve/reject in particular can trigger a real governed Agent Loop
+        # run — same consequence as an approval from Telegram, just a different door.
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/api/role-profile":
             self._handle_update_role_profile()
+        elif parsed.path == "/api/role-profile/independent":
+            self._handle_make_role_profiles_independent()
+        elif parsed.path == "/api/approval":
+            self._handle_approval_action()
         else:
             self.send_response(404)
             self.end_headers()
 
-    def _handle_update_role_profile(self) -> None:
-        from memtrace_harness.cli import update_role_profile_for_project
-
+    def _read_json_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length") or "0")
         raw = self.rfile.read(length) if length else b""
         try:
             payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    def _handle_update_role_profile(self) -> None:
+        from memtrace_harness.cli import update_role_profile_for_project
+
+        payload = self._read_json_body()
+        try:
             project = str(payload["project"])
             profile_id = str(payload["profile_id"])
             provider = str(payload["provider"])
             model = str(payload["model"])
-        except Exception:
+        except (TypeError, KeyError):
             self._send_json(400, {"error": "malformed request body"})
             return
         try:
@@ -515,6 +615,68 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             return
         self.bus.publish()
         self._send_json(200, {"ok": True})
+
+    def _handle_make_role_profiles_independent(self) -> None:
+        from memtrace_harness.cli import create_dedicated_role_profiles_file
+
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            dest = create_dedicated_role_profiles_file(self.config, project)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to create a dedicated role-profiles file")
+            self._send_json(500, {"error": "internal error creating the dedicated file"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True, "path": str(dest)})
+
+    def _handle_approval_action(self) -> None:
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+            request_id = str(payload["request_id"])
+            action = str(payload["action"]).lower()
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        if action not in ("approve", "reject"):
+            self._send_json(
+                400, {"error": f"unsupported action {action!r} (expected approve or reject)"}
+            )
+            return
+        gateway = self.gateway_for_project.get(project)
+        if gateway is None:
+            self._send_json(400, {"error": f"no gateway registered for project {project!r}"})
+            return
+        req = gateway.approval_manager.get_request(request_id)
+        if req is None:
+            self._send_json(400, {"error": f"approval request {request_id!r} not found"})
+            return
+        if req.telegram_chat_id is None:
+            self._send_json(
+                400, {"error": "this request was never posted to a chat, cannot resolve it here"}
+            )
+            return
+        try:
+            # Same code path a Telegram text command, inline button, or swipe-reply
+            # would go through — one place resolves an approval, this is just
+            # another door to it. Runs any resulting Agent Loop resumption in a
+            # background thread (see _resume_approved_conversation()), so this call
+            # returns immediately rather than blocking the request on a full run.
+            msg = gateway._resolve_approval_action(request_id, action, req.telegram_chat_id, None)
+        except Exception:
+            logger.exception("status dashboard failed to resolve an approval")
+            self._send_json(500, {"error": "internal error resolving the approval"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True, "message": msg})
 
     def _send_json(self, status: int, data: dict) -> None:
         payload = json.dumps(data).encode("utf-8")
@@ -595,15 +757,24 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
 
 def start_status_server(
     config: HarnessConfig,
+    gateway_for_project: dict[str, Any] | None = None,
 ) -> tuple[ThreadingHTTPServer, StatusEventBus] | tuple[None, None]:
-    """Start the read-only web status dashboard in a background thread, bound to
+    """Start the web status dashboard in a background thread, bound to
     config.status_server_host (default 127.0.0.1 — not exposed off the machine unless
     the operator explicitly widens it, e.g. via Tailscale). Returns (None, None) if
     disabled or if the port can't be bound (e.g. already running from a previous
     process), so this never blocks the gateway's actual job. The returned bus's
     publish() should be called by the caller whenever something worth showing changed
     (a Telegram update was processed, a scan/consolidation pass did something) so
-    connected browsers update immediately instead of waiting for the heartbeat."""
+    connected browsers update immediately instead of waiting for the heartbeat.
+
+    gateway_for_project (project name -> TelegramGateway, same mapping
+    _serve_gateway_loop already builds) is what lets the dashboard's approve/reject
+    buttons resolve an approval through the exact same TelegramGateway._resolve_
+    approval_action() every other entry point (text command, inline button, swipe-
+    reply) already goes through — one place, no drift. None (the CLI `gateway`
+    one-shot path, or tests) just means approve/reject aren't available; every
+    read-only view still works."""
     if not config.status_server_enabled:
         return None, None
 
@@ -611,7 +782,7 @@ def start_status_server(
     handler_cls = type(
         "StatusRequestHandler",
         (_StatusRequestHandler,),
-        {"config": config, "bus": bus},
+        {"config": config, "bus": bus, "gateway_for_project": gateway_for_project or {}},
     )
     try:
         server = ThreadingHTTPServer(

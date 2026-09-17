@@ -662,7 +662,7 @@ def _serve_gateway_loop(
 
     from memtrace_harness.status_server import start_status_server
 
-    status_server, status_bus = start_status_server(config)
+    status_server, status_bus = start_status_server(config, gateway_for_project)
     if status_server is not None:
         print(f"Status dashboard: http://{config.status_server_host}:{config.status_server_port}")
 
@@ -1398,6 +1398,33 @@ def update_role_profile_for_project(
         raise ValueError(f"profile {profile_id!r} in {path} has no model line to update")
 
     path.write_text(text[:body_start] + new_block + text[body_end:], encoding="utf-8")
+
+
+def create_dedicated_role_profiles_file(config: "HarnessConfig", project_name: str) -> Path:
+    """Give a project its own editable role-profiles.toml, copied from the packaged
+    default-role-profiles.toml — the same one-time step as init-project's "要複製一份
+    可自訂的 role-profiles.toml 嗎" wizard question, exposed as the status dashboard's
+    "獨立出去" button (POST /api/role-profile/independent) so it doesn't require the
+    interactive CLI. Writes HARNESS_ROLE_PROFILES_FILE_<PROJECT> into .env — like any
+    other .env change, this only takes effect for THIS process on its next restart;
+    this function does not restart anything itself."""
+    from memtrace_harness.config import project_role_profiles_env_var
+
+    projects = load_project_index(config.project_index_path)
+    scope = next((p for p in projects if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+    if config.role_profiles_file_for(scope.name) is not None:
+        raise ValueError(f"'{project_name}' already has a dedicated role-profiles file")
+
+    dest = Path("profiles") / f"{_slugify(scope.name)}.toml"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.is_file():
+        default_toml = Path(__file__).with_name("default-role-profiles.toml")
+        dest.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
+
+    _write_env_updates(Path(".env"), {project_role_profiles_env_var(scope.name): str(dest)})
+    return dest
 
 
 def _render_status_text(data: dict) -> str:
