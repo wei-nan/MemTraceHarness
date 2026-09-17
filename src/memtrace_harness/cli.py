@@ -1212,6 +1212,13 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         daemon["launchd_error"] = str(exc)
 
     project_entries = []
+    # Built up across every project below: every (provider, model) pair actually
+    # configured anywhere in this harness (role profiles, their fallbacks, chat
+    # candidates) — the dashboard's model dropdowns are populated from this rather
+    # than a hardcoded catalog, since model names change too often to keep a static
+    # list current (see profiles/beri.toml's own comments verifying names against
+    # `agy models` at the time). A "自訂…" option still covers anything not seen yet.
+    known_models: dict[str, set[str]] = {p: set() for p in PROVIDERS}
     for scope in projects:
         dedicated_bot = bool(os.getenv(project_bot_token_env_var(scope.name)))
         dedicated_chat = bool(os.getenv(project_chat_provider_env_var(scope.name)))
@@ -1264,6 +1271,16 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
             ]
         except Exception as exc:
             role_profiles_error = str(exc)
+
+        for provider, model in chat_candidates:
+            if provider in known_models and model:
+                known_models[provider].add(model)
+        for entry in role_profiles_entries or []:
+            if entry["provider"] in known_models and entry["model"]:
+                known_models[entry["provider"]].add(entry["model"])
+            for fb in entry["fallbacks"]:
+                if fb["provider"] in known_models and fb["model"]:
+                    known_models[fb["provider"]].add(fb["model"])
 
         project_entries.append(
             {
@@ -1330,7 +1347,43 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         "daemon": daemon,
         "project_index_path": str(config.project_index_path) if config.project_index_path else None,
         "projects": project_entries,
+        "known_models": {p: sorted(models) for p, models in known_models.items()},
     }
+
+
+def update_chat_model_for_project(
+    config: "HarnessConfig", project_name: str, provider: str, model: str
+) -> None:
+    """Set a project's quick-chat model (the cheap --print call behind ordinary
+    Telegram conversation, not an Agent Loop role) via the status dashboard's POST
+    /api/chat-model. Unlike a role profile, the chat model has no TOML file to
+    surgically patch — it's plain HARNESS_CHAT_PROVIDER_<PROJECT>/_MODEL_<PROJECT>
+    env vars (see HarnessConfig.chat_candidates_for()) — so this always writes a
+    project-specific override into .env, never the shared global
+    HARNESS_CHAT_PROVIDER/_MODEL a project without one is currently falling back to;
+    there is no "already dedicated" case to refuse the way role-profiles has, since
+    adding one more project-specific override never affects any other project. Only
+    the primary candidate is touched, never HARNESS_CHAT_FALLBACKS_<PROJECT>. Like
+    any other .env change, this only takes effect on this process's next restart."""
+    from memtrace_harness.config import project_chat_model_env_var, project_chat_provider_env_var
+
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+    if not model.strip():
+        raise ValueError("model must be a non-empty string")
+
+    projects = load_project_index(config.project_index_path)
+    scope = next((p for p in projects if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+
+    _write_env_updates(
+        Path(".env"),
+        {
+            project_chat_provider_env_var(scope.name): provider,
+            project_chat_model_env_var(scope.name): model,
+        },
+    )
 
 
 def update_role_profile_for_project(

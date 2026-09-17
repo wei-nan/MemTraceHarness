@@ -223,19 +223,78 @@ function matchesQuery(project, q) {
   });
 }
 
-function renderChatCandidates(list) {
-  if (!list || !list.length) return '<div class="empty">（未設定 HARNESS_CHAT_PROVIDER）</div>';
-  return '<div class="chips">' + list.map(function (c) {
-    return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
-  }).join(" -> ") + "</div>";
-}
-
 var PROVIDERS = ["claude", "codex", "antigravity"];
 
 function providerOptions(selected) {
   return PROVIDERS.map(function (p) {
     return '<option value="' + p + '"' + (p === selected ? " selected" : "") + ">" + p + "</option>";
   }).join("");
+}
+
+var CUSTOM_MODEL_VALUE = "__custom__";
+
+function modelOptions(provider, currentModel) {
+  var known = (state.data.known_models && state.data.known_models[provider]) || [];
+  var opts = known.slice();
+  if (currentModel && opts.indexOf(currentModel) === -1) opts.unshift(currentModel);
+  var html = opts.map(function (m) {
+    return '<option value="' + esc(m) + '"' + (m === currentModel ? " selected" : "") + ">" + esc(m) + "</option>";
+  }).join("");
+  return html + '<option value="' + CUSTOM_MODEL_VALUE + '">— 自訂 —</option>';
+}
+
+// Shared by every "provider + model" edit row (role-profile rows, the chat-model
+// row): a model <select> populated from known_models for the currently-chosen
+// provider, plus a "自訂" option that reveals a free-text fallback — model catalogs
+// aren't tracked anywhere in this codebase (names change too often, see
+// profiles/beri.toml's own "verified against `agy models`" comments), so the
+// dropdown only ever offers what's already configured somewhere in this harness.
+function modelEditRowHtml(provider, model) {
+  return '<select class="rp-provider" onchange="onProviderSelectChange(this)">' + providerOptions(provider) + "</select>" +
+    '<select class="rp-model-select" onchange="onModelSelectChange(this)">' + modelOptions(provider, model) + "</select>" +
+    '<input class="rp-model-custom" type="text" value="' + esc(model || "") + '" placeholder="模型名稱" style="display:none">';
+}
+
+function onProviderSelectChange(providerSelect) {
+  var row = providerSelect.closest(".rp-row");
+  var modelSelect = row.querySelector(".rp-model-select");
+  modelSelect.innerHTML = modelOptions(providerSelect.value, "");
+  syncCustomModelVisibility(row);
+}
+
+function onModelSelectChange(modelSelect) {
+  syncCustomModelVisibility(modelSelect.closest(".rp-row"));
+}
+
+function syncCustomModelVisibility(row) {
+  var modelSelect = row.querySelector(".rp-model-select");
+  row.querySelector(".rp-model-custom").style.display =
+    modelSelect.value === CUSTOM_MODEL_VALUE ? "inline-block" : "none";
+}
+
+function readModelEditRow(row) {
+  var provider = row.querySelector(".rp-provider").value;
+  var modelSelect = row.querySelector(".rp-model-select");
+  var model = modelSelect.value === CUSTOM_MODEL_VALUE
+    ? row.querySelector(".rp-model-custom").value
+    : modelSelect.value;
+  return { provider: provider, model: model };
+}
+
+function renderChatCandidates(project) {
+  var list = project.chat_candidates;
+  var display = (!list || !list.length)
+    ? '<div class="empty">（未設定 HARNESS_CHAT_PROVIDER）</div>'
+    : '<div class="chips">' + list.map(function (c) {
+        return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
+      }).join(" -> ") + "</div>";
+  var current = list && list.length ? list[0] : { provider: "claude", model: "" };
+  var editRow = '<div class="rp-row">' +
+    modelEditRowHtml(current.provider, current.model) +
+    '<button class="chat-model-save" data-project="' + esc(project.name) + '">儲存</button>' +
+    '<span class="rp-status"></span>' +
+    "</div>";
+  return display + editRow;
 }
 
 function renderRoleProfiles(project) {
@@ -253,8 +312,7 @@ function renderRoleProfiles(project) {
       (fb ? " <span class='chip'>fallback: " + esc(fb) + "</span>" : "");
     if (editable) {
       current += '<div class="rp-row">' +
-        '<select class="rp-provider">' + providerOptions(p.provider) + "</select>" +
-        '<input class="rp-model" type="text" value="' + esc(p.model) + '">' +
+        modelEditRowHtml(p.provider, p.model) +
         '<button class="rp-save" data-project="' + esc(project.name) + '" data-profile="' + esc(p.id) + '">儲存</button>' +
         '<span class="rp-status"></span>' +
         "</div>";
@@ -283,8 +341,7 @@ document.addEventListener("click", function (e) {
   var row = btn.closest(".rp-row");
   var project = btn.getAttribute("data-project");
   var profileId = btn.getAttribute("data-profile");
-  var provider = row.querySelector(".rp-provider").value;
-  var model = row.querySelector(".rp-model").value;
+  var picked = readModelEditRow(row);
   var statusEl = row.querySelector(".rp-status");
   statusEl.className = "rp-status";
   statusEl.textContent = "儲存中…";
@@ -292,7 +349,9 @@ document.addEventListener("click", function (e) {
   fetch("/api/role-profile", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: project, profile_id: profileId, provider: provider, model: model })
+    body: JSON.stringify({
+      project: project, profile_id: profileId, provider: picked.provider, model: picked.model
+    })
   })
     .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
     .then(function (res) {
@@ -300,6 +359,39 @@ document.addEventListener("click", function (e) {
       if (res.ok) {
         statusEl.className = "rp-status ok";
         statusEl.textContent = "已儲存，下次執行生效";
+      } else {
+        statusEl.className = "rp-status err";
+        statusEl.textContent = res.body.error || "儲存失敗";
+      }
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "rp-status err";
+      statusEl.textContent = "儲存失敗（連線問題）";
+    });
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("chat-model-save")) return;
+  var btn = e.target;
+  var row = btn.closest(".rp-row");
+  var project = btn.getAttribute("data-project");
+  var picked = readModelEditRow(row);
+  var statusEl = row.querySelector(".rp-status");
+  statusEl.className = "rp-status";
+  statusEl.textContent = "儲存中…";
+  btn.disabled = true;
+  fetch("/api/chat-model", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: project, provider: picked.provider, model: picked.model })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      if (res.ok) {
+        statusEl.className = "rp-status ok";
+        statusEl.textContent = "已儲存，重啟 gateway 後生效";
       } else {
         statusEl.className = "rp-status err";
         statusEl.textContent = res.body.error || "儲存失敗";
@@ -504,7 +596,7 @@ function renderProject(project, q) {
     '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "專屬" : "預設") + "</span>" +
     '<span class="chip' + ((project.schedules || []).length ? " on" : "") + '">排程: ' + (project.schedules || []).length + "</span>" +
     "</div>" +
-    '<div class="section-label">聊天模型</div>' + renderChatCandidates(project.chat_candidates) +
+    '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
     renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + '、偏好待處理 ' + project.pending_pref + ')</div>' +
@@ -577,6 +669,8 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             self._handle_update_role_profile()
         elif parsed.path == "/api/role-profile/independent":
             self._handle_make_role_profiles_independent()
+        elif parsed.path == "/api/chat-model":
+            self._handle_update_chat_model()
         elif parsed.path == "/api/approval":
             self._handle_approval_action()
         else:
@@ -637,6 +731,29 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
         self.bus.publish()
         self._send_json(200, {"ok": True, "path": str(dest)})
 
+    def _handle_update_chat_model(self) -> None:
+        from memtrace_harness.cli import update_chat_model_for_project
+
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+            provider = str(payload["provider"])
+            model = str(payload["model"])
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            update_chat_model_for_project(self.config, project, provider, model)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to update a chat model")
+            self._send_json(500, {"error": "internal error updating the chat model"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True})
+
     def _handle_approval_action(self) -> None:
         payload = self._read_json_body()
         try:
@@ -693,7 +810,12 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             return _collect_status_data(self.config)
         except Exception as exc:  # keep the dashboard itself from crashing on a bad read
             logger.exception("status dashboard failed to collect status")
-            return {"daemon": {"pids": [], "multiple_warning": False, "pgrep_error": str(exc), "launchd": None, "launchd_error": None}, "project_index_path": None, "projects": []}
+            return {
+                "daemon": {"pids": [], "multiple_warning": False, "pgrep_error": str(exc), "launchd": None, "launchd_error": None},
+                "project_index_path": None,
+                "projects": [],
+                "known_models": {},
+            }
 
     def _serve_page(self) -> None:
         data_json = json.dumps(self._collect_data())
