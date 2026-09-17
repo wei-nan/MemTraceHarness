@@ -1,0 +1,14 @@
+#!/bin/sh
+# Non-interactive equivalent of the `codex-will` zsh function in ~/.zshrc
+# (CODEX_HOME="$HOME/.codex-william" command codex "$@") — harness invokes CLIs
+# via subprocess.Popen directly, not through a shell, so a shell function alone
+# is never resolvable as an executable (shutil.which returns None for it).
+# HARNESS_CODEX_COMMAND points at this script's absolute path instead.
+CODEX_HOME="$HOME/.codex-william"
+export CODEX_HOME
+# Absolute path, not a bare "codex" resolved via PATH: this script is invoked by
+# the gateway launchd service (com.memtraceharness.gateway.plist), whose PATH is
+# launchd's minimal default and does NOT include ChatGPT.app's Resources dir —
+# only an interactive shell's PATH does. A bare `exec codex` failed with
+# "exec: codex: not found" the first time this ran under launchd (2026-09-05).
+exec "/Applications/ChatGPT.app/Contents/Resources/codex" "$@"

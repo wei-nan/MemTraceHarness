@@ -168,13 +168,10 @@ class RedTeamAcceptanceTests(TestCase):
                 duration_ms=10,
             )
             with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=fake_res):
-                # No "!" prefix: plain messages route to "chat" (a quick, no-approval
-                # reply), not "task" — project classification for routing is unaffected.
+                # There is no more "!" prefix or "task" kind — every plain message
+                # routes to "chat" regardless of phrasing; project classification
+                # for routing is unaffected.
                 res = triage.triage_message("Help me fix the auth issue in the second system")
                 self.assertEqual(res.kind, "chat")
                 self.assertIsNotNone(res.project_scope)
                 self.assertEqual(res.project_scope.name, "proj_beta")
-
-                res_task = triage.triage_message("!Help me fix the auth issue in the second system")
-                self.assertEqual(res_task.kind, "task")
-                self.assertEqual(res_task.project_scope.name, "proj_beta")

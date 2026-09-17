@@ -47,6 +47,9 @@ class HarnessRunner:
                 title=f"Harness draft: {task.goal[:72]}",
                 body=render_memtrace_draft(task, responses, conflicts, recommendation, trace_id),
                 content_type="inquiry",
+                run_id=trace_id,
+                task_id=task.task_id,
+                stage="cli_run_draft_write",
             )
             summary = replace(
                 summary,

@@ -201,8 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_parser.add_argument(
         "--scan-interval-seconds",
         type=int,
-        default=60,
-        help="Minimum seconds between unattended backlog scan passes in --serve mode (default 60).",
+        default=1800,
+        help="Minimum seconds between unattended backlog scan passes in --serve mode (default 1800). "
+        "Each pass costs one search_nodes call per project even when the backlog is empty — keep this "
+        "well above a few minutes or idle scanning dominates MemTrace token spend (was 60s, see "
+        "ws_spec_plan/mem_c9c4affd).",
     )
     gateway_parser.add_argument(
         "--consolidation-interval-seconds",
@@ -250,6 +253,7 @@ def run_command(args: argparse.Namespace) -> int:
         raise ValueError("--timeout-seconds must be greater than zero")
 
     memtrace_client = _memtrace_client(args, config)
+    task_id = f"task_{uuid4().hex[:12]}"
     context_refs = list(args.context_ref)
     context_items = []
     if args.hydrate_context:
@@ -258,10 +262,11 @@ def run_command(args: argparse.Namespace) -> int:
             workspace_id=args.workspace,
             refs=context_refs,
             max_response_tokens=args.context_max_tokens,
+            task_id=task_id,
         )
 
     task = TaskEnvelope(
-        task_id=f"task_{uuid4().hex[:12]}",
+        task_id=task_id,
         workspace_id=args.workspace,
         goal=args.goal,
         context_refs=context_refs,
@@ -356,6 +361,7 @@ def loop_command(args: argparse.Namespace) -> int:
         memtrace_client=memtrace_client,
         max_total_tokens=args.max_total_tokens,
         working_directory=working_directory,
+        config=config,
     ).run(
         task,
         writeback=args.writeback,
@@ -400,6 +406,7 @@ def _memtrace_client(args: argparse.Namespace, config: HarnessConfig) -> MemTrac
 def _task_from_args(
     args: argparse.Namespace, memtrace_client: MemTraceClient | None
 ) -> TaskEnvelope:
+    task_id = f"task_{uuid4().hex[:12]}"
     context_refs = list(args.context_ref)
     context_items = []
     if args.hydrate_context:
@@ -408,9 +415,10 @@ def _task_from_args(
             workspace_id=args.workspace,
             refs=context_refs,
             max_response_tokens=args.context_max_tokens,
+            task_id=task_id,
         )
     return TaskEnvelope(
-        task_id=f"task_{uuid4().hex[:12]}",
+        task_id=task_id,
         workspace_id=args.workspace,
         goal=args.goal,
         context_refs=context_refs,
@@ -645,6 +653,17 @@ def _serve_gateway_loop(
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
+
+    for gw in gateways:
+        label = ", ".join(p.name for p in gw.projects) or "unassigned"
+        try:
+            gw.register_bot_commands()
+        except Exception:
+            logger.exception(f"[{label}] registering bot commands failed; continuing")
+        try:
+            gw.notify_all_allowlisted(f"✅ Harness gateway 已啟動，開始監聽（{label}）。")
+        except Exception:
+            logger.exception(f"[{label}] startup notification failed; continuing")
 
     last_scan = 0.0
     last_consolidation = 0.0

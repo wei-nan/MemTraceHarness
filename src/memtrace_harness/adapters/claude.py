@@ -31,6 +31,22 @@ class ClaudeCliAdapter(CliModelAdapter):
         if self.output_schema_path:
             schema = json.loads(self.output_schema_path.read_text(encoding="utf-8"))
             command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
+        # 2026-09-05: --permission-mode "default" (the read-only branch below)
+        # requires per-tool approval for anything not pre-allowlisted, and there's
+        # no human present headlessly to grant it — a G1 Red Team run observed
+        # this denying its own get_node call outright ("被拒"), not a considered
+        # choice not to search. MemTrace's own read-only lookup tools are always
+        # pre-allowlisted below so every stage can actually query MemTrace, not
+        # just be told in its prompt that it's allowed to. write_tools stays empty
+        # for every role except Controller (see controller_task()'s converge-stage
+        # instruction to record completion) — no other role should get standing
+        # permission to alter the KB.
+        read_tools = "mcp__memtrace__search_nodes,mcp__memtrace__get_node,mcp__memtrace__list_nodes,mcp__memtrace__traverse"
+        write_tools = (
+            ",mcp__memtrace__create_node,mcp__memtrace__update_node"
+            if self.role_profile_id == "controller"
+            else ""
+        )
         if self.permission == "read-only":
             # NOT --permission-mode plan: that mode is built for an interactive human
             # session (it can hand off to ExitPlanMode, or — observed 2026-08-12 on a
@@ -49,10 +65,14 @@ class ClaudeCliAdapter(CliModelAdapter):
                     "default",
                     "--disallowedTools",
                     "Write,Edit,NotebookEdit",
+                    "--allowedTools",
+                    read_tools + write_tools,
                 ]
             )
         else:
-            command.extend(["--permission-mode", "acceptEdits"])
+            command.extend(
+                ["--permission-mode", "acceptEdits", "--allowedTools", read_tools + write_tools]
+            )
         return command
 
     def parse_response(
