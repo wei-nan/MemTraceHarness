@@ -14,12 +14,47 @@ class MemTraceClientError(RuntimeError):
     pass
 
 
+class MemTraceDuplicateError(MemTraceClientError):
+    """create_node was rejected because the body is >0.95 similar to an existing node.
+    Distinct from other MemTraceClientErrors so callers can choose to retry with
+    force_create=True, fall back to the existing node, or skip — instead of that
+    choice being made implicitly by whether an exception handler happens to catch
+    the generic error type."""
+
+    def __init__(self, *, existing_node_id: str, similarity: float) -> None:
+        self.existing_node_id = existing_node_id
+        self.similarity = similarity
+        super().__init__(
+            f"create_node found a near-duplicate ({similarity:.3f} similarity): {existing_node_id}"
+        )
+
+
 @dataclass(frozen=True)
 class MemTraceClient:
     mcp_url: str
     token: str | None = None
 
-    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
+    ) -> dict[str, Any]:
+        # run_id/task_id/stage are an undeclared side-channel the server reads via
+        # args.get(...) regardless of a tool's declared inputSchema (contextvar-based
+        # correlation, see MemTrace packages/api/services/mcp_tools.py — set once per
+        # request, read by log_mcp_interaction). Merging them here lets every harness
+        # call site opt in without the server needing per-tool schema changes.
+        if run_id is not None or task_id is not None or stage is not None:
+            arguments = {
+                **arguments,
+                **({"run_id": run_id} if run_id is not None else {}),
+                **({"task_id": task_id} if task_id is not None else {}),
+                **({"stage": stage} if stage is not None else {}),
+            }
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid4()),
@@ -38,6 +73,9 @@ class MemTraceClient:
         node_id: str,
         detail_level: str = "full",
         max_response_tokens: int = 3000,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
     ) -> dict[str, Any]:
         result = self.call_tool(
             "get_node",
@@ -47,6 +85,9 @@ class MemTraceClient:
                 "detail_level": detail_level,
                 "max_response_tokens": max_response_tokens,
             },
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
         )
         text = _extract_text(result)
         try:
@@ -63,6 +104,9 @@ class MemTraceClient:
         workspace_id: str,
         refs: list[str],
         max_response_tokens: int = 3000,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
     ) -> list[ContextItem]:
         items: list[ContextItem] = []
         for ref in refs:
@@ -74,6 +118,9 @@ class MemTraceClient:
                 node_id=ref,
                 detail_level="full",
                 max_response_tokens=max_response_tokens,
+                run_id=run_id,
+                task_id=task_id,
+                stage=stage or "context_hydration",
             )
             items.append(
                 ContextItem(
@@ -94,7 +141,17 @@ class MemTraceClient:
         body: str,
         content_type: str = "inquiry",
         tags: list[str] | None = None,
+        force_create: bool = False,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
     ) -> str:
+        # MemTrace rejects a create_node whose body is >0.95 similar to an existing
+        # node with {"action": "duplicate_found", ...} instead of an id — no exception
+        # is raised by call_tool() for this (it's a 200, not an "error" field), but the
+        # caller-facing contract of create_node() is "returns an id or raises", so
+        # surface it as a distinct, catchable error rather than the generic "no id"
+        # MemTraceClientError a caller can't distinguish from a real API problem.
         result = self.call_tool(
             "create_node",
             {
@@ -106,7 +163,11 @@ class MemTraceClient:
                 "source_type": "ai",
                 "visibility": "private",
                 "tags": tags or ["harness", "draft", "human-gate"],
+                "force_create": force_create,
             },
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
         )
         text = _extract_text(result)
         try:
@@ -115,20 +176,52 @@ class MemTraceClient:
             raise MemTraceClientError(f"create_node returned non-JSON content: {text}") from exc
         node_id = data.get("id")
         if not node_id:
+            if data.get("action") == "duplicate_found":
+                raise MemTraceDuplicateError(
+                    existing_node_id=str(data.get("existing_node_id") or ""),
+                    similarity=float(data.get("similarity") or 0.0),
+                )
             raise MemTraceClientError(f"create_node response did not include id: {data}")
         return str(node_id)
 
-    def update_node(self, *, workspace_id: str, node_id: str, body: str) -> None:
+    def update_node(
+        self,
+        *,
+        workspace_id: str,
+        node_id: str,
+        body: str,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
+    ) -> None:
         self.call_tool(
             "update_node",
             {"workspace_id": workspace_id, "node_id": node_id, "body": body},
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
         )
 
     def search_nodes(
-        self, *, workspace_id: str, query: str, limit: int = 5
+        self,
+        *,
+        workspace_id: str,
+        query: str,
+        limit: int = 5,
+        detail_level: str | None = None,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
     ) -> list[dict[str, Any]]:
+        arguments: dict[str, Any] = {"workspace_id": workspace_id, "query": query, "limit": limit}
+        if detail_level is not None:
+            arguments["detail_level"] = detail_level
         result = self.call_tool(
-            "search_nodes", {"workspace_id": workspace_id, "query": query, "limit": limit}
+            "search_nodes",
+            arguments,
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
         )
         text = _extract_text(result)
         try:

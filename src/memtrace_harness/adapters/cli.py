@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any
 
 from memtrace_harness.adapters.base import ModelAdapter
@@ -43,6 +44,7 @@ class CliModelAdapter(ModelAdapter):
         output_schema_path: Path | None = None,
         quota_bucket: str | None = None,
         fallback_index: int = 0,
+        reply_language: str | None = None,
     ) -> None:
         self.adapter_id = adapter_id
         self.role = role
@@ -60,10 +62,19 @@ class CliModelAdapter(ModelAdapter):
         self.output_schema_path = output_schema_path
         self.quota_bucket = quota_bucket or f"{self.provider}-account"
         self.fallback_index = fallback_index
+        self.reply_language = reply_language
 
     def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
-        prompt = render_agent_prompt(task, self.role)
+        prompt = render_agent_prompt(task, self.role, reply_language=self.reply_language)
         command = self.build_command(prompt)
+        # For a read-only role, this is the one independent check that doesn't trust
+        # the CLI's own mode gate — some providers (Antigravity's --mode plan) can't
+        # complete headlessly, and the only way to still use them for a read-only role
+        # is a mode that's technically capable of writing (accept-edits). Comparing
+        # git state before/after means a write is caught and fails closed even if the
+        # CLI-level permission gate was bypassed or never enforced it in the first
+        # place — see the antigravity-headless-command-permission memory note.
+        before_snapshot = _git_status_snapshot(self.working_directory) if self.permission == "read-only" else None
         process = self.process_runner.run(
             command,
             cwd=self.working_directory,
@@ -80,10 +91,34 @@ class CliModelAdapter(ModelAdapter):
             if process.unavailable
             else "timed_out"
             if process.timed_out
+            # A provider CLI can report an internal error (quota exhaustion, safety
+            # refusal, subagent cancellation) as data inside its own JSON protocol
+            # while still exiting 0 — process.return_code alone would misreport this
+            # as "succeeded" (confirmed 2026-08-14 for Antigravity's quota errors; see
+            # adapters/antigravity.py's _last_error()). If the adapter's own
+            # parse_response() surfaced an error, trust that over a clean exit code.
+            else "failed"
+            if response.execution.error
             else "succeeded"
             if process.return_code == 0
             else "failed"
         )
+        error = process.error or response.execution.error or _stderr_error(process)
+        if before_snapshot is not None:
+            after_snapshot = _git_status_snapshot(self.working_directory)
+            if after_snapshot is not None and after_snapshot != before_snapshot:
+                # Fail closed, don't try to auto-revert: an automatic git cleanup here
+                # could itself destroy legitimate uncommitted work if this check ever
+                # has a bug. Surfacing it loudly and stopping is the safe choice; a
+                # human decides what to do with the actual diff.
+                status = "failed"
+                error = (
+                    f"safety violation: a read-only role ({self.role_profile_id or self.role}) "
+                    "modified the working directory despite permission=read-only. Working "
+                    "tree state changed during this call — treating the result as untrusted "
+                    "and stopping instead of using it. Inspect `git status`/`git diff` in "
+                    f"{self.working_directory} before deciding how to proceed."
+                )
         execution = replace(
             response.execution,
             status=status,
@@ -102,7 +137,7 @@ class CliModelAdapter(ModelAdapter):
             # on stdout instead of stderr (e.g. Codex's `{"type":"error","message":...}`);
             # _stderr_error() falls back to a generic "CLI exited with code N" when stderr
             # is empty, which would otherwise silently win and discard the real message.
-            error=process.error or response.execution.error or _stderr_error(process),
+            error=error,
             parse_warnings=[*response.execution.parse_warnings, *parse_warnings],
         )
         return replace(response, execution=execution)
@@ -175,22 +210,66 @@ class CliModelAdapter(ModelAdapter):
         )
 
 
-def render_agent_prompt(task: TaskEnvelope, role: str) -> str:
+def _git_status_snapshot(working_directory: Path) -> str | None:
+    """Cheap, dependency-free proof of "did anything in the working tree change":
+    `git status --porcelain` output for tracked and untracked files, plus the
+    current HEAD (catches a commit with an otherwise-clean tree). Returns None when
+    working_directory isn't a git repo at all (e.g. Controller's isolated sandbox
+    directory under trace_root/controller-workspace, which is intentionally not a
+    real project checkout) — nothing to protect there, so the caller skips the
+    write-detection check entirely rather than treating "not a repo" as a violation."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if status.returncode != 0:
+            return None
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return f"{head.stdout.strip()}\n{status.stdout}"
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def render_agent_prompt(
+    task: TaskEnvelope, role: str, *, reply_language: str | None = None
+) -> str:
     payload = task.to_dict()
-    return "\n".join(
+    lines = [
+        f"You are the {role} in a MemTrace external harness run.",
+        "Execute the goal in the current working directory when edits are requested.",
+        "Follow repository agent instructions and preserve human approval checkpoints.",
+        "Do not call a model provider API or reveal credentials.",
+        (
+            "End with a concise result containing evidence, tests, gaps, and human "
+            "decisions needed."
+        ),
+    ]
+    if reply_language:
+        # A fixed, Harness-owned policy — not derived from task content, so it never
+        # grows or duplicates across resume rounds the way baking it into `goal` text
+        # did (see the resume_goal-augmentation-nesting fix). Every role gets exactly
+        # this one line, once, regardless of how many times a conversation resumes.
+        lines.append(
+            f"Reply/summarize in {reply_language}, regardless of what language the "
+            "task envelope or prior discussion uses."
+        )
+    lines.extend(
         [
-            f"You are the {role} in a MemTrace external harness run.",
-            "Execute the goal in the current working directory when edits are requested.",
-            "Follow repository agent instructions and preserve human approval checkpoints.",
-            "Do not call a model provider API or reveal credentials.",
-            (
-                "End with a concise result containing evidence, tests, gaps, and human "
-                "decisions needed."
-            ),
             "Task envelope:",
             json.dumps(payload, ensure_ascii=False, indent=2),
         ]
     )
+    return "\n".join(lines)
 
 
 def parse_json_lines(stdout: str) -> tuple[list[dict[str, Any]], list[str]]:

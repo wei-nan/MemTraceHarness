@@ -7,15 +7,24 @@ import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
-from typing import cast
+from typing import Any, cast
 from unittest import TestCase
 
 from memtrace_harness.adapters.base import ModelAdapter
-from memtrace_harness.loop import AgentLoopRunner
+from memtrace_harness.loop import (
+    AgentLoopRunner,
+    _is_technical_output_failure,
+    _plan_structure_ok,
+    controller_task,
+    summarize_invalid_artifact,
+    summarize_plan_needs_human,
+    valid_plan,
+)
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schemas import (
     CliExecution,
+    ContextItem,
     ModelResponse,
     TaskEnvelope,
     TokenUsage,
@@ -39,11 +48,15 @@ class QueueAdapter(ModelAdapter):
         completeness = output.pop("_usage", "complete")
         status = output.pop("_status", "succeeded")
         error = output.pop("_error", None)
+        raw_text = output.pop("_raw_text", None)
         return ModelResponse(
             adapter_id=self.adapter_id,
             role=self.role,
             claims=[],
-            final_text=json.dumps(output) if status == "succeeded" else "",
+            final_text=(
+                raw_text if raw_text is not None
+                else json.dumps(output) if status == "succeeded" else ""
+            ),
             requires_human_decision=True,
             execution=CliExecution(
                 provider=self.provider,
@@ -107,6 +120,145 @@ def completed_development() -> dict:
     }
 
 
+class TechnicalOutputFailureDetectionTests(TestCase):
+    def test_schema_validation_failure_is_technical(self) -> None:
+        text = summarize_invalid_artifact("Controller", {"action": "finish", "reason": "..."})
+        self.assertTrue(_is_technical_output_failure(text))
+
+    def test_missing_structured_output_is_technical(self) -> None:
+        self.assertTrue(_is_technical_output_failure(summarize_invalid_artifact("Planner", None)))
+
+    def test_raw_invalid_output_fallback_text_is_technical(self) -> None:
+        self.assertTrue(
+            _is_technical_output_failure(
+                "planner returned invalid structured output; no stage advanced.\nModel said:\n..."
+            )
+        )
+
+    def test_genuine_open_question_is_not_technical(self) -> None:
+        # A real G1/Controller "ask_human" recommendation must NOT be misrouted —
+        # only a parsing/schema failure counts.
+        self.assertFalse(
+            _is_technical_output_failure(
+                "G1 verdict: NEEDS_HUMAN (reasoning_gap)\n- [?] scope 邊界未確認"
+            )
+        )
+
+
+class WellFormedNeedsHumanPlanTests(TestCase):
+    """2026-09-05 bug (run_3fd1adaf7e8a): valid_plan() rejected ANY status other
+    than "ready", including a complete, well-formed plan that honestly reported
+    status="needs_human" with real open_questions — that got misrouted through
+    summarize_invalid_artifact() as "structured output was returned but failed
+    schema validation", sounding like a retry-fixable parsing glitch when the
+    model had done its job correctly and a human genuinely needed to answer
+    something. Fixed by splitting the structural check (_plan_structure_ok) from
+    the status=="ready" gate (valid_plan)."""
+
+    def _well_formed_needs_human_plan(self) -> dict:
+        return {
+            "status": "needs_human",
+            "plan": "A complete, valid plan that honestly needs human input.",
+            "acceptance_criteria": ["criterion one"],
+            "open_questions": ["What should happen to the orphaned service?"],
+            "scope_exclusions": ["Not touching unrelated feature X."],
+        }
+
+    def test_well_formed_needs_human_plan_is_not_a_valid_ready_plan(self) -> None:
+        # valid_plan() still means "ready to hand to Dev" — a needs_human plan,
+        # however well-formed, is correctly NOT that.
+        self.assertFalse(valid_plan(self._well_formed_needs_human_plan()))
+
+    def test_well_formed_needs_human_plan_passes_structure_check(self) -> None:
+        self.assertTrue(_plan_structure_ok(self._well_formed_needs_human_plan()))
+
+    def test_genuinely_malformed_plan_fails_structure_check(self) -> None:
+        self.assertFalse(_plan_structure_ok({"status": "needs_human", "plan": ""}))
+        self.assertFalse(_plan_structure_ok(None))
+
+    def test_well_formed_needs_human_plan_is_not_classified_as_technical_failure(self) -> None:
+        detail = summarize_plan_needs_human("Planner", self._well_formed_needs_human_plan())
+        self.assertIn("What should happen to the orphaned service?", detail)
+        self.assertIn("A complete, valid plan", detail)
+        self.assertFalse(_is_technical_output_failure(detail))
+
+
+class ControllerTaskContextTests(TestCase):
+    def test_controller_sees_project_scope_and_prior_discussion(self) -> None:
+        # 2026-09-05: Controller used to be filtered down to ONLY loop-snapshot +
+        # harness_resume_envelope items, silently dropping the project-scope and
+        # prior-discussion context TelegramGateway attaches to every chat-triggered
+        # task — which is exactly why it kept saying "I don't have context" for
+        # goals like "接續 chat_3077a492 的任務" (chat_621c8bb9, generation 17).
+        base_task = TaskEnvelope(
+            task_id="task_1",
+            workspace_id="ws_test",
+            goal="接續 chat_3077a492 的任務",
+            context_refs=[],
+            context_items=[
+                ContextItem(
+                    ref="harness:project-scope:Beri",
+                    title="Project scope",
+                    body="# Beri scope",
+                    content_type="context",
+                    source="harness",
+                ),
+                ContextItem(
+                    ref="harness:prior-discussion:Beri",
+                    title="Prior discussion",
+                    body="Earlier substantive context: ...",
+                    content_type="context",
+                    source="harness",
+                ),
+                ContextItem(
+                    ref="harness:resume:conv_1",
+                    title="Resume envelope",
+                    body="{}",
+                    content_type="harness_resume_envelope",
+                    source="harness",
+                ),
+                ContextItem(
+                    ref="harness:accepted-plan",
+                    title="Accepted plan",
+                    body="{}",
+                    content_type="artifact",
+                    source="harness",
+                ),
+            ],
+        )
+        result = controller_task(base_task, stage="start", stages=[])
+        refs = {item.ref for item in result.context_items}
+        self.assertIn("harness:project-scope:Beri", refs)
+        self.assertIn("harness:prior-discussion:Beri", refs)
+        self.assertIn("harness:resume:conv_1", refs)
+        # Still excludes unrelated artifact-type items — Controller's sandbox isn't
+        # thrown wide open, just given the same static text Planner already sees.
+        self.assertNotIn("harness:accepted-plan", refs)
+
+    def test_controller_is_allowed_to_search_memtrace_but_not_other_tools(self) -> None:
+        # 2026-09-05: the user explicitly asked that Controller be able to search
+        # MemTrace/history itself (deciding when it's actually needed) rather than
+        # being fully tool-blind, while staying honest about whether it searched.
+        task = TaskEnvelope(
+            task_id="task_1", workspace_id="ws_test", goal="接續 chat_3077a492 的任務"
+        )
+        result = controller_task(task, stage="start", stages=[])
+        goal_text = result.goal
+        self.assertIn("search_nodes", goal_text)
+        self.assertIn("searched_history", goal_text)
+        self.assertIn("no git command", goal_text)
+
+    def test_only_converge_stage_offers_update_node_permission(self) -> None:
+        task = TaskEnvelope(
+            task_id="task_1", workspace_id="ws_test", goal="do the thing"
+        )
+        start_goal = controller_task(task, stage="start", stages=[]).goal
+        converge_goal = controller_task(task, stage="converge", stages=[]).goal
+        self.assertNotIn("update_node", start_goal)
+        self.assertIn("update_node", converge_goal)
+        self.assertIn("create_node", converge_goal)
+
+
 class AgentLoopRunnerTests(TestCase):
     def setUp(self) -> None:
         self.temp_dir_context = TemporaryDirectory()
@@ -143,6 +295,168 @@ class AgentLoopRunnerTests(TestCase):
             ).fetchone()
         self.assertEqual(stage_count, 6)
         self.assertEqual(planner_execution, ("sonnet", "claude-test-version", "read-only"))
+
+    def test_developer_needs_human_still_flows_to_g2_for_review(self) -> None:
+        # A developer's own "needs_human"/"failed" status must not skip G2 and go
+        # straight to a human — G2 is the reviewer built to catch exactly the kind of
+        # gap a developer would self-report (missing compile evidence, expanded
+        # scope), via the same REJECT verdict it already renders for a "completed"
+        # development.
+        adapters = self._adapters()
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "needs_human",
+                    "summary": "blocked on tool permission denials, could not verify build",
+                    "changed_files": ["src/example.py"],
+                    "tests": ["written but not executed"],
+                    "gaps": ["no compiler evidence available this session"],
+                }
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(len(adapters["red-team"].calls), 2)
+        self.assertEqual(summary.status, "succeeded")
+
+    def test_developer_needs_human_g2_reject_triggers_one_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "needs_human",
+                    "summary": "wrote the change but could not run tests",
+                    "changed_files": ["src/example.py"],
+                    "tests": ["written but not executed"],
+                    "gaps": ["no compiler evidence available this session"],
+                },
+                completed_development(),
+            ],
+        )
+        adapters["red-team"] = QueueAdapter(
+            "red-team",
+            "codex",
+            "gpt-5.6-sol",
+            [
+                passed_gate(),
+                {
+                    "verdict": "REJECT",
+                    "reason_code": "test_gap",
+                    "findings": [{"description": "no compiler/test evidence provided"}],
+                    "unverified_items": [],
+                    "confidence": 0.9,
+                },
+                passed_gate(),
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["developer"].calls), 2)
+        self.assertIn("develop-revision", [stage.stage for stage in summary.stages])
+
+    def test_verify_command_failure_skips_g2_model_and_forces_a_revision(self) -> None:
+        # A failing deterministic build/test command must be a hard precondition —
+        # G2's model is never even asked, and the resulting synthetic REJECT drives
+        # the same one-bounded-revision loop a real G2 REJECT would.
+        adapters = self._adapters()
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [completed_development(), completed_development()],
+        )
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+            working_directory=self.root,
+            verify_command="exit 1",
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        # Only G1 called the red-team model; both G2 attempts were pre-empted by the
+        # failing verification command instead of reaching the model.
+        self.assertEqual(len(adapters["red-team"].calls), 1)
+        self.assertEqual(len(adapters["developer"].calls), 2)
+        stage_names = [stage.stage for stage in summary.stages]
+        self.assertIn("g2", stage_names)
+        self.assertIn("develop-revision", stage_names)
+        self.assertIn("g2-recheck", stage_names)
+
+    def test_verify_command_success_still_lets_g2_model_review(self) -> None:
+        adapters = self._adapters()
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+            working_directory=self.root,
+            verify_command="exit 0",
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["red-team"].calls), 2)
+
+    def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
+        self,
+    ) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [
+                {"action": "run_planner", "reason": "ready"},
+                {"action": "run_planner", "reason": "still ready after clarification"},
+                {"action": "finish", "reason": "complete"},
+            ],
+        )
+        adapters["red-team"] = QueueAdapter(
+            "red-team",
+            "codex",
+            "gpt-5.6-sol",
+            [
+                {
+                    "verdict": "NEEDS_HUMAN",
+                    "reason_code": "acceptance_gap",
+                    "findings": [{"description": "needs a human call on scope"}],
+                    "unverified_items": [],
+                    "confidence": 0.6,
+                },
+                passed_gate(),
+                passed_gate(),
+            ],
+        )
+        trace_store = TraceStore(self.db_path)
+
+        first = AgentLoopRunner(adapters=adapters, trace_store=trace_store).run(
+            self.task, conversation_id="chat_resume_test"
+        )
+        self.assertEqual(first.status, "needs_human")
+        self.assertEqual(len(adapters["planner"].calls), 1)
+        self.assertEqual(len(adapters["red-team"].calls), 1)
+
+        second = AgentLoopRunner(adapters=adapters, trace_store=trace_store).run(
+            self.task, conversation_id="chat_resume_test"
+        )
+        self.assertEqual(second.status, "succeeded")
+        # The settled plan from the first run is reused, not regenerated.
+        self.assertEqual(len(adapters["planner"].calls), 1)
+        # G1 had not PASSed yet, so it (and everything after it) reruns.
+        self.assertEqual(len(adapters["red-team"].calls), 3)
+        self.assertEqual(len(adapters["developer"].calls), 1)
 
     def test_opus_is_used_only_after_g1_reasoning_gap(self) -> None:
         adapters = self._adapters()
@@ -503,3 +817,195 @@ class AgentLoopRunnerTests(TestCase):
                 [completed_development()],
             ),
         }
+
+
+def _stub_adapters() -> dict[str, QueueAdapter]:
+    """Satisfies AgentLoopRunner._validate_adapters()'s required-role check for
+    tests that only need a runner instance to call a helper method directly,
+    never .run() — the queues are empty because they're never dequeued."""
+    return {
+        role: QueueAdapter(role, "codex", "gpt-5.6-luna", [])
+        for role in ("controller", "planner", "planner-escalation", "red-team", "developer")
+    }
+
+
+class _FakeChatConfig:
+    def __init__(self, provider: str | None = "claude", model: str | None = "haiku") -> None:
+        self.chat_provider = provider
+        self.chat_model = model
+
+    def command_for(self, provider: str) -> str:
+        return provider
+
+
+class MalformedOutputRepairTests(TestCase):
+    def setUp(self) -> None:
+        self.temp_dir_context = TemporaryDirectory()
+        self.addCleanup(self.temp_dir_context.cleanup)
+        self.root = Path(self.temp_dir_context.name)
+        self.db_path = self.root / "trace.sqlite3"
+
+    def test_no_config_returns_none_without_any_cli_call(self) -> None:
+        runner = AgentLoopRunner(adapters=_stub_adapters(), trace_store=TraceStore(self.db_path))
+        self.assertIsNone(
+            runner._repair_malformed_output(profile_id="controller", raw_text="I did the thing.")
+        )
+
+    def test_repair_reformats_prose_into_the_stage_schema(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        runner = AgentLoopRunner(
+            adapters=_stub_adapters(),
+            trace_store=TraceStore(self.db_path),
+            config=cast(Any, _FakeChatConfig()),
+        )
+        repaired_json = json.dumps({"action": "run_planner", "reason": "ready to proceed"})
+        with patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run",
+            return_value=ProcessResult(
+                command=["claude"],
+                return_code=0,
+                stdout=repaired_json,
+                stderr="",
+                started_at="2026-09-05T00:00:00+00:00",
+                completed_at="2026-09-05T00:00:01+00:00",
+                duration_ms=100,
+            ),
+        ):
+            result = runner._repair_malformed_output(
+                profile_id="controller",
+                raw_text="Sure! I've decided we should run the planner next because it's ready.",
+            )
+        self.assertEqual(result, {"action": "run_planner", "reason": "ready to proceed"})
+
+    def test_repair_returning_unparseable_text_yields_none(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        runner = AgentLoopRunner(
+            adapters=_stub_adapters(),
+            trace_store=TraceStore(self.db_path),
+            config=cast(Any, _FakeChatConfig()),
+        )
+        with patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run",
+            return_value=ProcessResult(
+                command=["claude"],
+                return_code=0,
+                stdout="I'm not sure how to express that as JSON.",
+                stderr="",
+                started_at="2026-09-05T00:00:00+00:00",
+                completed_at="2026-09-05T00:00:01+00:00",
+                duration_ms=100,
+            ),
+        ):
+            result = runner._repair_malformed_output(profile_id="controller", raw_text="garbled")
+        self.assertIsNone(result)
+
+    def test_execute_recovers_a_prose_wrapped_controller_response(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        task = TaskEnvelope(
+            task_id="task_repair",
+            workspace_id="ws_spec_plan",
+            goal="Implement the accepted change",
+            risk_level="high",
+        )
+        adapters: dict[str, QueueAdapter] = {
+            "controller": QueueAdapter(
+                "controller",
+                "codex",
+                "gpt-5.6-luna",
+                [
+                    {
+                        "_raw_text": (
+                            "I've decided to run the planner next since the request is ready. "
+                            'Here is my JSON-ish answer: {action: run_planner, reason: ready}'
+                        )
+                    },
+                    {"action": "finish", "reason": "complete"},
+                ],
+            ),
+            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
+            "planner-escalation": QueueAdapter(
+                "planner-escalation", "claude", "opus", [ready_plan("deep plan")]
+            ),
+            "red-team": QueueAdapter(
+                "red-team", "codex", "gpt-5.6-sol", [passed_gate(), passed_gate()]
+            ),
+            "developer": QueueAdapter(
+                "developer",
+                "antigravity",
+                "gemini-3.1-pro-high",
+                [completed_development()],
+            ),
+        }
+        repaired_json = json.dumps({"action": "run_planner", "reason": "ready to proceed"})
+        with patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run",
+            return_value=ProcessResult(
+                command=["claude"],
+                return_code=0,
+                stdout=repaired_json,
+                stderr="",
+                started_at="2026-09-05T00:00:00+00:00",
+                completed_at="2026-09-05T00:00:01+00:00",
+                duration_ms=100,
+            ),
+        ):
+            summary = AgentLoopRunner(
+                adapters=adapters,
+                trace_store=TraceStore(self.db_path),
+                config=cast(Any, _FakeChatConfig()),
+            ).run(task)
+
+        self.assertEqual(summary.status, "succeeded")
+        controller_stage = summary.stages[0]
+        self.assertEqual(controller_stage.state, "succeeded")
+        self.assertEqual(controller_stage.artifact, {"action": "run_planner", "reason": "ready to proceed"})
+        self.assertIn(
+            "final_text was not valid JSON; repaired via chat-model reformatting",
+            controller_stage.response.execution.parse_warnings,
+        )
+
+    def test_execute_falls_back_to_invalid_output_when_repair_also_fails(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        task = TaskEnvelope(
+            task_id="task_repair_fail",
+            workspace_id="ws_spec_plan",
+            goal="Implement the accepted change",
+            risk_level="high",
+        )
+        adapters: dict[str, QueueAdapter] = {
+            **_stub_adapters(),
+            "controller": QueueAdapter(
+                "controller",
+                "codex",
+                "gpt-5.6-luna",
+                [{"_raw_text": "This isn't JSON at all and never will be."}],
+            ),
+        }
+        with patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run",
+            return_value=ProcessResult(
+                command=["claude"],
+                return_code=1,
+                stdout="",
+                stderr="error",
+                started_at="2026-09-05T00:00:00+00:00",
+                completed_at="2026-09-05T00:00:01+00:00",
+                duration_ms=100,
+            ),
+        ):
+            summary = AgentLoopRunner(
+                adapters=adapters,
+                trace_store=TraceStore(self.db_path),
+                config=cast(Any, _FakeChatConfig()),
+            ).run(task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertEqual(summary.stages[0].state, "invalid_output")

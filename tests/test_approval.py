@@ -8,6 +8,57 @@ from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.trace_store import TraceStore
 
 
+class ApprovalMessageTests(TestCase):
+    def test_info_needed_reason_leads_with_answer_not_a_button(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_1",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="ambiguous_requirement",
+                proposed_action="需要澄清「個別存在 commit 內」的意思",
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("需要你回答問題", msg)
+            self.assertIn("不用按鈕", msg)
+
+    def test_model_output_invalid_explains_its_a_technical_glitch_not_a_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_3",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="model_output_invalid",
+                proposed_action='Controller: structured output was returned but failed schema validation.\nRaw output:\n{"action": "finish"}',
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("系統技術性錯誤", msg)
+            self.assertIn("不是要問你問題", msg)
+            self.assertNotIn("需要你回答問題", msg)
+
+    def test_write_action_reason_keeps_approve_reject_framing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test.sqlite3")
+            mgr = ApprovalManager(trace_store, {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_2",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="unattended_write",
+                proposed_action="掃描器發現待辦，是否核准開始？",
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("核准請求", msg)
+            self.assertNotIn("需要你回答問題", msg)
+
+
 class ApprovalTests(TestCase):
     def test_approval_request_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -44,3 +95,47 @@ class ApprovalTests(TestCase):
             ok_second, msg_second, _ = mgr.respond(req.id, "reject", chat_id=12345)
             self.assertFalse(ok_second)
             self.assertIn("已經是", msg_second)
+
+    def test_resume_goal_is_separate_from_the_human_facing_proposed_action(self) -> None:
+        # proposed_action is what a human reads to decide whether to approve; resume_goal
+        # is what actually gets re-run once they do. A needs_human stop shows the human
+        # the failure summary but must resume the *original* request, not the summary.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_approval_resume_goal.sqlite3"
+            trace_store = TraceStore(db_path)
+            mgr = ApprovalManager(trace_store, {12345})
+
+            req = mgr.request_approval(
+                conversation_id="conv_002",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="ambiguous_requirement",
+                proposed_action="controller returned invalid structured output; no stage advanced.",
+                resume_goal="幫我建立工作樹，依照agent loop 流程來開發上述四個功能",
+            )
+            self.assertEqual(
+                req.proposed_action,
+                "controller returned invalid structured output; no stage advanced.",
+            )
+            self.assertEqual(req.resume_goal, "幫我建立工作樹，依照agent loop 流程來開發上述四個功能")
+
+            fetched = mgr.get_request(req.id)
+            assert fetched is not None
+            self.assertEqual(fetched.resume_goal, req.resume_goal)
+
+    def test_resume_goal_defaults_to_none_for_backward_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_approval_no_resume_goal.sqlite3"
+            trace_store = TraceStore(db_path)
+            mgr = ApprovalManager(trace_store, {12345})
+
+            req = mgr.request_approval(
+                conversation_id="conv_003",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="git_push",
+                proposed_action="git push origin main",
+            )
+            self.assertIsNone(req.resume_goal)

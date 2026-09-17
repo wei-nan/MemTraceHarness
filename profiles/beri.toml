@@ -2,23 +2,31 @@
 role = "Controller"
 provider = "codex"
 model = "gpt-5.6-luna"
-reasoning_effort = "low"
+reasoning_effort = "medium"
 permission = "read-only"
 context_policy = "loop-snapshot"
 max_attempts = 1
 quota_bucket = "codex-account"
 fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
-max_fallback_hops = 2
+max_fallback_hops = 1
 fallback_cooldown_seconds = 1800
 
-# Reordered for Beri, same as MemTrace's profile: prefer Gemini over Sonnet when
-# Codex Luna (the primary) is unavailable.
-[[profiles.controller.fallbacks]]
-provider = "antigravity"
-model = "gemini-3.6-flash-high"
-reasoning_effort = "high"
-quota_bucket = "antigravity-account"
-
+# 2026-08-13: Antigravity is usable for read-only roles again — adapters/cli.py's
+# CliModelAdapter.run() now independently diffs git status before/after any
+# permission="read-only" call and fails closed if anything changed, so the safety
+# property no longer depends on Antigravity's own (headlessly non-functional)
+# --mode plan gate. See the antigravity-headless-command-permission memory note.
+# Also serves the Converge stage (same "controller" profile, no separate config).
+#
+# 2026-09-05: switched primary from Antigravity to Codex (gpt-5.6-luna, promoted
+# from a low-effort fallback to medium-effort primary) after a review of every
+# Beri cli_execution showed Antigravity's clean-success rate at only 53% (66
+# calls: 18 quota-cooldown, 6 schema-validation failures, 2 timeouts, 2 quota
+# failures, 1 safety violation) versus Claude's 96% — Antigravity was the
+# dominant source of the "操作不順暢" the user was seeing. Antigravity dropped
+# from Controller's candidate list entirely (was primary, then a second-tier
+# fallback); Claude kept as the sole fallback, now genuinely diverse from the
+# codex-account primary.
 [[profiles.controller.fallbacks]]
 provider = "claude"
 model = "sonnet"
@@ -27,53 +35,115 @@ quota_bucket = "claude-account"
 
 [profiles.planner]
 role = "Planner"
-provider = "antigravity"
-model = "gemini-3.6-flash-high"
-reasoning_effort = "high"
-permission = "read-only"
-context_policy = "task-and-targeted-evidence"
-max_attempts = 1
-quota_bucket = "antigravity-account"
-
-[profiles.planner-escalation]
-role = "Planning Escalation"
 provider = "claude"
-model = "opus"
-reasoning_effort = "high"
+model = "sonnet"
+reasoning_effort = "medium"
 permission = "read-only"
 context_policy = "task-and-targeted-evidence"
 max_attempts = 1
 quota_bucket = "claude-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
 
-# Red Team: Claude via Antigravity (not the direct `claude` CLI — an independent auth
-# path, and a different vendor from Developer's Gemini). Fallback chain now allowed
-# (role_profiles._validate_role_boundaries no longer hard-blocks it): if the primary
-# model is unavailable, the completion summary will show it fell back, so this is a
-# visible degrade, not a silent one.
+# 2026-09-04: switched primary from Antigravity/Gemini to Claude, after a Gemini
+# Planner call used replace_file_content to directly edit FullItemEntrySheet.swift
+# despite permission=read-only (run_49618ef933c8, chat_88564fc7) — caught and failed
+# closed by the git-diff safety net (see antigravity_git_diff_safety_net memory), so
+# nothing bad landed, but the model kept reaching for write tools it was never
+# supposed to have in the first place. Claude's read-only path (adapters/claude.py)
+# passes --disallowedTools Write,Edit,NotebookEdit — the CLI itself refuses the tool
+# call outright, closing this failure mode at the source instead of only detecting
+# it after the fact.
+#
+# 2026-09-05: fallback switched from Antigravity/Gemini to Codex (gpt-5.6-sol) —
+# same reliability review as Controller's above; Antigravity dropped from this
+# role's candidate list entirely rather than kept as an unreliable backstop.
+[[profiles.planner.fallbacks]]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+quota_bucket = "codex-account"
+
+[profiles.planner-escalation]
+role = "Planning Escalation"
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+permission = "read-only"
+context_policy = "task-and-targeted-evidence"
+max_attempts = 1
+quota_bucket = "codex-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
+
+# 2026-09-05: swapped primary and fallback — Codex (gpt-5.6-sol, was the
+# fallback) promoted to primary, Antigravity (was primary) demoted to fallback,
+# per the same reliability review noted on Controller/Planner above (Antigravity
+# 53% clean vs Claude 96% across Beri's actual run history).
+[[profiles.planner-escalation.fallbacks]]
+provider = "antigravity"
+model = "claude-opus-4-6-thinking"
+reasoning_effort = "high"
+quota_bucket = "antigravity-account"
+
 [profiles.red-team]
 role = "Red Team"
-provider = "antigravity"
-model = "claude-sonnet-4-6"
-reasoning_effort = "high"
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
 permission = "read-only"
 context_policy = "gate-evidence-only"
 max_attempts = 1
-quota_bucket = "antigravity-account"
+quota_bucket = "claude-account"
 fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
 max_fallback_hops = 1
+fallback_cooldown_seconds = 1800
 
+# Used for both G1 (plan audit) and G2 (post-dev recheck) — one role profile, one
+# model, per the user's own "統一用同一個模型" decision (2026-08-13).
+#
+# 2026-09-05: primary switched from Antigravity to Claude, fallback switched from
+# Claude to Codex (gpt-5.6-sol) — Antigravity dropped from this role's candidate
+# list entirely, per the reliability review noted on Controller/Planner above
+# (Antigravity 53% clean vs Claude 96% across Beri's actual run history; Red
+# Team's own Antigravity primary had contributed a provider_overloaded timeout to
+# that count).
 [[profiles.red-team.fallbacks]]
-provider = "antigravity"
-model = "gemini-3.6-flash-high"
-reasoning_effort = "high"
-quota_bucket = "antigravity-account"
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+quota_bucket = "codex-account"
 
 [profiles.developer]
 role = "Developer"
 provider = "antigravity"
-model = "gemini-3.1-pro-high"
+model = "gemini-3.8-flash-high"
 reasoning_effort = "high"
 permission = "workspace-write"
 context_policy = "accepted-plan-and-repo"
 max_attempts = 1
 quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+fallback_cooldown_seconds = 1800
+
+# 2026-09-05: primary model bumped from gemini-3.6-flash-medium to
+# gemini-3.8-flash-high (verified against `agy models` before use, per the
+# antigravity_git_diff_safety_net memory's guidance — display names differ from
+# CLI identifiers, never guess). Still Antigravity/Gemini, unlike the read-only
+# roles above: Developer needs workspace-write, and this was a "same provider,
+# newer/higher-tier model" request, not part of the reliability-driven move off
+# Antigravity applied to the read-only roles.
+[[profiles.developer.fallbacks]]
+provider = "antigravity"
+model = "claude-sonnet-4-6"
+reasoning_effort = "high"
+quota_bucket = "antigravity-account"
+
+[[profiles.developer.fallbacks]]
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"

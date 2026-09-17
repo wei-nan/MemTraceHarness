@@ -31,12 +31,48 @@ class ClaudeCliAdapter(CliModelAdapter):
         if self.output_schema_path:
             schema = json.loads(self.output_schema_path.read_text(encoding="utf-8"))
             command.extend(["--json-schema", json.dumps(schema, separators=(",", ":"))])
-        command.extend(
-            [
-                "--permission-mode",
-                "plan" if self.permission == "read-only" else "acceptEdits",
-            ]
+        # 2026-09-05: --permission-mode "default" (the read-only branch below)
+        # requires per-tool approval for anything not pre-allowlisted, and there's
+        # no human present headlessly to grant it — a G1 Red Team run observed
+        # this denying its own get_node call outright ("被拒"), not a considered
+        # choice not to search. MemTrace's own read-only lookup tools are always
+        # pre-allowlisted below so every stage can actually query MemTrace, not
+        # just be told in its prompt that it's allowed to. write_tools stays empty
+        # for every role except Controller (see controller_task()'s converge-stage
+        # instruction to record completion) — no other role should get standing
+        # permission to alter the KB.
+        read_tools = "mcp__memtrace__search_nodes,mcp__memtrace__get_node,mcp__memtrace__list_nodes,mcp__memtrace__traverse"
+        write_tools = (
+            ",mcp__memtrace__create_node,mcp__memtrace__update_node"
+            if self.role_profile_id == "controller"
+            else ""
         )
+        if self.permission == "read-only":
+            # NOT --permission-mode plan: that mode is built for an interactive human
+            # session (it can hand off to ExitPlanMode, or — observed 2026-08-12 on a
+            # real Red Team run — fall back to writing the model's full analysis and
+            # JSON verdict into a ~/.claude/plans/*.md file instead of returning it as
+            # the turn's final text). Headlessly, Harness never sees that file; it
+            # only sees a prose "I wrote the plan to a file" summary, which fails the
+            # "final text is exactly one JSON object" contract every stage relies on.
+            # --permission-mode default + explicitly disallowing the write-capable
+            # tools gets the same "cannot modify the repo" guarantee without route-ing
+            # through that plan-mode UX. Read-only tool use (Bash for grep-style
+            # queries, Read, etc.) is unaffected.
+            command.extend(
+                [
+                    "--permission-mode",
+                    "default",
+                    "--disallowedTools",
+                    "Write,Edit,NotebookEdit",
+                    "--allowedTools",
+                    read_tools + write_tools,
+                ]
+            )
+        else:
+            command.extend(
+                ["--permission-mode", "acceptEdits", "--allowedTools", read_tools + write_tools]
+            )
         return command
 
     def parse_response(

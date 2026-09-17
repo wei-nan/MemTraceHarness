@@ -6,8 +6,12 @@
       "type": "string",
       "enum": ["run_planner", "ask_human", "stop", "finish"]
     },
-    "reason": {"type": "string", "maxLength": 1000}
+    "reason": {"type": "string", "maxLength": 1000},
+    "searched_history": {
+      "type": "boolean",
+      "description": "True if you called a MemTrace search/lookup tool during this decision, false if you decided it wasn't needed. Must be honest either way — say so in `reason` too."
+    }
   },
-  "required": ["action", "reason"],
+  "required": ["action", "reason", "searched_history"],
   "additionalProperties": false
 }

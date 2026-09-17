@@ -110,3 +110,45 @@ class CliTests(TestCase):
             mock_runner_cls.return_value = mock_runner
             exit_code = probe_command(args)
             self.assertEqual(exit_code, 0)
+
+    def test_serve_gateway_loop_notifies_each_bot_on_startup(self) -> None:
+        import os
+        import signal as signal_module
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli import _serve_gateway_loop
+
+        scope = MagicMock()
+        scope.name = "Beri"
+        gw = MagicMock()
+        gw.projects = [scope]
+
+        def fake_poll_once(timeout: int = 30) -> int:
+            # First loop iteration signals the process to stop, so the loop exits
+            # right after the startup notification without blocking on a real
+            # long-poll or waiting for an actual OS signal delivery race.
+            os.kill(os.getpid(), signal_module.SIGTERM)
+            return 0
+
+        gw.poll_once.side_effect = fake_poll_once
+
+        scanner = MagicMock()
+        config = MagicMock()
+        config.shutdown_grace_seconds = 0
+
+        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
+            _serve_gateway_loop(
+                [gw],
+                scanner,
+                MagicMock(),
+                [],
+                config,
+                poll_timeout=1,
+                scan_interval=9999,
+                consolidation_interval=9999,
+            )
+
+        gw.notify_all_allowlisted.assert_called_once()
+        (notified_text,), _ = gw.notify_all_allowlisted.call_args
+        self.assertIn("已啟動", notified_text)
+        self.assertIn("Beri", notified_text)
