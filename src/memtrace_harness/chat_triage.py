@@ -94,15 +94,17 @@ class ChatTriage:
                 rejection_message="無法對應到任何已註冊的專案（找不到符合的 harness-scope.md）。",
             )
 
-        # Check off-limits rules in matched_project
-        if matched_project.off_limits:
-            for rule in matched_project.off_limits:
-                if rule.lower() in lower_text:
-                    return TriageResult(
-                        kind="out_of_scope",
-                        project_scope=matched_project,
-                        rejection_message=f"這個請求碰到 harness-scope.md 設定的禁區規則：「{rule}」",
-                    )
+        # off_limits is NOT enforced here as a mechanical keyword block any more
+        # (2026-09-17, explicit user request): a substring match can't tell "the key
+        # is in .env, use it" (safe reference by name) apart from an actual leaked
+        # value, so it only ever blocked the safe case — the unsafe case (a raw
+        # secret string) usually doesn't even contain the keyword. Enforcement moves
+        # to the model, same trust model as HARNESS_TASK_START: harness-scope.md's
+        # full text (including off_limits) is already part of the chat prompt's
+        # identity context (see TelegramGateway._identity_context()), and the prompt
+        # explicitly tells the model those are boundaries to respect while replying,
+        # not just background text. off_limits still travels as TaskEnvelope.constraints
+        # to the governed Agent Loop roles for real work — that path is unaffected.
 
         if lower_text in {"status", "help", "/status", "/help"}:
             return TriageResult(kind="status", project_scope=matched_project)

@@ -668,7 +668,15 @@ class TelegramGateway:
         old "!" trigger did — except the decision now comes from the model
         judging the conversation, not a mechanical prefix, and there is no
         separate approval step in between: reaching this marker together with
-        the human in chat IS the decision to proceed."""
+        the human in chat IS the decision to proceed.
+
+        off_limits is enforced the same way (2026-09-17): chat_triage.py no longer
+        keyword-blocks a message mentioning an off_limits term before it reaches the
+        model — that mechanical check couldn't tell "the key is in .env, use it"
+        (a safe reference) from an actual leaked value, and in practice only ever
+        caught the safe case. The prompt below spells out the project's off_limits
+        list explicitly and tells the model to treat it as a real boundary while
+        replying, not just background text to ignore."""
         from memtrace_harness.cli_process import CliProcessRunner
 
         candidates = self.config.chat_candidates_for(scope.name)
@@ -680,8 +688,20 @@ class TelegramGateway:
             )
             return msg
 
+        off_limits_notice = ""
+        if scope.off_limits:
+            rules = "、".join(scope.off_limits)
+            off_limits_notice = (
+                f"這個專案的禁區規則（off_limits）：{rules}。這些是你在這個對話裡要遵守的邊界——"
+                "不要執行、印出、或協助繞過這些規則所指的實際內容（例如印出金鑰/憑證的真實值、"
+                "操作正式環境資料庫）。但單純聊到這些字眼本身、或使用者只是告訴你金鑰放在哪個"
+                "檔案/變數名稱（沒有貼出實際值），是安全且被允許的，不要因為訊息裡出現這些字就"
+                "拒絕回覆或裝作沒看到。\n\n"
+            )
+
         prompt = (
             f"{self._identity_context(scope)}\n\n---\n\n"
+            f"{off_limits_notice}"
             "你正在跟這個專案的負責人自由對話，直接回覆使用者的訊息即可，一律使用繁體中文。\n\n"
             "如果，而且只有在，根據這則訊息（以及前面的對話），你確信使用者現在真的是要你"
             "動手進行開發——修改這個 repo 的程式碼、實際落地某個具體改動——才在回覆的最後"

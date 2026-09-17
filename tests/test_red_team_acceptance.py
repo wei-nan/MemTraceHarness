@@ -79,15 +79,102 @@ class RedTeamAcceptanceTests(TestCase):
             )
             triage = ChatTriage([scope])
 
-            # Request to open PR (out of scope for Harness remote ops)
+            # Request to open PR (out of scope for Harness remote ops) — still a
+            # hard, deterministic block; unaffected by the off_limits change below.
             res1 = triage.triage_message("Open a PR on GitHub for feature X")
             self.assertEqual(res1.kind, "out_of_scope")
             self.assertIn("超出 Harness 遠端操作的範圍", res1.rejection_message or "")
 
-            # Request touching off-limits area
+            # off_limits is deliberately NOT a mechanical keyword block any more
+            # (2026-09-17): a substring match can't tell "the key is in .env, use
+            # it" (a safe reference) from an actual leaked value, and in practice
+            # only ever caught the safe case — the harness-scope.md TWTradingStrategy
+            # incident that motivated this change. A message mentioning an
+            # off_limits term now reaches the model like any other chat message;
+            # see test_off_limits_reaches_model_as_an_explicit_boundary below for
+            # where the actual enforcement now lives.
             res2 = triage.triage_message("Migrate the production database now", default_project="secure_project")
-            self.assertEqual(res2.kind, "out_of_scope")
-            self.assertIn("禁區規則", res2.rejection_message or "")
+            self.assertEqual(res2.kind, "chat")
+            self.assertEqual(res2.project_scope, scope)
+
+    def test_off_limits_reaches_model_as_an_explicit_boundary(self) -> None:
+        """Red Team Verification 2b: off_limits enforcement moved from a mechanical
+        chat_triage keyword block to the model's own judgment (same trust model as
+        HARNESS_TASK_START) — this verifies the off_limits list actually reaches the
+        model's prompt as an explicit instruction, not just passively via the raw
+        harness-scope.md text, and that a matching message is not blocked before
+        getting there."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "rt_sec.sqlite3"
+            trace_store = TraceStore(db_path)
+            config = HarnessConfig(
+                memtrace_mcp_url=None,
+                memtrace_api_token=None,
+                trace_db_path=db_path,
+                trace_root=tmp_path,
+                claude_command="claude",
+                codex_command="codex",
+                antigravity_command="agy",
+                antigravity_output_mode="auto",
+                cli_timeout_seconds=900,
+                telegram_bot_token="fake_bot_token",
+                telegram_allowed_chat_ids={12345},
+                project_index_path=None,
+                chat_provider="claude",
+                chat_model="haiku",
+                unattended_write_requires_approval=True,
+            )
+            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+            scope = ProjectScope(
+                name="secure_project",
+                workspace_id="ws_secure",
+                working_directory=tmp_path,
+                scope_file_path=tmp_path / "harness-scope.md",
+                off_limits=[".env", "api_key"],
+            )
+            triage = ChatTriage([scope])
+            psess_mgr = PrimarySessionManager(trace_store)
+            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+
+            from unittest.mock import patch
+            from memtrace_harness.cli_process import ProcessResult
+
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            model_reply = ProcessResult(
+                command=[], return_code=0,
+                stdout="好的，我知道金鑰放在 .env 裡，我不會印出實際值。",
+                stderr="", started_at="2026-09-17T00:00:00+00:00",
+                completed_at="2026-09-17T00:00:01+00:00", duration_ms=500,
+            )
+
+            captured_prompts: list[str] = []
+
+            def fake_run(cmd, cwd=None, timeout_seconds=None):
+                captured_prompts.append(cmd[-1])
+                return model_reply
+
+            with patch("urllib.request.urlopen", return_value=mock_response), patch(
+                "memtrace_harness.cli_process.CliProcessRunner.run", side_effect=fake_run
+            ):
+                update = {
+                    "update_id": 1,
+                    "message": {"chat": {"id": 12345}, "text": "我在 .env 內放了一把 X-API-KEY 的 token"},
+                }
+                result = gateway.process_update(update)
+
+            # Never blocked at the triage layer before reaching the model.
+            self.assertIsNotNone(result)
+            self.assertIn("金鑰放在 .env", result)
+
+            # The off_limits terms were surfaced to the model as an explicit
+            # boundary, not silently dropped.
+            self.assertEqual(len(captured_prompts), 1)
+            self.assertIn(".env", captured_prompts[0])
+            self.assertIn("api_key", captured_prompts[0])
+            self.assertIn("邊界", captured_prompts[0])
 
     def test_red_team_acceptance_approval_request_guarantees(self) -> None:
         """Red Team Verification 3: Approval Request Policy Guarantees"""
