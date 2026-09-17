@@ -130,10 +130,56 @@ class CliAdapterTests(TestCase):
         self.assertEqual(response.execution.usage.cached_input_tokens, 11)
         self.assertEqual(response.execution.usage.reasoning_output_tokens, 5)
         self.assertEqual(response.execution.usage.completeness, "complete")
+        self.assertEqual(response.execution.command[1:3], ["exec", "--json"])
+        self.assertEqual(response.execution.command[3], "--cd")
+        self.assertIn("--sandbox", response.execution.command)
         self.assertEqual(
-            response.execution.command[1:5], ["exec", "--json", "--sandbox", "workspace-write"]
+            response.execution.command[
+                response.execution.command.index("--sandbox") + 1
+            ],
+            "workspace-write",
         )
         self.assertEqual(response.execution.command[-1], "-")
+
+    def test_codex_explicitly_passes_cd_matching_working_directory(self) -> None:
+        # Belt-and-suspenders alongside subprocess cwd=: a HARNESS_CODEX_COMMAND
+        # that switches CODEX_HOME to a different account (e.g. scripts/codex-will)
+        # must never be ambiguous about which directory it's operating on.
+        adapter = self._adapter(CodexCliAdapter, StaticProcessRunner(process_result("")))
+        command = adapter.build_command("prompt")
+        self.assertIn("--cd", command)
+        self.assertEqual(command[command.index("--cd") + 1], str(self.root))
+
+    def test_claude_read_only_allowlists_memtrace_read_tools_but_not_write_by_default(self) -> None:
+        # 2026-09-05: --permission-mode default requires per-tool approval with no
+        # human present headlessly — a real G1 run got its own get_node call denied
+        # outright. MemTrace read tools must be pre-allowlisted for every role.
+        adapter = self._adapter(
+            ClaudeCliAdapter,
+            StaticProcessRunner(process_result("")),
+            permission="read-only",
+            role_profile_id="red-team",
+        )
+        command = adapter.build_command("prompt")
+        allowed = command[command.index("--allowedTools") + 1]
+        self.assertIn("mcp__memtrace__search_nodes", allowed)
+        self.assertIn("mcp__memtrace__get_node", allowed)
+        self.assertNotIn("mcp__memtrace__update_node", allowed)
+        self.assertNotIn("mcp__memtrace__create_node", allowed)
+
+    def test_claude_controller_role_also_allowlists_memtrace_write_tools(self) -> None:
+        # Only Controller (converge stage) may update/create MemTrace nodes — see
+        # controller_task()'s write_permission note.
+        adapter = self._adapter(
+            ClaudeCliAdapter,
+            StaticProcessRunner(process_result("")),
+            permission="read-only",
+            role_profile_id="controller",
+        )
+        command = adapter.build_command("prompt")
+        allowed = command[command.index("--allowedTools") + 1]
+        self.assertIn("mcp__memtrace__update_node", allowed)
+        self.assertIn("mcp__memtrace__create_node", allowed)
 
     def test_codex_usage_limit_error_is_surfaced_for_failure_classification(self) -> None:
         stdout = "\n".join(
@@ -250,17 +296,12 @@ class CliAdapterTests(TestCase):
         self.assertTrue(
             any("version-sensitive" in item for item in response.execution.parse_warnings)
         )
-        self.assertEqual(
-            response.execution.command[1:7],
-            [
-                "--print",
-                "--output-format",
-                "stream-json",
-                "--mode",
-                "accept-edits",
-                "--sandbox",
-            ],
-        )
+        # --add-dir's value is a dynamic temp path, so check the stable flag pairs
+        # rather than a rigid positional slice.
+        command = response.execution.command
+        self.assertEqual(command[1:5], ["--output-format", "stream-json", "--mode", "accept-edits"])
+        self.assertIn("--add-dir", command)
+        self.assertEqual(command[-2], "--prompt")
 
     def test_unavailable_cli_fails_closed_and_keeps_trace(self) -> None:
         result = process_result(
@@ -314,10 +355,10 @@ class CliAdapterTests(TestCase):
 
         self.assertEqual(response.execution.usage.completeness, "unavailable")
         self.assertEqual(response.final_text, "Antigravity text response")
-        self.assertEqual(
-            response.execution.command[1:5],
-            ["--print", "--mode", "accept-edits", "--sandbox"],
-        )
+        command = response.execution.command
+        self.assertEqual(command[1:3], ["--mode", "accept-edits"])
+        self.assertIn("--add-dir", command)
+        self.assertEqual(command[-2], "--prompt")
         self.assertNotIn("--output-format", response.execution.command)
         self.assertFalse(any("stdout line" in item for item in response.execution.parse_warnings))
 
@@ -356,13 +397,20 @@ class CliAdapterTests(TestCase):
         planner_command = planner_runner.calls[0][0]
         self.assertIn("sonnet", planner_command)
         self.assertIn("medium", planner_command)
+        # Not "plan": that mode routes through Claude Code's interactive plan-mode UX
+        # (ExitPlanMode / writing a ~/.claude/plans/*.md file), which breaks the "final
+        # text is exactly one JSON object" contract when run headlessly (observed for
+        # real on a Red Team run, 2026-08-12). "default" + disallowedTools gets the
+        # same "cannot modify the repo" guarantee without that failure mode.
         self.assertEqual(
             planner_command[
                 planner_command.index("--permission-mode") :
                 planner_command.index("--permission-mode") + 2
             ],
-            ["--permission-mode", "plan"],
+            ["--permission-mode", "default"],
         )
+        self.assertIn("--disallowedTools", planner_command)
+        self.assertIn("Write,Edit,NotebookEdit", planner_command)
         self.assertIn("--json-schema", planner_command)
 
         developer_runner = StaticProcessRunner(process_result(""))
@@ -379,7 +427,9 @@ class CliAdapterTests(TestCase):
         developer_response = developer.run(self.task, "run_developer")
         developer_command = developer_runner.calls[0][0]
         self.assertIn("gemini-3.1-pro-high", developer_command)
-        self.assertIn("high", developer_command)
+        # "gemini-3.1-pro-high" already bakes in the effort tier — passing a separate
+        # --effort alongside it is a hard CLI error, so it must not be emitted here.
+        self.assertNotIn("--effort", developer_command)
         self.assertIn("accept-edits", developer_command)
         self.assertIn("--json-schema", developer_command)
         self.assertIn("Inspect the repository", developer_command[-1])
@@ -396,3 +446,73 @@ class CliAdapterTests(TestCase):
             process_runner=runner,
             **kwargs,
         )
+
+
+class ReadOnlyWriteDetectionTests(TestCase):
+    """A read-only role assigned to a CLI/mode that can't reliably be trusted to skip
+    writes (e.g. Antigravity accept-edits used to dodge the --mode plan deadlock — see
+    the antigravity-headless-command-permission and harness-agent-loop discussions)
+    must not be able to silently modify the repo. cli.py's CliModelAdapter.run()
+    compares git status before/after any permission="read-only" call and fails closed
+    if anything changed — trace_root is deliberately kept OUTSIDE the git repo here,
+    matching real config (config.trace_root lives in the Harness's own repo, never
+    inside the target project), since a trace_root nested inside the working
+    directory would itself look like a write and false-positive."""
+
+    def setUp(self) -> None:
+        import subprocess
+
+        self.repo_dir = TemporaryDirectory()
+        self.trace_dir = TemporaryDirectory()
+        self.addCleanup(self.repo_dir.cleanup)
+        self.addCleanup(self.trace_dir.cleanup)
+        self.repo = Path(self.repo_dir.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b.com"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=self.repo, check=True)
+        (self.repo / "README.md").write_text("hello\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, check=True)
+        self.task = TaskEnvelope(task_id="t1", workspace_id="ws_test", goal="audit only")
+
+    def _adapter(self, runner, *, permission: str) -> ClaudeCliAdapter:
+        return ClaudeCliAdapter(
+            adapter_id="red-team",
+            role="Red Team",
+            executable="claude",
+            working_directory=self.repo,
+            trace_root=Path(self.trace_dir.name),
+            timeout_seconds=30,
+            process_runner=runner,
+            permission=permission,
+            role_profile_id="red-team",
+        )
+
+    def test_read_only_role_that_writes_fails_closed(self) -> None:
+        class WritingRunner:
+            def run(self, command, *, cwd, timeout_seconds, input_text=None):
+                (Path(cwd) / "unexpected.txt").write_text("oops")
+                return process_result('{"type":"result","result":"{}","usage":{}}')
+
+        response = self._adapter(WritingRunner(), permission="read-only").run(self.task, "trace1/attempt0")
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("safety violation", response.execution.error)
+        self.assertIn("permission=read-only", response.execution.error)
+
+    def test_read_only_role_that_does_not_write_passes(self) -> None:
+        class CleanRunner:
+            def run(self, command, *, cwd, timeout_seconds, input_text=None):
+                return process_result('{"type":"result","result":"{}","usage":{}}')
+
+        response = self._adapter(CleanRunner(), permission="read-only").run(self.task, "trace1/attempt1")
+        self.assertEqual(response.execution.status, "succeeded")
+        self.assertIsNone(response.execution.error)
+
+    def test_workspace_write_role_writing_is_not_flagged(self) -> None:
+        class WritingRunner:
+            def run(self, command, *, cwd, timeout_seconds, input_text=None):
+                (Path(cwd) / "expected.txt").write_text("this is fine, Developer can write")
+                return process_result('{"type":"result","result":"{}","usage":{}}')
+
+        response = self._adapter(WritingRunner(), permission="workspace-write").run(self.task, "trace1/attempt2")
+        self.assertEqual(response.execution.status, "succeeded")

@@ -554,7 +554,15 @@ class TraceStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        # timeout=30: background Agent Loop runs (Telegram gateway, unattended scanner)
+        # and the status dashboard's read queries can now all be writing/reading
+        # concurrently from separate threads — each opens its own short-lived
+        # connection here, but a stage-result write racing a scan-pass write can still
+        # briefly contend for SQLite's single-writer lock. 30s is generous headroom
+        # over any individual write's actual duration. WAL mode lets read-only queries
+        # (e.g. the status dashboard) proceed without waiting on an in-progress writer.
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
         try:
             yield conn
             conn.commit()
@@ -792,6 +800,9 @@ class TraceStore:
             self._ensure_column(
                 conn, "primary_sessions_hot_log", "consolidated_preference", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
+            self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
+            self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
             self._ensure_column(conn, "model_responses", "stage", "TEXT")
             self._ensure_column(conn, "model_responses", "sequence", "INTEGER")
@@ -900,6 +911,37 @@ class TraceStore:
             for row in rows
         ]
 
+    def get_recent_primary_session_turns(self, primary_session_id: str, limit: int) -> list[dict]:
+        """Most recent `limit` turns, in chronological order — for display (e.g. the
+        status dashboard's conversation preview), not for consolidation bookkeeping."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, primary_session_id, project, turn_seq, created_at, speaker, "
+                "provider, model, turn_type, content, source_work_conversation_id, consolidated "
+                "FROM primary_sessions_hot_log WHERE primary_session_id = ? "
+                "ORDER BY turn_seq DESC LIMIT ?",
+                (primary_session_id, limit),
+            ).fetchall()
+        turns = [
+            {
+                "id": row[0],
+                "primary_session_id": row[1],
+                "project": row[2],
+                "turn_seq": row[3],
+                "created_at": row[4],
+                "speaker": row[5],
+                "provider": row[6],
+                "model": row[7],
+                "turn_type": row[8],
+                "content": row[9],
+                "source_work_conversation_id": row[10],
+                "consolidated": bool(row[11]),
+            }
+            for row in rows
+        ]
+        turns.reverse()
+        return turns
+
     def get_unconsolidated_turns(self, primary_session_id: str) -> list[dict]:
         return self.get_primary_session_turns(primary_session_id, include_consolidated=False)
 
@@ -967,6 +1009,7 @@ class TraceStore:
         reason: str,
         proposed_action: str,
         stage_ref: str | None = None,
+        resume_goal: str | None = None,
     ) -> str:
         request_id = f"appr_{uuid4().hex[:12]}"
         now = utc_now_iso()
@@ -975,8 +1018,8 @@ class TraceStore:
                 """
                 INSERT INTO approval_requests (
                     id, conversation_id, workspace, working_directory, stage_ref,
-                    reason, proposed_action, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    reason, proposed_action, status, created_at, resume_goal
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     request_id,
@@ -987,6 +1030,7 @@ class TraceStore:
                     reason,
                     proposed_action,
                     now,
+                    resume_goal,
                 ),
             )
         return request_id
@@ -996,7 +1040,8 @@ class TraceStore:
             row = conn.execute(
                 """
                 SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
+                       resume_goal, telegram_chat_id, telegram_message_id
                 FROM approval_requests WHERE id = ?
                 """,
                 (request_id,),
@@ -1015,6 +1060,9 @@ class TraceStore:
             "created_at": row[8],
             "responded_at": row[9],
             "responded_by_chat_id": row[10],
+            "resume_goal": row[11],
+            "telegram_chat_id": row[12],
+            "telegram_message_id": row[13],
         }
 
     def get_pending_approval_request(self, conversation_id: str) -> dict | None:
@@ -1022,7 +1070,8 @@ class TraceStore:
             row = conn.execute(
                 """
                 SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
+                       resume_goal, telegram_chat_id, telegram_message_id
                 FROM approval_requests WHERE conversation_id = ? AND status = 'pending'
                 ORDER BY created_at DESC LIMIT 1
                 """,
@@ -1042,6 +1091,9 @@ class TraceStore:
             "created_at": row[8],
             "responded_at": row[9],
             "responded_by_chat_id": row[10],
+            "resume_goal": row[11],
+            "telegram_chat_id": row[12],
+            "telegram_message_id": row[13],
         }
 
     def list_pending_approvals_for_workspace(self, workspace_id: str) -> list[dict]:
@@ -1049,7 +1101,8 @@ class TraceStore:
             rows = conn.execute(
                 """
                 SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
+                       resume_goal, telegram_chat_id, telegram_message_id
                 FROM approval_requests WHERE workspace = ? AND status = 'pending'
                 ORDER BY created_at ASC
                 """,
@@ -1068,9 +1121,69 @@ class TraceStore:
                 "created_at": row[8],
                 "responded_at": row[9],
                 "responded_by_chat_id": row[10],
+                "resume_goal": row[11],
+                "telegram_chat_id": row[12],
+                "telegram_message_id": row[13],
             }
             for row in rows
         ]
+
+    def list_recently_declined_stage_refs(self, workspace_id: str, reason: str) -> set[str]:
+        """stage_ref values of rejected approval_requests for this workspace+reason —
+        lets the unattended scanner skip a Task Node the operator already said "not
+        this one" to and propose the next one in queue order instead, rather than
+        re-proposing the same declined node on every subsequent scan pass."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT stage_ref FROM approval_requests
+                WHERE workspace = ? AND reason = ? AND status = 'rejected' AND stage_ref IS NOT NULL
+                """,
+                (workspace_id, reason),
+            ).fetchall()
+        return {row[0] for row in rows}
+
+    def set_approval_telegram_message(
+        self, request_id: str, *, chat_id: int, message_id: int
+    ) -> None:
+        """Records which sent Telegram message carries this approval request, so a
+        native swipe-reply to it can be resolved back to the exact approval without
+        the human typing an ID — see get_approval_request_by_message_id()."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE approval_requests SET telegram_chat_id = ?, telegram_message_id = ? WHERE id = ?",
+                (chat_id, message_id, request_id),
+            )
+
+    def get_approval_request_by_message_id(self, chat_id: int, message_id: int) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, workspace, working_directory, stage_ref,
+                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
+                       resume_goal, telegram_chat_id, telegram_message_id
+                FROM approval_requests WHERE telegram_chat_id = ? AND telegram_message_id = ?
+                """,
+                (chat_id, message_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "conversation_id": row[1],
+            "workspace": row[2],
+            "working_directory": row[3],
+            "stage_ref": row[4],
+            "reason": row[5],
+            "proposed_action": row[6],
+            "status": row[7],
+            "created_at": row[8],
+            "responded_at": row[9],
+            "responded_by_chat_id": row[10],
+            "resume_goal": row[11],
+            "telegram_chat_id": row[12],
+            "telegram_message_id": row[13],
+        }
 
     def resolve_approval_request(
         self, request_id: str, status: str, responded_by_chat_id: int | None = None
@@ -1107,6 +1220,115 @@ class TraceStore:
     def release_workspace_lock(self, workspace_id: str) -> None:
         with self._connection() as conn:
             conn.execute("DELETE FROM workspace_locks WHERE workspace_id = ?", (workspace_id,))
+
+    def get_latest_turn(self, conversation_id: str) -> dict | None:
+        """Most recently completed Agent Loop stage for a conversation — written by
+        save_stage_result() as each stage finishes, so this reflects live progress
+        (e.g. "planner just finished, red-team is running now") for a run still in
+        flight, not only a run's final summary. Used by the status dashboard to show
+        what a locked workspace is actually doing right now."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT stage, profile_id, provider, model, state, created_at "
+                "FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "stage": row[0],
+            "profile_id": row[1],
+            "provider": row[2],
+            "model": row[3],
+            "state": row[4],
+            "created_at": row[5],
+        }
+
+    def get_conversation_pipeline(self, conversation_id: str) -> list[dict]:
+        """Every stage attempt for a conversation's most recent run, in the order they
+        actually executed — the run_id changes each time a conversation resumes (a new
+        AgentLoopRunner.run() call), so this scopes to the latest one rather than
+        mixing stages from an earlier attempt into the same pipeline view. Includes
+        fallback/retry attempts as separate entries (they get their own sequence
+        number in _execute()), which is useful information, not noise, for a status
+        dashboard. Used to render the Agent Loop stepper — read-only, no artifact
+        bodies here (see get_turn_detail() for that)."""
+        with self._connection() as conn:
+            latest_run = conn.execute(
+                "SELECT run_id FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if not latest_run:
+                return []
+            rows = conn.execute(
+                "SELECT id, sequence, stage, profile_id, provider, model, state, "
+                "attempt_index, created_at FROM turns WHERE conversation_id = ? AND run_id = ? "
+                "ORDER BY sequence ASC, attempt_index ASC",
+                (conversation_id, latest_run[0]),
+            ).fetchall()
+        return [
+            {
+                "turn_id": row[0],
+                "sequence": row[1],
+                "stage": row[2],
+                "profile_id": row[3],
+                "provider": row[4],
+                "model": row[5],
+                "state": row[6],
+                "attempt_index": row[7],
+                "created_at": row[8],
+            }
+            for row in rows
+        ]
+
+    def get_turn_detail(self, turn_id: int) -> dict | None:
+        """Full detail for one stage attempt: the parsed structured artifact (the
+        decision/plan/verdict itself) plus the model's raw final response text, for
+        the status dashboard's "click a stage to see what happened" view. Looks up
+        model_responses by (run_id, sequence, attempt_index) — the same triple
+        save_stage_result() writes both rows under — to find the matching response_json
+        without needing a foreign key column added just for this."""
+        with self._connection() as conn:
+            turn = conn.execute(
+                "SELECT id, conversation_id, run_id, sequence, stage, profile_id, "
+                "attempt_index, provider, model, state, artifact_json, created_at "
+                "FROM turns WHERE id = ?",
+                (turn_id,),
+            ).fetchone()
+            if not turn:
+                return None
+            response_row = conn.execute(
+                "SELECT response_json FROM model_responses "
+                "WHERE run_id = ? AND sequence = ? AND attempt_index = ? LIMIT 1",
+                (turn[2], turn[3], turn[6]),
+            ).fetchone()
+        final_text = None
+        if response_row:
+            try:
+                final_text = json.loads(response_row[0]).get("final_text")
+            except (json.JSONDecodeError, AttributeError):
+                final_text = None
+        artifact = None
+        if turn[10]:
+            try:
+                artifact = json.loads(turn[10])
+            except json.JSONDecodeError:
+                artifact = None
+        return {
+            "turn_id": turn[0],
+            "conversation_id": turn[1],
+            "run_id": turn[2],
+            "sequence": turn[3],
+            "stage": turn[4],
+            "profile_id": turn[5],
+            "attempt_index": turn[6],
+            "provider": turn[7],
+            "model": turn[8],
+            "state": turn[9],
+            "artifact": artifact,
+            "final_text": final_text,
+            "created_at": turn[11],
+        }
 
     def get_workspace_lock(self, workspace_id: str) -> dict | None:
         with self._connection() as conn:

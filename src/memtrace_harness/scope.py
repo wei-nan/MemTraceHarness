@@ -15,6 +15,9 @@ class ProjectScope:
     off_limits: list[str] | None = None
     raw_markdown: str = ""
     telegram_bot_token: str | None = None
+    verify_command: str | None = None
+    verify_timeout_seconds: int | None = None
+    github_repo: str | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:
@@ -42,6 +45,21 @@ class ProjectScope:
 
         telegram_bot_token = _extract_field(content, "telegram_bot_token", "bot_token")
 
+        verify_command = _extract_field(content, "verify_command")
+        verify_timeout_str = _extract_field(content, "verify_timeout_seconds")
+        verify_timeout_seconds = (
+            int(verify_timeout_str)
+            if verify_timeout_str and verify_timeout_str.isdigit()
+            else None
+        )
+
+        # "owner/repo", used by the unattended scanner as an alternative backlog
+        # source to MemTrace Task Nodes (2026-09-05: git/GitHub Issues chosen over
+        # MemTrace Task Node tracking, decided after the MemTrace convention proved
+        # hard to keep in sync in practice) — see scanner.py's
+        # _find_ready_github_issues().
+        github_repo = _extract_field(content, "github_repo")
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -51,6 +69,9 @@ class ProjectScope:
             off_limits=off_limits,
             raw_markdown=content,
             telegram_bot_token=telegram_bot_token,
+            verify_command=verify_command,
+            verify_timeout_seconds=verify_timeout_seconds,
+            github_repo=github_repo,
         )
 
 

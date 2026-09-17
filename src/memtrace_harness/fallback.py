@@ -22,11 +22,28 @@ def classify_execution_failure(execution: CliExecution) -> FailureCategory:
         if isinstance(item, str) and item.strip()
     ).lower()
 
-    if _contains(detail, "quota exhausted", "usage limit", "weekly limit", "5-hour limit"):
+    if _contains(
+        detail,
+        "quota exhausted",
+        "quota reached",
+        "usage limit",
+        "weekly limit",
+        "5-hour limit",
+    ):
         return "quota_exhausted"
     if _contains(detail, "rate limit", "too many requests", "429"):
         return "rate_limit"
-    if _contains(detail, "overloaded", "capacity", "temporarily unavailable"):
+    if _contains(
+        detail,
+        "overloaded",
+        "capacity",
+        "temporarily unavailable",
+        "currently unavailable",
+        "service unavailable",
+        "code 503",
+        "eligibility check failed",
+        "timeout waiting for response",
+    ):
         return "provider_overloaded"
     if _contains(detail, "context window", "context length", "maximum context", "too many tokens"):
         return "context_limit"
@@ -40,7 +57,14 @@ def classify_execution_failure(execution: CliExecution) -> FailureCategory:
         return "network"
     if _contains(detail, "json schema", "schema validation", "invalid structured output"):
         return "schema"
-    if _contains(detail, "safety policy", "policy refusal", "content policy"):
+    if _contains(
+        detail,
+        "safety policy",
+        "policy refusal",
+        "content policy",
+        "safety violation",
+        "modified the working directory despite permission=read-only",
+    ):
         return "safety"
     return "unknown"
 

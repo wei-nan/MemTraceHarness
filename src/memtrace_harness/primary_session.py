@@ -98,13 +98,16 @@ class PrimarySessionManager:
         primary_sessions_hot_log transcript; cold = what gets promoted to MemTrace).
 
         turn_type already settles "decision" and "dev_report" turns as substantive —
-        those came from an explicit, deterministic trigger (a "!" task, a loop result)
-        and don't need judgment. Plain "chat" turns are different: whether a message is
-        worth remembering isn't something a prefix can decide, so if `classify_chat_fn`
-        is given, it's asked to judge them. This is deliberately separate from whether a
-        message triggers real work — that stays a fixed "!" gate (never inferred) since
-        it spends real quota and can write to disk; judging "is this worth a draft note"
-        carries none of that risk, so a model call is an acceptable way to decide it."""
+        those are recorded only once a governed task actually started (the model
+        decided, in conversation, to emit its HARNESS_TASK_START marker — see
+        TelegramGateway._chat_reply_and_maybe_start_task()) or a loop produced a
+        result, so they don't need further judgment here. Plain "chat" turns are
+        different: whether a message is worth remembering is a separate, lower-stakes
+        question, so if `classify_chat_fn` is given, it's asked to judge them. This is
+        deliberately separate from whether a message triggers real work: that decision
+        already happened upstream and spent real quota / can write to disk; judging
+        "is this worth a draft note" carries none of that risk, so a model call here
+        is an acceptable way to decide it."""
         session_id = self.primary_session_id_for_project(project)
         unconsolidated_data = self.trace_store.get_unconsolidated_turns(session_id)
         if not unconsolidated_data:
@@ -146,12 +149,26 @@ class PrimarySessionManager:
             # Write draft evidence via MemTrace Client create_node. Left uncaught: a
             # failed write (e.g. MemTrace unreachable) must not mark these consolidated
             # either — the caller decides whether to log-and-retry-later or propagate.
+            # content_type must be one of MemTrace's fixed enum (context, document,
+            # factual, gap, inquiry, preference, procedural) — "evidence" isn't a
+            # member and was silently rejected with a 400 on every attempt (bug fixed
+            # 2026-08-12; see the agent-loop-background-execution/memory investigation
+            # that surfaced it). "context" is the closest fit: this is background
+            # information about what happened, not a settled fact or a procedure.
+            # force_create=True: this writes a new append-only draft note each cycle,
+            # titled the same for every batch of a given project — expected to recur
+            # with similar wording as consolidation runs repeatedly, which is exactly
+            # what MemTrace's similarity-based duplicate detection would otherwise
+            # reject (observed for real against the MemTrace project's own
+            # consolidation; see the beri-consolidation-content_type-bug memory note).
             self.memtrace_client.create_node(
                 workspace_id=workspace_id,
                 title=f"Draft primary session consolidation: {project}",
                 body=summary_content,
-                content_type="evidence",
+                content_type="context",
                 tags=["harness", "draft", "primary-session"],
+                force_create=True,
+                stage="consolidation",
             )
 
         self.trace_store.mark_turns_consolidated([t.id for t in turns])
@@ -202,7 +219,7 @@ class PrimarySessionManager:
         assert self.memtrace_client is not None
         new_lines = "\n".join(f"- {t.content}" for t in promoted)
         existing = self.memtrace_client.search_nodes(
-            workspace_id=workspace_id, query=OPERATOR_PROFILE_TITLE
+            workspace_id=workspace_id, query=OPERATOR_PROFILE_TITLE, stage="preference_consolidation"
         )
         existing_node = next(
             (n for n in existing if isinstance(n, dict) and n.get("title") == OPERATOR_PROFILE_TITLE and n.get("id")),
@@ -210,12 +227,13 @@ class PrimarySessionManager:
         )
         if existing_node:
             current = self.memtrace_client.get_node(
-                workspace_id=workspace_id, node_id=str(existing_node["id"])
+                workspace_id=workspace_id, node_id=str(existing_node["id"]), stage="preference_consolidation"
             )
             current_body = str(current.get("body") or "").strip()
             merged_body = f"{current_body}\n{new_lines}".strip() if current_body else new_lines
             self.memtrace_client.update_node(
-                workspace_id=workspace_id, node_id=str(existing_node["id"]), body=merged_body
+                workspace_id=workspace_id, node_id=str(existing_node["id"]), body=merged_body,
+                stage="preference_consolidation",
             )
         else:
             self.memtrace_client.create_node(
@@ -224,4 +242,5 @@ class PrimarySessionManager:
                 body=new_lines,
                 content_type="preference",
                 tags=["harness", "draft", "operator-preference"],
+                stage="preference_consolidation",
             )
