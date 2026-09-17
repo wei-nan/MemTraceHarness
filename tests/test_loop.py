@@ -258,6 +258,41 @@ class ControllerTaskContextTests(TestCase):
         self.assertIn("update_node", converge_goal)
         self.assertIn("create_node", converge_goal)
 
+    def test_start_stage_explains_run_operational_action_choice(self) -> None:
+        task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
+        goal_text = controller_task(task, stage="start", stages=[]).goal
+        self.assertIn("run_operational_action", goal_text)
+        self.assertIn("run_planner", goal_text)
+        self.assertIn(
+            "['run_planner', 'run_operational_action', 'ask_human', 'stop']", goal_text
+        )
+
+    def test_agent_loop_disabled_strips_run_planner_from_allowed_actions(self) -> None:
+        task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
+        goal_text = controller_task(
+            task, stage="start", stages=[], agent_loop_enabled=False
+        ).goal
+        self.assertIn(
+            "['run_operational_action', 'ask_human', 'stop']", goal_text
+        )
+        self.assertNotIn(
+            "['run_planner', 'run_operational_action', 'ask_human', 'stop']", goal_text
+        )
+        self.assertIn("agent_loop is disabled", goal_text)
+
+    def test_converge_stage_ignores_agent_loop_enabled(self) -> None:
+        # agent_loop_enabled only changes what's valid at the "start" decision —
+        # converge's own allowed set (finish/ask_human) never mentions run_planner
+        # in the first place, so passing False here must not change its text at all.
+        task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
+        enabled_goal = controller_task(
+            task, stage="converge", stages=[], agent_loop_enabled=True
+        ).goal
+        disabled_goal = controller_task(
+            task, stage="converge", stages=[], agent_loop_enabled=False
+        ).goal
+        self.assertEqual(enabled_goal, disabled_goal)
+
 
 class AgentLoopRunnerTests(TestCase):
     def setUp(self) -> None:
@@ -295,6 +330,107 @@ class AgentLoopRunnerTests(TestCase):
             ).fetchone()
         self.assertEqual(stage_count, 6)
         self.assertEqual(planner_execution, ("sonnet", "claude-test-version", "read-only"))
+
+    def test_run_operational_action_skips_planner_and_review(self) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [{"action": "run_operational_action", "reason": "just needs a check"}],
+        )
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "completed",
+                    "summary": "2891 is up 3%, well above the 5% stop-loss",
+                    "changed_files": [],
+                    "tests": [],
+                    "gaps": [],
+                }
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertIn("5% stop-loss", summary.recommendation)
+        self.assertEqual(
+            [stage.profile_id for stage in summary.stages], ["controller", "developer"]
+        )
+        self.assertEqual(len(adapters["planner"].calls), 0)
+        self.assertEqual(len(adapters["red-team"].calls), 0)
+        self.assertEqual(len(adapters["developer"].calls), 1)
+        self.assertIn(
+            "NOT a code-development task", adapters["developer"].calls[0].goal
+        )
+
+    def test_run_operational_action_needs_human_is_reported_without_g2(self) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [{"action": "run_operational_action", "reason": "just needs a check"}],
+        )
+        adapters["developer"] = QueueAdapter(
+            "developer",
+            "antigravity",
+            "gemini-3.1-pro-high",
+            [
+                {
+                    "status": "needs_human",
+                    "summary": "no quote source configured, cannot fetch a live price",
+                    "changed_files": [],
+                    "tests": [],
+                    "gaps": ["missing quote source config"],
+                }
+            ],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("quote source", summary.recommendation)
+        self.assertEqual(len(adapters["red-team"].calls), 0)
+
+    def test_agent_loop_disabled_blocks_run_planner_deterministically(self) -> None:
+        # A model picking run_planner anyway despite controller_task()'s own
+        # instruction (agent_loop_enabled=False strips it from the allowed list) must
+        # still be blocked structurally — never reach Planner/Developer.
+        adapters = self._adapters()  # controller queue defaults to run_planner first
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+            agent_loop_enabled=False,
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("agent_loop", summary.recommendation)
+        self.assertIn("disabled", summary.recommendation)
+        self.assertEqual(len(adapters["planner"].calls), 0)
+        self.assertEqual(len(adapters["developer"].calls), 0)
+
+    def test_agent_loop_enabled_by_default_allows_run_planner(self) -> None:
+        # Sanity check that the new constructor default doesn't change any existing
+        # behavior for a runner that never opts into agent_loop_enabled=False.
+        adapters = self._adapters()
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["planner"].calls), 1)
 
     def test_developer_needs_human_still_flows_to_g2_for_review(self) -> None:
         # A developer's own "needs_human"/"failed" status must not skip G2 and go

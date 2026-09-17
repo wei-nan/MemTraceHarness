@@ -911,6 +911,7 @@ class TelegramGateway:
             verify_command=scope.verify_command,
             verify_timeout_seconds=scope.verify_timeout_seconds or 1200,
             config=self.config,
+            agent_loop_enabled=scope.agent_loop_enabled,
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
         self.primary_session_mgr.record_turn(
@@ -1014,6 +1015,9 @@ class TelegramGateway:
                         (matching_scope.verify_timeout_seconds if matching_scope else None) or 1200
                     ),
                     config=self.config,
+                    agent_loop_enabled=(
+                        matching_scope.agent_loop_enabled if matching_scope else True
+                    ),
                 )
                 summary = runner.run(
                     task,

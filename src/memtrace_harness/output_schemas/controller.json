@@ -3,7 +3,7 @@
   "properties": {
     "action": {
       "type": "string",
-      "enum": ["run_planner", "ask_human", "stop", "finish"]
+      "enum": ["run_planner", "run_operational_action", "ask_human", "stop", "finish"]
     },
     "reason": {"type": "string", "maxLength": 1000},
     "searched_history": {

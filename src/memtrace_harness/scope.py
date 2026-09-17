@@ -18,6 +18,7 @@ class ProjectScope:
     verify_command: str | None = None
     verify_timeout_seconds: int | None = None
     github_repo: str | None = None
+    agent_loop_enabled: bool = True
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:
@@ -60,6 +61,15 @@ class ProjectScope:
         # _find_ready_github_issues().
         github_repo = _extract_field(content, "github_repo")
 
+        # Per-project capability flag: a project that never wants real code changes
+        # (e.g. a pure operational/monitoring project with no repo to develop) sets
+        # `- agent_loop: disabled` so Controller is told run_planner isn't available
+        # and can only ever pick run_operational_action/ask_human/stop instead. Any
+        # value other than the literal "disabled" (including the field being absent)
+        # leaves the full development loop enabled — this is opt-out, not opt-in.
+        agent_loop_str = _extract_field(content, "agent_loop")
+        agent_loop_enabled = (agent_loop_str or "").strip().lower() != "disabled"
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -72,6 +82,7 @@ class ProjectScope:
             verify_command=verify_command,
             verify_timeout_seconds=verify_timeout_seconds,
             github_repo=github_repo,
+            agent_loop_enabled=agent_loop_enabled,
         )
 
 
