@@ -8,8 +8,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.primary_session import OPERATOR_PROFILE_TITLE
 from memtrace_harness.role_profiles import load_role_profiles
+from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
 from memtrace_harness.trace_store import TraceStore
 
@@ -172,6 +175,8 @@ class TelegramGateway:
             {"command": "approve", "description": "核准待處理的請求（可加請求 ID）"},
             {"command": "reject", "description": "拒絕待處理的請求（可加請求 ID）"},
             {"command": "clarify", "description": "補充說明並繼續執行（可加請求 ID 與說明）"},
+            {"command": "schedules", "description": "查看這個專案目前的排程"},
+            {"command": "schedule_cancel", "description": "取消一組排程（需加排程 ID）"},
         ]
         try:
             req = urllib.request.Request(
@@ -347,12 +352,31 @@ class TelegramGateway:
                 "指令：\n"
                 "/status — 看這則訊息\n"
                 "一般打字：直接跟模型聊天即可，不用特定格式或前綴。如果對話讓模型確信你"
-                "真的要開始開發，它會自己觸發受控任務，不需要另外核准。\n"
+                "真的要開始開發，它會自己觸發受控任務，不需要另外核准；如果對話讓模型確信"
+                "你要的是週期性重複執行，它會自己建立排程。\n"
                 "待核准的請求（來自背景掃描或執行中任務暫停詢問）可以直接點訊息下方的按鈕，"
-                "或用 /approve /reject /clarify <id>。"
+                "或用 /approve /reject /clarify <id>。\n"
+                "/schedules — 查看這個專案目前的排程\n"
+                "/schedule_cancel <id> — 取消一組排程"
             )
             self.send_message(chat_id, info)
             return info
+
+        if result.kind == "schedule_list":
+            scope = result.project_scope
+            if scope is None:
+                msg = "無法對應到任何已註冊的專案，請在訊息裡提到專案名稱。"
+                self.send_message(chat_id, msg)
+                return msg
+            msg = self.list_schedules_message(scope)
+            self.send_message(chat_id, msg)
+            return msg
+
+        if result.kind == "schedule_cancel":
+            assert result.schedule_id is not None
+            msg = self.cancel_schedule_message(result.schedule_id)
+            self.send_message(chat_id, msg)
+            return msg
 
         if result.kind == "chat":
             # Every plain message just goes to the model — no more separate
@@ -629,6 +653,7 @@ class TelegramGateway:
         return "、".join(parts) if parts else "無"
 
     _TASK_START_MARKER = "HARNESS_TASK_START::"
+    _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
 
     def _chat_reply_and_maybe_start_task(self, scope: ProjectScope, chat_id: int, text: str) -> str:
         """The entire chat front door goes through one model call now: no more
@@ -663,6 +688,15 @@ class TelegramGateway:
             f"另起一行，格式為「{self._TASK_START_MARKER}<一句話描述要做的具體任務>」，交給"
             "受控的 Controller/Planner/RedTeam/Developer 流程去執行。單純聊天、討論、還在"
             "釐清需求、或只是在問問題時，絕對不要輸出這一行——不確定就不要輸出。\n\n"
+            "如果，而且只有在，使用者明確要你之後每隔一段時間、或每天/每個工作日固定時間"
+            "重複執行某件事——才在回覆的最後另起一行，格式為「"
+            f"{self._SCHEDULE_START_MARKER}<kind>::<spec>::<一句話描述要做的具體任務>」，"
+            "其中 kind 是 interval、daily 或 weekdays 三選一：interval 的 spec 是週期秒數"
+            "（例如 3600 代表每小時一次，最少 60 秒）；daily 的 spec 是每天固定時間，"
+            "24 小時制 HH:MM（例如 09:00）；weekdays 的 spec 跟 daily 一樣但只在週一到"
+            "週五觸發。同一則回覆不要同時輸出這一行和上面的任務啟動標記。不確定使用者是否"
+            "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
+            "裡把細節問清楚。\n\n"
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
@@ -679,6 +713,7 @@ class TelegramGateway:
                         f"'{scope.name}' after: {'; '.join(failures)}"
                     )
                 reply_text, goal = self._extract_task_start(result.stdout.strip())
+                reply_text, schedule_directive = self._extract_schedule_start(reply_text)
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
                 reply = f"{reply_text}\n\n{attribution}" if reply_text else attribution
                 self.primary_session_mgr.record_turn(
@@ -690,6 +725,8 @@ class TelegramGateway:
                         project=scope.name, speaker="user", turn_type="decision", content=goal
                     )
                     self._start_or_queue_task(scope, goal, chat_id)
+                if schedule_directive:
+                    self._create_schedule(scope, chat_id, schedule_directive)
                 return reply
             detail = result.error or result.stderr.strip() or f"exit code {result.return_code}"
             failures.append(f"{provider}/{model or '預設模型'}：{detail}")
@@ -703,17 +740,127 @@ class TelegramGateway:
         return msg
 
     @classmethod
-    def _extract_task_start(cls, raw: str) -> tuple[str, str | None]:
-        """Split a model reply into (human-visible text, task goal or None) by
-        pulling out a trailing "HARNESS_TASK_START::<goal>" line if present."""
+    def _extract_marker_line(cls, raw: str, marker: str) -> tuple[str, str | None]:
+        """Split a model reply into (human-visible text, marker payload or None) by
+        pulling out a trailing "<marker><payload>" line if present, scanning from the
+        bottom so the marker line doesn't have to be the very last line of output."""
         lines = raw.splitlines()
         for i in range(len(lines) - 1, -1, -1):
             stripped = lines[i].strip()
-            if stripped.startswith(cls._TASK_START_MARKER):
-                goal = stripped[len(cls._TASK_START_MARKER):].strip()
+            if stripped.startswith(marker):
+                payload = stripped[len(marker):].strip()
                 reply_text = "\n".join(lines[:i]).rstrip()
-                return reply_text, (goal or None)
+                return reply_text, (payload or None)
         return raw, None
+
+    @classmethod
+    def _extract_task_start(cls, raw: str) -> tuple[str, str | None]:
+        """Pull a trailing "HARNESS_TASK_START::<goal>" line out of a model reply."""
+        return cls._extract_marker_line(raw, cls._TASK_START_MARKER)
+
+    @classmethod
+    def _extract_schedule_start(cls, raw: str) -> tuple[str, str | None]:
+        """Pull a trailing "HARNESS_SCHEDULE_START::<kind>::<spec>::<goal>" line out of
+        a model reply."""
+        return cls._extract_marker_line(raw, cls._SCHEDULE_START_MARKER)
+
+    def _create_schedule(self, scope: ProjectScope, chat_id: int, directive: str) -> None:
+        """Parse a HARNESS_SCHEDULE_START directive's "<kind>::<spec>::<goal>" payload,
+        persist it to TraceStore, and confirm back to the chat that raised it. Bad
+        input (malformed kind/spec) is reported to the chat rather than raised —
+        this runs inline in the chat-reply path, so it must never take down an
+        otherwise-successful reply."""
+        parts = directive.split("::", 2)
+        if len(parts) != 3:
+            self.send_message(
+                chat_id,
+                f"⚠️ 排程指令格式有誤，未建立：「{directive}」（預期格式：kind::spec::goal）",
+            )
+            return
+        kind, spec, goal = (p.strip() for p in parts)
+        if not goal:
+            self.send_message(chat_id, "⚠️ 排程指令缺少任務內容，未建立。")
+            return
+        try:
+            parsed = parse_schedule_spec(kind, spec)
+            tz = ZoneInfo(self.config.schedule_timezone)
+            next_run_at = compute_next_run(parsed, after=datetime.now(timezone.utc), tz=tz)
+        except Exception as exc:
+            self.send_message(chat_id, f"⚠️ 排程設定有誤，未建立：{exc}")
+            return
+
+        trace_store = self.approval_manager.trace_store
+        schedule_id = trace_store.create_schedule(
+            project=scope.name,
+            workspace_id=scope.workspace_id,
+            goal=goal,
+            kind=parsed.kind,
+            interval_seconds=parsed.interval_seconds,
+            time_of_day=parsed.time_of_day,
+            chat_id=chat_id,
+            next_run_at=next_run_at,
+        )
+        local_next = next_run_at.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+        self.send_message(
+            chat_id,
+            f"⏰ 已建立排程 {schedule_id}（{describe_schedule(parsed)}）。"
+            f"下次執行時間：{local_next}（{self.config.schedule_timezone}）。\n"
+            f"任務內容：{goal[:120]}\n"
+            f"用 /schedules 查看，/schedule_cancel {schedule_id} 取消。",
+        )
+
+    def run_due_schedule(self, schedule: dict) -> None:
+        """Trigger one due schedule row from the gateway serve loop. Reuses the exact
+        same governed-task-start path a chat-triggered "HARNESS_TASK_START::" goal
+        does (_start_or_queue_task) — a scheduled run is not a different kind of task,
+        just a different trigger — notifying back to the chat that created the
+        schedule. Best-effort: a schedule row this gateway doesn't own any project for
+        (project removed from the index after the schedule was created) is skipped
+        and logged rather than raised, so one stale schedule can't break the tick."""
+        scope = next((p for p in self.projects if p.name == schedule["project"]), None)
+        if scope is None:
+            logger.error(
+                f"schedule {schedule['id']} targets unknown project "
+                f"'{schedule['project']}'; skipping this run"
+            )
+            return
+        chat_id = schedule.get("chat_id")
+        if chat_id is None:
+            logger.error(f"schedule {schedule['id']} has no chat_id to notify; skipping this run")
+            return
+        self.primary_session_mgr.record_turn(
+            project=scope.name,
+            speaker="system",
+            turn_type="decision",
+            content=f"排程 {schedule['id']} 觸發：{schedule['goal']}",
+        )
+        self._start_or_queue_task(scope, schedule["goal"], chat_id)
+
+    def list_schedules_message(self, scope: ProjectScope) -> str:
+        """Deterministic /schedules reply — no model call, just a formatted read of
+        TraceStore's schedules table for this project."""
+        schedules = self.approval_manager.trace_store.list_schedules(scope.name)
+        if not schedules:
+            return f"「{scope.name}」目前沒有排程中的任務。"
+        tz = ZoneInfo(self.config.schedule_timezone)
+        lines = [f"「{scope.name}」目前的排程："]
+        for row in schedules:
+            spec = ScheduleSpec(
+                kind=row["kind"],
+                interval_seconds=row["interval_seconds"],
+                time_of_day=row["time_of_day"],
+            )
+            next_local = datetime.fromisoformat(row["next_run_at"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
+            lines.append(
+                f"- {row['id']}：{describe_schedule(spec)}，下次 {next_local}。任務：{row['goal'][:80]}"
+            )
+        lines.append("用 /schedule_cancel <id> 取消。")
+        return "\n".join(lines)
+
+    def cancel_schedule_message(self, schedule_id: str) -> str:
+        if self.approval_manager.trace_store.deactivate_schedule(schedule_id):
+            return f"✅ 已取消排程 {schedule_id}。"
+        return f"⚠️ 找不到可取消的排程 {schedule_id}（可能已經被取消，或 ID 打錯了）。"
 
     def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str):
         task = TaskEnvelope(

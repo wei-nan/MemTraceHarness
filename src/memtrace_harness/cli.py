@@ -7,9 +7,11 @@ import os
 import signal
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from memtrace_harness.adapter_factory import (
     build_provider_adapter,
@@ -27,6 +29,7 @@ from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
 from memtrace_harness.scanner import UnattendedScanner
+from memtrace_harness.schedule import ScheduleSpec, compute_next_run
 from memtrace_harness.schemas import TaskEnvelope
 from memtrace_harness.scope import load_project_index
 from memtrace_harness.telegram_gateway import TelegramGateway
@@ -214,6 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Minimum seconds between cold-memory consolidation passes (hot primary-session "
             "turns -> draft MemTrace nodes) per project in --serve mode (default 3600)."
+        ),
+    )
+    gateway_parser.add_argument(
+        "--schedule-check-interval-seconds",
+        type=int,
+        default=30,
+        help=(
+            "Minimum seconds between checks for due chat-created schedules "
+            "(see HARNESS_SCHEDULE_START in the chat) in --serve mode (default 30). "
+            "Cheap (a single indexed SQLite query), safe to keep short."
         ),
     )
 
@@ -524,9 +537,12 @@ def gateway_command(args: argparse.Namespace) -> int:
             primary_session_mgr,
             projects,
             config,
+            trace_store,
+            gateway_for_project,
             poll_timeout=max(1, args.poll_timeout_seconds),
             scan_interval=max(1, args.scan_interval_seconds),
             consolidation_interval=max(1, args.consolidation_interval_seconds),
+            schedule_check_interval=max(1, args.schedule_check_interval_seconds),
         )
 
     print(f"Starting Telegram gateway ({len(gateways)} bot(s)) and unattended scanner...")
@@ -622,10 +638,13 @@ def _serve_gateway_loop(
     primary_session_mgr: PrimarySessionManager,
     projects: list,
     config: HarnessConfig,
+    trace_store: TraceStore,
+    gateway_for_project: dict[str, TelegramGateway],
     *,
     poll_timeout: int,
     scan_interval: int,
     consolidation_interval: int,
+    schedule_check_interval: int,
 ) -> int:
     """Long-poll continuously instead of the one-shot poll-and-exit gateway command.
     Telegram's getUpdates blocks server-side up to `poll_timeout` seconds when there is
@@ -636,7 +655,8 @@ def _serve_gateway_loop(
     print(
         f"Serving Telegram gateway ({len(gateways)} bot(s)); "
         f"poll_timeout={poll_timeout}s scan_interval={scan_interval}s "
-        f"consolidation_interval={consolidation_interval}s. Ctrl-C to stop."
+        f"consolidation_interval={consolidation_interval}s "
+        f"schedule_check_interval={schedule_check_interval}s. Ctrl-C to stop."
     )
 
     from memtrace_harness.status_server import start_status_server
@@ -667,6 +687,8 @@ def _serve_gateway_loop(
 
     last_scan = 0.0
     last_consolidation = 0.0
+    last_schedule_check = 0.0
+    schedule_tz = ZoneInfo(config.schedule_timezone)
     while not stop_requested:
         for gw in gateways:
             if stop_requested:
@@ -698,6 +720,43 @@ def _serve_gateway_loop(
             except Exception:
                 logger.exception("scan pass failed; continuing")
             last_scan = now
+
+        if now - last_schedule_check >= schedule_check_interval:
+            try:
+                due = trace_store.list_due_schedules(datetime.now(timezone.utc))
+                for row in due:
+                    gw = gateway_for_project.get(row["project"])
+                    if gw is None:
+                        logger.error(
+                            f"schedule {row['id']} targets project '{row['project']}' with "
+                            "no active gateway; skipping this run"
+                        )
+                        continue
+                    # Advance next_run_at before triggering: run_due_schedule() only
+                    # starts a background thread (non-blocking), and if the workspace
+                    # turns out to be locked it just skips this occurrence — either
+                    # way the schedule must not re-fire every tick until it succeeds.
+                    spec = ScheduleSpec(
+                        kind=row["kind"],
+                        interval_seconds=row["interval_seconds"],
+                        time_of_day=row["time_of_day"],
+                    )
+                    ran_at = datetime.now(timezone.utc)
+                    next_run_at = compute_next_run(spec, after=ran_at, tz=schedule_tz)
+                    trace_store.mark_schedule_ran(
+                        row["id"], ran_at=ran_at, next_run_at=next_run_at, status="triggered"
+                    )
+                    try:
+                        gw.run_due_schedule(row)
+                    except Exception:
+                        logger.exception(f"scheduled run for {row['id']} failed to start; continuing")
+                if due:
+                    print(f"triggered {len(due)} due schedule(s)")
+                    if status_bus is not None:
+                        status_bus.publish()
+            except Exception:
+                logger.exception("schedule check pass failed; continuing")
+            last_schedule_check = now
 
         if now - last_consolidation >= consolidation_interval:
             for scope in projects:
