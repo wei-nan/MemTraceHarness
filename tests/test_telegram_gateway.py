@@ -555,3 +555,265 @@ class TelegramGatewayTests(TestCase):
             )
 
         self.assertIsNone(item)
+
+
+def _build_schedule_gateway(tmp_path: Path):
+    """Shared boilerplate for the schedule tests below: a real TraceStore-backed
+    TelegramGateway with one project, same construction shape every other test in
+    this file repeats inline — factored out here since every schedule test needs it."""
+    db_path = tmp_path / "test.sqlite3"
+    trace_store = TraceStore(db_path)
+    config = HarnessConfig(
+        memtrace_mcp_url=None,
+        memtrace_api_token=None,
+        trace_db_path=db_path,
+        trace_root=tmp_path,
+        claude_command="claude",
+        codex_command="codex",
+        antigravity_command="agy",
+        antigravity_output_mode="auto",
+        cli_timeout_seconds=900,
+        telegram_bot_token="fake_bot_token",
+        telegram_allowed_chat_ids={12345},
+        project_index_path=None,
+        chat_provider="claude",
+        chat_model="haiku",
+        unattended_write_requires_approval=True,
+    )
+    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+    scope = ProjectScope(
+        name="test_proj",
+        workspace_id="ws_test",
+        working_directory=tmp_path,
+        scope_file_path=tmp_path / "harness-scope.md",
+    )
+    triage = ChatTriage([scope])
+    psess_mgr = PrimarySessionManager(trace_store)
+    gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+    return gateway, trace_store, scope
+
+
+class ScheduleCommandTests(TestCase):
+    def test_model_deciding_to_start_a_schedule_creates_a_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, trace_store, scope = _build_schedule_gateway(tmp_path)
+
+            from unittest.mock import patch, MagicMock
+            from memtrace_harness.cli_process import ProcessResult
+
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            model_reply = ProcessResult(
+                command=[],
+                return_code=0,
+                stdout=(
+                    "好的，我幫你排好每天早上檢查一次。\n"
+                    "HARNESS_SCHEDULE_START::daily::09:00::daily backlog review"
+                ),
+                stderr="",
+                started_at="2026-09-17T00:00:00+00:00",
+                completed_at="2026-09-17T00:00:01+00:00",
+                duration_ms=500,
+            )
+
+            with patch("urllib.request.urlopen", return_value=mock_response), patch(
+                "memtrace_harness.cli_process.CliProcessRunner.run", return_value=model_reply
+            ):
+                update = {
+                    "update_id": 300,
+                    "message": {"chat": {"id": 12345}, "text": "每天早上幫我檢查一次 backlog"},
+                }
+                result = gateway.process_update(update)
+
+            # The marker line itself must not leak to the human.
+            self.assertIsNotNone(result)
+            self.assertNotIn("HARNESS_SCHEDULE_START", result)
+            self.assertIn("每天早上", result)
+
+            rows = trace_store.list_schedules(scope.name)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "daily")
+            self.assertEqual(rows[0]["time_of_day"], "09:00")
+            self.assertEqual(rows[0]["goal"], "daily backlog review")
+            self.assertEqual(rows[0]["chat_id"], 12345)
+
+    def test_malformed_schedule_spec_reports_error_and_creates_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, trace_store, scope = _build_schedule_gateway(tmp_path)
+
+            from unittest.mock import patch, MagicMock
+            from memtrace_harness.cli_process import ProcessResult
+
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            model_reply = ProcessResult(
+                command=[],
+                return_code=0,
+                stdout="好，幫你排。\nHARNESS_SCHEDULE_START::daily::not-a-time::check backlog",
+                stderr="",
+                started_at="2026-09-17T00:00:00+00:00",
+                completed_at="2026-09-17T00:00:01+00:00",
+                duration_ms=500,
+            )
+
+            with patch("urllib.request.urlopen", return_value=mock_response), patch(
+                "memtrace_harness.cli_process.CliProcessRunner.run", return_value=model_reply
+            ):
+                update = {
+                    "update_id": 301,
+                    "message": {"chat": {"id": 12345}, "text": "每天幫我檢查"},
+                }
+                gateway.process_update(update)
+
+            self.assertEqual(trace_store.list_schedules(scope.name), [])
+
+    def test_schedules_command_lists_existing_schedules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, trace_store, scope = _build_schedule_gateway(tmp_path)
+            from datetime import datetime, timezone
+            trace_store.create_schedule(
+                project=scope.name,
+                workspace_id=scope.workspace_id,
+                goal="daily backlog review",
+                kind="daily",
+                time_of_day="09:00",
+                chat_id=12345,
+                next_run_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+            )
+
+            from unittest.mock import patch, MagicMock
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                update = {
+                    "update_id": 302,
+                    "message": {"chat": {"id": 12345}, "text": "/schedules"},
+                }
+                result = gateway.process_update(update)
+
+            self.assertIsNotNone(result)
+            self.assertIn("daily backlog review", result)
+            self.assertIn("sched_", result)
+
+    def test_schedules_command_with_no_schedules_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, _trace_store, _scope = _build_schedule_gateway(tmp_path)
+
+            from unittest.mock import patch, MagicMock
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                update = {
+                    "update_id": 303,
+                    "message": {"chat": {"id": 12345}, "text": "/schedules"},
+                }
+                result = gateway.process_update(update)
+
+            self.assertIn("沒有排程", result)
+
+    def test_schedule_cancel_deactivates_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, trace_store, scope = _build_schedule_gateway(tmp_path)
+            from datetime import datetime, timezone
+            schedule_id = trace_store.create_schedule(
+                project=scope.name,
+                workspace_id=scope.workspace_id,
+                goal="daily backlog review",
+                kind="interval",
+                interval_seconds=3600,
+                chat_id=12345,
+                next_run_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+            )
+
+            from unittest.mock import patch, MagicMock
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                update = {
+                    "update_id": 304,
+                    "message": {"chat": {"id": 12345}, "text": f"/schedule_cancel {schedule_id}"},
+                }
+                result = gateway.process_update(update)
+
+            self.assertIn("已取消", result)
+            self.assertEqual(trace_store.list_schedules(scope.name), [])
+
+    def test_schedule_cancel_unknown_id_reports_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, _trace_store, _scope = _build_schedule_gateway(tmp_path)
+
+            from unittest.mock import patch, MagicMock
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"ok": true, "result": []}'
+            mock_response.__enter__.return_value = mock_response
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                update = {
+                    "update_id": 305,
+                    "message": {"chat": {"id": 12345}, "text": "/schedule_cancel sched_doesnotexist"},
+                }
+                result = gateway.process_update(update)
+
+            self.assertIn("找不到", result)
+
+    def test_run_due_schedule_starts_the_governed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, trace_store, scope = _build_schedule_gateway(tmp_path)
+            from datetime import datetime, timezone
+
+            from unittest.mock import MagicMock
+            run_new_task_mock = MagicMock(
+                return_value=MagicMock(status="succeeded", recommendation="", conversation_id="x")
+            )
+            gateway._run_new_task = run_new_task_mock
+
+            schedule_id = trace_store.create_schedule(
+                project=scope.name,
+                workspace_id=scope.workspace_id,
+                goal="daily backlog review",
+                kind="interval",
+                interval_seconds=3600,
+                chat_id=12345,
+                next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            )
+            row = trace_store.get_schedule(schedule_id)
+
+            from unittest.mock import patch
+            with patch.object(gateway, "send_message"):
+                gateway.run_due_schedule(row)
+
+            import threading as _threading
+            for t in _threading.enumerate():
+                if t.name.startswith("agent-loop-"):
+                    t.join(timeout=5)
+
+            run_new_task_mock.assert_called_once()
+            _scope_arg, _conv_id_arg, goal_arg = run_new_task_mock.call_args[0]
+            self.assertEqual(goal_arg, "daily backlog review")
+
+    def test_run_due_schedule_skips_unknown_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            gateway, _trace_store, _scope = _build_schedule_gateway(tmp_path)
+            from unittest.mock import MagicMock
+            gateway._run_new_task = MagicMock()
+
+            row = {
+                "id": "sched_ghost",
+                "project": "no_such_project",
+                "goal": "g",
+                "chat_id": 12345,
+            }
+            gateway.run_due_schedule(row)  # must not raise
+            gateway._run_new_task.assert_not_called()

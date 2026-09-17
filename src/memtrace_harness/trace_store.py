@@ -787,6 +787,22 @@ class TraceStore:
                     last_offset INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    interval_seconds INTEGER,
+                    time_of_day TEXT,
+                    chat_id INTEGER,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    next_run_at TEXT NOT NULL,
+                    last_run_at TEXT,
+                    last_run_status TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_turns_conversation
                     ON turns(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
@@ -795,6 +811,10 @@ class TraceStore:
                     ON primary_sessions_hot_log(primary_session_id, turn_seq);
                 CREATE INDEX IF NOT EXISTS idx_approval_conv
                     ON approval_requests(conversation_id, status);
+                CREATE INDEX IF NOT EXISTS idx_schedules_due
+                    ON schedules(active, next_run_at);
+                CREATE INDEX IF NOT EXISTS idx_schedules_project
+                    ON schedules(project, active);
                 """
             )
             self._ensure_column(
@@ -1339,6 +1359,99 @@ class TraceStore:
         if not row:
             return None
         return {"workspace_id": row[0], "conversation_id": row[1], "locked_at": row[2]}
+
+    def create_schedule(
+        self,
+        *,
+        project: str,
+        workspace_id: str,
+        goal: str,
+        kind: str,
+        next_run_at: datetime,
+        interval_seconds: int | None = None,
+        time_of_day: str | None = None,
+        chat_id: int | None = None,
+    ) -> str:
+        schedule_id = f"sched_{uuid4().hex[:10]}"
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO schedules (
+                    id, project, workspace_id, goal, kind, interval_seconds,
+                    time_of_day, chat_id, active, created_at, next_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    schedule_id, project, workspace_id, goal, kind, interval_seconds,
+                    time_of_day, chat_id, utc_now_iso(), next_run_at.isoformat(),
+                ),
+            )
+        return schedule_id
+
+    @staticmethod
+    def _schedule_row_to_dict(row: tuple) -> dict:
+        return {
+            "id": row[0],
+            "project": row[1],
+            "workspace_id": row[2],
+            "goal": row[3],
+            "kind": row[4],
+            "interval_seconds": row[5],
+            "time_of_day": row[6],
+            "chat_id": row[7],
+            "active": bool(row[8]),
+            "created_at": row[9],
+            "next_run_at": row[10],
+            "last_run_at": row[11],
+            "last_run_status": row[12],
+        }
+
+    _SCHEDULE_COLUMNS = (
+        "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, "
+        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status"
+    )
+
+    def get_schedule(self, schedule_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._SCHEDULE_COLUMNS} FROM schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+        return self._schedule_row_to_dict(row) if row else None
+
+    def list_schedules(self, project: str, *, active_only: bool = True) -> list[dict]:
+        query = f"SELECT {self._SCHEDULE_COLUMNS} FROM schedules WHERE project = ?"
+        params: tuple = (project,)
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY next_run_at ASC"
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._schedule_row_to_dict(row) for row in rows]
+
+    def list_due_schedules(self, now: datetime) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._SCHEDULE_COLUMNS} FROM schedules "
+                "WHERE active = 1 AND next_run_at <= ? ORDER BY next_run_at ASC",
+                (now.isoformat(),),
+            ).fetchall()
+        return [self._schedule_row_to_dict(row) for row in rows]
+
+    def deactivate_schedule(self, schedule_id: str) -> bool:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "UPDATE schedules SET active = 0 WHERE id = ? AND active = 1", (schedule_id,)
+            )
+            return cur.rowcount > 0
+
+    def mark_schedule_ran(
+        self, schedule_id: str, *, ran_at: datetime, next_run_at: datetime, status: str
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE schedules SET last_run_at = ?, last_run_status = ?, next_run_at = ? WHERE id = ?",
+                (ran_at.isoformat(), status, next_run_at.isoformat(), schedule_id),
+            )
 
     def get_telegram_offset(self, bot_token_hash: str) -> int:
         with self._connection() as conn:

@@ -135,6 +135,9 @@ class CliTests(TestCase):
         scanner = MagicMock()
         config = MagicMock()
         config.shutdown_grace_seconds = 0
+        config.schedule_timezone = "Asia/Taipei"
+        trace_store = MagicMock()
+        trace_store.list_due_schedules.return_value = []
 
         with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
             _serve_gateway_loop(
@@ -143,12 +146,72 @@ class CliTests(TestCase):
                 MagicMock(),
                 [],
                 config,
+                trace_store,
+                {"Beri": gw},
                 poll_timeout=1,
                 scan_interval=9999,
                 consolidation_interval=9999,
+                schedule_check_interval=9999,
             )
 
         gw.notify_all_allowlisted.assert_called_once()
         (notified_text,), _ = gw.notify_all_allowlisted.call_args
         self.assertIn("已啟動", notified_text)
         self.assertIn("Beri", notified_text)
+
+    def test_serve_gateway_loop_triggers_due_schedules(self) -> None:
+        import os
+        import signal as signal_module
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli import _serve_gateway_loop
+
+        scope = MagicMock()
+        scope.name = "Beri"
+        gw = MagicMock()
+        gw.projects = [scope]
+        gw.poll_once.return_value = 0
+
+        scanner = MagicMock()
+        config = MagicMock()
+        config.shutdown_grace_seconds = 0
+        config.schedule_timezone = "Asia/Taipei"
+
+        due_row = {
+            "id": "sched_abc123",
+            "project": "Beri",
+            "goal": "daily backlog review",
+            "kind": "interval",
+            "interval_seconds": 3600,
+            "time_of_day": None,
+            "chat_id": 12345,
+        }
+        trace_store = MagicMock()
+
+        def fake_list_due(now):
+            # Stop the loop right after the first schedule check so this test
+            # doesn't block on a real poll cycle or an OS signal race.
+            os.kill(os.getpid(), signal_module.SIGTERM)
+            return [due_row]
+
+        trace_store.list_due_schedules.side_effect = fake_list_due
+
+        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
+            _serve_gateway_loop(
+                [gw],
+                scanner,
+                MagicMock(),
+                [],
+                config,
+                trace_store,
+                {"Beri": gw},
+                poll_timeout=1,
+                scan_interval=9999,
+                consolidation_interval=9999,
+                schedule_check_interval=1,
+            )
+
+        gw.run_due_schedule.assert_called_once_with(due_row)
+        trace_store.mark_schedule_ran.assert_called_once()
+        _args, kwargs = trace_store.mark_schedule_ran.call_args
+        self.assertEqual(kwargs["status"], "triggered")

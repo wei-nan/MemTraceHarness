@@ -31,6 +31,7 @@ class HarnessConfig:
     status_server_port: int = 8787
     shutdown_grace_seconds: int = 120
     reply_language: str | None = "Traditional Chinese (繁體中文，台灣用語與正體字)"
+    schedule_timezone: str = "Asia/Taipei"
 
     def command_for(self, provider: str) -> str:
         if provider == "claude":
@@ -117,6 +118,7 @@ class HarnessConfig:
                 else "Traditional Chinese (繁體中文，台灣用語與正體字)"
             )
             or None,
+            schedule_timezone=os.getenv("HARNESS_SCHEDULE_TIMEZONE", "Asia/Taipei"),
         )
 
     def memory_workspace_id_for(self, project_name: str, project_workspace_id: str) -> str:

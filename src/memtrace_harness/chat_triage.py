@@ -11,13 +11,15 @@ if TYPE_CHECKING:
 
 @dataclass
 class TriageResult:
-    kind: str  # "approval_response", "chat", "status", "out_of_scope", "unrecognized"
+    kind: str  # "approval_response", "chat", "status", "out_of_scope", "unrecognized",
+    # "schedule_list", "schedule_cancel"
     project_scope: ProjectScope | None
     approval_id: str | None = None
     approval_action: str | None = None  # "approve", "reject", "clarify"
     approval_reason: str | None = None
     task_goal: str | None = None
     rejection_message: str | None = None
+    schedule_id: str | None = None
 
 
 class ChatTriage:
@@ -49,6 +51,27 @@ class ChatTriage:
                 approval_action=cmd,
                 approval_reason=reason,
             )
+
+        # /schedules and /schedule_cancel are deterministic, structured operations
+        # (list/cancel a row) — unlike starting a schedule, which needs the model to
+        # judge conversational intent, these never need a model call.
+        if cleaned.startswith("/schedule_cancel"):
+            parts = cleaned.split(maxsplit=1)
+            if len(parts) < 2:
+                return TriageResult(
+                    kind="out_of_scope",
+                    project_scope=None,
+                    rejection_message="指令 /schedule_cancel 需要排程 ID（例如 /schedule_cancel sched_abc123）",
+                )
+            return TriageResult(
+                kind="schedule_cancel", project_scope=None, schedule_id=parts[1].strip()
+            )
+
+        if cleaned.startswith("/schedules"):
+            matched = self._match_project_from_text(cleaned) or self._find_project(default_project)
+            if not matched and len(self.projects) == 1:
+                matched = self.projects[0]
+            return TriageResult(kind="schedule_list", project_scope=matched)
 
         # Check for scope/boundary violations
         lower_text = cleaned.lower()
