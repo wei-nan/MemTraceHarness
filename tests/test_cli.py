@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -5,9 +6,15 @@ from unittest import TestCase
 from memtrace_harness.cli import (
     build_parser,
     create_dedicated_role_profiles_file,
+    update_chat_model_for_project,
     update_role_profile_for_project,
 )
-from memtrace_harness.config import HarnessConfig, project_role_profiles_env_var
+from memtrace_harness.config import (
+    HarnessConfig,
+    project_chat_model_env_var,
+    project_chat_provider_env_var,
+    project_role_profiles_env_var,
+)
 
 
 class CliTests(TestCase):
@@ -405,3 +412,115 @@ class CreateDedicatedRoleProfilesFileTests(TestCase):
         config = self._build_config(tmp_path)
         with self.assertRaises(ValueError):
             create_dedicated_role_profiles_file(config, "NoSuchProject")
+
+
+class UpdateChatModelForProjectTests(TestCase):
+    """update_chat_model_for_project() writes a bare relative ".env" — every test
+    here runs inside an isolated temp cwd so it can never touch this repo's real
+    .env, restored via addCleanup even if the test body raises."""
+
+    def _chdir_to_temp(self) -> Path:
+        import os
+
+        tmp_dir_ctx = TemporaryDirectory()
+        self.addCleanup(tmp_dir_ctx.cleanup)
+        tmp_path = Path(tmp_dir_ctx.name)
+        original_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        self.addCleanup(os.chdir, original_cwd)
+        return tmp_path
+
+    def _build_config(self, tmp_path: Path) -> HarnessConfig:
+        scope_dir = tmp_path / "TestProj"
+        scope_dir.mkdir()
+        scope_path = scope_dir / "harness-scope.md"
+        scope_path.write_text(
+            "# Harness scope — TestProj\n\n- workspace_id: ws_test\n", encoding="utf-8"
+        )
+        index_path = tmp_path / "projects.index.txt"
+        index_path.write_text(str(scope_path) + "\n", encoding="utf-8")
+
+        return HarnessConfig(
+            memtrace_mcp_url=None, memtrace_api_token=None,
+            trace_db_path=tmp_path / "trace.sqlite3", trace_root=tmp_path,
+            claude_command="claude", codex_command="codex", antigravity_command="agy",
+            antigravity_output_mode="auto", cli_timeout_seconds=900,
+            telegram_bot_token=None, telegram_allowed_chat_ids=set(),
+            project_index_path=index_path, chat_provider="claude", chat_model="haiku",
+            unattended_write_requires_approval=True,
+        )
+
+    def test_writes_a_project_specific_override_even_without_one_yet(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+
+        update_chat_model_for_project(config, "TestProj", "antigravity", "gemini-3.8-flash-high")
+
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn(f"{project_chat_provider_env_var('TestProj')}=antigravity", env_text)
+        self.assertIn(
+            f"{project_chat_model_env_var('TestProj')}=gemini-3.8-flash-high", env_text
+        )
+
+    def test_rejects_unknown_provider(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        with self.assertRaises(ValueError):
+            update_chat_model_for_project(config, "TestProj", "openai", "gpt-5")
+
+    def test_rejects_empty_model(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        with self.assertRaises(ValueError):
+            update_chat_model_for_project(config, "TestProj", "claude", "   ")
+
+    def test_rejects_unknown_project(self) -> None:
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        with self.assertRaises(ValueError):
+            update_chat_model_for_project(config, "NoSuchProject", "claude", "sonnet")
+
+
+class CollectStatusDataKnownModelsTests(TestCase):
+    def test_known_models_collects_every_configured_pair(self) -> None:
+        from memtrace_harness.cli import _collect_status_data
+
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            scope_dir = tmp_path / "P"
+            scope_dir.mkdir()
+            (scope_dir / "harness-scope.md").write_text(
+                "# scope\n\n- workspace_id: ws_x\n", encoding="utf-8"
+            )
+            idx = tmp_path / "projects.index.txt"
+            idx.write_text(str(scope_dir / "harness-scope.md") + "\n", encoding="utf-8")
+
+            # Reuse the real packaged default-role-profiles.toml as the fixture
+            # instead of hand-writing a minimal one — RoleProfile.from_mapping()
+            # requires all five roles plus a fair amount of fallback-related fields
+            # to validate at all, and the packaged file is already a known-good
+            # example of exactly that shape.
+            default_toml = (
+                Path(__file__).parent.parent / "src/memtrace_harness/default-role-profiles.toml"
+            )
+            profiles_path = tmp_path / "profiles.toml"
+            profiles_path.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
+            env_var = project_role_profiles_env_var("P")
+            os.environ[env_var] = str(profiles_path)
+            self.addCleanup(os.environ.pop, env_var, None)
+
+            config = HarnessConfig(
+                memtrace_mcp_url=None, memtrace_api_token=None,
+                trace_db_path=tmp_path / "trace.sqlite3", trace_root=tmp_path,
+                claude_command="claude", codex_command="codex", antigravity_command="agy",
+                antigravity_output_mode="auto", cli_timeout_seconds=900,
+                telegram_bot_token=None, telegram_allowed_chat_ids=set(),
+                project_index_path=idx, chat_provider="antigravity",
+                chat_model="gemini-3.6-flash-high", unattended_write_requires_approval=True,
+            )
+            data = _collect_status_data(config)
+
+            self.assertIn("gpt-5.6-luna", data["known_models"]["codex"])
+            self.assertIn("sonnet", data["known_models"]["claude"])
+            self.assertIn("gemini-3.6-flash-high", data["known_models"]["antigravity"])
+            self.assertEqual(set(data["known_models"].keys()), {"claude", "codex", "antigravity"})
