@@ -51,6 +51,7 @@ class AgentLoopRunner:
         verify_command: str | None = None,
         verify_timeout_seconds: int = 1200,
         config: "HarnessConfig | None" = None,
+        agent_loop_enabled: bool = True,
     ) -> None:
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
@@ -63,6 +64,14 @@ class AgentLoopRunner:
         self.verify_command = verify_command
         self.verify_timeout_seconds = verify_timeout_seconds
         self.config = config
+        # Per-project capability flag (harness-scope.md's `agent_loop: disabled`, see
+        # ProjectScope.agent_loop_enabled) — some projects only ever want operational
+        # execution (run_operational_action), never real code changes. Both an explicit
+        # instruction to Controller (controller_task() strips "run_planner" out of the
+        # allowed-actions list it's told) and a deterministic backstop below (in case
+        # Controller picks it anyway) enforce this, same fail-closed shape as every
+        # other hard boundary in this file.
+        self.agent_loop_enabled = agent_loop_enabled
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -100,7 +109,9 @@ class AgentLoopRunner:
         stages.extend(reconstructed.values())
 
         controller = self._execute(
-            task=controller_task(task, stage="start", stages=stages),
+            task=controller_task(
+                task, stage="start", stages=stages, agent_loop_enabled=self.agent_loop_enabled
+            ),
             trace_id=trace_id,
             stages=stages,
             stage="control-start",
@@ -110,7 +121,8 @@ class AgentLoopRunner:
         if stopped:
             return self._persist(stopped, writeback=writeback)
         controller_artifact = controller.artifact or {}
-        if not valid_controller(controller_artifact, {"run_planner", "ask_human", "stop"}):
+        start_actions = {"run_planner", "run_operational_action", "ask_human", "stop"}
+        if not valid_controller(controller_artifact, start_actions):
             return self._persist(
                 self._summary(
                     task,
@@ -121,7 +133,32 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
-        if controller_artifact.get("action") != "run_planner":
+        action = controller_artifact.get("action")
+        if action == "run_planner" and not self.agent_loop_enabled:
+            # Deterministic backstop for the instruction controller_task() already
+            # gave it (agent_loop_enabled=False strips "run_planner" from the allowed
+            # list in the prompt) — a misbehaving model picking it anyway must not
+            # reach Planner/Developer on a project that opted out of development work.
+            return self._persist(
+                self._summary(
+                    task,
+                    trace_id,
+                    stages,
+                    "needs_human",
+                    "Controller chose run_planner, but this project has agent_loop "
+                    "disabled (harness-scope.md) — real development work is not "
+                    "available here. Use run_operational_action for execution-only "
+                    "requests, or enable agent_loop for this project if development "
+                    "work is actually wanted.",
+                ),
+                writeback=writeback,
+            )
+        if action == "run_operational_action":
+            return self._persist(
+                self._run_operational_action(task, trace_id, stages),
+                writeback=writeback,
+            )
+        if action != "run_planner":
             return self._persist(
                 self._summary(
                     task,
@@ -425,6 +462,44 @@ class AgentLoopRunner:
             ),
             writeback=writeback,
         )
+
+    def _run_operational_action(
+        self, task: TaskEnvelope, trace_id: str, stages: list[LoopStageResult]
+    ) -> LoopSummary:
+        """Controller chose run_operational_action: execute the request directly via
+        Developer and report the result, skipping Planner/G1/G2/Converge entirely
+        (2026-09-17, explicit user request) — for a request that isn't a code-development
+        task (e.g. "check the current price and P&L on 2891/2884"), the plan-then-review
+        ceremony doesn't fit and only adds latency/cost. This is a deliberately weaker
+        guarantee than the full loop: nothing here reviews Developer's own report the way
+        G2 does, so treat operational_action as suitable for read/execute-only requests,
+        not code changes that need a second opinion."""
+        result = self._execute(
+            task=operational_task(task),
+            trace_id=trace_id,
+            stages=stages,
+            stage="operate",
+            profile_id="developer",
+        )
+        stopped = self._stop_after_execution(task, trace_id, stages, result)
+        if stopped:
+            return stopped
+        normalized = normalized_development(result.artifact)
+        if normalized == "INVALID":
+            return self._summary(
+                task,
+                trace_id,
+                stages,
+                "needs_human",
+                summarize_invalid_artifact("Developer (operational action)", result.artifact),
+            )
+        status: LoopStatus = {
+            "COMPLETED": "succeeded",
+            "NEEDS_HUMAN": "needs_human",
+            "FAILED": "failed",
+        }[normalized]
+        summary_text = str((result.artifact or {}).get("summary") or "(no summary given)")
+        return self._summary(task, trace_id, stages, status, summary_text)
 
     def _execute(
         self,
@@ -1059,7 +1134,11 @@ class AgentLoopRunner:
 
 
 def controller_task(
-    task: TaskEnvelope, *, stage: str, stages: list[LoopStageResult]
+    task: TaskEnvelope,
+    *,
+    stage: str,
+    stages: list[LoopStageResult],
+    agent_loop_enabled: bool = True,
 ) -> TaskEnvelope:
     snapshot = {
         "task_id": task.task_id,
@@ -1077,10 +1156,42 @@ def controller_task(
         ],
         "token_spent": token_budget_units(stages),
     }
-    allowed = ["run_planner", "ask_human", "stop"] if stage == "start" else [
-        "finish",
-        "ask_human",
-    ]
+    if stage == "start":
+        allowed = ["run_operational_action", "ask_human", "stop"]
+        if agent_loop_enabled:
+            allowed.insert(0, "run_planner")
+    else:
+        allowed = ["finish", "ask_human"]
+    # run_planner starts the full plan-then-review development loop (Planner/G1/
+    # Developer/G2) — pick it only for a request that actually changes this project's
+    # code. run_operational_action skips straight to Developer and reports its result
+    # directly, no plan or review in between — pick it for a request that just needs
+    # something done/checked/executed once (fetch data, run an existing script,
+    # inspect current state) and doesn't touch the codebase. Get this choice right:
+    # picking run_planner for a check-only request wastes a full loop on nothing to
+    # plan; picking run_operational_action for a real code change skips the review
+    # that change would need.
+    operational_action_notice = ""
+    if stage == "start":
+        operational_action_notice = (
+            "run_planner starts the full plan-then-review development loop "
+            "(Planner/G1/Developer/G2) — choose it only when the goal actually needs "
+            "code changed in this project's repository. run_operational_action skips "
+            "straight to Developer and reports its result directly, with no plan or "
+            "review step — choose it when the goal just needs something done or "
+            "checked once (run an existing script, fetch live data, inspect current "
+            "state, report a number) without touching the codebase. Picking "
+            "run_planner for a check-only request wastes a full review loop on "
+            "nothing to plan; picking run_operational_action for a real code change "
+            "skips the review that change would need — get this right.\n"
+        )
+        if not agent_loop_enabled:
+            operational_action_notice += (
+                "run_planner is not available for this project (agent_loop is "
+                "disabled in its harness-scope.md) — use run_operational_action for "
+                "anything executable, or ask_human/stop if the request genuinely "
+                "requires a code change.\n"
+            )
     # 2026-09-05: only the converge stage (after G2 PASS, right before the loop
     # reports "succeeded") may write to MemTrace — update_node/create_node are
     # explicitly disallowed for every other stage/role, so this is the one place
@@ -1133,6 +1244,7 @@ def controller_task(
             "attempt is denied or errors, do not stop or explain what happened — "
             "immediately answer the JSON decision anyway using whatever you already have; "
             "a partial answer is always better than none.\n"
+            f"{operational_action_notice}"
             "The JSON schema enforced on this call's output is shared by both controller "
             "stages (start and converge) and therefore lists a wider action enum than is "
             "valid right now — it will not stop you from picking a value that's wrong for "
@@ -1280,6 +1392,33 @@ def gate_task(
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=items,
+    )
+
+
+def operational_task(task: TaskEnvelope) -> TaskEnvelope:
+    """Controller chose run_operational_action: run this directly via Developer with
+    no plan and no review afterward (see AgentLoopRunner._run_operational_action()).
+    Reuses the same output contract as developer_task()'s (development.json) since
+    changed_files/tests being empty is a perfectly valid answer for a request that
+    never touched the codebase — no separate schema needed for this."""
+    return stage_task(
+        task,
+        suffix="operate",
+        goal=(
+            f"Carry out this operational request directly — it is NOT a code-development "
+            f"task, so there is no plan to follow and no review afterward: {task.goal}\n"
+            "Use whatever tools/commands are actually appropriate (run a script, fetch "
+            "data, inspect files or state) to really do this, rather than describing "
+            "what should happen. If it requires information you don't have and can't "
+            "discover yourself, say so in `summary` and use status 'needs_human' "
+            "instead of guessing.\n"
+            "Return only a valid JSON object after the work with status ('completed', "
+            "'needs_human', or 'failed'), summary (string) containing the actual result "
+            "you found or did, changed_files (string array, normally empty here), tests "
+            "(string array, normally empty here), and gaps (string array).\n"
+            f"{_TOOL_DENIAL_RESILIENCE}"
+        ),
+        context_items=task.context_items,
     )
 
 
