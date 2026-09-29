@@ -119,6 +119,12 @@ Only these failure categories may cross provider boundaries:
 - `quota_exhausted`
 - `rate_limit`
 - `provider_overloaded`
+- `cli_unavailable` — the provider CLI could not be launched at all (executable missing, wrapper
+  script pointing at a stale path, `cannot execute`). The request was never evaluated, so the next
+  candidate is safe. This category ignores a profile's `fallback_on` list, sets no cooldown (the
+  primary is retried on the next stage so a fixed install recovers immediately), and always sends
+  the operator a Telegram alert via `AgentLoopRunner.alert_callback` — even when no fallback
+  exists — naming the failed and (if any) substitute provider/model.
 
 `context_limit`, timeout, network, authentication, permission, configuration, schema, safety and
 unknown failures do not trigger a cross-provider fallback. Error classification is conservative;

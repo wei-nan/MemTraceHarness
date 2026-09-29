@@ -899,6 +899,61 @@ class AgentLoopRunnerTests(TestCase):
             "authentication",
         )
 
+    def test_unlaunchable_cli_falls_back_and_alerts_operator(self) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            # The primary is re-tried on every controller stage (no cooldown for a launch
+            # failure), so it fails once per stage and falls back each time.
+            [{"_status": "failed", "_error": "exec: /x/codex: cannot execute: No such file or directory"}] * 2,
+        )
+        fallback = QueueAdapter(
+            "controller-fallback-1",
+            "claude",
+            "sonnet",
+            [
+                {"action": "run_planner", "reason": "continued"},
+                {"action": "finish", "reason": "complete"},
+            ],
+        )
+        alerts: list[str] = []
+
+        AgentLoopRunner(
+            adapters=adapters,
+            fallback_adapters={"controller": [fallback]},
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+            alert_callback=alerts.append,
+        ).run(self.task)
+
+        self.assertEqual(len(fallback.calls), 2)
+        self.assertEqual(len(alerts), 2)
+        self.assertIn("codex/gpt-5.6-luna", alerts[0])
+        self.assertIn("claude/sonnet", alerts[0])
+
+    def test_unlaunchable_cli_without_fallback_still_alerts(self) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [{"_status": "failed", "_error": "CLI executable not found: codex"}],
+        )
+        alerts: list[str] = []
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+            alert_callback=alerts.append,
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "failed")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("沒有可用的備援", alerts[0])
+
     def test_existing_conversation_injects_latest_resume_envelope(self) -> None:
         store = TraceStore(self.db_path)
         first = AgentLoopRunner(

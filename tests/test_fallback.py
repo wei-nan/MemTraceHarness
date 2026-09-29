@@ -32,6 +32,9 @@ class FailureClassifierTests(TestCase):
             "Access denied": "permission",
             "login required": "authentication",
             "connection refused": "network",
+            "codex-will: line 14: exec: /Applications/ChatGPT.app/Contents/Resources/codex: cannot execute: No such file or directory": "cli_unavailable",
+            "CLI executable not found: codex": "cli_unavailable",
+            "config file not found": "configuration",
             "unrecognized provider failure": "unknown",
         }
 
@@ -41,7 +44,8 @@ class FailureClassifierTests(TestCase):
                 self.assertEqual(category, expected)
                 self.assertEqual(
                     permits_cross_provider_fallback(category),
-                    expected in {"quota_exhausted", "rate_limit", "provider_overloaded"},
+                    expected
+                    in {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable"},
                 )
 
     def test_timeout_is_not_a_model_fallback_signal(self) -> None:
