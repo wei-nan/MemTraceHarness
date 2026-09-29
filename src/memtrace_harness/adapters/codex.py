@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from memtrace_harness.adapters.cli import CliModelAdapter
@@ -40,6 +41,13 @@ class CodexCliAdapter(CliModelAdapter):
             command.append("--ignore-user-config")
         if self.context_policy == "loop-snapshot":
             command.extend(["--ignore-rules", "--skip-git-repo-check"])
+        elif not _inside_git_repo(Path(self.working_directory)):
+            # Codex refuses to run in a directory that isn't a git repo unless told
+            # otherwise ("Not inside a trusted directory and --skip-git-repo-check was
+            # not specified"). Some governed projects (e.g. TWTradingStrategy, a plain
+            # scripts folder) legitimately aren't repos; the flag only skips Codex's
+            # own trust check — the role's --sandbox permission above still applies.
+            command.append("--skip-git-repo-check")
         command.append("-")
         return command
 
@@ -134,3 +142,8 @@ def _int(value: Any) -> int:
 def _sum_optional(items: list[dict[str, Any]], key: str) -> int | None:
     values = [item.get(key) for item in items if item.get(key) is not None]
     return sum(_int(value) for value in values) if values else None
+
+
+def _inside_git_repo(directory: Path) -> bool:
+    resolved = directory.resolve()
+    return any((candidate / ".git").exists() for candidate in (resolved, *resolved.parents))
