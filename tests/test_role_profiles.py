@@ -211,3 +211,29 @@ class RoleProfileTests(TestCase):
             profiles = load_role_profiles(path)
 
         self.assertEqual(profiles["planner"].model, "claude-sonnet-pinned")
+
+
+class OutputSchemaStrictModeTests(TestCase):
+    def test_every_object_lists_all_of_its_properties_as_required(self) -> None:
+        # OpenAI structured outputs (used by `codex exec --output-schema`) reject any
+        # object whose `properties` aren't all in `required` (2026-09-29: Red Team's
+        # gate.json failed every codex call with invalid_json_schema). Optional-ness is
+        # expressed as an empty string, never by omitting the key.
+        import json
+
+        from memtrace_harness.output_contracts import PROFILE_SCHEMAS, output_schema_path
+
+        def check(node, path, filename):
+            if isinstance(node, dict):
+                if "properties" in node:
+                    missing = set(node["properties"]) - set(node.get("required", []))
+                    self.assertFalse(missing, f"{filename} {path}: not required: {sorted(missing)}")
+                for key, value in node.items():
+                    check(value, f"{path}/{key}", filename)
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    check(value, f"{path}[{index}]", filename)
+
+        for profile_id in PROFILE_SCHEMAS:
+            path = output_schema_path(profile_id)
+            check(json.loads(path.read_text(encoding="utf-8")), "", path.name)
