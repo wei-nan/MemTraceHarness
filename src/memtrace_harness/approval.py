@@ -16,6 +16,7 @@ VALID_REASONS = {
     "git_push",
     "unattended_write",
     "model_output_invalid",
+    "config_change_required",
 }
 
 # These reasons mean "the loop stopped because it needs information only a human
@@ -68,6 +69,20 @@ class ApprovalRequestData:
                 f"👉 滑動回覆（swipe-reply）這則訊息、直接寫下你的答案，就會帶著答案繼續執行——"
                 f"不用按鈕，也不用特定格式。"
                 f"如果想直接放棄這個任務，按下面的「放棄」。"
+            )
+        if self.reason == "config_change_required":
+            # The stop is caused by a harness/project setting (e.g. agent_loop disabled
+            # in the target project's harness-scope.md), not by missing information: no
+            # approve and no typed answer can change that, so resuming with the same
+            # goal just reproduces this exact stop (2026-09-29: 17 approve/answer rounds
+            # on chat_3317bb36 / chat_0cf19653). Say so, and offer only "give up".
+            return (
+                f"🔧 需要先改設定，核准或回覆都無法解決 [{self.id}]\n"
+                f"工作區：{self.workspace}\n"
+                f"內容：{self.proposed_action}\n\n"
+                f"這個任務被專案的設定擋住了，不是缺資訊——直接核准或回答，只會用同樣的設定再停一次。"
+                f"請先修改設定（例如把該專案 harness-scope.md 的 agent_loop 改成 enabled），"
+                f"改好之後重新下一次任務指令即可。這則請求可以按下方「放棄」關閉。"
             )
         if self.reason == "model_output_invalid":
             # See model_output_invalid's comment above: this is a parsing/schema

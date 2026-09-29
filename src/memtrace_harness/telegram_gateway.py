@@ -273,6 +273,10 @@ class TelegramGateway:
             # would just resume with the same unchanged goal that produced this
             # question in the first place. Answering is a text reply, not a tap.
             return [[{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}]]
+        if reason == "config_change_required":
+            # Only a way to close the request — see format_telegram_message(): neither
+            # approving nor answering can lift a project-setting limit.
+            return [[{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}]]
         if reason == "model_output_invalid":
             # Same approve/reject callback_data as the default case (resolve logic
             # is unchanged) — only the labels differ, since "approve" here means
