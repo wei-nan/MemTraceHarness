@@ -11,4 +11,22 @@ export CODEX_HOME
 # launchd's minimal default and does NOT include ChatGPT.app's Resources dir —
 # only an interactive shell's PATH does. A bare `exec codex` failed with
 # "exec: codex: not found" the first time this ran under launchd (2026-09-05).
-exec "/Applications/ChatGPT.app/Contents/Resources/codex" "$@"
+# ChatGPT.app has moved its bundled binary between releases (Resources/codex ->
+# Resources/codex-cli/bin/codex on 2026-09-27), so try the known locations in order
+# and only then fall back to whatever `codex` PATH provides.
+for candidate in \
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex" \
+    "/Applications/ChatGPT.app/Contents/Resources/codex" \
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex" \
+    "$HOME/.codex/plugins/.plugin-appserver/codex-cli/bin/codex" \
+    "/opt/homebrew/bin/codex" \
+    "/usr/local/bin/codex"; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+if command -v codex >/dev/null 2>&1; then
+    exec codex "$@"
+fi
+echo "codex-will: no codex executable found (looked in ChatGPT.app and standard install locations)" >&2
+exit 127
