@@ -150,6 +150,15 @@ class CliAdapterTests(TestCase):
         self.assertIn("--cd", command)
         self.assertEqual(command[command.index("--cd") + 1], str(self.root))
 
+    def test_codex_skips_git_repo_check_only_outside_a_git_repo(self) -> None:
+        adapter = self._adapter(CodexCliAdapter, StaticProcessRunner(process_result("")))
+        (self.root / ".git").mkdir(exist_ok=True)
+        self.assertNotIn("--skip-git-repo-check", adapter.build_command("prompt"))
+        (self.root / ".git").rmdir()
+        # self.root is a temp dir; only assert the flag when no ancestor is a repo.
+        if not any((p / ".git").exists() for p in (self.root.resolve(), *self.root.resolve().parents)):
+            self.assertIn("--skip-git-repo-check", adapter.build_command("prompt"))
+
     def test_claude_read_only_allowlists_memtrace_read_tools_but_not_write_by_default(self) -> None:
         # 2026-09-05: --permission-mode default requires per-tool approval with no
         # human present headlessly — a real G1 run got its own get_node call denied
