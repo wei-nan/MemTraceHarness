@@ -28,7 +28,7 @@
           "requirement_ref": {"type": "string", "maxLength": 1000},
           "required_action": {"type": "string", "maxLength": 2000}
         },
-        "required": ["description"],
+        "required": ["severity", "description", "evidence_ref", "requirement_ref", "required_action"],
         "additionalProperties": false
       }
     },
