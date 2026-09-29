@@ -32,6 +32,15 @@ class RoleProfileTests(TestCase):
             ["developer"],
         )
 
+    def test_only_developer_has_a_longer_timeout_than_the_global_default(self) -> None:
+        profiles = load_role_profiles()
+
+        self.assertEqual(profiles["developer"].timeout_seconds, 3600)
+        self.assertEqual(
+            [p.profile_id for p in profiles.values() if p.timeout_seconds],
+            ["developer"],
+        )
+
     def test_custom_profile_cannot_grant_controller_write_access(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
