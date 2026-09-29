@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import logging
 from pathlib import Path
 import subprocess
 import time
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
@@ -33,6 +34,8 @@ from memtrace_harness.trace_store import TraceStore
 if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
 
+logger = logging.getLogger(__name__)
+
 
 class AgentLoopRunner:
     """Run a bounded, fail-closed role-profile loop through local CLI adapters."""
@@ -52,7 +55,12 @@ class AgentLoopRunner:
         verify_timeout_seconds: int = 1200,
         config: "HarnessConfig | None" = None,
         agent_loop_enabled: bool = True,
+        alert_callback: Callable[[str], None] | None = None,
     ) -> None:
+        # Operator-facing out-of-band alert (the gateway wires this to Telegram) for
+        # infrastructure faults the operator must fix — currently only a provider CLI
+        # that cannot be launched at all, see _alert_cli_unavailable().
+        self.alert_callback = alert_callback
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
         self.role_profiles = role_profiles or {}
@@ -646,6 +654,17 @@ class AgentLoopRunner:
 
             if response.execution.status == "succeeded":
                 return result
+            if response.execution.failure_category == "cli_unavailable":
+                self._alert_cli_unavailable(
+                    profile_id=profile_id,
+                    adapter=adapter,
+                    execution=response.execution,
+                    next_adapter=(
+                        candidates[attempt_index + 1]
+                        if attempt_index + 1 < len(candidates)
+                        else None
+                    ),
+                )
             if not self._may_fallback(
                 profile_id=profile_id,
                 category=response.execution.failure_category,
@@ -983,7 +1002,13 @@ class AgentLoopRunner:
         if attempt_index + 1 >= len(candidates):
             return False
         profile = self.role_profiles.get(profile_id)
-        if profile is not None and category not in profile.fallback_on:
+        # cli_unavailable bypasses the profile's fallback_on: that list is about capacity
+        # policy, whereas a CLI that cannot launch never evaluated the request at all.
+        if (
+            profile is not None
+            and category != "cli_unavailable"
+            and category not in profile.fallback_on
+        ):
             return False
         if not permits_cross_provider_fallback(category):
             return False
@@ -993,6 +1018,36 @@ class AgentLoopRunner:
         ):
             return False
         return True
+
+    def _alert_cli_unavailable(
+        self,
+        *,
+        profile_id: str,
+        adapter: ModelAdapter,
+        execution: CliExecution,
+        next_adapter: ModelAdapter | None,
+    ) -> None:
+        """Tell the operator a provider CLI could not even be launched. Best-effort:
+        an alert failure must never change the loop's own outcome."""
+        if self.alert_callback is None:
+            return
+        failed = f"{getattr(adapter, 'provider', 'unknown')}/{getattr(adapter, 'model', None) or 'provider-default'}"
+        if next_adapter is not None:
+            follow_up = (
+                f"已自動改用備援 {getattr(next_adapter, 'provider', 'unknown')}/"
+                f"{getattr(next_adapter, 'model', None) or 'provider-default'}。"
+            )
+        else:
+            follow_up = "沒有可用的備援，這個階段會停止。"
+        detail = (execution.error or "").strip().splitlines()
+        try:
+            self.alert_callback(
+                f"⚠️ {profile_id} 角色的 CLI 無法啟動：{failed}。{follow_up}\n"
+                "請檢查該 CLI 的安裝或路徑（例如 App 更新後執行檔位置改變）。\n"
+                f"錯誤：{(detail[0] if detail else '(no error text)')[:300]}"
+            )
+        except Exception:
+            logger.exception("failed to deliver cli_unavailable alert")
 
     def _fallback_cooldown_seconds(self, profile_id: str) -> int:
         profile = self.role_profiles.get(profile_id)

@@ -6,7 +6,7 @@ from memtrace_harness.schemas import CliExecution, FailureCategory
 
 
 CROSS_PROVIDER_FALLBACK_CATEGORIES: frozenset[FailureCategory] = frozenset(
-    {"quota_exhausted", "rate_limit", "provider_overloaded"}
+    {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable"}
 )
 
 
@@ -51,6 +51,17 @@ def classify_execution_failure(execution: CliExecution) -> FailureCategory:
         return "authentication"
     if _contains(detail, "access denied", "permission denied", "operation not permitted"):
         return "permission"
+    # The provider CLI itself could not be launched (binary moved/uninstalled, a wrapper
+    # script pointing at a stale path). Nothing about the request was ever evaluated, so
+    # trying the next provider is safe — unlike a generic "configuration" failure.
+    if _contains(
+        detail,
+        "cli executable not found",
+        "cannot execute",
+        "exec format error",
+        "exec: ",
+    ) and _contains(detail, "not found", "no such file", "cannot execute", "exec format error"):
+        return "cli_unavailable"
     if _contains(detail, "not found", "no such file", "is not recognized", "cannot find"):
         return "configuration"
     if _contains(detail, "connection reset", "connection refused", "dns", "network"):

@@ -22,6 +22,7 @@ FailureCategory = Literal[
     "authentication",
     "permission",
     "configuration",
+    "cli_unavailable",
     "schema",
     "safety",
     "unknown",
