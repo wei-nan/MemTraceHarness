@@ -30,7 +30,7 @@ from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
 from memtrace_harness.scanner import UnattendedScanner
-from memtrace_harness.schedule import ScheduleSpec, compute_next_run
+from memtrace_harness.schedule import ScheduleSpec, compute_next_run, is_past_window_end
 from memtrace_harness.schemas import TaskEnvelope
 from memtrace_harness.scope import load_project_index
 from memtrace_harness.telegram_gateway import TelegramGateway
@@ -741,9 +741,19 @@ def _serve_gateway_loop(
                         kind=row["kind"],
                         interval_seconds=row["interval_seconds"],
                         time_of_day=row["time_of_day"],
+                        end_time_of_day=row.get("end_time_of_day"),
                     )
                     ran_at = datetime.now(timezone.utc)
                     next_run_at = compute_next_run(spec, after=ran_at, tz=schedule_tz)
+                    if is_past_window_end(spec, at=ran_at, tz=schedule_tz):
+                        trace_store.mark_schedule_ran(
+                            row["id"], ran_at=ran_at, next_run_at=next_run_at, status="skipped_window"
+                        )
+                        logger.info(
+                            f"schedule {row['id']} due but past its {spec.end_time_of_day} window "
+                            "end; skipping this run"
+                        )
+                        continue
                     trace_store.mark_schedule_ran(
                         row["id"], ran_at=ran_at, next_run_at=next_run_at, status="triggered"
                     )
@@ -1334,6 +1344,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                         "kind": s["kind"],
                         "interval_seconds": s["interval_seconds"],
                         "time_of_day": s["time_of_day"],
+                        "end_time_of_day": s["end_time_of_day"],
                         "next_run_at": s["next_run_at"],
                         "last_run_at": s["last_run_at"],
                         "goal": s["goal"],

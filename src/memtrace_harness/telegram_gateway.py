@@ -35,6 +35,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Telegram's sendMessage rejects any text over 4096 UTF-16 code units; stay comfortably
+# under that in plain characters so multi-byte text (e.g. Chinese) never trips it.
+TELEGRAM_MAX_MESSAGE_LENGTH = 3500
+
+
+def _split_telegram_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split text into <=limit-char chunks, preferring to break on line boundaries so
+    a long report (e.g. a backtest summary) arrives as multiple readable messages
+    instead of being silently truncated or rejected by Telegram."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 
 def _hydrate_github_issue_context(stage_ref: str, *, working_directory: Path) -> ContextItem | None:
     """Fetch a GitHub issue's real content for a stage_ref shaped "gh:owner/repo#N"
@@ -109,6 +132,12 @@ class TelegramGateway:
             # Enforce allowlist: never send to non-allowlisted chat IDs
             return False
 
+        ok = True
+        for chunk in _split_telegram_text(text):
+            ok = self._send_single_message(chat_id, chunk) and ok
+        return ok
+
+    def _send_single_message(self, chat_id: int, text: str) -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         # Plain text, deliberately no parse_mode: most fields interpolated into these
         # messages (goal text, reasons, recommendations) are arbitrary/user-provided and
@@ -138,10 +167,15 @@ class TelegramGateway:
         message a button/reply is about — see record_telegram_message()."""
         if not self.is_enabled() or chat_id not in self.allowed_chat_ids:
             return None
+        chunks = _split_telegram_text(text)
+        # Send any overflow as plain leading messages, so the keyboard ends up
+        # attached to the final chunk where the operator will actually tap it.
+        for chunk in chunks[:-1]:
+            self._send_single_message(chat_id, chunk)
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = {
             "chat_id": chat_id,
-            "text": text,
+            "text": chunks[-1],
             "reply_markup": {"inline_keyboard": keyboard},
         }
         try:
@@ -817,6 +851,7 @@ class TelegramGateway:
             kind=parsed.kind,
             interval_seconds=parsed.interval_seconds,
             time_of_day=parsed.time_of_day,
+            end_time_of_day=parsed.end_time_of_day,
             chat_id=chat_id,
             next_run_at=next_run_at,
         )
@@ -869,6 +904,7 @@ class TelegramGateway:
                 kind=row["kind"],
                 interval_seconds=row["interval_seconds"],
                 time_of_day=row["time_of_day"],
+                end_time_of_day=row.get("end_time_of_day"),
             )
             next_local = datetime.fromisoformat(row["next_run_at"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
             lines.append(
