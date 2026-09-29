@@ -230,6 +230,70 @@ class CliTests(TestCase):
         _args, kwargs = trace_store.mark_schedule_ran.call_args
         self.assertEqual(kwargs["status"], "triggered")
 
+    def test_serve_gateway_loop_skips_due_schedule_past_its_window_end(self) -> None:
+        import os
+        import signal as signal_module
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli import _serve_gateway_loop
+
+        scope = MagicMock()
+        scope.name = "Beri"
+        gw = MagicMock()
+        gw.projects = [scope]
+        gw.poll_once.return_value = 0
+
+        scanner = MagicMock()
+        config = MagicMock()
+        config.shutdown_grace_seconds = 0
+        config.schedule_timezone = "Asia/Taipei"
+
+        # A weekdays 09:00-13:25 schedule that is somehow still "due" well after
+        # its window closed (e.g. the gateway was down over lunch) must not start
+        # a new run — it should just roll next_run_at forward and skip.
+        due_row = {
+            "id": "sched_window1",
+            "project": "Beri",
+            "goal": "morning backlog review",
+            "kind": "weekdays",
+            "interval_seconds": None,
+            "time_of_day": "09:00",
+            "end_time_of_day": "13:25",
+            "chat_id": 12345,
+        }
+        trace_store = MagicMock()
+
+        def fake_list_due(now):
+            os.kill(os.getpid(), signal_module.SIGTERM)
+            return [due_row]
+
+        trace_store.list_due_schedules.side_effect = fake_list_due
+
+        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
+            with patch("memtrace_harness.cli.datetime") as mock_datetime:
+                # 2026-09-22 (Tuesday) 14:00 Asia/Taipei == 06:00 UTC — past the 13:25 window end.
+                mock_datetime.now.return_value = datetime(2026, 9, 22, 6, 0, tzinfo=timezone.utc)
+                mock_datetime.side_effect = lambda *a, **kw: datetime(*a, **kw)
+                _serve_gateway_loop(
+                    [gw],
+                    scanner,
+                    MagicMock(),
+                    [],
+                    config,
+                    trace_store,
+                    {"Beri": gw},
+                    poll_timeout=1,
+                    scan_interval=9999,
+                    consolidation_interval=9999,
+                    schedule_check_interval=1,
+                )
+
+        gw.run_due_schedule.assert_not_called()
+        trace_store.mark_schedule_ran.assert_called_once()
+        _args, kwargs = trace_store.mark_schedule_ran.call_args
+        self.assertEqual(kwargs["status"], "skipped_window")
+
 
 class UpdateRoleProfileForProjectTests(TestCase):
     """Covers the status dashboard's one write endpoint (POST /api/role-profile) at

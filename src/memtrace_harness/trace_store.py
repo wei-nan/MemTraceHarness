@@ -795,6 +795,7 @@ class TraceStore:
                     kind TEXT NOT NULL,
                     interval_seconds INTEGER,
                     time_of_day TEXT,
+                    end_time_of_day TEXT,
                     chat_id INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
@@ -820,6 +821,7 @@ class TraceStore:
             self._ensure_column(
                 conn, "primary_sessions_hot_log", "consolidated_preference", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
@@ -1370,6 +1372,7 @@ class TraceStore:
         next_run_at: datetime,
         interval_seconds: int | None = None,
         time_of_day: str | None = None,
+        end_time_of_day: str | None = None,
         chat_id: int | None = None,
     ) -> str:
         schedule_id = f"sched_{uuid4().hex[:10]}"
@@ -1378,12 +1381,12 @@ class TraceStore:
                 """
                 INSERT INTO schedules (
                     id, project, workspace_id, goal, kind, interval_seconds,
-                    time_of_day, chat_id, active, created_at, next_run_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    time_of_day, end_time_of_day, chat_id, active, created_at, next_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     schedule_id, project, workspace_id, goal, kind, interval_seconds,
-                    time_of_day, chat_id, utc_now_iso(), next_run_at.isoformat(),
+                    time_of_day, end_time_of_day, chat_id, utc_now_iso(), next_run_at.isoformat(),
                 ),
             )
         return schedule_id
@@ -1398,16 +1401,17 @@ class TraceStore:
             "kind": row[4],
             "interval_seconds": row[5],
             "time_of_day": row[6],
-            "chat_id": row[7],
-            "active": bool(row[8]),
-            "created_at": row[9],
-            "next_run_at": row[10],
-            "last_run_at": row[11],
-            "last_run_status": row[12],
+            "end_time_of_day": row[7],
+            "chat_id": row[8],
+            "active": bool(row[9]),
+            "created_at": row[10],
+            "next_run_at": row[11],
+            "last_run_at": row[12],
+            "last_run_status": row[13],
         }
 
     _SCHEDULE_COLUMNS = (
-        "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, "
+        "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, end_time_of_day, "
         "chat_id, active, created_at, next_run_at, last_run_at, last_run_status"
     )
 

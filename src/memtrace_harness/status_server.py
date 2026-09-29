@@ -326,9 +326,10 @@ function renderSchedules(project) {
   var list = project.schedules || [];
   if (!list.length) return "";
   var rows = list.map(function (s) {
+    var window = s.end_time_of_day ? s.time_of_day + "~" + s.end_time_of_day : s.time_of_day;
     var freq = s.kind === "interval"
       ? "每 " + s.interval_seconds + " 秒"
-      : (s.kind === "daily" ? "每天 " : "每個工作日 ") + s.time_of_day;
+      : (s.kind === "daily" ? "每天 " : "每個工作日 ") + window;
     return '<div class="schedule"><span class="id">' + esc(s.id) + "</span> — " + esc(freq) +
       '<div class="meta">下次 ' + esc(s.next_run_at) + " · " + esc(s.goal.slice(0, 60)) + "</div></div>";
   }).join("");

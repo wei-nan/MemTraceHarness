@@ -8,6 +8,7 @@ from memtrace_harness.schedule import (
     ScheduleSpec,
     compute_next_run,
     describe_schedule,
+    is_past_window_end,
     parse_schedule_spec,
 )
 
@@ -42,6 +43,20 @@ class ParseScheduleSpecTests(TestCase):
     def test_unknown_kind_rejected(self) -> None:
         with self.assertRaises(ValueError):
             parse_schedule_spec("monthly", "1")
+
+    def test_weekdays_parses_window(self) -> None:
+        spec = parse_schedule_spec("weekdays", "9:0-13:25")
+        self.assertEqual(
+            spec, ScheduleSpec(kind="weekdays", time_of_day="09:00", end_time_of_day="13:25")
+        )
+
+    def test_window_rejects_end_before_start(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_schedule_spec("weekdays", "13:25-09:00")
+
+    def test_window_rejects_bad_end_time(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_schedule_spec("daily", "09:00-25:00")
 
 
 class ComputeNextRunTests(TestCase):
@@ -78,6 +93,23 @@ class ComputeNextRunTests(TestCase):
         self.assertEqual(local.weekday(), 0)  # Monday
 
 
+class IsPastWindowEndTests(TestCase):
+    def test_no_end_time_never_past_window(self) -> None:
+        spec = ScheduleSpec(kind="weekdays", time_of_day="09:00")
+        at = datetime(2026, 9, 22, 10, 0, tzinfo=timezone.utc)  # 18:00 Taipei
+        self.assertFalse(is_past_window_end(spec, at=at, tz=TAIPEI))
+
+    def test_before_end_time_is_not_past_window(self) -> None:
+        spec = ScheduleSpec(kind="weekdays", time_of_day="09:00", end_time_of_day="13:25")
+        at = datetime(2026, 9, 22, 1, 0, tzinfo=timezone.utc)  # 09:00 Taipei
+        self.assertFalse(is_past_window_end(spec, at=at, tz=TAIPEI))
+
+    def test_after_end_time_is_past_window(self) -> None:
+        spec = ScheduleSpec(kind="weekdays", time_of_day="09:00", end_time_of_day="13:25")
+        at = datetime(2026, 9, 22, 5, 31, tzinfo=timezone.utc)  # 13:31 Taipei
+        self.assertTrue(is_past_window_end(spec, at=at, tz=TAIPEI))
+
+
 class DescribeScheduleTests(TestCase):
     def test_interval_description(self) -> None:
         self.assertIn("3600", describe_schedule(ScheduleSpec(kind="interval", interval_seconds=3600)))
@@ -89,3 +121,9 @@ class DescribeScheduleTests(TestCase):
         desc = describe_schedule(ScheduleSpec(kind="weekdays", time_of_day="09:00"))
         self.assertIn("工作日", desc)
         self.assertIn("09:00", desc)
+
+    def test_weekdays_description_includes_window(self) -> None:
+        desc = describe_schedule(
+            ScheduleSpec(kind="weekdays", time_of_day="09:00", end_time_of_day="13:25")
+        )
+        self.assertIn("09:00~13:25", desc)
