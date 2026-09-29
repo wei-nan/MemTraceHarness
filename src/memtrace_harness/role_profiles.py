@@ -80,6 +80,10 @@ class RoleProfile:
     fallback_on: tuple[FailureCategory, ...] = ()
     max_fallback_hops: int = 0
     fallback_cooldown_seconds: int = 1800
+    # Per-role CLI wall-clock limit; None means use the global
+    # HARNESS_CLI_TIMEOUT_SECONDS. Long-running roles (Developer running backtests)
+    # need more than the short routing/review stages should be allowed to hang for.
+    timeout_seconds: int | None = None
 
     @classmethod
     def from_mapping(cls, profile_id: str, data: Mapping[str, object]) -> "RoleProfile":
@@ -159,6 +163,10 @@ class RoleProfile:
             raise ValueError(
                 f"Role profile {profile_id!r} has fallbacks but no eligible failure categories"
             )
+        raw_timeout = data.get("timeout_seconds")
+        timeout_seconds = int(raw_timeout) if raw_timeout is not None else None
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError(f"Role profile {profile_id!r} timeout_seconds must be positive")
         return cls(
             profile_id=profile_id,
             role=str(data["role"]),
@@ -173,6 +181,7 @@ class RoleProfile:
             fallback_on=fallback_on,
             max_fallback_hops=max_fallback_hops,
             fallback_cooldown_seconds=cooldown,
+            timeout_seconds=timeout_seconds,
         )
 
     @property
@@ -200,6 +209,7 @@ class RoleProfile:
             "fallback_on": list(self.fallback_on),
             "max_fallback_hops": self.max_fallback_hops,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
+            "timeout_seconds": self.timeout_seconds,
         }
 
 

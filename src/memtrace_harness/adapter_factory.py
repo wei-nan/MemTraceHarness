@@ -40,7 +40,9 @@ def build_provider_adapter(
         "executable": commands[effective_provider],
         "working_directory": effective_directory,
         "trace_root": config.trace_root,
-        "timeout_seconds": timeout_seconds,
+        "timeout_seconds": (
+            profile.timeout_seconds if profile and profile.timeout_seconds else timeout_seconds
+        ),
         "role_profile_id": profile.profile_id if profile else None,
         "model": candidate.model if candidate else profile.model if profile else None,
         "reasoning_effort": (

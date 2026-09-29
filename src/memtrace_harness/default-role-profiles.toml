@@ -62,3 +62,7 @@ permission = "workspace-write"
 context_policy = "accepted-plan-and-repo"
 max_attempts = 1
 quota_bucket = "antigravity-account"
+# 2026-09-29: the global 900s CLI timeout killed a Developer run that was iterating on
+# and re-running a full-market backtest (248 steps); backtest work routinely needs
+# well over 15 minutes. Only this role gets the longer limit.
+timeout_seconds = 3600
