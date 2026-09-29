@@ -1133,6 +1133,10 @@ class AgentLoopRunner:
                 reason = "budget_exhausted"
             elif _is_technical_output_failure(summary.recommendation):
                 reason = "model_output_invalid"
+            elif not self.agent_loop_enabled and "agent_loop" in summary.recommendation:
+                # Stopped because this project's agent_loop is disabled, not for lack of
+                # information — see the "config_change_required" message in approval.py.
+                reason = "config_change_required"
             else:
                 reason = "ambiguous_requirement"
             self.approval_manager.request_approval(

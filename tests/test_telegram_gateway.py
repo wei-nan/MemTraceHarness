@@ -501,6 +501,19 @@ class TelegramGatewayTests(TestCase):
         button_texts = [btn["text"] for row in keyboard for btn in row]
         self.assertEqual(button_texts, ["🛑 放棄這個任務"])
 
+    def test_config_change_required_approval_only_offers_give_up(self) -> None:
+        gateway, approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
+        req = approval_mgr.request_approval(
+            conversation_id="conv_cfg",
+            workspace="ws_test",
+            working_directory="/tmp",
+            reason="config_change_required",
+            proposed_action="agent_loop 已停用",
+        )
+        keyboard = gateway._approval_keyboard(req.id, req.reason)
+        buttons = [(btn["text"], btn["callback_data"]) for row in keyboard for btn in row]
+        self.assertEqual(buttons, [("🛑 放棄這個任務", f"reject:{req.id}")])
+
     def test_model_output_invalid_approval_offers_retry_and_give_up(self) -> None:
         gateway, approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
         req = approval_mgr.request_approval(

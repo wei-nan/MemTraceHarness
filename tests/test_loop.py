@@ -899,6 +899,30 @@ class AgentLoopRunnerTests(TestCase):
             "authentication",
         )
 
+    def test_agent_loop_disabled_stop_is_routed_to_config_change_required(self) -> None:
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller",
+            "codex",
+            "gpt-5.6-luna",
+            [{"action": "ask_human", "reason": "需要改程式碼，但專案 agent_loop 已停用"}],
+        )
+        requested: list[str] = []
+
+        class FakeApprovals:
+            def request_approval(self, **kwargs):
+                requested.append(kwargs["reason"])
+
+        AgentLoopRunner(
+            adapters=adapters,
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+            approval_manager=FakeApprovals(),
+            agent_loop_enabled=False,
+        ).run(self.task)
+
+        self.assertEqual(requested, ["config_change_required"])
+
     def test_unlaunchable_cli_falls_back_and_alerts_operator(self) -> None:
         adapters = self._adapters()
         adapters["controller"] = QueueAdapter(

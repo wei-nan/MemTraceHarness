@@ -42,6 +42,22 @@ class ApprovalMessageTests(TestCase):
             self.assertIn("不是要問你問題", msg)
             self.assertNotIn("需要你回答問題", msg)
 
+    def test_config_change_required_says_approving_cannot_help(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_cfg",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="config_change_required",
+                proposed_action="agent_loop 已停用，需要修改程式碼",
+            )
+            msg = req.format_telegram_message()
+            self.assertIn("需要先改設定", msg)
+            self.assertIn("核准或回覆都無法解決", msg)
+            self.assertNotIn("需要你回答問題", msg)
+
     def test_write_action_reason_keeps_approve_reject_framing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
