@@ -633,6 +633,10 @@ def _make_preference_classifier(config: HarnessConfig, working_directory: Path):
     return classify
 
 
+# How often the gateway loop looks for pending approvals that have outlived their TTL.
+APPROVAL_EXPIRY_CHECK_SECONDS = 600
+
+
 def _serve_gateway_loop(
     gateways: list[TelegramGateway],
     scanner: UnattendedScanner,
@@ -689,6 +693,7 @@ def _serve_gateway_loop(
     last_scan = 0.0
     last_consolidation = 0.0
     last_schedule_check = 0.0
+    last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
     while not stop_requested:
         for gw in gateways:
@@ -721,6 +726,14 @@ def _serve_gateway_loop(
             except Exception:
                 logger.exception("scan pass failed; continuing")
             last_scan = now
+
+        if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
+            for gw in gateways:
+                try:
+                    gw.expire_stale_approvals(config.approval_ttl_hours)
+                except Exception:
+                    logger.exception("expiring stale approvals failed; continuing")
+            last_approval_expiry = now
 
         if now - last_schedule_check >= schedule_check_interval:
             try:

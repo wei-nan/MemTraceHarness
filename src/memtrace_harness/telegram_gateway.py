@@ -8,7 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -464,6 +464,32 @@ class TelegramGateway:
                 self.approval_manager.trace_store.release_workspace_lock(req_data.workspace)
         return msg
 
+    def expire_stale_approvals(self, ttl_hours: int, now: datetime | None = None) -> list[str]:
+        """Close this gateway's pending approvals older than `ttl_hours`: mark them
+        expired, strip their Telegram buttons, and tell the operator once. Workspace
+        locks are deliberately not touched — a lock belongs to whatever run holds it
+        now, not to an old unanswered question. Returns the expired request ids."""
+        if ttl_hours <= 0:
+            return []
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=ttl_hours)
+        workspaces = {p.workspace_id for p in self.projects}
+        stale = self.approval_manager.trace_store.list_stale_pending_approvals(
+            workspaces, cutoff.isoformat()
+        )
+        expired: list[str] = []
+        for data in stale:
+            if not self.approval_manager.trace_store.resolve_approval_request(data["id"], "expired"):
+                continue
+            expired.append(data["id"])
+            if data.get("telegram_chat_id") is not None and data.get("telegram_message_id") is not None:
+                self.clear_message_keyboard(data["telegram_chat_id"], data["telegram_message_id"])
+        if expired:
+            self.notify_all_allowlisted(
+                f"⌛ {len(expired)} 筆超過 {ttl_hours} 小時沒回應的請求已自動失效"
+                f"（{', '.join(expired)}）。它們的按鈕已移除；如果任務還需要，請重新下指令。"
+            )
+        return expired
+
     def _handle_callback_query(self, callback_query: dict[str, Any]) -> str | None:
         """A tap on an approve/reject inline-keyboard button. Telegram delivers this as
         its own update type (not a "message"), separate from ordinary text updates."""
@@ -693,6 +719,11 @@ class TelegramGateway:
     _TASK_START_MARKER = "HARNESS_TASK_START::"
     _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
 
+    _CHAT_MEMTRACE_READ_TOOLS = (
+        "mcp__memtrace__search_nodes,mcp__memtrace__get_node,"
+        "mcp__memtrace__list_nodes,mcp__memtrace__traverse"
+    )
+
     def _chat_reply_and_maybe_start_task(self, scope: ProjectScope, chat_id: int, text: str) -> str:
         """The entire chat front door goes through one model call now: no more
         separate CHAT/QUESTION/LOOKUP/TASK classification pass, and no more
@@ -741,6 +772,11 @@ class TelegramGateway:
             f"{self._identity_context(scope)}\n\n---\n\n"
             f"{off_limits_notice}"
             "你正在跟這個專案的負責人自由對話，直接回覆使用者的訊息即可，一律使用繁體中文。\n\n"
+            "你可以直接使用 MemTrace 的唯讀查詢工具（search_nodes、get_node、list_nodes、"
+            f"traverse）查這個專案的知識庫，工作區 id 是 {scope.workspace_id}；使用者要你查知識庫時"
+            "就直接查，不需要先徵求任何核准。不要說「需要核准權限」或「正在等待權限確認」——沒有"
+            "這樣的核准流程。如果查詢真的失敗或被拒絕，就如實說「這次知識庫查詢失敗」以及看得到的"
+            "原因，不要假裝在等待。\n\n"
             "如果，而且只有在，根據這則訊息（以及前面的對話），你確信使用者現在真的是要你"
             "動手進行開發——修改這個 repo 的程式碼、實際落地某個具體改動——才在回覆的最後"
             f"另起一行，格式為「{self._TASK_START_MARKER}<一句話描述要做的具體任務>」，交給"
@@ -760,6 +796,12 @@ class TelegramGateway:
         failures: list[str] = []
         for provider, model in candidates:
             cmd = [self.config.command_for(provider)]
+            if provider == "claude":
+                # Headless `claude --print` has nobody to approve a tool prompt, so an
+                # un-allowlisted MCP call is just refused (and the model then made up a
+                # "waiting for approval" story — 2026-09-30 貿聯 lookup). MemTrace's
+                # read-only lookups are safe to pre-allow; writes stay unavailable.
+                cmd.extend(["--allowedTools", self._CHAT_MEMTRACE_READ_TOOLS])
             if model:
                 cmd.extend(["--model", model])
             cmd.extend(["--print", prompt])

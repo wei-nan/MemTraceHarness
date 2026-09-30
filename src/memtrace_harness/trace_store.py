@@ -1072,6 +1072,19 @@ class TraceStore:
             ).fetchone()
         return int(row[0])
 
+    def list_stale_pending_approvals(self, workspaces: set[str], older_than_iso: str) -> list[dict]:
+        """Pending approval requests for `workspaces` created before `older_than_iso`."""
+        if not workspaces:
+            return []
+        placeholders = ",".join("?" for _ in workspaces)
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT id FROM approval_requests WHERE status = 'pending' "
+                f"AND created_at < ? AND workspace IN ({placeholders}) ORDER BY created_at",
+                (older_than_iso, *sorted(workspaces)),
+            ).fetchall()
+        return [d for d in (self.get_approval_request(r[0]) for r in rows) if d]
+
     def get_approval_request(self, request_id: str) -> dict | None:
         with self._connection() as conn:
             row = conn.execute(
