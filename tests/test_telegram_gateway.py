@@ -501,6 +501,69 @@ class TelegramGatewayTests(TestCase):
         button_texts = [btn["text"] for row in keyboard for btn in row]
         self.assertEqual(button_texts, ["🛑 放棄這個任務"])
 
+    def test_chat_reply_preallowlists_memtrace_read_tools_for_claude_only(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        gateway, _mgr, _store = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        scope = gateway.projects[0]
+        reply = ProcessResult(
+            command=[], return_code=0, stdout="好", stderr="",
+            started_at="2026-09-30T00:00:00+00:00", completed_at="2026-09-30T00:00:01+00:00",
+            duration_ms=1,
+        )
+        with patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply
+        ) as run:
+            gateway._chat_reply_and_maybe_start_task(scope, 12345, "查一下知識庫")
+        cmd = run.call_args.args[0]
+        allowed = cmd[cmd.index("--allowedTools") + 1]
+        self.assertIn("mcp__memtrace__search_nodes", allowed)
+        self.assertNotIn("update_node", allowed)
+        self.assertNotIn("create_node", allowed)
+        # --allowedTools is variadic: it must come before the flag that precedes the prompt.
+        self.assertLess(cmd.index("--allowedTools"), cmd.index("--print"))
+        self.assertIn("不需要先徵求任何核准", cmd[-1])
+
+    def test_expire_stale_approvals_closes_old_pending_only(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+
+        gateway, mgr, store = self._gateway_for_report_outcome_tests()
+        gateway.notify_all_allowlisted = MagicMock()
+        gateway.clear_message_keyboard = MagicMock()
+        old = mgr.request_approval(
+            conversation_id="conv_old", workspace="ws_test", working_directory="/tmp",
+            reason="ambiguous_requirement", proposed_action="old",
+        )
+        mgr.record_telegram_message(old.id, chat_id=12345, message_id=7)
+        fresh = mgr.request_approval(
+            conversation_id="conv_new", workspace="ws_test", working_directory="/tmp",
+            reason="git_push", proposed_action="fresh",
+        )
+        other = mgr.request_approval(
+            conversation_id="conv_other", workspace="ws_elsewhere", working_directory="/tmp",
+            reason="git_push", proposed_action="other project",
+        )
+        # 13h later: `old` and `fresh` are both stale by then unless created "later";
+        # age only `old` by evaluating just past its TTL.
+        later = datetime.now(timezone.utc) + timedelta(hours=13)
+        with store._connection() as conn:
+            conn.execute(
+                "UPDATE approval_requests SET created_at = ? WHERE id = ?",
+                ((later - timedelta(hours=1)).isoformat(), fresh.id),
+            )
+        expired = gateway.expire_stale_approvals(12, now=later)
+
+        self.assertEqual(expired, [old.id])
+        self.assertEqual(mgr.get_request(old.id).status, "expired")
+        self.assertEqual(mgr.get_request(fresh.id).status, "pending")
+        self.assertEqual(mgr.get_request(other.id).status, "pending")  # other workspace untouched
+        gateway.clear_message_keyboard.assert_called_once_with(12345, 7)
+        gateway.notify_all_allowlisted.assert_called_once()
+        self.assertEqual(gateway.expire_stale_approvals(0, now=later), [])  # ttl 0 disables
+
     def test_config_change_required_approval_only_offers_give_up(self) -> None:
         gateway, approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
         req = approval_mgr.request_approval(

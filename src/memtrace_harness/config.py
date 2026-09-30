@@ -32,6 +32,11 @@ class HarnessConfig:
     shutdown_grace_seconds: int = 120
     reply_language: str | None = "Traditional Chinese (繁體中文，台灣用語與正體字)"
     schedule_timezone: str = "Asia/Taipei"
+    # A pending approval nobody answered for this long is closed automatically so an
+    # old message's buttons can't be tapped later and resume a task the human has since
+    # forgotten (2026-09-30: a day-old backtest approval was tapped thinking it was
+    # something else). 0 disables.
+    approval_ttl_hours: int = 12
 
     def command_for(self, provider: str) -> str:
         if provider == "claude":
@@ -119,6 +124,7 @@ class HarnessConfig:
             )
             or None,
             schedule_timezone=os.getenv("HARNESS_SCHEDULE_TIMEZONE", "Asia/Taipei"),
+            approval_ttl_hours=_non_negative_int(os.getenv("HARNESS_APPROVAL_TTL_HOURS"), 12),
         )
 
     def memory_workspace_id_for(self, project_name: str, project_workspace_id: str) -> str:
@@ -136,6 +142,14 @@ class HarnessConfig:
             or self.harness_memory_workspace_id
             or project_workspace_id
         )
+
+
+def _non_negative_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int(value) if value is not None and value.strip() else default
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _parse_chat_fallbacks(value: str) -> tuple[tuple[str, str], ...]:
