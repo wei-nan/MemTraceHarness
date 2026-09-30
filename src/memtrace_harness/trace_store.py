@@ -1057,6 +1057,21 @@ class TraceStore:
             )
         return request_id
 
+    def count_approval_requests(self, conversation_id: str, reasons: set[str]) -> int:
+        """How many approval requests this conversation has already raised for any of
+        `reasons` (any status) — used to notice a task that keeps stopping on the same
+        kind of question."""
+        if not reasons:
+            return 0
+        placeholders = ",".join("?" for _ in reasons)
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM approval_requests "
+                f"WHERE conversation_id = ? AND reason IN ({placeholders})",
+                (conversation_id, *sorted(reasons)),
+            ).fetchone()
+        return int(row[0])
+
     def get_approval_request(self, request_id: str) -> dict | None:
         with self._connection() as conn:
             row = conn.execute(

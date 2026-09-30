@@ -58,6 +58,45 @@ class ApprovalMessageTests(TestCase):
             self.assertIn("核准或回覆都無法解決", msg)
             self.assertNotIn("需要你回答問題", msg)
 
+    def test_bare_approve_on_a_question_is_refused_and_leaves_it_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            req = mgr.request_approval(
+                conversation_id="conv_q",
+                workspace="ws_test",
+                working_directory=str(tmp_path),
+                reason="ambiguous_requirement",
+                proposed_action="低成交量門檻要多少？",
+            )
+            ok, msg, _ = mgr.respond(req.id, "approve", 12345, None)
+            self.assertFalse(ok)
+            self.assertIn("單純「核准」不會讓任務往前", msg)
+            self.assertEqual(mgr.get_request(req.id).status, "pending")
+            # An actual answer still resumes it.
+            ok, _, data = mgr.respond(req.id, "clarify", 12345, "3000 張")
+            self.assertTrue(ok)
+            self.assertEqual(data.status, "approved")
+
+    def test_repeated_questions_on_one_conversation_are_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            texts = []
+            for _ in range(4):
+                req = mgr.request_approval(
+                    conversation_id="conv_rep",
+                    workspace="ws_test",
+                    working_directory=str(tmp_path),
+                    reason="ambiguous_requirement",
+                    proposed_action="同一個問題",
+                )
+                texts.append(req.proposed_action)
+            self.assertNotIn("第", texts[0])
+            self.assertNotIn("次因為同類問題", texts[1])
+            self.assertIn("第 3 次因為同類問題", texts[2])
+            self.assertIn("第 4 次因為同類問題", texts[3])
+
     def test_write_action_reason_keeps_approve_reject_framing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
