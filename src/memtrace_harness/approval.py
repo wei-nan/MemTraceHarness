@@ -32,6 +32,10 @@ VALID_REASONS = {
 # (reject), so it keeps the ordinary approve/reject framing instead.
 INFO_NEEDED_REASONS = {"ambiguous_requirement", "reasoning_gap", "gate_reject_twice"}
 
+# From this many earlier info-needed requests on the same conversation, the next one is
+# prefixed with a "you've been asked this before" warning (see request_approval()).
+REPEATED_QUESTION_THRESHOLD = 2
+
 
 @dataclass
 class ApprovalRequestData:
@@ -130,6 +134,18 @@ class ApprovalManager:
     ) -> ApprovalRequestData:
         if reason not in VALID_REASONS:
             raise ValueError(f"Invalid approval reason: {reason}")
+        if reason in INFO_NEEDED_REASONS:
+            earlier = self.trace_store.count_approval_requests(
+                conversation_id, INFO_NEEDED_REASONS
+            )
+            if earlier >= REPEATED_QUESTION_THRESHOLD:
+                # Each earlier request was resumed and the loop stopped on the same kind
+                # of question again — the replies given so far aren't resolving it.
+                proposed_action = (
+                    f"⚠️ 這個任務已是第 {earlier + 1} 次因為同類問題停下來——先前的回覆沒有解決它。"
+                    f"請這一次逐項寫出具體答案（不要只回「同意」），或直接放棄這個任務。\n\n"
+                    f"{proposed_action}"
+                )
         req_id = self.trace_store.create_approval_request(
             conversation_id=conversation_id,
             workspace=workspace,
@@ -180,6 +196,22 @@ class ApprovalManager:
 
         if req.status != "pending":
             return False, f"核准請求 {request_id} 已經是「{req.status}」狀態", None
+
+        if (
+            action.lower() == "approve"
+            and req.reason in INFO_NEEDED_REASONS
+            and not (reason_or_answer or "").strip()
+        ):
+            # See INFO_NEEDED_REASONS: a bare approve resumes with the same unchanged
+            # goal and reproduces this exact stop (2026-09-30 chat_74826f4c looped on
+            # it). Leave the request pending and say what is actually needed.
+            return (
+                False,
+                f"請求 {request_id} 是在問問題，單純「核准」不會讓任務往前——同樣的問題會再出現一次。"
+                "請滑動回覆（swipe-reply）該則訊息並寫下具體答案，或用 /clarify 帶上答案；"
+                "想放棄就按「放棄」。",
+                None,
+            )
 
         status_map = {
             "approve": "approved",
