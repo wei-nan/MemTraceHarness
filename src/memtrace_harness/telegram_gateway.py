@@ -20,6 +20,7 @@ from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.memory_digest import DIGEST_TITLE_PREFIX, preference_context_for
+from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
@@ -431,8 +432,16 @@ class TelegramGateway:
             # whether real development work should start).
             scope = result.project_scope
             assert scope is not None
+            # Telegram attaches the full text of a swipe-replied-to message, whoever
+            # sent it — including this bot's own scheduled pushes and notifications
+            # from external scripts that use the same bot, neither of which the
+            # Harness would otherwise ever see (a bot never receives its own messages).
+            quoted = self._replied_to_text(message)
             self.primary_session_mgr.record_turn(
-                project=scope.name, speaker="user", turn_type="chat", content=text
+                project=scope.name,
+                speaker="user",
+                turn_type="chat",
+                content=text if not quoted else f"{text}\n{self._quote_marker(quoted)}",
             )
             self.send_chat_action(chat_id, "typing")
 
@@ -448,7 +457,39 @@ class TelegramGateway:
                 if pending and pending.status == "pending":
                     return self._resolve_approval_action(pending.id, "clarify", chat_id, text)
 
-            return self._chat_reply_and_maybe_start_task(scope, chat_id, text)
+            return self._chat_reply_and_maybe_start_task(scope, chat_id, text, quoted_text=quoted)
+
+    # Stored with the user's turn so the transcript (and the nightly digest) still shows
+    # what a short reply like "那檔怎麼了" was about. Kept after the user's own words so
+    # the part the human actually typed reads first.
+    _QUOTE_STORED_CHARS = 200
+    _QUOTE_PROMPT_CHARS = 1500
+
+    @classmethod
+    def _quote_marker(cls, quoted: str) -> str:
+        shown = quoted if len(quoted) <= cls._QUOTE_STORED_CHARS else quoted[: cls._QUOTE_STORED_CHARS] + "…"
+        return f"（回覆的訊息：「{shown}」）"
+
+    @classmethod
+    def _quoted_reply_notice(cls, quoted: str | None) -> str:
+        if not quoted:
+            return ""
+        shown = quoted if len(quoted) <= cls._QUOTE_PROMPT_CHARS else quoted[: cls._QUOTE_PROMPT_CHARS] + "…（截斷）"
+        return (
+            "使用者這則訊息是「回覆」下面這則訊息——可能是 Harness 的排程推播、你先前的回覆，"
+            "或其他排程腳本發到這個聊天室的通知。請把使用者的話理解成針對它說的；它的內容就是"
+            "你要依據的事實，不要說你看不到。\n"
+            f"被回覆的訊息：\n「{shown}」\n\n"
+        )
+
+    @staticmethod
+    def _replied_to_text(message: dict[str, Any]) -> str | None:
+        reply_to = message.get("reply_to_message")
+        if not isinstance(reply_to, dict):
+            return None
+        text = reply_to.get("text") or reply_to.get("caption")
+        text = text.strip() if isinstance(text, str) else ""
+        return text or None
 
     def _resolve_approval_action(
         self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None
@@ -517,7 +558,9 @@ class TelegramGateway:
             self.answer_callback_query(callback_id, text=result[:200])
         return result
 
-    def _start_or_queue_task(self, scope: ProjectScope, goal: str, chat_id: int) -> str:
+    def _start_or_queue_task(
+        self, scope: ProjectScope, goal: str, chat_id: int, schedule_id: str | None = None
+    ) -> str:
         ws_id = scope.workspace_id
         trace_store = self.approval_manager.trace_store
         if trace_store.get_workspace_lock(ws_id) is not None:
@@ -547,7 +590,7 @@ class TelegramGateway:
 
         def _run() -> None:
             try:
-                summary = self._run_new_task(scope, conv_id, goal)
+                summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id)
                 msg = (
                     f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation[:200]}\n\n"
                     f"🧩 {self._model_summary(summary)}"
@@ -558,6 +601,17 @@ class TelegramGateway:
             except Exception:
                 logger.exception(f"background agent loop for '{scope.name}' ({conv_id}) failed")
                 self.send_message(chat_id, f"⚠️「{scope.name}」的任務執行時發生未預期錯誤，請查看日誌。")
+                if schedule_id:
+                    # The human just got a failure notice for this schedule; without a
+                    # row the chat model would know nothing about it.
+                    self.primary_session_mgr.record_turn(
+                        project=scope.name,
+                        speaker="work_session_report",
+                        turn_type=SCHEDULE_REPORT,
+                        content=f"排程 {schedule_id} 執行失敗（loop {conv_id}，未預期錯誤，詳見日誌）。",
+                        source_work_conversation_id=conv_id,
+                        schedule_id=schedule_id,
+                    )
             finally:
                 trace_store.release_workspace_lock(ws_id)
                 default_tracker.unregister(thread)
@@ -629,7 +683,9 @@ class TelegramGateway:
         digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
         if digests:
             parts.append(f"{_DIGESTS_HEADER}\n\n{digests}")
-        rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
+        rehydration = self.primary_session_mgr.get_rehydration_context(
+            scope.name, tz=ZoneInfo(self.config.schedule_timezone)
+        )
         if rehydration:
             parts.append(f"Prior discussion for this project (open items may still need action):\n\n{rehydration}")
         operator_profile = self._operator_profile_context(scope)
@@ -721,7 +777,9 @@ class TelegramGateway:
                     source="harness",
                 )
             )
-        rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
+        rehydration = self.primary_session_mgr.get_rehydration_context(
+            scope.name, tz=ZoneInfo(self.config.schedule_timezone)
+        )
         if rehydration:
             items.append(
                 ContextItem(
@@ -774,7 +832,9 @@ class TelegramGateway:
         "mcp__memtrace__list_nodes,mcp__memtrace__traverse"
     )
 
-    def _chat_reply_and_maybe_start_task(self, scope: ProjectScope, chat_id: int, text: str) -> str:
+    def _chat_reply_and_maybe_start_task(
+        self, scope: ProjectScope, chat_id: int, text: str, quoted_text: str | None = None
+    ) -> str:
         """The entire chat front door goes through one model call now: no more
         separate CHAT/QUESTION/LOOKUP/TASK classification pass, and no more
         "!"/"/task" marker to mechanically queue a governed task (2026-09-10,
@@ -841,6 +901,7 @@ class TelegramGateway:
             "週五觸發。同一則回覆不要同時輸出這一行和上面的任務啟動標記。不確定使用者是否"
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
             "裡把細節問清楚。\n\n"
+            f"{self._quoted_reply_notice(quoted_text)}"
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
@@ -982,10 +1043,11 @@ class TelegramGateway:
         self.primary_session_mgr.record_turn(
             project=scope.name,
             speaker="system",
-            turn_type="decision",
+            turn_type=SCHEDULE_TRIGGER,
             content=f"排程 {schedule['id']} 觸發：{schedule['goal']}",
+            schedule_id=schedule["id"],
         )
-        self._start_or_queue_task(scope, schedule["goal"], chat_id)
+        self._start_or_queue_task(scope, schedule["goal"], chat_id, schedule_id=schedule["id"])
 
     def list_schedules_message(self, scope: ProjectScope) -> str:
         """Deterministic /schedules reply — no model call, just a formatted read of
@@ -1014,7 +1076,7 @@ class TelegramGateway:
             return f"✅ 已取消排程 {schedule_id}。"
         return f"⚠️ 找不到可取消的排程 {schedule_id}（可能已經被取消，或 ID 打錯了）。"
 
-    def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str):
+    def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str, schedule_id: str | None = None):
         task = TaskEnvelope(
             task_id=f"task_{conv_id}",
             workspace_id=scope.workspace_id,
@@ -1047,13 +1109,26 @@ class TelegramGateway:
             alert_callback=self.notify_all_allowlisted,
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
-        self.primary_session_mgr.record_turn(
-            project=scope.name,
-            speaker="work_session_report",
-            turn_type="dev_report",
-            content=f"Chat-triggered loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
-            source_work_conversation_id=summary.conversation_id,
-        )
+        if schedule_id:
+            self.primary_session_mgr.record_turn(
+                project=scope.name,
+                speaker="work_session_report",
+                turn_type=SCHEDULE_REPORT,
+                content=(
+                    f"排程 {schedule_id} 執行完成（loop {summary.conversation_id}，"
+                    f"狀態 {summary.status}）：{summary.recommendation}"
+                ),
+                source_work_conversation_id=summary.conversation_id,
+                schedule_id=schedule_id,
+            )
+        else:
+            self.primary_session_mgr.record_turn(
+                project=scope.name,
+                speaker="work_session_report",
+                turn_type="dev_report",
+                content=f"Chat-triggered loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
+                source_work_conversation_id=summary.conversation_id,
+            )
         return summary
 
     def _resume_approved_conversation(

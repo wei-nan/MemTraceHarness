@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, tzinfo
 from typing import Any, Callable
 
+from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.trace_store import TraceStore
 
 logger = logging.getLogger(__name__)
@@ -167,11 +168,40 @@ def _format_log(turns: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def split_schedule_activity(turns: list[dict]) -> tuple[list[dict], int, str]:
+    """A schedule that fires every few minutes would otherwise be most of a day's log.
+    Keep every conversation turn, but of the schedule activity only each schedule's
+    LAST result of the day (so it can still be cited), plus a one-line count note.
+    Returns (turns to show, number of conversation turns, note for the prompt)."""
+    conversation = [t for t in turns if t.get("turn_type") not in (SCHEDULE_TRIGGER, SCHEDULE_REPORT)]
+    fired: dict[str, int] = {}
+    goals: dict[str, str] = {}
+    last_report: dict[str, dict] = {}
+    for turn in turns:
+        schedule_id = turn.get("schedule_id")
+        if not schedule_id:
+            continue
+        if turn["turn_type"] == SCHEDULE_TRIGGER:
+            fired[schedule_id] = fired.get(schedule_id, 0) + 1
+            goals[schedule_id] = turn["content"].partition("觸發：")[2].strip() or goals.get(schedule_id, "")
+        elif turn["turn_type"] == SCHEDULE_REPORT:
+            last_report[schedule_id] = turn
+    kept = sorted(conversation + list(last_report.values()), key=lambda t: int(t["turn_seq"]))
+    ids = sorted(set(fired) | set(last_report))
+    note = "\n".join(
+        f"- {sid}「{goals.get(sid, '')[:80]}」：當天觸發 {fired.get(sid, 0)} 次"
+        + ("，只列出最後一次的結果" if sid in last_report else "，沒有執行結果")
+        for sid in ids
+    )
+    return kept, len(conversation), note
+
+
 def build_digest_prompt(
     project: str,
     digest_date: str,
     turns: list[dict],
     carried_open_items: list[dict],
+    schedule_note: str = "",
 ) -> str:
     carried = (
         "\n".join(
@@ -191,6 +221,15 @@ def build_digest_prompt(
         "work_session_report = Agent Loop results.\n\n"
         "Open items carried over from earlier days, by index:\n"
         f"{carried}\n\n"
+        + (
+            "Scheduled runs that fired this day (a run repeats every few minutes, so only "
+            "each schedule's LAST result is in the log below; treat it as a status "
+            "snapshot, not as decisions or lessons):\n"
+            f"{schedule_note}\n\n"
+            if schedule_note
+            else ""
+        )
+        +
         "Return ONLY one JSON object, no prose and no code fence, with exactly these keys:\n"
         "{\n"
         '  "summary": "3 to 8 short lines about what happened this day",\n'
@@ -203,6 +242,10 @@ def build_digest_prompt(
         f'"category": "other", "explicit": true}}]\n'
         "}\n"
         "Rules:\n"
+        "- A user turn may end with （回覆的訊息：「…」）. That quoted text is a message the "
+        "human swiped to reply to (often a push from the harness or a script), not the "
+        "human's own words: use it to understand what the reply is about, never as a "
+        "preference and never as evidence of what the human said.\n"
         "- Every item must cite the turn numbers from THIS day's log that support it. "
         "Items without valid citations are discarded automatically.\n"
         "- decisions: things agreed or settled. facts: durable project knowledge worth "
@@ -413,23 +456,34 @@ def run_digest_for_date(
     previous = _previous_digest(trace_store, project, digest_date)
     carried = list(previous["digest"].get("open_items") or []) if previous else []
 
-    stdout, provider, model = call_model(build_digest_prompt(project, digest_date, turns, carried))
+    turns, conversation_turns, schedule_note = split_schedule_activity(turns)
+    if turns:
+        stdout, provider, model = call_model(
+            build_digest_prompt(project, digest_date, turns, carried, schedule_note)
+        )
+        raw = _extract_json_object(stdout)
+    else:
+        # Only schedule firings with no result (e.g. every run was refused by the
+        # workspace lock): nothing for a model to summarise. Record the day anyway so it
+        # isn't retried forever, and keep carrying the open items forward.
+        provider = model = None
+        raw = {"summary": "（這天只有排程觸發，沒有對話，也沒有執行結果。）"}
     digest, candidates = ground_digest(
-        _extract_json_object(stdout), digest_date=digest_date, turns=turns, carried_open_items=carried
+        raw, digest_date=digest_date, turns=turns, carried_open_items=carried
     )
     trace_store.save_memory_digest(
         project=project,
         digest_date=digest_date,
         provider=provider,
         model=model,
-        turn_count=len(turns),
+        turn_count=conversation_turns,
         digest=digest,
     )
     added = _store_preference_candidates(trace_store, project, digest_date, candidates, turns)
     return DigestOutcome(
         project=project,
         digest_date=digest_date,
-        turn_count=len(turns),
+        turn_count=conversation_turns,
         digest=digest,
         candidates_added=added,
         provider=provider,

@@ -846,6 +846,8 @@ class TraceStore:
                     ON schedules(project, active);
                 """
             )
+            self._ensure_column(conn, "primary_sessions_hot_log", "schedule_id", "TEXT")
+            self._retag_legacy_schedule_turns(conn)
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
@@ -886,6 +888,53 @@ class TraceStore:
             self._ensure_column(conn, "loop_stages", "fallback_from_model", "TEXT")
             self._ensure_column(conn, "loop_stages", "checkpoint_id", "TEXT")
 
+    @staticmethod
+    def _retag_legacy_schedule_turns(conn: sqlite3.Connection) -> None:
+        """Before 2026-10-02 a schedule firing was logged as an ordinary system
+        "decision" turn plus an ordinary "dev_report" turn, so a 10-minute schedule
+        flooded the rolling context window with its own noise (54% of one project's
+        log). New rows are typed schedule_trigger / schedule_report with a schedule_id;
+        this gives the old rows the same shape. Idempotent: only rows still carrying the
+        old shape are touched, and no content changes.
+
+        A trigger row is recognised by its exact text. When two schedules fall due
+        together only the first gets the workspace lock (the second is refused), so a
+        report belongs to the FIRST trigger of the contiguous run of trigger rows right
+        before it."""
+        triggers = conn.execute(
+            "SELECT id, primary_session_id, turn_seq, content FROM primary_sessions_hot_log "
+            "WHERE speaker = 'system' AND turn_type = 'decision' AND content LIKE '排程 sched_%觸發：%'"
+        ).fetchall()
+        for row_id, _session, _seq, content in triggers:
+            schedule_id = content.split(" ", 2)[1]
+            conn.execute(
+                "UPDATE primary_sessions_hot_log SET turn_type = 'schedule_trigger', schedule_id = ? WHERE id = ?",
+                (schedule_id, row_id),
+            )
+        reports = conn.execute(
+            "SELECT id, primary_session_id, turn_seq FROM primary_sessions_hot_log "
+            "WHERE speaker = 'work_session_report' AND turn_type = 'dev_report' "
+            "AND content LIKE 'Chat-triggered loop%' AND schedule_id IS NULL"
+        ).fetchall()
+        for row_id, session_id, seq in reports:
+            first_trigger = None
+            cursor_seq = seq - 1
+            while cursor_seq >= 1:
+                prev = conn.execute(
+                    "SELECT turn_type, schedule_id FROM primary_sessions_hot_log "
+                    "WHERE primary_session_id = ? AND turn_seq = ?",
+                    (session_id, cursor_seq),
+                ).fetchone()
+                if prev is None or prev[0] != "schedule_trigger" or not prev[1]:
+                    break
+                first_trigger = prev[1]
+                cursor_seq -= 1
+            if first_trigger is not None:
+                conn.execute(
+                    "UPDATE primary_sessions_hot_log SET turn_type = 'schedule_report', schedule_id = ? WHERE id = ?",
+                    (first_trigger, row_id),
+                )
+
     def append_primary_session_turn(
         self,
         *,
@@ -897,6 +946,7 @@ class TraceStore:
         provider: str | None = None,
         model: str | None = None,
         source_work_conversation_id: str | None = None,
+        schedule_id: str | None = None,
     ) -> int:
         now = utc_now_iso()
         with self._connection() as conn:
@@ -909,8 +959,9 @@ class TraceStore:
                 """
                 INSERT INTO primary_sessions_hot_log (
                     primary_session_id, project, turn_seq, created_at, speaker,
-                    provider, model, turn_type, content, source_work_conversation_id, consolidated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    provider, model, turn_type, content, source_work_conversation_id, consolidated,
+                    schedule_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
                 """,
                 (
                     primary_session_id,
@@ -923,6 +974,7 @@ class TraceStore:
                     turn_type,
                     content,
                     source_work_conversation_id,
+                    schedule_id,
                 ),
             )
             return cursor.lastrowid
@@ -931,7 +983,7 @@ class TraceStore:
         self, primary_session_id: str, limit: int | None = None, include_consolidated: bool = True
     ) -> list[dict]:
         with self._connection() as conn:
-            query = "SELECT id, primary_session_id, project, turn_seq, created_at, speaker, provider, model, turn_type, content, source_work_conversation_id, consolidated FROM primary_sessions_hot_log WHERE primary_session_id = ?"
+            query = "SELECT id, primary_session_id, project, turn_seq, created_at, speaker, provider, model, turn_type, content, source_work_conversation_id, consolidated, schedule_id FROM primary_sessions_hot_log WHERE primary_session_id = ?"
             params: list[object] = [primary_session_id]
             if not include_consolidated:
                 query += " AND consolidated = 0"
@@ -954,6 +1006,7 @@ class TraceStore:
                 "content": row[9],
                 "source_work_conversation_id": row[10],
                 "consolidated": bool(row[11]),
+                "schedule_id": row[12],
             }
             for row in rows
         ]
@@ -964,8 +1017,8 @@ class TraceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT id, primary_session_id, project, turn_seq, created_at, speaker, "
-                "provider, model, turn_type, content, source_work_conversation_id, consolidated "
-                "FROM primary_sessions_hot_log WHERE primary_session_id = ? "
+                "provider, model, turn_type, content, source_work_conversation_id, consolidated, "
+                "schedule_id FROM primary_sessions_hot_log WHERE primary_session_id = ? "
                 "ORDER BY turn_seq DESC LIMIT ?",
                 (primary_session_id, limit),
             ).fetchall()
@@ -983,6 +1036,7 @@ class TraceStore:
                 "content": row[9],
                 "source_work_conversation_id": row[10],
                 "consolidated": bool(row[11]),
+                "schedule_id": row[12],
             }
             for row in rows
         ]

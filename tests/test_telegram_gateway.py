@@ -954,3 +954,132 @@ class MemoryInjectionTests(TestCase):
             self.assertIn("決定資料期間為三年", identity)
             self.assertIn("決定資料期間為三年", items["harness:daily-digests:test_proj"].body)
             self.assertEqual(items["harness:daily-digests:test_proj"].content_type, "context")
+
+
+class RepliedToMessageTests(TestCase):
+    """2026-10-02: a bot never receives its own messages, and external scripts that post
+    with the same bot token (daily_watchlist.py) never touch the Harness's log, so the chat
+    model did not know what a swipe-reply to one of those pushes was about."""
+
+    PUSH = "🔔 8046 南電 開盤漲幅 3.2%，符合進場條件，建議入場"
+
+    def _update(self, text: str, reply_to: dict | None) -> dict:
+        message = {"chat": {"id": 12345}, "text": text}
+        if reply_to is not None:
+            message["reply_to_message"] = reply_to
+        return {"update_id": 1, "message": message}
+
+    def _chat(self, update: dict):
+        from unittest.mock import MagicMock, patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        gateway, store, scope = _build_schedule_gateway(Path(self._tmp.name))
+        gateway.send_message = MagicMock()
+        gateway.send_chat_action = MagicMock()
+        reply = ProcessResult(
+            command=[], return_code=0, stdout="了解", stderr="",
+            started_at="2026-10-02T00:00:00+00:00", completed_at="2026-10-02T00:00:01+00:00", duration_ms=1,
+        )
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply) as run:
+            gateway.process_update(update)
+        turns = store.get_primary_session_turns("psess_test_proj")
+        return run.call_args.args[0][-1], turns
+
+    def test_replied_to_push_reaches_the_prompt_and_the_transcript(self) -> None:
+        prompt, turns = self._chat(self._update("這檔後來怎麼了", {"message_id": 99, "text": self.PUSH}))
+
+        self.assertIn("被回覆的訊息", prompt)
+        self.assertIn(self.PUSH, prompt)
+        self.assertIn("使用者訊息：這檔後來怎麼了", prompt)
+        user_turn = next(t for t in turns if t["speaker"] == "user")
+        # What the human typed reads first; the quote follows so a later digest still
+        # knows what the short reply referred to.
+        self.assertTrue(user_turn["content"].startswith("這檔後來怎麼了\n（回覆的訊息：「🔔 8046"))
+
+    def test_a_long_quote_is_truncated_in_the_stored_turn_but_not_the_prompt(self) -> None:
+        long_push = "報價 " + "x" * 800
+        prompt, turns = self._chat(self._update("看一下", {"message_id": 99, "text": long_push}))
+
+        self.assertIn(long_push, prompt)
+        stored = next(t for t in turns if t["speaker"] == "user")["content"]
+        self.assertLess(len(stored), 300)
+        self.assertTrue(stored.endswith("…」）"))
+
+    def test_a_caption_counts_and_a_reply_without_text_is_ignored(self) -> None:
+        prompt, _ = self._chat(self._update("這張圖呢", {"message_id": 99, "caption": "走勢圖說明"}))
+        self.assertIn("走勢圖說明", prompt)
+
+        prompt, turns = self._chat(self._update("貼圖那則", {"message_id": 99, "sticker": {}}))
+        self.assertNotIn("被回覆的訊息", prompt)
+        self.assertEqual(next(t for t in turns if t["speaker"] == "user")["content"], "貼圖那則")
+
+    def test_a_plain_message_is_unchanged(self) -> None:
+        prompt, turns = self._chat(self._update("你好", None))
+        self.assertNotIn("被回覆的訊息", prompt)
+        self.assertEqual(next(t for t in turns if t["speaker"] == "user")["content"], "你好")
+
+
+class ScheduledRunLoggingTests(TestCase):
+    def _gateway(self):
+        from unittest.mock import MagicMock
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        gateway, store, scope = _build_schedule_gateway(Path(self._tmp.name))
+        gateway.send_message = MagicMock()
+        return gateway, store, scope
+
+    def test_trigger_and_result_are_typed_and_tagged_with_the_schedule(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        gateway, store, scope = self._gateway()
+        summary = MagicMock(conversation_id="chat_x", status="succeeded", recommendation="未達停損門檻")
+        with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
+            "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
+        ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+            runner.return_value.run.return_value = summary
+            gateway._run_new_task(scope, "chat_x", "追蹤持股", schedule_id="sched_a")
+            gateway._run_new_task(scope, "chat_y", "請開發功能")
+
+        turns = store.get_primary_session_turns("psess_test_proj")
+        scheduled, human = turns
+        self.assertEqual((scheduled["turn_type"], scheduled["schedule_id"]), ("schedule_report", "sched_a"))
+        self.assertIn("排程 sched_a 執行完成", scheduled["content"])
+        self.assertIn("未達停損門檻", scheduled["content"])
+        self.assertEqual((human["turn_type"], human["schedule_id"]), ("dev_report", None))
+
+    def test_due_schedule_logs_a_typed_trigger_and_passes_its_id_on(self) -> None:
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock
+
+        gateway, store, scope = self._gateway()
+        gateway._start_or_queue_task = MagicMock()
+        schedule_id = store.create_schedule(
+            project=scope.name, workspace_id=scope.workspace_id, goal="追蹤持股", kind="interval",
+            interval_seconds=600, chat_id=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+
+        gateway.run_due_schedule(store.get_schedule(schedule_id))
+
+        [trigger] = store.get_primary_session_turns("psess_test_proj")
+        self.assertEqual((trigger["turn_type"], trigger["schedule_id"]), ("schedule_trigger", schedule_id))
+        gateway._start_or_queue_task.assert_called_once()
+        self.assertEqual(gateway._start_or_queue_task.call_args.kwargs["schedule_id"], schedule_id)
+
+    def test_a_crashed_scheduled_run_is_still_recorded(self) -> None:
+        import threading
+        from unittest.mock import MagicMock
+
+        gateway, store, scope = self._gateway()
+        gateway._run_new_task = MagicMock(side_effect=RuntimeError("boom"))
+
+        gateway._start_or_queue_task(scope, "追蹤持股", 12345, schedule_id="sched_a")
+        for t in threading.enumerate():
+            if t.name.startswith("agent-loop-"):
+                t.join(timeout=5)
+
+        [report] = store.get_primary_session_turns("psess_test_proj")
+        self.assertEqual((report["turn_type"], report["schedule_id"]), ("schedule_report", "sched_a"))
+        self.assertIn("執行失敗", report["content"])

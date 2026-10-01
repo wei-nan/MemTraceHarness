@@ -312,3 +312,62 @@ class DigestWindowTests(TestCase):
         self.assertFalse(in_digest_window(at(3)))
         # An afternoon restart must not start digesting immediately.
         self.assertFalse(in_digest_window(at(17, 40)))
+
+
+class ScheduleActivityInDigestTests(TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _sched(self, kind: str, schedule_id: str, content: str, at: str) -> None:
+        turn_id = self.store.append_primary_session_turn(
+            primary_session_id=SESSION, project="proj",
+            speaker="system" if kind == "schedule_trigger" else "work_session_report",
+            turn_type=kind, content=content, schedule_id=schedule_id,
+        )
+        with sqlite3.connect(self.store.db_path) as conn:
+            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (at, turn_id))
+
+    def test_only_each_schedules_last_result_is_shown_with_a_count(self) -> None:
+        _add_turn(self.store, "user", "今天看盤", "2026-09-30T01:00:00+00:00")
+        for i in range(5):
+            at = f"2026-09-30T02:0{i}:00+00:00"
+            self._sched("schedule_trigger", "sched_a", "排程 sched_a 觸發：追蹤持股", at)
+            self._sched("schedule_report", "sched_a", f"排程 sched_a 執行完成：第 {i} 次", at)
+        call, calls = _model({"summary": "看盤", "facts": [{"text": "最後一次未達門檻", "turns": [11]}]})
+
+        outcome = run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call)
+
+        prompt = calls[0]
+        self.assertIn("sched_a「追蹤持股」：當天觸發 5 次，只列出最後一次的結果", prompt)
+        self.assertIn("第 4 次", prompt)
+        self.assertNotIn("第 3 次", prompt)
+        self.assertNotIn("觸發：追蹤持股", prompt)  # trigger rows themselves are not log lines
+        self.assertEqual(outcome.turn_count, 1)  # one real conversation turn
+        # The last result can still be cited as evidence.
+        self.assertEqual(outcome.digest["facts"][0]["turns"], [11])
+
+    def test_a_day_with_only_unanswered_triggers_is_recorded_without_a_model_call(self) -> None:
+        self._sched("schedule_trigger", "sched_a", "排程 sched_a 觸發：追蹤持股", "2026-09-30T02:00:00+00:00")
+        carried = {"summary": "d0", "new_open_items": []}
+        called = []
+
+        outcome = run_digest_for_date(
+            self.store, "proj", SESSION, "2026-09-30", TZ, lambda p: called.append(p) or ("{}", None, None)
+        )
+
+        self.assertEqual(called, [])
+        self.assertEqual(outcome.turn_count, 0)
+        self.assertIn("只有排程觸發", outcome.digest["summary"])
+        self.assertIsNotNone(self.store.get_memory_digest("proj", "2026-09-30"))
+
+    def test_the_prompt_warns_that_a_quoted_reply_is_not_the_humans_words(self) -> None:
+        _add_turn(self.store, "user", "這檔呢\n（回覆的訊息：「建議入場」）", "2026-09-30T01:00:00+00:00")
+        call, calls = _model({"summary": "s"})
+
+        run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call)
+
+        self.assertIn("never as evidence of what the human said", calls[0])
