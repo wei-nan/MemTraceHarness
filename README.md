@@ -294,6 +294,11 @@ repeatedly (e.g. every minute via Windows Task Scheduler) for near-real-time cha
   substantive parts back into MemTrace as draft evidence — never silently, never as canonical
   knowledge. `git push` always requires a separate Telegram approval, even after a full Agent Loop
   pass.
+- A scheduled run is logged as a `schedule_trigger` / `schedule_report` pair carrying the schedule's
+  id, kept out of the conversation window and the hourly MemTrace archive; chat and the Agent Loop
+  instead get one line per schedule (latest result, firings in the last 24h). Swipe-replying to any
+  message — including pushes from this bot's schedules or from external scripts using the same bot
+  token, which the Harness never otherwise sees — puts that message's text in front of the model.
 - **Nightly memory digest** (`gateway --serve`, 02:00–02:59 in `HARNESS_SCHEDULE_TIMEZONE`, Asia/Taipei by default): each
   finished day of a project's transcript is replayed through one tool-less chat-model call into a
   digest (decisions, facts, open items carried forward until resolved, process lessons). Every item
