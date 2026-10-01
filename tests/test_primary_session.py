@@ -216,3 +216,39 @@ class PrimarySessionTests(TestCase):
                 "proj_h", "ws_pref", classify_fn=lambda contents: [True]
             )
             self.assertEqual(len(pref_written), 1)
+
+    def test_consolidate_preferences_only_classifies_the_humans_own_turns(self) -> None:
+        # 2026-10-01: assistant replies and work-session reports were classified too,
+        # and a whole stock-analysis reply ended up in the operator profile.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            trace_store = TraceStore(tmp_path / "test_psess_pref_user_only.sqlite3")
+            mock_client = MagicMock()
+            mock_client.search_nodes.return_value = []
+            psess_mgr = PrimarySessionManager(trace_store, mock_client)
+
+            psess_mgr.record_turn(
+                project="proj_i", speaker="assistant", turn_type="chat", content="以下是 16 檔個股評估"
+            )
+            psess_mgr.record_turn(
+                project="proj_i", speaker="work_session_report", turn_type="dev_report",
+                content="Resumed loop chat_1 completed with status needs_human",
+            )
+            psess_mgr.record_turn(
+                project="proj_i", speaker="user", turn_type="chat", content="以後需要資料直接查 MemTrace"
+            )
+            seen: list[list[str]] = []
+
+            def classify(contents: list[str]) -> list[bool]:
+                seen.append(contents)
+                return [True] * len(contents)
+
+            written = psess_mgr.consolidate_preferences("proj_i", "ws_pref", classify_fn=classify)
+
+            self.assertEqual(seen, [["以後需要資料直接查 MemTrace"]])
+            self.assertEqual(len(written), 1)
+            body = mock_client.create_node.call_args.kwargs["body"]
+            self.assertNotIn("16 檔", body)
+            self.assertNotIn("Resumed loop", body)
+            session_id = psess_mgr.primary_session_id_for_project("proj_i")
+            self.assertEqual(trace_store.get_unconsolidated_turns_for_preference(session_id), [])

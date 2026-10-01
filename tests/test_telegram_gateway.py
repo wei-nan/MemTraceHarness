@@ -893,3 +893,34 @@ class ScheduleCommandTests(TestCase):
             }
             gateway.run_due_schedule(row)  # must not raise
             gateway._run_new_task.assert_not_called()
+
+
+class KnowledgeBaseLocationsTests(TestCase):
+    def test_agent_loop_context_items_name_the_cold_memory_workspace(self) -> None:
+        # 2026-10-01: only the chat identity context used to mention the cold-memory
+        # workspace; Agent Loop tasks got project scope + prior discussion only, so
+        # consolidated history was write-only for Controller/Planner/Developer.
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, _, scope = _build_schedule_gateway(Path(tmp_dir))
+            gateway.config = replace(gateway.config, harness_memory_workspace_id="ws_memory")
+
+            items = {item.ref: item for item in gateway._project_context_items(scope)}
+
+            kb = items["harness:knowledge-bases:test_proj"]
+            self.assertEqual(kb.content_type, "context")
+            self.assertIn("`ws_test`", kb.body)
+            self.assertIn("`ws_memory`", kb.body)
+            self.assertIn("Draft primary session consolidation: test_proj", kb.body)
+            # Chat and Agent Loop are told the same thing.
+            self.assertIn(kb.body, gateway._identity_context(scope))
+
+    def test_falls_back_to_spec_workspace_when_no_memory_workspace_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, _, scope = _build_schedule_gateway(Path(tmp_dir))
+
+            body = gateway._knowledge_base_locations(scope)
+
+            self.assertIn("no dedicated memory workspace is configured", body)
+            self.assertIn("spec workspace `ws_test` itself", body)

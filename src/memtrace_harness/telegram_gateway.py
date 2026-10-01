@@ -563,20 +563,56 @@ class TelegramGateway:
         )
         return f"任務已在背景開始執行：{goal[:80]}"
 
-    def _identity_context(self, scope: ProjectScope) -> str:
+    def _knowledge_base_locations(self, scope: ProjectScope) -> str:
+        """Where this project's knowledge lives in MemTrace — shared by the chat
+        identity context and the Agent Loop's context items. Before 2026-10-01 only
+        chat was told about the cold-memory workspace; the Agent Loop could search
+        MemTrace but only knew the spec workspace from harness-scope.md, so every
+        consolidated conversation note was effectively write-only for it."""
         memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
+        note_shape = (
+            f"draft nodes titled \"Draft primary session consolidation: {scope.name}\" "
+            "(content_type context, tags harness/draft/primary-session), each holding a "
+            "batch of past chat turns and decisions"
+        )
+        if memory_ws == scope.workspace_id:
+            memory_line = (
+                f"- Cold memory (what was discussed/decided before): no dedicated memory "
+                f"workspace is configured, so the periodic background consolidation pass "
+                f"writes into the spec workspace `{memory_ws}` itself, as {note_shape}."
+            )
+        else:
+            memory_line = (
+                f"- Cold memory (what was discussed/decided before): `{memory_ws}` "
+                f"(\"Harness Memory\" in MemTrace), separate from the spec workspace. A "
+                f"periodic background consolidation pass writes {note_shape}."
+            )
+        return "\n".join(
+            [
+                f"Knowledge-base locations for project '{scope.name}':",
+                f"- Project specification (what should be built, accepted decisions): "
+                f"`{scope.workspace_id}`.",
+                memory_line,
+                "The prior-discussion context is only a recent rolling window. When a "
+                "past conversation, task, or decision you need isn't in it, search the "
+                "cold-memory workspace with MemTrace's search_nodes (pass that "
+                "workspace_id explicitly). Cold-memory notes are unreviewed draft "
+                "evidence of what was said, not accepted spec: if one conflicts with "
+                "the spec workspace, the spec wins and the conflict should be flagged.",
+                "A local Claude Code project-memory directory (e.g. under "
+                "~/.claude/projects/.../memory/) you may know of from your own tool "
+                "context is unrelated to the Harness and is NOT one of this project's "
+                "knowledge bases — only the workspaces named here are.",
+            ]
+        )
+
+    def _identity_context(self, scope: ProjectScope) -> str:
         parts = [
             f"You are the Harness agent for project '{scope.name}' (workspace "
             f"`{scope.workspace_id}`). This is the project's harness-scope.md, its source of "
             f"identity, default risk level, and off-limits rules — do not ask the user to repeat "
             f"it:\n\n{scope.raw_markdown.strip()}",
-            f"Cold-memory workspace: `{memory_ws}` (\"Harness Memory\" in MemTrace) — where "
-            "consolidated conversation history and decisions get written as draft evidence "
-            "by a periodic background pass. This is separate from the project's own spec "
-            "workspace above. If you are aware of a local Claude Code project-memory "
-            "directory (e.g. under ~/.claude/projects/.../memory/) from your own tool "
-            "context, that is unrelated to the Harness and must NOT be listed as one of "
-            "this project's registered knowledge bases — only the workspaces named here are.",
+            self._knowledge_base_locations(scope),
             "Language policy: every reply, recommendation, and summary sent back to the "
             "human — in every stage of this run — must be written in Traditional Chinese "
             "(繁體中文，台灣用語與正體字), never Simplified Chinese and never simplified "
@@ -669,7 +705,14 @@ class TelegramGateway:
                 body=scope.raw_markdown.strip(),
                 content_type="context",
                 source="harness",
-            )
+            ),
+            ContextItem(
+                ref=f"harness:knowledge-bases:{scope.name}",
+                title="Knowledge-base locations",
+                body=self._knowledge_base_locations(scope),
+                content_type="context",
+                source="harness",
+            ),
         ]
         rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
         if rehydration:
