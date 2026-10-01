@@ -48,6 +48,9 @@ class StatusEventBus:
 # /api/role-profile (see _StatusRequestHandler.do_POST()) even without that auth
 # story — its only real gate is the dashboard's own bind address (127.0.0.1 unless
 # the operator widens it).
+# Preference review (2026-10-01, explicit user request): POST /api/preference adopts,
+# dismisses, or retires a nightly-digest preference candidate. Same local-only gate.
+# This is the ONLY way a preference takes effect — candidates never apply on their own.
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -176,17 +179,53 @@ _PAGE_TEMPLATE = """<!doctype html>
   .schedule:last-child { border-bottom: none; }
   .schedule .id { color: var(--accent); }
   .schedule .meta { color: var(--muted); font-size: 0.72rem; }
+  .memory-card { background: var(--card); border: 1px solid var(--border); border-radius: 0.6rem; padding: 0.8rem 1rem; margin-bottom: 1rem; }
+  .memory-card h2 { font-size: 1rem; margin: 0 0 0.3rem; }
+  .pref { border-top: 1px solid var(--border); padding: 0.5rem 0; }
+  .pref:first-of-type { border-top: none; }
+  .pref .meta { color: var(--muted); font-size: 0.72rem; display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; }
+  .pref textarea {
+    width: 100%; min-height: 2.6rem; margin: 0.3rem 0; resize: vertical;
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 0.3rem; padding: 0.3rem 0.4rem; font: inherit; font-size: 0.85rem;
+  }
+  .pref-actions { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+  .pref-actions select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 0.3rem; padding: 0.15rem 0.35rem; font-size: 0.75rem;
+  }
+  .pref-btn { border: none; border-radius: 0.3rem; padding: 0.2rem 0.7rem; font-size: 0.78rem; cursor: pointer; font-weight: 600; }
+  .pref-btn.adopt { background: var(--live); color: #16181d; }
+  .pref-btn.dismiss { background: var(--chip); color: var(--text); }
+  .pref-btn.retire { background: #e05555; color: #fff; }
+  .pref-btn:hover { opacity: 0.85; }
+  .pref-btn:disabled { opacity: 0.5; cursor: default; }
+  .pref-status { font-size: 0.72rem; }
+  .pref-status.ok { color: var(--live); }
+  .pref-status.err { color: #e05555; }
+  .tag-explicit { color: var(--live); }
+  .tag-inferred { color: var(--warn); }
+  details.evidence summary, details.digest summary { cursor: pointer; color: var(--accent); font-size: 0.78rem; }
+  .evidence-item { font-size: 0.75rem; color: var(--muted); padding: 0.15rem 0 0.15rem 0.6rem; border-left: 2px solid var(--border); margin: 0.2rem 0; white-space: pre-wrap; }
+  details.digest { border-bottom: 1px solid var(--border); padding: 0.3rem 0; }
+  details.digest:last-child { border-bottom: none; }
+  .digest-body { font-size: 0.8rem; padding: 0.3rem 0 0.2rem 0.6rem; }
+  .digest-body .summary { white-space: pre-wrap; margin-bottom: 0.3rem; }
+  .digest-body ul { margin: 0.1rem 0 0.4rem; padding-left: 1.2rem; }
+  .digest-body .sub { color: var(--muted); font-size: 0.72rem; margin-top: 0.3rem; }
+  .refs { color: var(--muted); font-size: 0.7rem; }
 </style>
 </head>
 <body>
 <header>
   <h1>MemTrace Harness — 運行狀態</h1>
-  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 只有「Agent Loop 角色模型」可以編輯，其餘純檢視</div>
+  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 可編輯：Agent Loop 角色模型、聊天模型、待核准、偏好確認</div>
 </header>
 <div class="toolbar">
   <input id="search" type="text" placeholder="搜尋專案名稱或對話內容…">
 </div>
 <div id="daemon" class="daemon-bar"></div>
+<div id="memory"></div>
 <div id="projects"></div>
 <div id="stage-detail" class="stage-detail">
   <div class="stage-detail-panel">
@@ -198,7 +237,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   </div>
 </div>
 <script>
-var state = { data: null, query: "", collapsed: {} };
+var state = { data: null, query: "", collapsed: {}, prefDrafts: {}, openDetails: {}, renderDeferred: false };
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, function (c) {
@@ -573,6 +612,105 @@ function closeStageDetail() {
   document.getElementById("stage-detail").classList.remove("open");
 }
 
+function categoryLabel(cat) {
+  var labels = (state.data.preferences && state.data.preferences.category_labels) || {};
+  return labels[cat] || cat;
+}
+
+function detailsOpen(key) {
+  return state.openDetails[key] ? " open" : "";
+}
+
+function renderEvidence(rule) {
+  var key = "evidence:" + rule.id;
+  var items = (rule.evidence || []).map(function (e) {
+    return '<div class="evidence-item">' + esc(e.date) + " #" + esc(e.turn_seq) + "：" + esc(e.quote) + "</div>";
+  }).join("");
+  return '<details class="evidence" data-key="' + key + '"' + detailsOpen(key) + "><summary>你當時說的原話（" +
+    (rule.evidence || []).length + "）</summary>" + items + "</details>";
+}
+
+function renderPendingPreference(rule) {
+  var draft = state.prefDrafts[rule.id] || {};
+  var text = draft.text !== undefined ? draft.text : rule.text;
+  var scope = draft.scope || rule.scope;
+  return '<div class="pref" data-id="' + rule.id + '">' +
+    '<div class="meta"><span class="chip">' + esc(categoryLabel(rule.category)) + "</span>" +
+    (rule.explicit
+      ? '<span class="tag-explicit">● 你明確說過的規則</span>'
+      : '<span class="tag-inferred">● 模型推測，請仔細確認</span>') +
+    "<span>來源：" + esc(rule.project) + " · " + esc(rule.source_digest_date || "") + "</span></div>" +
+    '<textarea class="pref-text" data-id="' + rule.id + '">' + esc(text) + "</textarea>" +
+    '<div class="pref-actions">' +
+    '<select class="pref-scope" data-id="' + rule.id + '">' +
+    '<option value="global"' + (scope === "global" ? " selected" : "") + ">全域（所有專案）</option>" +
+    '<option value="project"' + (scope === "project" ? " selected" : "") + ">僅 " + esc(rule.project) + "</option>" +
+    "</select>" +
+    '<button class="pref-btn adopt" data-id="' + rule.id + '" data-action="adopt">✅ 採用</button>' +
+    '<button class="pref-btn dismiss" data-id="' + rule.id + '" data-action="dismiss">略過</button>' +
+    '<span class="pref-status"></span></div>' +
+    renderEvidence(rule) + "</div>";
+}
+
+function renderAdoptedPreference(rule) {
+  return '<div class="pref" data-id="' + rule.id + '">' +
+    '<div class="meta"><span class="chip">' + esc(categoryLabel(rule.category)) + "</span>" +
+    "<span>" + (rule.scope === "global" ? "全域" : "僅 " + esc(rule.project)) + " · 採用於 " + esc((rule.resolved_at || "").slice(0, 10)) + "</span></div>" +
+    '<div class="content">' + esc(rule.text) + "</div>" +
+    '<div class="pref-actions"><button class="pref-btn retire" data-id="' + rule.id + '" data-action="retire">撤銷</button>' +
+    '<span class="pref-status"></span></div>' +
+    renderEvidence(rule) + "</div>";
+}
+
+function renderMemory() {
+  var prefs = state.data.preferences || { pending: [], adopted: [] };
+  var pending = prefs.pending || [];
+  var adopted = prefs.adopted || [];
+  var html = '<div class="memory-card"><h2>🧠 記憶整理 · 偏好確認</h2>' +
+    '<div class="hint">每晚整理出的偏好候選會先停在這裡，採用後才會影響 chat；可以先修改文字或範圍再採用。</div>' +
+    '<div class="section-label">待確認 <span class="badge">' + pending.length + "</span></div>" +
+    (pending.length ? pending.map(renderPendingPreference).join("") : '<div class="empty">目前沒有待確認的偏好</div>') +
+    '<div class="section-label">已採用 (' + adopted.length + ")</div>" +
+    (adopted.length ? adopted.map(renderAdoptedPreference).join("") : '<div class="empty">尚未採用任何偏好</div>') +
+    "</div>";
+  document.getElementById("memory").innerHTML = html;
+}
+
+function renderItemList(title, items, withSince) {
+  if (!items || !items.length) return "";
+  return '<div class="sub">' + title + "</div><ul>" + items.map(function (it) {
+    var refs = it.turns || it.resolved_turns || [];
+    return "<li>" + esc(it.text) +
+      (withSince && it.since ? ' <span class="refs">（自 ' + esc(it.since) + "）</span>" : "") +
+      (refs.length ? ' <span class="refs">#' + refs.map(esc).join(", #") + "</span>" : "") + "</li>";
+  }).join("") + "</ul>";
+}
+
+function renderDigests(project) {
+  var list = project.digests || [];
+  var label = '<div class="section-label">每日摘要（最近 ' + list.length + " 天 · 寫入 " + esc(project.memory_workspace_id || "") + "）</div>";
+  if (!list.length) return label + '<div class="empty">尚無摘要（每天 02:00 整理前一天）</div>';
+  return label + list.map(function (d) {
+    var g = d.digest || {};
+    var key = "digest:" + project.name + ":" + d.digest_date;
+    var meta = d.turn_count + " 則對話 · " + (g.open_items || []).length + " 項未完成" +
+      ((g.preference_candidate_count || 0) ? " · " + g.preference_candidate_count + " 條偏好候選" : "") +
+      (d.synced ? "" : " · 尚未寫入 MemTrace");
+    return '<details class="digest" data-key="' + esc(key) + '"' + detailsOpen(key) + "><summary>" +
+      esc(d.digest_date) + ' <span class="refs">' + esc(meta) + "</span></summary>" +
+      '<div class="digest-body"><div class="summary">' + esc(g.summary || "（無摘要）") + "</div>" +
+      renderItemList("決策", g.decisions) +
+      renderItemList("知識與事實", g.facts) +
+      renderItemList("未完成事項", g.open_items, true) +
+      renderItemList("當天解決", g.resolved_items, true) +
+      renderItemList("過期未處理（超過 14 天）", g.expired_items, true) +
+      renderItemList("流程教訓", g.process_lessons) +
+      '<div class="sub">模型：' + esc((d.provider || "?") + "/" + (d.model || "?")) +
+      " · 無出處而捨棄：" + esc(g.discarded_ungrounded || 0) + "</div>" +
+      "</div></details>";
+  }).join("");
+}
+
 function renderProject(project, q) {
   var collapsed = state.collapsed[project.name] ? " collapsed" : "";
   var visible = matchesQuery(project, q) ? "" : " hidden";
@@ -600,15 +738,26 @@ function renderProject(project, q) {
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
     renderSchedules(project) +
-    '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + '、偏好待處理 ' + project.pending_pref + ')</div>' +
+    '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + ')</div>' +
     renderTurns(project.recent_turns, q) +
+    renderDigests(project) +
     lock + pipelineSection + renderApprovals(project.pending_approvals, project.name) +
     "</div></div>";
 }
 
+function isEditingPreference() {
+  var el = document.activeElement;
+  return !!(el && el.classList && (el.classList.contains("pref-text") || el.classList.contains("pref-scope")));
+}
+
 function render() {
   if (!state.data) return;
+  // An SSE push re-renders everything; don't yank the textarea out from under
+  // someone mid-edit — render once they leave it.
+  if (isEditingPreference()) { state.renderDeferred = true; return; }
+  state.renderDeferred = false;
   renderDaemon(state.data.daemon);
+  renderMemory();
   document.getElementById("projects").innerHTML = state.data.projects.length
     ? state.data.projects.map(function (p) { return renderProject(p, state.query); }).join("")
     : '<div class="empty">（沒有已註冊的專案）</div>';
@@ -618,6 +767,70 @@ function toggleCard(name) {
   state.collapsed[name] = !state.collapsed[name];
   render();
 }
+
+document.addEventListener("toggle", function (e) {
+  var key = e.target && e.target.getAttribute && e.target.getAttribute("data-key");
+  if (key) state.openDetails[key] = e.target.open;
+}, true);
+
+document.addEventListener("input", function (e) {
+  if (!e.target.classList.contains("pref-text")) return;
+  var id = e.target.getAttribute("data-id");
+  state.prefDrafts[id] = Object.assign(state.prefDrafts[id] || {}, { text: e.target.value });
+});
+
+document.addEventListener("change", function (e) {
+  if (!e.target.classList.contains("pref-scope")) return;
+  var id = e.target.getAttribute("data-id");
+  state.prefDrafts[id] = Object.assign(state.prefDrafts[id] || {}, { scope: e.target.value });
+});
+
+document.addEventListener("focusout", function (e) {
+  if (state.renderDeferred && e.target.classList && (e.target.classList.contains("pref-text") || e.target.classList.contains("pref-scope"))) {
+    setTimeout(function () { if (!isEditingPreference()) render(); }, 0);
+  }
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("pref-btn")) return;
+  var btn = e.target;
+  var id = btn.getAttribute("data-id");
+  var action = btn.getAttribute("data-action");
+  var box = btn.closest(".pref");
+  var statusEl = box.querySelector(".pref-status");
+  var body = { id: Number(id), action: action };
+  if (action === "adopt") {
+    body.text = box.querySelector(".pref-text").value;
+    body.scope = box.querySelector(".pref-scope").value;
+  }
+  if (action === "retire" && !confirm("撤銷後這條偏好就不再影響 chat，確定嗎？")) return;
+  var buttons = box.querySelectorAll(".pref-btn");
+  buttons.forEach(function (b) { b.disabled = true; });
+  statusEl.className = "pref-status";
+  statusEl.textContent = "處理中…";
+  fetch("/api/preference", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      if (res.ok) {
+        delete state.prefDrafts[id];
+        statusEl.className = "pref-status ok";
+        statusEl.textContent = res.body.memtrace_synced === false ? "已完成（MemTrace 同步失敗，下次再試）" : "已完成";
+      } else {
+        buttons.forEach(function (b) { b.disabled = false; });
+        statusEl.className = "pref-status err";
+        statusEl.textContent = res.body.error || "失敗";
+      }
+    })
+    .catch(function () {
+      buttons.forEach(function (b) { b.disabled = false; });
+      statusEl.className = "pref-status err";
+      statusEl.textContent = "連線失敗";
+    });
+});
 
 document.getElementById("search").addEventListener("input", function (e) {
   state.query = e.target.value;
@@ -674,6 +887,8 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             self._handle_update_chat_model()
         elif parsed.path == "/api/approval":
             self._handle_approval_action()
+        elif parsed.path == "/api/preference":
+            self._handle_preference_action()
         else:
             self.send_response(404)
             self.end_headers()
@@ -795,6 +1010,47 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             return
         self.bus.publish()
         self._send_json(200, {"ok": True, "message": msg})
+
+    def _handle_preference_action(self) -> None:
+        from memtrace_harness.memory_digest import resolve_preference, sync_operator_profile
+        from memtrace_harness.memtrace_client import MemTraceClient
+        from memtrace_harness.trace_store import TraceStore
+
+        payload = self._read_json_body()
+        try:
+            rule_id = int(payload["id"])
+            action = str(payload["action"]).lower()
+        except (TypeError, KeyError, ValueError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        text = payload.get("text")
+        scope = payload.get("scope")
+        if (text is not None and not isinstance(text, str)) or (scope is not None and not isinstance(scope, str)):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        trace_store = TraceStore(self.config.trace_db_path)
+        try:
+            rule = resolve_preference(trace_store, rule_id, action, text=text, scope=scope)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to resolve a preference")
+            self._send_json(500, {"error": "internal error resolving the preference"})
+            return
+        # Local SQLite is what chat reads, so the change is already in effect here.
+        # Rewriting the MemTrace profile node is a best-effort mirror.
+        synced: bool | None = None
+        if action in ("adopt", "retire") and self.config.memtrace_mcp_url and self.config.operator_preference_workspace_id:
+            try:
+                client = MemTraceClient(self.config.memtrace_mcp_url, self.config.memtrace_api_token)
+                sync_operator_profile(trace_store, client, self.config.operator_preference_workspace_id)
+                synced = True
+            except Exception:
+                logger.exception("mirroring the operator profile to MemTrace failed")
+                synced = False
+        self.bus.publish()
+        self._send_json(200, {"ok": True, "rule": rule, "memtrace_synced": synced})
 
     def _send_json(self, status: int, data: dict) -> None:
         payload = json.dumps(data).encode("utf-8")

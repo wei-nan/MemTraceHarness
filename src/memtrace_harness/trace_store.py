@@ -804,6 +804,34 @@ class TraceStore:
                     last_run_status TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_digests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    digest_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    turn_count INTEGER NOT NULL,
+                    digest_json TEXT NOT NULL,
+                    memtrace_workspace_id TEXT,
+                    memtrace_node_id TEXT,
+                    UNIQUE(project, digest_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS preference_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    explicit INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    source_digest_date TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_turns_conversation
                     ON turns(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
@@ -817,9 +845,6 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_schedules_project
                     ON schedules(project, active);
                 """
-            )
-            self._ensure_column(
-                conn, "primary_sessions_hot_log", "consolidated_preference", "INTEGER NOT NULL DEFAULT 0"
             )
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
@@ -977,50 +1002,225 @@ class TraceStore:
                 turn_ids,
             )
 
-    def get_unconsolidated_turns_for_preference(self, primary_session_id: str) -> list[dict]:
-        """Independent of get_unconsolidated_turns()/consolidated — the goal-oriented axis
-        ("does this matter for the project") and the preference axis ("does this reveal
-        how the human wants to be worked with") are different questions asked of the same
-        turns, so each needs its own pending/done tracking or one pass would silently
-        consume turns the other pass hasn't looked at yet."""
+    # --- Nightly memory digests (memory_digest.py) -------------------------------
+
+    _DIGEST_COLUMNS = (
+        "id, project, digest_date, created_at, provider, model, turn_count, digest_json, "
+        "memtrace_workspace_id, memtrace_node_id"
+    )
+
+    @staticmethod
+    def _digest_row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "project": row[1],
+            "digest_date": row[2],
+            "created_at": row[3],
+            "provider": row[4],
+            "model": row[5],
+            "turn_count": row[6],
+            "digest": json.loads(row[7]),
+            "memtrace_workspace_id": row[8],
+            "memtrace_node_id": row[9],
+        }
+
+    def save_memory_digest(
+        self,
+        *,
+        project: str,
+        digest_date: str,
+        provider: str | None,
+        model: str | None,
+        turn_count: int,
+        digest: dict,
+    ) -> int:
+        """Insert or replace that project's digest for that local date. Replacing
+        clears the MemTrace sync columns so the new content gets written again."""
+        with self._connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO memory_digests (
+                    project, digest_date, created_at, provider, model, turn_count, digest_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project, digest_date) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    turn_count = excluded.turn_count,
+                    digest_json = excluded.digest_json,
+                    memtrace_workspace_id = NULL,
+                    memtrace_node_id = NULL
+                """,
+                (
+                    project,
+                    digest_date,
+                    utc_now_iso(),
+                    provider,
+                    model,
+                    turn_count,
+                    json.dumps(digest, ensure_ascii=False),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM memory_digests WHERE project = ? AND digest_date = ?",
+                (project, digest_date),
+            ).fetchone()
+        return int(row[0]) if row else int(cur.lastrowid or 0)
+
+    def get_memory_digest(self, project: str, digest_date: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests "
+                "WHERE project = ? AND digest_date = ?",
+                (project, digest_date),
+            ).fetchone()
+        return self._digest_row_to_dict(row) if row else None
+
+    def list_memory_digests(self, project: str, limit: int | None = None) -> list[dict]:
+        """Newest first."""
+        query = (
+            f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests WHERE project = ? "
+            "ORDER BY digest_date DESC"
+        )
+        params: tuple = (project,)
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (project, limit)
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._digest_row_to_dict(row) for row in rows]
+
+    def list_digests_needing_sync(self, project: str, workspace_id: str) -> list[dict]:
+        """Digests never written to MemTrace, or written to a different workspace than
+        the project's current memory workspace (e.g. it just got a dedicated one)."""
         with self._connection() as conn:
             rows = conn.execute(
-                """
-                SELECT id, primary_session_id, project, turn_seq, created_at, speaker, provider,
-                       model, turn_type, content, source_work_conversation_id, consolidated
-                FROM primary_sessions_hot_log
-                WHERE primary_session_id = ? AND consolidated_preference = 0
-                ORDER BY turn_seq ASC
-                """,
-                (primary_session_id,),
+                f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests WHERE project = ? AND "
+                "(memtrace_node_id IS NULL OR memtrace_workspace_id IS NOT ?) "
+                "ORDER BY digest_date ASC",
+                (project, workspace_id),
             ).fetchall()
-        return [
-            {
-                "id": row[0],
-                "primary_session_id": row[1],
-                "project": row[2],
-                "turn_seq": row[3],
-                "created_at": row[4],
-                "speaker": row[5],
-                "provider": row[6],
-                "model": row[7],
-                "turn_type": row[8],
-                "content": row[9],
-                "source_work_conversation_id": row[10],
-                "consolidated": bool(row[11]),
-            }
-            for row in rows
-        ]
+        return [self._digest_row_to_dict(row) for row in rows]
 
-    def mark_turns_consolidated_preference(self, turn_ids: list[int]) -> None:
-        if not turn_ids:
-            return
+    def mark_digest_synced(self, digest_id: int, workspace_id: str, node_id: str) -> None:
         with self._connection() as conn:
-            placeholders = ",".join("?" * len(turn_ids))
             conn.execute(
-                f"UPDATE primary_sessions_hot_log SET consolidated_preference = 1 WHERE id IN ({placeholders})",
-                turn_ids,
+                "UPDATE memory_digests SET memtrace_workspace_id = ?, memtrace_node_id = ? "
+                "WHERE id = ?",
+                (workspace_id, node_id, digest_id),
             )
+
+    # --- Operator preference rules (candidates -> human review -> adopted) ---------
+
+    _PREFERENCE_COLUMNS = (
+        "id, project, scope, category, text, evidence_json, explicit, status, "
+        "source_digest_date, created_at, resolved_at"
+    )
+
+    @staticmethod
+    def _preference_row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "project": row[1],
+            "scope": row[2],
+            "category": row[3],
+            "text": row[4],
+            "evidence": json.loads(row[5]),
+            "explicit": bool(row[6]),
+            "status": row[7],
+            "source_digest_date": row[8],
+            "created_at": row[9],
+            "resolved_at": row[10],
+        }
+
+    def add_preference_candidate(
+        self,
+        *,
+        project: str,
+        scope: str,
+        category: str,
+        text: str,
+        evidence: list[dict],
+        explicit: bool,
+        source_digest_date: str | None,
+    ) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO preference_rules (
+                    project, scope, category, text, evidence_json, explicit, status,
+                    source_digest_date, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    project,
+                    scope,
+                    category,
+                    text,
+                    json.dumps(evidence, ensure_ascii=False),
+                    1 if explicit else 0,
+                    source_digest_date,
+                    utc_now_iso(),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def list_preference_rules(
+        self, *, statuses: tuple[str, ...] | None = None, project: str | None = None
+    ) -> list[dict]:
+        query = f"SELECT {self._PREFERENCE_COLUMNS} FROM preference_rules WHERE 1 = 1"
+        params: list = []
+        if statuses:
+            query += f" AND status IN ({','.join('?' * len(statuses))})"
+            params.extend(statuses)
+        if project is not None:
+            query += " AND project = ?"
+            params.append(project)
+        query += " ORDER BY id ASC"
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._preference_row_to_dict(row) for row in rows]
+
+    def get_preference_rule(self, rule_id: int) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._PREFERENCE_COLUMNS} FROM preference_rules WHERE id = ?",
+                (rule_id,),
+            ).fetchone()
+        return self._preference_row_to_dict(row) if row else None
+
+    def update_preference_rule(
+        self,
+        rule_id: int,
+        *,
+        status: str,
+        expected_statuses: tuple[str, ...],
+        text: str | None = None,
+        scope: str | None = None,
+        evidence: list[dict] | None = None,
+    ) -> bool:
+        """Compare-and-set on status so a double click (or the web page and a CLI at
+        once) can't resolve the same rule twice."""
+        sets = ["status = ?", "resolved_at = ?"]
+        params: list = [status, utc_now_iso()]
+        if text is not None:
+            sets.append("text = ?")
+            params.append(text)
+        if scope is not None:
+            sets.append("scope = ?")
+            params.append(scope)
+        if evidence is not None:
+            sets.append("evidence_json = ?")
+            params.append(json.dumps(evidence, ensure_ascii=False))
+        params.append(rule_id)
+        params.extend(expected_statuses)
+        with self._connection() as conn:
+            cur = conn.execute(
+                f"UPDATE preference_rules SET {', '.join(sets)} WHERE id = ? "
+                f"AND status IN ({','.join('?' * len(expected_statuses))})",
+                params,
+            )
+            return cur.rowcount > 0
 
     def create_approval_request(
         self,

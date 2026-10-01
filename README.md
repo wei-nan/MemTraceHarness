@@ -294,6 +294,15 @@ repeatedly (e.g. every minute via Windows Task Scheduler) for near-real-time cha
   substantive parts back into MemTrace as draft evidence — never silently, never as canonical
   knowledge. `git push` always requires a separate Telegram approval, even after a full Agent Loop
   pass.
+- **Nightly memory digest** (`gateway --serve`, 02:00–02:59 in `HARNESS_SCHEDULE_TIMEZONE`, Asia/Taipei by default): each
+  finished day of a project's transcript is replayed through one tool-less chat-model call into a
+  digest (decisions, facts, open items carried forward until resolved, process lessons). Every item
+  must cite turns from that day or it is discarded; the last few digests are injected into chat and
+  Agent Loop context and mirrored to the project's memory workspace in MemTrace. Preference
+  candidates found the same way may only cite the human's own turns and never apply on their own:
+  they wait on the status page until the operator adopts (optionally edits), dismisses, or later
+  retires them. `memory-digest [--project X] [--date YYYY-MM-DD] [--backfill] [--dry-run]` runs it
+  by hand; the automatic pass only catches up the last 2 days.
 
 Full design rationale and the open decisions behind this feature are in
 [`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).

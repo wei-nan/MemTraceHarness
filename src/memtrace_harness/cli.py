@@ -7,6 +7,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,15 @@ from memtrace_harness.config import HarnessConfig
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.loop import AgentLoopRunner
+from memtrace_harness.memory_digest import (
+    AUTO_CATCH_UP_DAYS,
+    PREFERENCE_CATEGORY_LABELS,
+    DigestError,
+    due_digest_dates,
+    in_digest_window,
+    run_digest_for_date,
+    sync_digests_to_memtrace,
+)
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
@@ -82,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
             return status_command(args)
         if args.command == "remove-project":
             return remove_project_command(args)
+        if args.command == "memory-digest":
+            return memory_digest_command(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -243,6 +255,31 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "status",
         help="Show running gateway process(es), registered projects, locks, and pending approvals",
+    )
+
+    digest_parser = subparsers.add_parser(
+        "memory-digest",
+        help=(
+            "Run the nightly memory digest (sleep cycle) now: consolidate finished days "
+            "into digests and preference candidates for review on the status page"
+        ),
+    )
+    digest_parser.add_argument("--project", help="Only this project (default: every registered project)")
+    digest_parser.add_argument(
+        "--date", help="Only this local date (YYYY-MM-DD); replaces an existing digest for it"
+    )
+    digest_parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            f"Digest every past day that has none yet, not just the last "
+            f"{AUTO_CATCH_UP_DAYS} days (one model call per project-day)"
+        ),
+    )
+    digest_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the project-days that would be digested, without any model call",
     )
 
     remove_project_parser = subparsers.add_parser(
@@ -606,36 +643,170 @@ def _make_chat_classifier(config: HarnessConfig, project_name: str, working_dire
     return classify
 
 
-def _make_preference_classifier(config: HarnessConfig, working_directory: Path):
-    """Build the classify_fn consolidate_preferences() uses. Deliberately global, not
-    per-project (config.chat_provider/model/fallbacks directly, not chat_candidates_for)
-    — an operator's preferences aren't scoped to whichever project they happened to
-    mention them in. A different question from _make_chat_classifier(): not "does this
-    matter for the project" but "does this reveal how the human wants to be worked
-    with"."""
-    candidates = ((config.chat_provider, config.chat_model), *config.chat_fallbacks) if config.chat_provider else ()
+# How often the gateway loop checks whether a nightly memory digest is due. Cheap when
+# nothing is due (SQLite reads only); the digest itself runs in its own thread so a
+# multi-minute model call never stalls Telegram polling.
+DIGEST_CHECK_SECONDS = 600
+# A project-day whose digest failed (provider down, unparseable answer) is retried at
+# most this often, instead of on every check.
+DIGEST_RETRY_SECONDS = 3600
+DIGEST_TIMEOUT_SECONDS = 300
+_digest_failures: dict[tuple[str, str], float] = {}
 
-    def classify(contents: list[str]) -> list[bool]:
-        prompt = (
-            "Below are messages a human sent to their assistant, numbered in order. "
-            "For each one, decide if it states a STANDING preference about how this "
-            "human wants to be worked with — something meant to keep applying to "
-            "future conversations, such as interaction style, tone, language, "
-            "formatting, approval habits, or a lasting rule or permission for how the "
-            "assistant should behave.\n"
-            "Answer OTHER for: a one-off request or question about the current task "
-            "(e.g. \"look this up\", \"is there no record of it?\"), anything only about "
-            "the project's own work or data, pasted material, and small talk. A "
-            "preference must read as a rule for next time, not an instruction for "
-            "right now. When unsure, answer OTHER.\n\n"
-            f"Reply with EXACTLY {len(contents)} lines, one per message in the same "
-            "order, each line either the single word PREFERENCE or the single word "
-            "OTHER and nothing else.\n\n"
-            + "\n".join(f"{i + 1}. {c}" for i, c in enumerate(contents))
+
+def make_digest_model_caller(config: HarnessConfig, project_name: str):
+    """One tool-less call through that project's chat candidates, in order. Runs in a
+    neutral empty directory (like Controller's sandbox) rather than the project repo,
+    so a provider CLI's own repo-scoped instructions or auto-memory can't leak into
+    the digest."""
+    candidates = config.chat_candidates_for(project_name)
+    sandbox = (config.trace_root / "digest-workspace").resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+
+    def call(prompt: str) -> tuple[str, str | None, str | None]:
+        errors = []
+        for provider, model in candidates:
+            cmd = [config.command_for(provider)]
+            if model:
+                cmd.extend(["--model", model])
+            cmd.extend(["--print", prompt])
+            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=DIGEST_TIMEOUT_SECONDS)
+            if result.return_code == 0 and result.stdout.strip():
+                return result.stdout, provider, model
+            errors.append(f"{provider}/{model}: exit {result.return_code}")
+        raise DigestError("no chat candidate produced a digest (" + "; ".join(errors) + ")")
+
+    return call
+
+
+def run_memory_digests(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    projects: list,
+    *,
+    max_days_back: int | None,
+    only_date: str | None = None,
+    dry_run: bool = False,
+    respect_retry_backoff: bool = False,
+    log=print,
+) -> dict[str, int]:
+    """Shared by the gateway's nightly trigger and the `memory-digest` command.
+    Returns {project: preference candidates added}. One project-day failing never
+    stops the others; MemTrace sync is best-effort and retried next pass."""
+    tz = ZoneInfo(config.schedule_timezone)
+    now = datetime.now(timezone.utc)
+    added: dict[str, int] = {}
+    for scope in projects:
+        session_id = f"psess_{scope.name}"
+        if only_date is not None:
+            dates = [only_date]
+        else:
+            dates = due_digest_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
+        if dry_run:
+            for d in dates:
+                log(f"[{scope.name}] would digest {d}")
+            continue
+        call_model = make_digest_model_caller(config, scope.name)
+        for d in dates:
+            key = (scope.name, d)
+            if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
+                continue
+            try:
+                outcome = run_digest_for_date(trace_store, scope.name, session_id, d, tz, call_model)
+            except Exception as exc:
+                _digest_failures[key] = time.monotonic()
+                logger.exception(f"[{scope.name}] memory digest for {d} failed; will retry later")
+                log(f"[{scope.name}] digest {d} failed: {exc}")
+                continue
+            _digest_failures.pop(key, None)
+            added[scope.name] = added.get(scope.name, 0) + outcome.candidates_added
+            log(
+                f"[{scope.name}] digested {d}: {outcome.turn_count} turn(s), "
+                f"{len(outcome.digest['decisions'])} decision(s), "
+                f"{len(outcome.digest['open_items'])} open item(s), "
+                f"{outcome.candidates_added} new preference candidate(s), "
+                f"{outcome.digest['discarded_ungrounded']} ungrounded item(s) discarded "
+                f"({outcome.provider}/{outcome.model})"
+            )
+        if memtrace_client is not None:
+            workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+            try:
+                synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id)
+                if synced:
+                    log(f"[{scope.name}] wrote {synced} digest(s) to MemTrace {workspace_id}")
+            except Exception:
+                logger.exception(f"[{scope.name}] syncing digests to MemTrace failed; will retry next pass")
+    return added
+
+
+def _run_nightly_digest_pass(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    projects: list,
+    *,
+    gateway_for_project: dict[str, TelegramGateway],
+    status_bus,
+) -> None:
+    try:
+        added = run_memory_digests(
+            config,
+            trace_store,
+            memtrace_client,
+            projects,
+            max_days_back=AUTO_CATCH_UP_DAYS,
+            respect_retry_backoff=True,
         )
-        return _classify_via_model(candidates, config, working_directory, prompt, contents, "PREFERENCE")
+    except Exception:
+        logger.exception("nightly memory digest pass failed")
+        return
+    if status_bus is not None:
+        status_bus.publish()
+    per_gateway: dict[int, tuple[TelegramGateway, int]] = {}
+    for project, count in added.items():
+        gw = gateway_for_project.get(project)
+        if gw is not None and count:
+            _, previous = per_gateway.get(id(gw), (gw, 0))
+            per_gateway[id(gw)] = (gw, previous + count)
+    for gw, count in per_gateway.values():
+        try:
+            gw.notify_all_allowlisted(
+                f"🧠 昨晚的記憶整理新增了 {count} 條偏好候選，"
+                f"請到 Harness 狀態網頁確認（http://{config.status_server_host}:"
+                f"{config.status_server_port}）。未確認前不會生效。"
+            )
+        except Exception:
+            logger.exception("notifying about new preference candidates failed")
 
-    return classify
+
+def memory_digest_command(args: argparse.Namespace) -> int:
+    config = HarnessConfig.from_env()
+    trace_store = TraceStore(config.trace_db_path)
+    projects = load_project_index(config.project_index_path)
+    if args.project:
+        projects = [p for p in projects if p.name == args.project]
+        if not projects:
+            raise ValueError(f"no registered project named {args.project!r}")
+    if args.date:
+        datetime.strptime(args.date, "%Y-%m-%d")
+    memtrace_client = (
+        MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+        if config.memtrace_mcp_url and not args.dry_run
+        else None
+    )
+    added = run_memory_digests(
+        config,
+        trace_store,
+        memtrace_client,
+        projects,
+        max_days_back=None if args.backfill else AUTO_CATCH_UP_DAYS,
+        only_date=args.date,
+        dry_run=args.dry_run,
+    )
+    if not args.dry_run:
+        print(f"preference candidates added: {sum(added.values())} (review them on the status page)")
+    return 0
 
 
 # How often the gateway loop looks for pending approvals that have outlived their TTL.
@@ -697,6 +868,8 @@ def _serve_gateway_loop(
 
     last_scan = 0.0
     last_consolidation = 0.0
+    last_digest_check = 0.0
+    digest_thread: threading.Thread | None = None
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
@@ -802,20 +975,21 @@ def _serve_gateway_loop(
                 except Exception:
                     logger.exception(f"[{scope.name}] cold-memory consolidation failed; will retry next cycle")
 
-                # Independent second axis: not "does this matter for the project" but
-                # "does this reveal how the human wants to be worked with" — cross-project,
-                # written into a single evolving operator-profile node, not per-project.
-                if config.operator_preference_workspace_id:
-                    try:
-                        pref_classify_fn = _make_preference_classifier(config, scope.working_directory)
-                        pref_written = primary_session_mgr.consolidate_preferences(
-                            scope.name, config.operator_preference_workspace_id, pref_classify_fn
-                        )
-                        if pref_written:
-                            print(f"[{scope.name}] merged {len(pref_written)} preference note(s) into operator profile")
-                    except Exception:
-                        logger.exception(f"[{scope.name}] preference consolidation failed; will retry next cycle")
             last_consolidation = now
+
+        if now - last_digest_check >= DIGEST_CHECK_SECONDS:
+            if (digest_thread is None or not digest_thread.is_alive()) and in_digest_window(
+                datetime.now(schedule_tz)
+            ):
+                digest_thread = threading.Thread(
+                    target=_run_nightly_digest_pass,
+                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects),
+                    kwargs={"gateway_for_project": gateway_for_project, "status_bus": status_bus},
+                    name="memory-digest",
+                    daemon=True,
+                )
+                digest_thread.start()
+            last_digest_check = now
 
     _drain_inflight_agent_loops(config.shutdown_grace_seconds)
 
@@ -1204,6 +1378,10 @@ def _slugify(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "project"
 
 
+# How many recent nightly digests per project the status page shows.
+STATUS_DIGEST_DAYS = 7
+
+
 def _collect_status_data(config: "HarnessConfig") -> dict:
     """Gather the harness's current diagnostic state as plain structured data (JSON-
     safe: only str/int/bool/list/dict). Read-only — never modifies process state,
@@ -1256,7 +1434,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         session_id = f"psess_{scope.name}"
         turn_count = len(trace_store.get_primary_session_turns(session_id))
         pending_goal = len(trace_store.get_unconsolidated_turns(session_id))
-        pending_pref = len(trace_store.get_unconsolidated_turns_for_preference(session_id))
+        digests = trace_store.list_memory_digests(scope.name, limit=STATUS_DIGEST_DAYS)
         lock = trace_store.get_workspace_lock(scope.workspace_id)
         pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
         recent_turns = trace_store.get_recent_primary_session_turns(session_id, limit=5)
@@ -1328,7 +1506,18 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                 "role_profiles_error": role_profiles_error,
                 "turn_count": turn_count,
                 "pending_goal": pending_goal,
-                "pending_pref": pending_pref,
+                "memory_workspace_id": config.memory_workspace_id_for(scope.name, scope.workspace_id),
+                "digests": [
+                    {
+                        "digest_date": d["digest_date"],
+                        "turn_count": d["turn_count"],
+                        "provider": d["provider"],
+                        "model": d["model"],
+                        "synced": d["memtrace_node_id"] is not None,
+                        "digest": d["digest"],
+                    }
+                    for d in digests
+                ],
                 "recent_turns": [
                     {
                         "created_at": turn["created_at"],
@@ -1372,10 +1561,16 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
             }
         )
 
+    preferences = trace_store.list_preference_rules(statuses=("pending", "adopted"))
     return {
         "daemon": daemon,
         "project_index_path": str(config.project_index_path) if config.project_index_path else None,
         "projects": project_entries,
+        "preferences": {
+            "pending": [r for r in preferences if r["status"] == "pending"],
+            "adopted": [r for r in preferences if r["status"] == "adopted"],
+            "category_labels": PREFERENCE_CATEGORY_LABELS,
+        },
         "known_models": {p: sorted(models) for p, models in known_models.items()},
     }
 
@@ -1568,7 +1763,7 @@ def _render_status_text(data: dict) -> str:
 
         lines.append(
             f"    對話記錄：{project['turn_count']} 則"
-            f"（目標分類待處理 {project['pending_goal']}、偏好分類待處理 {project['pending_pref']}）"
+            f"（目標分類待處理 {project['pending_goal']}、每日摘要 {len(project['digests'])} 天）"
         )
         if project["recent_turns"]:
             lines.append("    最近對話：")

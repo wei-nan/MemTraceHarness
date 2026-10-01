@@ -10,9 +10,6 @@ if TYPE_CHECKING:
     from memtrace_harness.runner import HarnessRunner
 
 
-OPERATOR_PROFILE_TITLE = "Operator preference profile"
-
-
 @dataclass
 class PrimarySessionTurn:
     id: int
@@ -86,6 +83,18 @@ class PrimarySessionManager:
         if older_summary:
             return f"{older_summary}\n\nRecent transcript:\n{recent_formatted}"
         return f"Recent transcript:\n{recent_formatted}"
+
+    def get_recent_digests_context(self, project: str) -> str:
+        """Mid-term continuity: the last few nightly digests (memory_digest.py), read
+        from local SQLite so it never depends on MemTrace being reachable."""
+        from memtrace_harness.memory_digest import (
+            RECENT_DIGESTS_FOR_CONTEXT,
+            render_digests_context,
+        )
+
+        return render_digests_context(
+            self.trace_store.list_memory_digests(project, limit=RECENT_DIGESTS_FOR_CONTEXT)
+        )
 
     def consolidate_to_memtrace(
         self,
@@ -173,81 +182,3 @@ class PrimarySessionManager:
 
         self.trace_store.mark_turns_consolidated([t.id for t in turns])
         return [t.id for t in substantive]
-
-    def consolidate_preferences(
-        self,
-        project: str,
-        preference_workspace_id: str,
-        classify_fn: Callable[[list[str]], list[bool]] | None,
-    ) -> list[int]:
-        """The preference/interaction-style axis of cold memory — a separate question
-        from consolidate_to_memtrace()'s "does this matter for the project", asked of the
-        same turns but tracked with its own consolidated_preference flag so the two
-        passes never consume each other's pending turns. Unlike project decisions (which
-        accumulate as separate draft notes), promoted turns get merged into ONE
-        continuously-updated operator profile node — this is meant to read like a slowly-
-        changing profile, not a growing log."""
-        session_id = self.primary_session_id_for_project(project)
-        unconsolidated_data = self.trace_store.get_unconsolidated_turns_for_preference(session_id)
-        if not unconsolidated_data:
-            return []
-
-        turns = [PrimarySessionTurn(**d) for d in unconsolidated_data]
-        # Only the human's own words can state how the human wants to be worked
-        # with. Assistant replies, system decisions and work-session reports used to
-        # go through the classifier too, and a full stock-analysis reply plus a
-        # "Resumed loop ... needs_human" status line ended up merged into the
-        # profile that every chat reply is told to follow (found 2026-10-01).
-        # Non-user turns are still marked done below, just never classified.
-        candidates = [t for t in turns if t.speaker == "user"]
-        promoted: list[PrimarySessionTurn] = []
-        if classify_fn and candidates:
-            try:
-                flags = classify_fn([t.content for t in candidates])
-                if len(flags) == len(candidates):
-                    promoted = [t for t, is_preference in zip(candidates, flags) if is_preference]
-            except Exception:
-                pass  # fail closed: classifier errors never block consolidation itself
-
-        if promoted:
-            if not self.memtrace_client:
-                non_promoted = [t.id for t in turns if t not in promoted]
-                if non_promoted:
-                    self.trace_store.mark_turns_consolidated_preference(non_promoted)
-                return []
-            self._merge_into_operator_profile(preference_workspace_id, promoted)
-
-        self.trace_store.mark_turns_consolidated_preference([t.id for t in turns])
-        return [t.id for t in promoted]
-
-    def _merge_into_operator_profile(
-        self, workspace_id: str, promoted: list[PrimarySessionTurn]
-    ) -> None:
-        assert self.memtrace_client is not None
-        new_lines = "\n".join(f"- {t.content}" for t in promoted)
-        existing = self.memtrace_client.search_nodes(
-            workspace_id=workspace_id, query=OPERATOR_PROFILE_TITLE, stage="preference_consolidation"
-        )
-        existing_node = next(
-            (n for n in existing if isinstance(n, dict) and n.get("title") == OPERATOR_PROFILE_TITLE and n.get("id")),
-            None,
-        )
-        if existing_node:
-            current = self.memtrace_client.get_node(
-                workspace_id=workspace_id, node_id=str(existing_node["id"]), stage="preference_consolidation"
-            )
-            current_body = str(current.get("body") or "").strip()
-            merged_body = f"{current_body}\n{new_lines}".strip() if current_body else new_lines
-            self.memtrace_client.update_node(
-                workspace_id=workspace_id, node_id=str(existing_node["id"]), body=merged_body,
-                stage="preference_consolidation",
-            )
-        else:
-            self.memtrace_client.create_node(
-                workspace_id=workspace_id,
-                title=OPERATOR_PROFILE_TITLE,
-                body=new_lines,
-                content_type="preference",
-                tags=["harness", "draft", "operator-preference"],
-                stage="preference_consolidation",
-            )
