@@ -818,6 +818,17 @@ class TraceStore:
                     UNIQUE(project, digest_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    first_turn_seq INTEGER NOT NULL,
+                    last_turn_seq INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(workspace_id, node_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS preference_rules (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project TEXT NOT NULL,
@@ -846,6 +857,8 @@ class TraceStore:
                     ON schedules(project, active);
                 """
             )
+            self._ensure_column(conn, "memory_digests", "node_dirty", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "memory_digests", "edges_synced", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "primary_sessions_hot_log", "schedule_id", "TEXT")
             self._retag_legacy_schedule_turns(conn)
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
@@ -1060,7 +1073,7 @@ class TraceStore:
 
     _DIGEST_COLUMNS = (
         "id, project, digest_date, created_at, provider, model, turn_count, digest_json, "
-        "memtrace_workspace_id, memtrace_node_id"
+        "memtrace_workspace_id, memtrace_node_id, node_dirty, edges_synced"
     )
 
     @staticmethod
@@ -1076,6 +1089,8 @@ class TraceStore:
             "digest": json.loads(row[7]),
             "memtrace_workspace_id": row[8],
             "memtrace_node_id": row[9],
+            "node_dirty": bool(row[10]),
+            "edges_synced": bool(row[11]),
         }
 
     def save_memory_digest(
@@ -1088,8 +1103,9 @@ class TraceStore:
         turn_count: int,
         digest: dict,
     ) -> int:
-        """Insert or replace that project's digest for that local date. Replacing
-        clears the MemTrace sync columns so the new content gets written again."""
+        """Insert or replace that project's digest for that local date. Replacing keeps
+        the MemTrace node it already has and marks it dirty, so the next sync updates
+        that node in place instead of leaving the old version next to a new one."""
         with self._connection() as conn:
             cur = conn.execute(
                 """
@@ -1102,8 +1118,7 @@ class TraceStore:
                     model = excluded.model,
                     turn_count = excluded.turn_count,
                     digest_json = excluded.digest_json,
-                    memtrace_workspace_id = NULL,
-                    memtrace_node_id = NULL
+                    node_dirty = 1
                 """,
                 (
                     project,
@@ -1145,24 +1160,86 @@ class TraceStore:
         return [self._digest_row_to_dict(row) for row in rows]
 
     def list_digests_needing_sync(self, project: str, workspace_id: str) -> list[dict]:
-        """Digests never written to MemTrace, or written to a different workspace than
-        the project's current memory workspace (e.g. it just got a dedicated one)."""
+        """Digests never written to MemTrace, written to a different workspace than the
+        project's current memory workspace (e.g. it just got a dedicated one), or
+        regenerated since they were written."""
         with self._connection() as conn:
             rows = conn.execute(
                 f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests WHERE project = ? AND "
-                "(memtrace_node_id IS NULL OR memtrace_workspace_id IS NOT ?) "
+                "(memtrace_node_id IS NULL OR memtrace_workspace_id IS NOT ? OR node_dirty = 1) "
                 "ORDER BY digest_date ASC",
                 (project, workspace_id),
             ).fetchall()
         return [self._digest_row_to_dict(row) for row in rows]
 
-    def mark_digest_synced(self, digest_id: int, workspace_id: str, node_id: str) -> None:
+    def mark_digest_synced(
+        self, digest_id: int, workspace_id: str, node_id: str, *, new_node: bool = True
+    ) -> None:
+        """new_node=True: a node was just created, so its edges still have to be made.
+        False: an existing node was updated in place and keeps the edges it has."""
         with self._connection() as conn:
             conn.execute(
-                "UPDATE memory_digests SET memtrace_workspace_id = ?, memtrace_node_id = ? "
+                "UPDATE memory_digests SET memtrace_workspace_id = ?, memtrace_node_id = ?, "
+                "node_dirty = 0, edges_synced = CASE WHEN ? THEN 0 ELSE edges_synced END "
                 "WHERE id = ?",
-                (workspace_id, node_id, digest_id),
+                (workspace_id, node_id, 1 if new_node else 0, digest_id),
             )
+
+    def list_digests_needing_edges(self, project: str, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests WHERE project = ? AND "
+                "memtrace_workspace_id = ? AND memtrace_node_id IS NOT NULL AND edges_synced = 0 "
+                "ORDER BY digest_date ASC",
+                (project, workspace_id),
+            ).fetchall()
+        return [self._digest_row_to_dict(row) for row in rows]
+
+    def mark_digest_edges_synced(self, digest_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE memory_digests SET edges_synced = 1 WHERE id = ?", (digest_id,))
+
+    def previous_synced_digest(self, project: str, workspace_id: str, before_date: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._DIGEST_COLUMNS} FROM memory_digests WHERE project = ? AND "
+                "memtrace_workspace_id = ? AND memtrace_node_id IS NOT NULL AND digest_date < ? "
+                "ORDER BY digest_date DESC LIMIT 1",
+                (project, workspace_id, before_date),
+            ).fetchone()
+        return self._digest_row_to_dict(row) if row else None
+
+    # --- Hourly archive nodes written to MemTrace (memory_drafts) ------------------
+
+    def record_memory_draft(
+        self, *, project: str, workspace_id: str, node_id: str, first_turn_seq: int, last_turn_seq: int
+    ) -> None:
+        """Remember which MemTrace node holds which turns. Until 2026-10-02 the id
+        create_node returned was thrown away, so nothing could be linked to a draft."""
+        with self._connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_drafts (
+                    project, workspace_id, node_id, first_turn_seq, last_turn_seq, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, node_id) DO UPDATE SET
+                    first_turn_seq = excluded.first_turn_seq,
+                    last_turn_seq = excluded.last_turn_seq
+                """,
+                (project, workspace_id, node_id, first_turn_seq, last_turn_seq, utc_now_iso()),
+            )
+
+    def list_memory_drafts(self, project: str, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT node_id, first_turn_seq, last_turn_seq, created_at FROM memory_drafts "
+                "WHERE project = ? AND workspace_id = ? ORDER BY first_turn_seq ASC",
+                (project, workspace_id),
+            ).fetchall()
+        return [
+            {"node_id": r[0], "first_turn_seq": r[1], "last_turn_seq": r[2], "created_at": r[3]}
+            for r in rows
+        ]
 
     # --- Operator preference rules (candidates -> human review -> adopted) ---------
 

@@ -189,18 +189,62 @@ class MemTraceClient:
         *,
         workspace_id: str,
         node_id: str,
-        body: str,
+        body: str | None = None,
+        title: str | None = None,
         run_id: str | None = None,
         task_id: str | None = None,
         stage: str | None = None,
     ) -> None:
-        self.call_tool(
-            "update_node",
-            {"workspace_id": workspace_id, "node_id": node_id, "body": body},
-            run_id=run_id,
-            task_id=task_id,
+        arguments: dict[str, Any] = {"workspace_id": workspace_id, "node_id": node_id}
+        if body is not None:
+            arguments["body"] = body
+        if title is not None:
+            arguments["title"] = title
+        self.call_tool("update_node", arguments, run_id=run_id, task_id=task_id, stage=stage)
+
+    def create_edge(
+        self,
+        *,
+        workspace_id: str,
+        from_id: str,
+        to_id: str,
+        relation: str,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        stage: str | None = None,
+    ) -> bool:
+        """True if the edge was created, False if MemTrace already had it (HTTP 409 /
+        unique_edge) — callers can treat both as "the link exists", so a retry after a
+        partial failure is harmless. Anything else raises."""
+        try:
+            self.call_tool(
+                "create_edge",
+                {"workspace_id": workspace_id, "from_id": from_id, "to_id": to_id, "relation": relation},
+                run_id=run_id,
+                task_id=task_id,
+                stage=stage,
+            )
+        except MemTraceClientError as exc:
+            message = str(exc).lower()
+            if "already exists" in message or "unique_edge" in message or "409" in message:
+                return False
+            raise
+        return True
+
+    def list_nodes(
+        self, *, workspace_id: str, limit: int = 200, offset: int = 0, stage: str | None = None
+    ) -> list[dict[str, Any]]:
+        result = self.call_tool(
+            "list_nodes",
+            {"workspace_id": workspace_id, "limit": limit, "offset": offset},
             stage=stage,
         )
+        text = _extract_text(result)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise MemTraceClientError(f"list_nodes returned non-JSON content: {text}") from exc
+        return data if isinstance(data, list) else []
 
     def search_nodes(
         self,

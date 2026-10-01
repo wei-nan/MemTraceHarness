@@ -26,7 +26,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable
 
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
@@ -562,24 +562,91 @@ def render_digests_context(digests_newest_first: list[dict], char_budget: int = 
 # --- MemTrace sync ---------------------------------------------------------------
 
 
-def sync_digests_to_memtrace(trace_store: TraceStore, memtrace_client, project: str, workspace_id: str) -> int:
-    """Write digests MemTrace doesn't have yet (or that were written to a workspace
-    the project no longer uses). Local SQLite stays the source of truth: a failed
-    write is retried on the next pass and never blocks injection."""
-    synced = 0
-    for row in trace_store.list_digests_needing_sync(project, workspace_id):
-        node_id = memtrace_client.create_node(
+def _digest_turn_range(
+    trace_store: TraceStore, project: str, digest_date: str, tz: tzinfo
+) -> tuple[int, int] | None:
+    """First and last turn number of that local day, from the local log."""
+    day_turns = turns_by_local_date(
+        trace_store.get_primary_session_turns(f"psess_{project}"), tz
+    ).get(digest_date)
+    if not day_turns:
+        return None
+    seqs = [int(t["turn_seq"]) for t in day_turns]
+    return min(seqs), max(seqs)
+
+
+def _link_digest(
+    trace_store: TraceStore, memtrace_client, project: str, workspace_id: str, row: dict, tz: tzinfo
+) -> None:
+    """Make the digest navigable in MemTrace: `extends` the previous day's digest (a
+    timeline to walk) and `extracted_from` every hourly draft holding turns of that day
+    (from the summary back to its evidence). Raises on the first real failure; creating
+    an edge MemTrace already has counts as done, so the whole step is safe to retry."""
+    node_id = row["memtrace_node_id"]
+    previous = trace_store.previous_synced_digest(project, workspace_id, row["digest_date"])
+    if previous is not None:
+        memtrace_client.create_edge(
             workspace_id=workspace_id,
-            title=digest_title(project, row["digest_date"]),
-            body=render_digest_markdown(project, row["digest_date"], row["digest"]),
-            content_type="context",
-            tags=["harness", "draft", "daily-digest"],
-            force_create=True,
+            from_id=node_id,
+            to_id=previous["memtrace_node_id"],
+            relation="extends",
             stage="daily_digest",
         )
-        trace_store.mark_digest_synced(row["id"], workspace_id, str(node_id))
-        synced += 1
-    return synced
+    day = _digest_turn_range(trace_store, project, row["digest_date"], tz)
+    if day is None:
+        return
+    for draft in trace_store.list_memory_drafts(project, workspace_id):
+        if draft["first_turn_seq"] <= day[1] and draft["last_turn_seq"] >= day[0]:
+            memtrace_client.create_edge(
+                workspace_id=workspace_id,
+                from_id=node_id,
+                to_id=draft["node_id"],
+                relation="extracted_from",
+                stage="daily_digest",
+            )
+
+
+def sync_digests_to_memtrace(
+    trace_store: TraceStore, memtrace_client, project: str, workspace_id: str, tz: tzinfo | None = None
+) -> int:
+    """Write digests MemTrace doesn't have yet, refresh ones regenerated since, and move
+    ones written to a workspace the project no longer uses; then link them (see
+    _link_digest). Local SQLite stays the source of truth: a failed write or link is
+    retried on the next pass and never blocks injection. Returns nodes written."""
+    tz = tz or timezone.utc
+    written = 0
+    for row in trace_store.list_digests_needing_sync(project, workspace_id):
+        title = digest_title(project, row["digest_date"])
+        body = render_digest_markdown(project, row["digest_date"], row["digest"])
+        if row["memtrace_node_id"] and row["memtrace_workspace_id"] == workspace_id:
+            # Regenerated: update the node it already has rather than leaving the old
+            # version beside a new one.
+            memtrace_client.update_node(
+                workspace_id=workspace_id,
+                node_id=row["memtrace_node_id"],
+                body=body,
+                title=title,
+                stage="daily_digest",
+            )
+            trace_store.mark_digest_synced(
+                row["id"], workspace_id, row["memtrace_node_id"], new_node=False
+            )
+        else:
+            node_id = memtrace_client.create_node(
+                workspace_id=workspace_id,
+                title=title,
+                body=body,
+                content_type="context",
+                tags=["harness", "draft", "daily-digest"],
+                force_create=True,
+                stage="daily_digest",
+            )
+            trace_store.mark_digest_synced(row["id"], workspace_id, str(node_id), new_node=True)
+        written += 1
+    for row in trace_store.list_digests_needing_edges(project, workspace_id):
+        _link_digest(trace_store, memtrace_client, project, workspace_id, row, tz)
+        trace_store.mark_digest_edges_synced(row["id"])
+    return written
 
 
 # --- Preferences -----------------------------------------------------------------

@@ -631,11 +631,13 @@ class TelegramGateway:
         consolidated conversation note was effectively write-only for it."""
         memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
         note_shape = (
-            f"draft nodes titled \"Draft primary session consolidation: {scope.name}\" "
-            "(content_type context, tags harness/draft/primary-session), each holding a "
-            "batch of past chat turns and decisions, plus one nightly digest per day "
-            f"titled \"{DIGEST_TITLE_PREFIX}: {scope.name} <YYYY-MM-DD>\" (tag daily-digest) "
-            "with that day's decisions, facts and open items"
+            f"draft nodes titled \"Draft: {scope.name} <YYYY-MM-DD HH:MM>（turns #a–#b）· "
+            "<how it opens>\" (content_type context, tags harness/draft/primary-session), "
+            "each holding a batch of past chat turns and decisions, plus one nightly digest "
+            f"per day titled \"{DIGEST_TITLE_PREFIX}: {scope.name} <YYYY-MM-DD>\" (tag "
+            "daily-digest) with that day's decisions, facts and open items. A digest is "
+            "linked by `extends` to the previous day's digest and by `extracted_from` to the "
+            "drafts it was made from, so traverse from a digest to reach its raw evidence"
         )
         if memory_ws == scope.workspace_id:
             memory_line = (
