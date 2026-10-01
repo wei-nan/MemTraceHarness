@@ -94,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
             return remove_project_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
+        if args.command == "memory-drafts":
+            return memory_drafts_command(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -280,6 +282,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="List the project-days that would be digested, without any model call",
+    )
+
+    drafts_parser = subparsers.add_parser(
+        "memory-drafts",
+        help=(
+            "Rename the old hourly archive nodes in MemTrace (all titled "
+            "'Draft primary session consolidation: <project>') by date and turn range, and "
+            "record which node holds which turns. Dry run unless --apply."
+        ),
+    )
+    drafts_parser.add_argument("--project", help="Only this project (default: every registered project)")
+    drafts_parser.add_argument(
+        "--apply", action="store_true", help="Actually rename the nodes (default: only print the plan)"
+    )
+    drafts_parser.add_argument(
+        "--plan-file", type=Path, help="Also write the full old -> new plan to this markdown file"
     )
 
     remove_project_parser = subparsers.add_parser(
@@ -732,7 +750,7 @@ def run_memory_digests(
         if memtrace_client is not None:
             workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
             try:
-                synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id)
+                synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)
                 if synced:
                     log(f"[{scope.name}] wrote {synced} digest(s) to MemTrace {workspace_id}")
             except Exception:
@@ -778,6 +796,43 @@ def _run_nightly_digest_pass(
             )
         except Exception:
             logger.exception("notifying about new preference candidates failed")
+
+
+def memory_drafts_command(args: argparse.Namespace) -> int:
+    from memtrace_harness.memory_drafts import apply_draft_retitle, plan_draft_retitle
+
+    config = HarnessConfig.from_env()
+    if not config.memtrace_mcp_url:
+        raise RuntimeError("MEMTRACE_MCP_URL is required")
+    trace_store = TraceStore(config.trace_db_path)
+    projects = load_project_index(config.project_index_path)
+    if args.project:
+        projects = [p for p in projects if p.name == args.project]
+        if not projects:
+            raise ValueError(f"no registered project named {args.project!r}")
+    client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+    tz = ZoneInfo(config.schedule_timezone)
+    report: list[str] = []
+    total = 0
+    for scope in projects:
+        workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+        plans, skipped = plan_draft_retitle(client, trace_store, scope.name, workspace_id, tz)
+        print(f"[{scope.name}] {workspace_id}: {len(plans)} draft(s) to rename, {len(skipped)} skipped")
+        report.append(f"## {scope.name} — `{workspace_id}` ({len(plans)} to rename, {len(skipped)} skipped)\n")
+        report += [f"- `{p.node_id}` → {p.new_title}" for p in plans]
+        report += [f"- `{k.node_id}` **skipped**: {k.reason}" for k in skipped]
+        report.append("")
+        for p in plans[:3] + plans[-1:]:
+            print(f"    {p.node_id}  →  {p.new_title}")
+        for k in skipped:
+            print(f"    skipped {k.node_id}: {k.reason}")
+        if args.apply and plans:
+            total += apply_draft_retitle(client, trace_store, scope.name, workspace_id, plans)
+    if args.plan_file:
+        args.plan_file.write_text("\n".join(report), encoding="utf-8")
+        print(f"full plan written to {args.plan_file}")
+    print(f"renamed {total} node(s)" if args.apply else "dry run: nothing was changed (use --apply)")
+    return 0
 
 
 def memory_digest_command(args: argparse.Namespace) -> int:
@@ -966,7 +1021,7 @@ def _serve_gateway_loop(
                     memory_workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
                     classify_fn = _make_chat_classifier(config, scope.name, scope.working_directory)
                     written = primary_session_mgr.consolidate_to_memtrace(
-                        scope.name, memory_workspace_id, classify_fn
+                        scope.name, memory_workspace_id, classify_fn, tz=schedule_tz
                     )
                     if written:
                         print(f"[{scope.name}] consolidated {len(written)} turn(s) to MemTrace as draft evidence")

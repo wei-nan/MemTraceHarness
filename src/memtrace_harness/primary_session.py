@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING, Callable
 
+from memtrace_harness.memory_drafts import draft_title
+
 if TYPE_CHECKING:
     from memtrace_harness.memtrace_client import MemTraceClient
     from memtrace_harness.trace_store import TraceStore
@@ -175,6 +177,7 @@ class PrimarySessionManager:
         project: str,
         workspace_id: str,
         classify_chat_fn: Callable[[list[str]], list[bool]] | None = None,
+        tz: tzinfo | None = None,
     ) -> list[int]:
         """Classify unconsolidated turns and write substantive ones to MemTrace as draft
         evidence — the "cold memory" side of the hot/cold split (hot = the running
@@ -222,7 +225,9 @@ class PrimarySessionManager:
             except Exception:
                 pass  # fail closed: classifier errors never block consolidation itself
 
-        substantive = deterministic + promoted_chat
+        # In turn order: the body and the title's turn range read as one stretch of
+        # conversation, not "decisions first, then whichever chat turns got promoted".
+        substantive = sorted(deterministic + promoted_chat, key=lambda t: t.turn_seq)
         chat_only = [t for t in turns if t not in substantive]
 
         if substantive:
@@ -254,14 +259,28 @@ class PrimarySessionManager:
             # what MemTrace's similarity-based duplicate detection would otherwise
             # reject (observed for real against the MemTrace project's own
             # consolidation; see the beri-consolidation-content_type-bug memory note).
-            self.memtrace_client.create_node(
+            # Titled by when and which turns (see memory_drafts.py): the same title for
+            # every draft made them indistinguishable in MemTrace.
+            node_id = self.memtrace_client.create_node(
                 workspace_id=workspace_id,
-                title=f"Draft primary session consolidation: {project}",
+                title=draft_title(
+                    project,
+                    [(t.turn_seq, t.created_at, t.speaker, t.content) for t in substantive],
+                    tz or timezone.utc,
+                ),
                 body=summary_content,
                 content_type="context",
                 tags=["harness", "draft", "primary-session"],
                 force_create=True,
                 stage="consolidation",
+            )
+            # Remember which node holds which turns, so the nightly digest can link to it.
+            self.trace_store.record_memory_draft(
+                project=project,
+                workspace_id=workspace_id,
+                node_id=str(node_id),
+                first_turn_seq=substantive[0].turn_seq,
+                last_turn_seq=substantive[-1].turn_seq,
             )
 
         self.trace_store.mark_turns_consolidated([t.id for t in turns])

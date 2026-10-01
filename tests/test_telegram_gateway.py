@@ -912,7 +912,8 @@ class KnowledgeBaseLocationsTests(TestCase):
             self.assertEqual(kb.content_type, "context")
             self.assertIn("`ws_test`", kb.body)
             self.assertIn("`ws_memory`", kb.body)
-            self.assertIn("Draft primary session consolidation: test_proj", kb.body)
+            self.assertIn("Draft: test_proj <YYYY-MM-DD HH:MM>", kb.body)
+            self.assertIn("`extracted_from`", kb.body)
             # Chat and Agent Loop are told the same thing.
             self.assertIn(kb.body, gateway._identity_context(scope))
 
