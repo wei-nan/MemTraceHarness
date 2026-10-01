@@ -48,9 +48,11 @@ class StatusEventBus:
 # /api/role-profile (see _StatusRequestHandler.do_POST()) even without that auth
 # story — its only real gate is the dashboard's own bind address (127.0.0.1 unless
 # the operator widens it).
-# Preference review (2026-10-01, explicit user request): POST /api/preference adopts,
-# dismisses, or retires a nightly-digest preference candidate. Same local-only gate.
-# This is the ONLY way a preference takes effect — candidates never apply on their own.
+# Preferences (2026-10-01/02, explicit user request): the Harness adopts and retires
+# the operator's standing preferences ITSELF (nightly digest, or a correction made in
+# chat); this page is the after-the-fact view and override. POST /api/preference adopts a
+# rule that was left waiting (over the per-day auto-adopt cap), dismisses it, retires an
+# adopted one, or restores a retired one. Same local-only gate as the other writes.
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -203,6 +205,8 @@ _PAGE_TEMPLATE = """<!doctype html>
   .pref-status { font-size: 0.72rem; }
   .pref-status.ok { color: var(--live); }
   .pref-status.err { color: #e05555; }
+  .tag-auto { color: var(--accent); }
+  .pref-btn.restore { background: var(--chip); color: var(--text); }
   .tag-explicit { color: var(--live); }
   .tag-inferred { color: var(--warn); }
   details.evidence summary, details.digest summary { cursor: pointer; color: var(--accent); font-size: 0.78rem; }
@@ -624,7 +628,8 @@ function detailsOpen(key) {
 function renderEvidence(rule) {
   var key = "evidence:" + rule.id;
   var items = (rule.evidence || []).map(function (e) {
-    return '<div class="evidence-item">' + esc(e.date) + " #" + esc(e.turn_seq) + "：" + esc(e.quote) + "</div>";
+    var at = e.turn_seq === null || e.turn_seq === undefined ? "" : " #" + e.turn_seq;
+    return '<div class="evidence-item">' + esc(e.date) + esc(at) + "：" + esc(e.quote) + "</div>";
   }).join("");
   return '<details class="evidence" data-key="' + key + '"' + detailsOpen(key) + "><summary>你當時說的原話（" +
     (rule.evidence || []).length + "）</summary>" + items + "</details>";
@@ -652,26 +657,51 @@ function renderPendingPreference(rule) {
     renderEvidence(rule) + "</div>";
 }
 
+var ADOPTED_BY_LABELS = {
+  "harness-digest": "Harness 每晚整理時自動採用",
+  "harness-chat": "Harness 依你的聊天更正",
+  "operator": "你在網頁採用"
+};
+
 function renderAdoptedPreference(rule) {
   return '<div class="pref" data-id="' + rule.id + '">' +
-    '<div class="meta"><span class="chip">' + esc(categoryLabel(rule.category)) + "</span>" +
-    "<span>" + (rule.scope === "global" ? "全域" : "僅 " + esc(rule.project)) + " · 採用於 " + esc((rule.resolved_at || "").slice(0, 10)) + "</span></div>" +
+    '<div class="meta"><span class="chip">#' + rule.id + " " + esc(categoryLabel(rule.category)) + "</span>" +
+    '<span class="tag-auto">' + esc(ADOPTED_BY_LABELS[rule.adopted_by] || "已採用") + "</span>" +
+    "<span>" + (rule.scope === "global" ? "全域" : "僅 " + esc(rule.project)) + " · " + esc((rule.resolved_at || "").slice(0, 10)) + "</span></div>" +
     '<div class="content">' + esc(rule.text) + "</div>" +
     '<div class="pref-actions"><button class="pref-btn retire" data-id="' + rule.id + '" data-action="retire">撤銷</button>' +
     '<span class="pref-status"></span></div>' +
     renderEvidence(rule) + "</div>";
 }
 
+function renderRetiredPreference(rule) {
+  return '<div class="pref" data-id="' + rule.id + '">' +
+    '<div class="meta"><span class="chip">#' + rule.id + " " + esc(categoryLabel(rule.category)) + "</span>" +
+    "<span>" + esc((rule.resolved_at || "").slice(0, 10)) + " 撤回</span></div>" +
+    '<div class="content">' + esc(rule.text) + "</div>" +
+    '<div class="meta">' + esc(rule.retire_reason || "") + "</div>" +
+    '<div class="pref-actions"><button class="pref-btn restore" data-id="' + rule.id + '" data-action="restore">恢復</button>' +
+    '<span class="pref-status"></span></div></div>';
+}
+
 function renderMemory() {
-  var prefs = state.data.preferences || { pending: [], adopted: [] };
+  var prefs = state.data.preferences || { pending: [], adopted: [], retired: [] };
   var pending = prefs.pending || [];
-  var adopted = prefs.adopted || [];
-  var html = '<div class="memory-card"><h2>🧠 記憶整理 · 偏好確認</h2>' +
-    '<div class="hint">每晚整理出的偏好候選會先停在這裡，採用後才會影響 chat；可以先修改文字或範圍再採用。</div>' +
-    '<div class="section-label">待確認 <span class="badge">' + pending.length + "</span></div>" +
-    (pending.length ? pending.map(renderPendingPreference).join("") : '<div class="empty">目前沒有待確認的偏好</div>') +
+  var adopted = (prefs.adopted || []).slice().sort(function (a, b) { return b.id - a.id; });
+  var retired = prefs.retired || [];
+  var html = '<div class="memory-card"><h2>🧠 記憶整理 · 偏好</h2>' +
+    '<div class="hint">Harness 會自己從你的對話歸納偏好，直接採用並套用到之後的聊天，不需要先經過你；' +
+    "不同意可以直接在聊天裡說（例如「那個不用了」），或在這裡撤銷。每條都附你當時說的原話。</div>" +
     '<div class="section-label">已採用 (' + adopted.length + ")</div>" +
     (adopted.length ? adopted.map(renderAdoptedPreference).join("") : '<div class="empty">尚未採用任何偏好</div>') +
+    (pending.length
+      ? '<div class="section-label">等你確認 <span class="badge">' + pending.length + "</span></div>" +
+        '<div class="hint">超過每日自動採用上限，或舊版留下來的候選；採用前可以先修改。</div>' +
+        pending.map(renderPendingPreference).join("")
+      : "") +
+    (retired.length
+      ? '<div class="section-label">最近撤回 (' + retired.length + ")</div>" + retired.map(renderRetiredPreference).join("")
+      : "") +
     "</div>";
   document.getElementById("memory").innerHTML = html;
 }
@@ -694,7 +724,8 @@ function renderDigests(project) {
     var g = d.digest || {};
     var key = "digest:" + project.name + ":" + d.digest_date;
     var meta = d.turn_count + " 則對話 · " + (g.open_items || []).length + " 項未完成" +
-      ((g.preference_candidate_count || 0) ? " · " + g.preference_candidate_count + " 條偏好候選" : "") +
+      ((g.preferences_adopted || 0) ? " · 自動採用 " + g.preferences_adopted + " 條偏好" : "") +
+      ((g.preferences_retired || 0) ? " · 撤回 " + g.preferences_retired + " 條" : "") +
       (d.synced ? "" : " · 尚未寫入 MemTrace");
     return '<details class="digest" data-key="' + esc(key) + '"' + detailsOpen(key) + "><summary>" +
       esc(d.digest_date) + ' <span class="refs">' + esc(meta) + "</span></summary>" +
@@ -803,7 +834,7 @@ document.addEventListener("click", function (e) {
     body.text = box.querySelector(".pref-text").value;
     body.scope = box.querySelector(".pref-scope").value;
   }
-  if (action === "retire" && !confirm("撤銷後這條偏好就不再影響 chat，確定嗎？")) return;
+  if (action === "retire" && !confirm("撤銷後這條偏好就不再影響聊天（可以在「最近撤回」恢復），確定嗎？")) return;
   var buttons = box.querySelectorAll(".pref-btn");
   buttons.forEach(function (b) { b.disabled = true; });
   statusEl.className = "pref-status";
@@ -1041,7 +1072,7 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
         # Local SQLite is what chat reads, so the change is already in effect here.
         # Rewriting the MemTrace profile node is a best-effort mirror.
         synced: bool | None = None
-        if action in ("adopt", "retire") and self.config.memtrace_mcp_url and self.config.operator_preference_workspace_id:
+        if action in ("adopt", "retire", "restore") and self.config.memtrace_mcp_url and self.config.operator_preference_workspace_id:
             try:
                 client = MemTraceClient(self.config.memtrace_mcp_url, self.config.memtrace_api_token)
                 sync_operator_profile(trace_store, client, self.config.operator_preference_workspace_id)

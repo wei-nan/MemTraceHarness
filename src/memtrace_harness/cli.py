@@ -30,10 +30,12 @@ from memtrace_harness.memory_digest import (
     AUTO_CATCH_UP_DAYS,
     PREFERENCE_CATEGORY_LABELS,
     DigestError,
+    PreferenceChanges,
     due_digest_dates,
     in_digest_window,
     run_digest_for_date,
     sync_digests_to_memtrace,
+    sync_operator_profile,
 )
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.primary_session import PrimarySessionManager
@@ -263,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
         "memory-digest",
         help=(
             "Run the nightly memory digest (sleep cycle) now: consolidate finished days "
-            "into digests and preference candidates for review on the status page"
+            "into digests, and adopt or retire the operator's standing preferences from them"
         ),
     )
     digest_parser.add_argument("--project", help="Only this project (default: every registered project)")
@@ -708,13 +710,14 @@ def run_memory_digests(
     dry_run: bool = False,
     respect_retry_backoff: bool = False,
     log=print,
-) -> dict[str, int]:
+) -> dict[str, PreferenceChanges]:
     """Shared by the gateway's nightly trigger and the `memory-digest` command.
-    Returns {project: preference candidates added}. One project-day failing never
-    stops the others; MemTrace sync is best-effort and retried next pass."""
+    Returns {project: the preferences the Harness adopted / retired / left waiting}. One
+    project-day failing never stops the others; MemTrace sync is best-effort and retried
+    next pass."""
     tz = ZoneInfo(config.schedule_timezone)
     now = datetime.now(timezone.utc)
-    added: dict[str, int] = {}
+    changed: dict[str, PreferenceChanges] = {}
     for scope in projects:
         session_id = f"psess_{scope.name}"
         if only_date is not None:
@@ -738,12 +741,17 @@ def run_memory_digests(
                 log(f"[{scope.name}] digest {d} failed: {exc}")
                 continue
             _digest_failures.pop(key, None)
-            added[scope.name] = added.get(scope.name, 0) + outcome.candidates_added
+            total = changed.setdefault(scope.name, PreferenceChanges())
+            total.adopted += outcome.preferences.adopted
+            total.retired += outcome.preferences.retired
+            total.waiting += outcome.preferences.waiting
             log(
                 f"[{scope.name}] digested {d}: {outcome.turn_count} turn(s), "
                 f"{len(outcome.digest['decisions'])} decision(s), "
                 f"{len(outcome.digest['open_items'])} open item(s), "
-                f"{outcome.candidates_added} new preference candidate(s), "
+                f"preferences +{len(outcome.preferences.adopted)} "
+                f"-{len(outcome.preferences.retired)} "
+                f"(waiting {len(outcome.preferences.waiting)}), "
                 f"{outcome.digest['discarded_ungrounded']} ungrounded item(s) discarded "
                 f"({outcome.provider}/{outcome.model})"
             )
@@ -755,7 +763,25 @@ def run_memory_digests(
                     log(f"[{scope.name}] wrote {synced} digest(s) to MemTrace {workspace_id}")
             except Exception:
                 logger.exception(f"[{scope.name}] syncing digests to MemTrace failed; will retry next pass")
-    return added
+    if (
+        memtrace_client is not None
+        and config.operator_preference_workspace_id
+        and any(c.adopted or c.retired for c in changed.values())
+    ):
+        try:
+            sync_operator_profile(trace_store, memtrace_client, config.operator_preference_workspace_id)
+        except Exception:
+            logger.exception("mirroring the operator profile to MemTrace failed; will retry on the next change")
+    return changed
+
+
+def _describe_preference_changes(changes: PreferenceChanges, limit: int = 8) -> list[str]:
+    lines = [f"- [#{r['id']}] {r['text']}" for r in changes.adopted[:limit]]
+    lines += [f"- 撤回 [#{r['id']}] {r['text']}（{r['retire_reason'] or ''}）" for r in changes.retired[:limit]]
+    hidden = len(changes.adopted) + len(changes.retired) - len(lines)
+    if hidden > 0:
+        lines.append(f"…另外 {hidden} 條")
+    return lines
 
 
 def _run_nightly_digest_pass(
@@ -768,7 +794,7 @@ def _run_nightly_digest_pass(
     status_bus,
 ) -> None:
     try:
-        added = run_memory_digests(
+        changed = run_memory_digests(
             config,
             trace_store,
             memtrace_client,
@@ -781,21 +807,28 @@ def _run_nightly_digest_pass(
         return
     if status_bus is not None:
         status_bus.publish()
-    per_gateway: dict[int, tuple[TelegramGateway, int]] = {}
-    for project, count in added.items():
+    per_gateway: dict[int, tuple[TelegramGateway, PreferenceChanges]] = {}
+    for project, changes in changed.items():
         gw = gateway_for_project.get(project)
-        if gw is not None and count:
-            _, previous = per_gateway.get(id(gw), (gw, 0))
-            per_gateway[id(gw)] = (gw, previous + count)
-    for gw, count in per_gateway.values():
+        if gw is None or not (changes.adopted or changes.retired or changes.waiting):
+            continue
+        _, merged = per_gateway.setdefault(id(gw), (gw, PreferenceChanges()))
+        merged.adopted += changes.adopted
+        merged.retired += changes.retired
+        merged.waiting += changes.waiting
+    for gw, changes in per_gateway.values():
+        lines = ["🧠 昨晚的記憶整理自動調整了你的偏好："]
+        lines += _describe_preference_changes(changes)
+        if changes.waiting:
+            lines.append(f"另有 {len(changes.waiting)} 條超過每日自動採用上限，等你到網頁確認。")
+        lines.append(
+            "不同意的話，直接在聊天裡說（例如「那個不用了」），或到狀態網頁撤銷："
+            f"http://{config.status_server_host}:{config.status_server_port}"
+        )
         try:
-            gw.notify_all_allowlisted(
-                f"🧠 昨晚的記憶整理新增了 {count} 條偏好候選，"
-                f"請到 Harness 狀態網頁確認（http://{config.status_server_host}:"
-                f"{config.status_server_port}）。未確認前不會生效。"
-            )
+            gw.notify_all_allowlisted("\n".join(lines))
         except Exception:
-            logger.exception("notifying about new preference candidates failed")
+            logger.exception("notifying about preference changes failed")
 
 
 def memory_drafts_command(args: argparse.Namespace) -> int:
@@ -850,7 +883,7 @@ def memory_digest_command(args: argparse.Namespace) -> int:
         if config.memtrace_mcp_url and not args.dry_run
         else None
     )
-    added = run_memory_digests(
+    changed = run_memory_digests(
         config,
         trace_store,
         memtrace_client,
@@ -860,7 +893,13 @@ def memory_digest_command(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
     )
     if not args.dry_run:
-        print(f"preference candidates added: {sum(added.values())} (review them on the status page)")
+        adopted = sum(len(c.adopted) for c in changed.values())
+        retired = sum(len(c.retired) for c in changed.values())
+        waiting = sum(len(c.waiting) for c in changed.values())
+        print(
+            f"preferences adopted: {adopted}, retired: {retired}, waiting for review: {waiting} "
+            "(adjust them on the status page)"
+        )
     return 0
 
 
@@ -1435,6 +1474,8 @@ def _slugify(name: str) -> str:
 
 # How many recent nightly digests per project the status page shows.
 STATUS_DIGEST_DAYS = 7
+# How many of the most recently retired preferences the status page lists (with a way back).
+STATUS_RETIRED_PREFERENCES = 10
 
 
 def _collect_status_data(config: "HarnessConfig") -> dict:
@@ -1616,7 +1657,12 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
             }
         )
 
-    preferences = trace_store.list_preference_rules(statuses=("pending", "adopted"))
+    preferences = trace_store.list_preference_rules(statuses=("pending", "adopted", "retired"))
+    recently_retired = sorted(
+        (r for r in preferences if r["status"] == "retired"),
+        key=lambda r: r["resolved_at"] or "",
+        reverse=True,
+    )[:STATUS_RETIRED_PREFERENCES]
     return {
         "daemon": daemon,
         "project_index_path": str(config.project_index_path) if config.project_index_path else None,
@@ -1624,6 +1670,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         "preferences": {
             "pending": [r for r in preferences if r["status"] == "pending"],
             "adopted": [r for r in preferences if r["status"] == "adopted"],
+            "retired": recently_retired,
             "category_labels": PREFERENCE_CATEGORY_LABELS,
         },
         "known_models": {p: sorted(models) for p, models in known_models.items()},

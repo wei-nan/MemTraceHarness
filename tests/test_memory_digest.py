@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from memtrace_harness.memory_digest import (
     DigestError,
+    apply_chat_preference_correction,
     due_digest_dates,
     in_digest_window,
     ground_digest,
@@ -55,7 +56,7 @@ def _turns(*speakers: str) -> list[dict]:
 
 class GroundingTests(TestCase):
     def test_items_without_valid_citations_are_discarded(self) -> None:
-        digest, _ = ground_digest(
+        digest, _, _ = ground_digest(
             {
                 "summary": "s",
                 "decisions": [
@@ -75,7 +76,7 @@ class GroundingTests(TestCase):
     def test_preference_citing_anything_but_the_humans_turns_is_discarded(self) -> None:
         # The bug that motivated this: an assistant's stock-analysis reply ended up
         # in the operator profile.
-        _, prefs = ground_digest(
+        _, prefs, _ = ground_digest(
             {
                 "preference_candidates": [
                     {"text": "回覆一律用繁體中文", "turns": [1], "scope": "global", "category": "language_format", "explicit": True},
@@ -100,7 +101,7 @@ class GroundingTests(TestCase):
             {"text": "ancient", "turns": [1], "since": "2026-09-01"},
             {"text": "claimed resolved without evidence", "turns": [1], "since": "2026-09-29"},
         ]
-        digest, _ = ground_digest(
+        digest, _, _ = ground_digest(
             {
                 "new_open_items": [{"text": "new", "turns": [2]}],
                 "resolved_open_items": [{"index": 1, "turns": [2]}, {"index": 3, "turns": []}, {"index": 9, "turns": [1]}],
@@ -150,7 +151,7 @@ class DigestRunTests(TestCase):
             ["2026-09-30"],
         )
 
-    def test_run_saves_digest_and_queues_candidates_with_the_humans_own_words(self) -> None:
+    def test_run_saves_digest_and_adopts_preferences_from_the_humans_own_words(self) -> None:
         _add_turn(self.store, "user", "以後回覆都用繁體中文", "2026-09-30T01:00:00+00:00")
         _add_turn(self.store, "assistant", "好的", "2026-09-30T01:01:00+00:00")
         call, calls = _model(
@@ -165,19 +166,21 @@ class DigestRunTests(TestCase):
 
         outcome = run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call)
 
-        self.assertEqual(outcome.candidates_added, 1)
+        self.assertEqual(len(outcome.preferences.adopted), 1)
         self.assertIn("#1 [user] 以後回覆都用繁體中文", calls[0])
         saved = self.store.get_memory_digest("proj", "2026-09-30")
         self.assertEqual(saved["digest"]["summary"], "討論語言")
+        self.assertEqual(saved["digest"]["preferences_adopted"], 1)
         self.assertEqual(saved["provider"], "claude")
-        [pending] = self.store.list_preference_rules(statuses=("pending",))
-        self.assertEqual(pending["evidence"][0]["quote"], "以後回覆都用繁體中文")
-        # A candidate never takes effect by itself.
-        self.assertEqual(preference_context_for(self.store, "proj"), "")
+        [rule] = self.store.list_preference_rules(statuses=("adopted",))
+        # Nothing waited for a click: it is in effect, attributed, and cites the human.
+        self.assertEqual(rule["adopted_by"], "harness-digest")
+        self.assertEqual(rule["evidence"][0]["quote"], "以後回覆都用繁體中文")
+        self.assertIn("回覆一律用繁體中文", preference_context_for(self.store, "proj"))
 
-        # Re-running the same day does not queue the same candidate twice.
+        # Re-running the same day does not adopt the same rule twice.
         run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call)
-        self.assertEqual(len(self.store.list_preference_rules(statuses=("pending",))), 1)
+        self.assertEqual(len(self.store.list_preference_rules(statuses=("adopted",))), 1)
 
     def test_next_day_sees_previous_open_items(self) -> None:
         _add_turn(self.store, "user", "要決定資料期間", "2026-09-29T01:00:00+00:00")
@@ -371,3 +374,168 @@ class ScheduleActivityInDigestTests(TestCase):
         run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call)
 
         self.assertIn("never as evidence of what the human said", calls[0])
+
+
+class AutonomousPreferenceTests(TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _rule(self, project: str, text: str, scope: str = "global") -> int:
+        return self.store.add_preference_candidate(
+            project=project, scope=scope, category="communication", text=text, evidence=[],
+            explicit=True, source_digest_date="2026-09-29", status="adopted", adopted_by="harness-digest",
+        )
+
+    def _pref(self, text: str, turns: list[int], **extra) -> dict:
+        return {"text": text, "turns": turns, "scope": "global", "category": "communication", "explicit": True, **extra}
+
+    def _day(self, *contents: str) -> None:
+        for i, content in enumerate(contents):
+            _add_turn(self.store, "user", content, f"2026-09-30T01:0{i}:00+00:00")
+
+    def _run(self, answer: dict):
+        call, calls = _model(answer)
+        return run_digest_for_date(self.store, "proj", SESSION, "2026-09-30", TZ, call), calls
+
+    def test_the_prompt_shows_the_adopted_rules_this_project_can_see(self) -> None:
+        mine = self._rule("proj", "回覆簡短")
+        theirs = self._rule("other", "別專案的偏好", scope="project")
+        self._day("你好")
+
+        _, calls = self._run({"summary": "s"})
+
+        self.assertIn(f"[{mine}] (global) 回覆簡短", calls[0])
+        self.assertNotIn("別專案的偏好", calls[0])
+        self.assertIsNotNone(theirs)
+
+    def test_a_refinement_replaces_the_rule_it_names(self) -> None:
+        old = self._rule("proj", "回覆簡短")
+        self._day("回覆可以詳細一點，但先給結論")
+
+        outcome, _ = self._run(
+            {"summary": "s", "preference_candidates": [self._pref("先給結論，再詳細說明", [1], replaces=[old, 999])]}
+        )
+
+        [new] = outcome.preferences.adopted
+        self.assertEqual([r["id"] for r in outcome.preferences.retired], [old])
+        retired = self.store.get_preference_rule(old)
+        self.assertEqual(retired["status"], "retired")
+        self.assertIn(f"被 #{new['id']} 取代", retired["retire_reason"])
+
+    def test_a_retirement_needs_a_real_adopted_rule_and_the_humans_own_turn(self) -> None:
+        keep = self._rule("proj", "留著的規則")
+        drop = self._rule("proj", "要撤回的規則")
+        foreign = self._rule("other", "別人的專案規則", scope="project")
+        _add_turn(self.store, "user", "那個『要撤回』的不用了", "2026-09-30T01:00:00+00:00")
+        _add_turn(self.store, "assistant", "好，我不再套用", "2026-09-30T01:01:00+00:00")
+
+        outcome, _ = self._run(
+            {
+                "summary": "s",
+                "preference_retirements": [
+                    {"id": drop, "turns": [1]},
+                    {"id": keep, "turns": [2]},       # cites the assistant, not the human
+                    {"id": foreign, "turns": [1]},    # not a rule this project can see
+                    {"id": 424242, "turns": [1]},     # no such rule
+                ],
+            }
+        )
+
+        self.assertEqual([r["id"] for r in outcome.preferences.retired], [drop])
+        self.assertIn("你在對話中撤回", self.store.get_preference_rule(drop)["retire_reason"])
+        self.assertIn("要撤回", self.store.get_preference_rule(drop)["retire_reason"])
+        self.assertEqual(self.store.get_preference_rule(keep)["status"], "adopted")
+        self.assertEqual(self.store.get_preference_rule(foreign)["status"], "adopted")
+        self.assertEqual(outcome.digest["discarded_ungrounded"], 3)
+
+    def test_only_the_first_few_new_rules_per_day_are_adopted_the_rest_wait(self) -> None:
+        self._day("一", "二", "三", "四", "五", "六", "七")
+        candidates = [self._pref(f"規則 {i}", [i]) for i in range(1, 8)]
+
+        outcome, _ = self._run({"summary": "s", "preference_candidates": candidates})
+
+        self.assertEqual(len(outcome.preferences.adopted), 5)
+        self.assertEqual(len(outcome.preferences.waiting), 2)
+        self.assertEqual(len(self.store.list_preference_rules(statuses=("pending",))), 2)
+        self.assertNotIn("規則 6", preference_context_for(self.store, "proj"))
+
+    def test_a_rule_the_human_brings_back_after_retiring_it_is_adopted_again(self) -> None:
+        old = self._rule("proj", "回覆簡短")
+        self.store.update_preference_rule(old, status="retired", expected_statuses=("adopted",), retire_reason="x")
+        self._day("還是回覆簡短一點")
+
+        outcome, _ = self._run({"summary": "s", "preference_candidates": [self._pref("回覆簡短", [1])]})
+
+        self.assertEqual(len(outcome.preferences.adopted), 1)
+        self.assertEqual(self.store.get_preference_rule(old)["status"], "retired")
+
+    def test_context_numbers_the_rules_and_keeps_only_the_newest(self) -> None:
+        from memtrace_harness.memory_digest import MAX_PREFERENCES_IN_CONTEXT
+
+        for i in range(MAX_PREFERENCES_IN_CONTEXT + 3):
+            self._rule("proj", f"規則 {i}")
+
+        text = preference_context_for(self.store, "proj", with_ids=True)
+
+        self.assertEqual(text.count("- [#"), MAX_PREFERENCES_IN_CONTEXT)
+        self.assertIn(f"規則 {MAX_PREFERENCES_IN_CONTEXT + 2}", text)
+        self.assertNotIn("規則 0\n", text + "\n")
+
+    def test_the_operator_can_restore_a_retired_rule(self) -> None:
+        rule_id = self._rule("proj", "回覆簡短")
+        self.store.update_preference_rule(rule_id, status="retired", expected_statuses=("adopted",), retire_reason="x")
+
+        rule = resolve_preference(self.store, rule_id, "restore")
+
+        self.assertEqual((rule["status"], rule["adopted_by"]), ("adopted", "operator"))
+        self.assertEqual(rule["retire_reason"], "")  # the old reason no longer applies
+        with self.assertRaisesRegex(ValueError, "is adopted, cannot restore"):
+            resolve_preference(self.store, rule_id, "restore")
+
+
+class ChatPreferenceCorrectionTests(TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+        self.rule = self.store.add_preference_candidate(
+            project="proj", scope="global", category="communication", text="回覆簡短", evidence=[],
+            explicit=True, source_digest_date="2026-09-29", status="adopted", adopted_by="harness-digest",
+        )
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_retire_and_replace(self) -> None:
+        said = apply_chat_preference_correction(self.store, "proj", f"{self.rule}::retire", "那個不用了", "2026-10-02")
+        self.assertIn(f"已撤回偏好 #{self.rule}", said)
+        retired = self.store.get_preference_rule(self.rule)
+        self.assertEqual(retired["status"], "retired")
+        self.assertIn("你在聊天中更正：那個不用了", retired["retire_reason"])
+
+        again = self.store.add_preference_candidate(
+            project="proj", scope="project", category="workflow", text="先給結論", evidence=[],
+            explicit=True, source_digest_date="2026-09-29", status="adopted", adopted_by="harness-digest",
+        )
+        said = apply_chat_preference_correction(
+            self.store, "proj", f"#{again}::replace::先給結論再補充細節", "改成先給結論再補充細節", "2026-10-02"
+        )
+        self.assertIn("先給結論 → 先給結論再補充細節", said)
+        [new] = [r for r in self.store.list_preference_rules(statuses=("adopted",))]
+        self.assertEqual((new["text"], new["scope"], new["category"], new["adopted_by"]), ("先給結論再補充細節", "project", "workflow", "harness-chat"))
+        self.assertEqual(new["evidence"][0]["quote"], "改成先給結論再補充細節")
+        self.assertIn(f"被 #{new['id']} 取代", self.store.get_preference_rule(again)["retire_reason"])
+
+    def test_anything_stale_foreign_or_malformed_is_ignored(self) -> None:
+        other = self.store.add_preference_candidate(
+            project="other", scope="project", category="other", text="別專案", evidence=[],
+            explicit=True, source_digest_date="2026-09-29", status="adopted", adopted_by="harness-digest",
+        )
+        for payload in ("", "abc::retire", f"{self.rule}", f"{self.rule}::explode", f"{self.rule}::replace::", f"{other}::retire", "9999::retire"):
+            self.assertIsNone(apply_chat_preference_correction(self.store, "proj", payload, "x", "2026-10-02"), payload)
+        apply_chat_preference_correction(self.store, "proj", f"{self.rule}::retire", "x", "2026-10-02")
+        self.assertIsNone(apply_chat_preference_correction(self.store, "proj", f"{self.rule}::retire", "x", "2026-10-02"))
+        self.assertEqual(self.store.get_preference_rule(other)["status"], "adopted")
