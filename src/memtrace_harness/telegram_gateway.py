@@ -19,7 +19,7 @@ from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
-from memtrace_harness.primary_session import OPERATOR_PROFILE_TITLE
+from memtrace_harness.memory_digest import DIGEST_TITLE_PREFIX, preference_context_for
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
@@ -34,6 +34,12 @@ if TYPE_CHECKING:
     from memtrace_harness.scope import ProjectScope
 
 logger = logging.getLogger(__name__)
+
+_DIGESTS_HEADER = (
+    "Recent daily digests for this project — the Harness's nightly consolidation of "
+    "the last few days (decisions, facts, items still open). Drafts grounded in the "
+    "transcript, not accepted spec; the recent transcript below is newer than these"
+)
 
 # Telegram's sendMessage rejects any text over 4096 UTF-16 code units; stay comfortably
 # under that in plain characters so multi-byte text (e.g. Chinese) never trips it.
@@ -573,7 +579,9 @@ class TelegramGateway:
         note_shape = (
             f"draft nodes titled \"Draft primary session consolidation: {scope.name}\" "
             "(content_type context, tags harness/draft/primary-session), each holding a "
-            "batch of past chat turns and decisions"
+            "batch of past chat turns and decisions, plus one nightly digest per day "
+            f"titled \"{DIGEST_TITLE_PREFIX}: {scope.name} <YYYY-MM-DD>\" (tag daily-digest) "
+            "with that day's decisions, facts and open items"
         )
         if memory_ws == scope.workspace_id:
             memory_line = (
@@ -618,15 +626,18 @@ class TelegramGateway:
             "(繁體中文，台灣用語與正體字), never Simplified Chinese and never simplified "
             "phrasing/vocabulary, regardless of what language the human's own message used.",
         ]
+        digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
+        if digests:
+            parts.append(f"{_DIGESTS_HEADER}\n\n{digests}")
         rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
         if rehydration:
             parts.append(f"Prior discussion for this project (open items may still need action):\n\n{rehydration}")
-        operator_profile = self._operator_profile_context()
+        operator_profile = self._operator_profile_context(scope)
         if operator_profile:
             parts.append(
-                "Operator preference profile — how this human wants you to work with "
-                "them, learned from prior conversations across every project, not just "
-                f"this one. Follow it same as any explicit instruction:\n\n{operator_profile}"
+                "Operator preferences — each one reviewed and adopted by this human on "
+                "the Harness status page. Treat them as standing defaults; an explicit "
+                f"instruction in the current message takes precedence:\n\n{operator_profile}"
             )
         role_summary = self._role_profiles_summary(scope)
         if role_summary:
@@ -657,31 +668,16 @@ class TelegramGateway:
             lines.append(entry)
         return "\n".join(lines)
 
-    def _operator_profile_context(self) -> str:
-        """Cross-project: the operator's own preference profile, not scoped to any one
-        project's workspace. Best-effort — MemTrace being unreachable must never break
-        an ordinary chat reply or task, so failures here are swallowed."""
-        if not self.memtrace_client or not self.config.operator_preference_workspace_id:
-            return ""
+    def _operator_profile_context(self, scope: ProjectScope) -> str:
+        """Only rules the operator adopted on the status page (memory_digest.py),
+        global ones plus this project's own, read from local SQLite. Until 2026-10-01
+        this read a MemTrace node that an automatic classifier appended raw turns to,
+        unreviewed, and a whole stock-analysis reply ended up injected into every chat
+        as an instruction to follow."""
         try:
-            results = self.memtrace_client.search_nodes(
-                workspace_id=self.config.operator_preference_workspace_id,
-                query=OPERATOR_PROFILE_TITLE,
-                stage="chat_context",
-            )
-            node = next(
-                (n for n in results if isinstance(n, dict) and n.get("title") == OPERATOR_PROFILE_TITLE and n.get("id")),
-                None,
-            )
-            if not node:
-                return ""
-            full = self.memtrace_client.get_node(
-                workspace_id=self.config.operator_preference_workspace_id, node_id=str(node["id"]),
-                stage="chat_context",
-            )
-            return str(full.get("body") or "").strip()
+            return preference_context_for(self.primary_session_mgr.trace_store, scope.name)
         except Exception:
-            logger.exception("Failed to fetch operator preference profile; continuing without it")
+            logger.exception("Failed to load adopted operator preferences; continuing without them")
             return ""
 
     def _project_context_items(self, scope: ProjectScope) -> list[ContextItem]:
@@ -714,6 +710,17 @@ class TelegramGateway:
                 source="harness",
             ),
         ]
+        digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
+        if digests:
+            items.append(
+                ContextItem(
+                    ref=f"harness:daily-digests:{scope.name}",
+                    title="Recent daily digests",
+                    body=f"{_DIGESTS_HEADER}\n\n{digests}",
+                    content_type="context",
+                    source="harness",
+                )
+            )
         rehydration = self.primary_session_mgr.get_rehydration_context(scope.name)
         if rehydration:
             items.append(

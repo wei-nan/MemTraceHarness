@@ -924,3 +924,33 @@ class KnowledgeBaseLocationsTests(TestCase):
 
             self.assertIn("no dedicated memory workspace is configured", body)
             self.assertIn("spec workspace `ws_test` itself", body)
+
+
+class MemoryInjectionTests(TestCase):
+    def test_only_adopted_preferences_and_recent_digests_reach_chat_and_agent_loop(self) -> None:
+        from memtrace_harness.memory_digest import resolve_preference
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, trace_store, scope = _build_schedule_gateway(Path(tmp_dir))
+            adopted = trace_store.add_preference_candidate(
+                project="test_proj", scope="global", category="language_format",
+                text="回覆一律用繁體中文", evidence=[], explicit=True, source_digest_date="2026-09-30",
+            )
+            trace_store.add_preference_candidate(
+                project="test_proj", scope="global", category="other",
+                text="還沒確認的候選", evidence=[], explicit=False, source_digest_date="2026-09-30",
+            )
+            resolve_preference(trace_store, adopted, "adopt")
+            trace_store.save_memory_digest(
+                project="test_proj", digest_date="2026-09-30", provider="claude", model="haiku",
+                turn_count=3, digest={"summary": "決定資料期間為三年", "decisions": [], "open_items": []},
+            )
+
+            identity = gateway._identity_context(scope)
+            items = {item.ref: item for item in gateway._project_context_items(scope)}
+
+            self.assertIn("回覆一律用繁體中文", identity)
+            self.assertNotIn("還沒確認的候選", identity)
+            self.assertIn("決定資料期間為三年", identity)
+            self.assertIn("決定資料期間為三年", items["harness:daily-digests:test_proj"].body)
+            self.assertEqual(items["harness:daily-digests:test_proj"].content_type, "context")
