@@ -19,7 +19,12 @@ from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
-from memtrace_harness.memory_digest import DIGEST_TITLE_PREFIX, preference_context_for
+from memtrace_harness.memory_digest import (
+    DIGEST_TITLE_PREFIX,
+    PREFERENCE_CORRECT_MARKER,
+    apply_chat_preference_correction,
+    preference_context_for,
+)
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
@@ -693,9 +698,16 @@ class TelegramGateway:
         operator_profile = self._operator_profile_context(scope)
         if operator_profile:
             parts.append(
-                "Operator preferences — each one reviewed and adopted by this human on "
-                "the Harness status page. Treat them as standing defaults; an explicit "
-                f"instruction in the current message takes precedence:\n\n{operator_profile}"
+                "Operator preferences — the Harness itself derived these from this human's "
+                "own past conversations and adopted them, so any of them may be wrong. Treat "
+                "them as standing defaults; an explicit instruction in the current message "
+                f"takes precedence:\n\n{operator_profile}\n\n"
+                "如果使用者在這則訊息裡明確撤回、或更正上面其中一條偏好（例如「那個不用了」"
+                "「改成…」），請在回覆最後另起一行輸出 "
+                f"`{PREFERENCE_CORRECT_MARKER}<編號>::retire`（撤回），或 "
+                f"`{PREFERENCE_CORRECT_MARKER}<編號>::replace::<更正後的一句話>`（更正）；"
+                "編號是上面方括號裡的數字，同一則回覆可以有多行。只有使用者明確針對那一條偏好"
+                "表態時才輸出；一般討論、單次的要求、對專案內容的意見都不算更正。"
             )
         role_summary = self._role_profiles_summary(scope)
         if role_summary:
@@ -727,13 +739,16 @@ class TelegramGateway:
         return "\n".join(lines)
 
     def _operator_profile_context(self, scope: ProjectScope) -> str:
-        """Only rules the operator adopted on the status page (memory_digest.py),
-        global ones plus this project's own, read from local SQLite. Until 2026-10-01
-        this read a MemTrace node that an automatic classifier appended raw turns to,
-        unreviewed, and a whole stock-analysis reply ended up injected into every chat
-        as an instruction to follow."""
+        """Adopted preference rules (memory_digest.py), global ones plus this project's
+        own, read from local SQLite, each with its id so a correction can name it. The
+        Harness adopts them itself from the nightly digest and the human corrects them in
+        chat or on the status page. Until 2026-10-01 this read a MemTrace node that an
+        automatic classifier appended raw turns to, with no evidence check, and a whole
+        stock-analysis reply ended up injected into every chat as an instruction."""
         try:
-            return preference_context_for(self.primary_session_mgr.trace_store, scope.name)
+            return preference_context_for(
+                self.primary_session_mgr.trace_store, scope.name, with_ids=True
+            )
         except Exception:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
             return ""
@@ -925,8 +940,14 @@ class TelegramGateway:
                         f"chat reply fell back to {provider}/{model} for project "
                         f"'{scope.name}' after: {'; '.join(failures)}"
                     )
-                reply_text, goal = self._extract_task_start(result.stdout.strip())
+                # Preference corrections first, and only their own lines are removed, so a
+                # task or schedule marker on another line still reaches the extractors.
+                stdout, corrections = self._extract_preference_corrections(result.stdout.strip())
+                confirmations = self._apply_preference_corrections(scope, corrections, text)
+                reply_text, goal = self._extract_task_start(stdout)
                 reply_text, schedule_directive = self._extract_schedule_start(reply_text)
+                if confirmations:
+                    reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
                 reply = f"{reply_text}\n\n{attribution}" if reply_text else attribution
                 self.primary_session_mgr.record_turn(
@@ -965,6 +986,38 @@ class TelegramGateway:
                 reply_text = "\n".join(lines[:i]).rstrip()
                 return reply_text, (payload or None)
         return raw, None
+
+    @staticmethod
+    def _extract_preference_corrections(raw: str) -> tuple[str, list[str]]:
+        """Pull every "HARNESS_PREFERENCE_CORRECT::<payload>" line out of a model reply,
+        wherever it sits, leaving all other lines untouched."""
+        kept, payloads = [], []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(PREFERENCE_CORRECT_MARKER):
+                payloads.append(stripped[len(PREFERENCE_CORRECT_MARKER):].strip())
+            else:
+                kept.append(line)
+        return "\n".join(kept).rstrip(), payloads
+
+    def _apply_preference_corrections(
+        self, scope: ProjectScope, payloads: list[str], user_text: str
+    ) -> list[str]:
+        """Best-effort: the model decided the human corrected a preference; a malformed
+        or stale directive is dropped rather than failing the reply."""
+        confirmations = []
+        today = datetime.now(ZoneInfo(self.config.schedule_timezone)).date().isoformat()
+        for payload in payloads:
+            try:
+                done = apply_chat_preference_correction(
+                    self.primary_session_mgr.trace_store, scope.name, payload, user_text, today
+                )
+            except Exception:
+                logger.exception(f"applying preference correction {payload!r} failed; ignoring it")
+                continue
+            if done:
+                confirmations.append(done)
+        return confirmations
 
     @classmethod
     def _extract_task_start(cls, raw: str) -> tuple[str, str | None]:

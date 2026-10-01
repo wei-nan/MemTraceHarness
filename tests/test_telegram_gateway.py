@@ -1084,3 +1084,90 @@ class ScheduledRunLoggingTests(TestCase):
         [report] = store.get_primary_session_turns("psess_test_proj")
         self.assertEqual((report["turn_type"], report["schedule_id"]), ("schedule_report", "sched_a"))
         self.assertIn("執行失敗", report["content"])
+
+
+class PreferenceCorrectionInChatTests(TestCase):
+    """The Harness adopts preferences itself, so the human has to be able to undo one in
+    the very conversation where they notice it is wrong."""
+
+    def _gateway(self):
+        from unittest.mock import MagicMock
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        gateway, store, scope = _build_schedule_gateway(Path(self._tmp.name))
+        gateway.send_message = MagicMock()
+        gateway.send_chat_action = MagicMock()
+        self.rule = store.add_preference_candidate(
+            project="test_proj", scope="global", category="communication", text="回覆簡短", evidence=[],
+            explicit=True, source_digest_date="2026-10-01", status="adopted", adopted_by="harness-digest",
+        )
+        return gateway, store, scope
+
+    def _chat(self, gateway, scope, model_output: str, text: str = "那個不用了"):
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        reply = ProcessResult(
+            command=[], return_code=0, stdout=model_output, stderr="",
+            started_at="2026-10-02T00:00:00+00:00", completed_at="2026-10-02T00:00:01+00:00", duration_ms=1,
+        )
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply) as run:
+            sent = gateway._chat_reply_and_maybe_start_task(scope, 12345, text)
+        return sent, run.call_args.args[0][-1]
+
+    def test_prompt_lists_the_rules_with_ids_and_the_correction_marker(self) -> None:
+        gateway, _store, scope = self._gateway()
+
+        _, prompt = self._chat(gateway, scope, "好")
+
+        self.assertIn(f"[#{self.rule}] 回覆簡短", prompt)
+        self.assertIn("HARNESS_PREFERENCE_CORRECT::<編號>::retire", prompt)
+        self.assertIn("any of them may be wrong", prompt)
+
+    def test_no_marker_instruction_when_there_are_no_adopted_rules(self) -> None:
+        gateway, store, scope = self._gateway()
+        store.update_preference_rule(self.rule, status="retired", expected_statuses=("adopted",), retire_reason="x")
+
+        _, prompt = self._chat(gateway, scope, "好")
+
+        self.assertNotIn("HARNESS_PREFERENCE_CORRECT", prompt)
+
+    def test_a_correction_marker_retires_the_rule_and_is_not_shown(self) -> None:
+        gateway, store, scope = self._gateway()
+
+        sent, _ = self._chat(
+            gateway, scope, f"好，之後不再限制長度。\nHARNESS_PREFERENCE_CORRECT::{self.rule}::retire"
+        )
+
+        self.assertEqual(store.get_preference_rule(self.rule)["status"], "retired")
+        self.assertNotIn("HARNESS_PREFERENCE_CORRECT", sent)
+        self.assertIn("好，之後不再限制長度。", sent)
+        self.assertIn(f"🧠 已撤回偏好 #{self.rule}：回覆簡短", sent)
+        stored = store.get_primary_session_turns("psess_test_proj")
+        self.assertIn("已撤回偏好", [t for t in stored if t["speaker"] == "assistant"][0]["content"])
+
+    def test_other_markers_still_work_when_a_correction_sits_above_them(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, store, scope = self._gateway()
+        gateway._start_or_queue_task = MagicMock()
+
+        self._chat(
+            gateway, scope,
+            f"收到。\nHARNESS_PREFERENCE_CORRECT::{self.rule}::replace::回覆詳細\nHARNESS_TASK_START::跑回測",
+        )
+
+        gateway._start_or_queue_task.assert_called_once()
+        self.assertEqual(gateway._start_or_queue_task.call_args.args[1], "跑回測")
+        new = [r for r in store.list_preference_rules(statuses=("adopted",))]
+        self.assertEqual([r["text"] for r in new], ["回覆詳細"])
+
+    def test_a_bad_marker_is_dropped_and_the_reply_is_still_sent(self) -> None:
+        gateway, store, scope = self._gateway()
+
+        sent, _ = self._chat(gateway, scope, "好\nHARNESS_PREFERENCE_CORRECT::9999::retire\nHARNESS_PREFERENCE_CORRECT::oops")
+
+        self.assertEqual(store.get_preference_rule(self.rule)["status"], "adopted")
+        self.assertTrue(sent.startswith("好"))
+        self.assertNotIn("HARNESS_PREFERENCE_CORRECT", sent)

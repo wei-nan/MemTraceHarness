@@ -857,6 +857,8 @@ class TraceStore:
                     ON schedules(project, active);
                 """
             )
+            self._ensure_column(conn, "preference_rules", "adopted_by", "TEXT")
+            self._ensure_column(conn, "preference_rules", "retire_reason", "TEXT")
             self._ensure_column(conn, "memory_digests", "node_dirty", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "memory_digests", "edges_synced", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "primary_sessions_hot_log", "schedule_id", "TEXT")
@@ -1245,7 +1247,7 @@ class TraceStore:
 
     _PREFERENCE_COLUMNS = (
         "id, project, scope, category, text, evidence_json, explicit, status, "
-        "source_digest_date, created_at, resolved_at"
+        "source_digest_date, created_at, resolved_at, adopted_by, retire_reason"
     )
 
     @staticmethod
@@ -1262,6 +1264,8 @@ class TraceStore:
             "source_digest_date": row[8],
             "created_at": row[9],
             "resolved_at": row[10],
+            "adopted_by": row[11],
+            "retire_reason": row[12],
         }
 
     def add_preference_candidate(
@@ -1274,14 +1278,21 @@ class TraceStore:
         evidence: list[dict],
         explicit: bool,
         source_digest_date: str | None,
+        status: str = "pending",
+        adopted_by: str | None = None,
     ) -> int:
+        """status="adopted" is how the Harness adopts a preference on its own (nightly
+        digest, or a correction made in chat); adopted_by then says who did."""
+        if status not in ("pending", "adopted"):
+            raise ValueError(f"a new preference starts pending or adopted, not {status!r}")
+        now = utc_now_iso()
         with self._connection() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO preference_rules (
                     project, scope, category, text, evidence_json, explicit, status,
-                    source_digest_date, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    source_digest_date, created_at, resolved_at, adopted_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project,
@@ -1290,8 +1301,11 @@ class TraceStore:
                     text,
                     json.dumps(evidence, ensure_ascii=False),
                     1 if explicit else 0,
+                    status,
                     source_digest_date,
-                    utc_now_iso(),
+                    now,
+                    now if status == "adopted" else None,
+                    adopted_by if status == "adopted" else None,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -1329,6 +1343,8 @@ class TraceStore:
         text: str | None = None,
         scope: str | None = None,
         evidence: list[dict] | None = None,
+        retire_reason: str | None = None,
+        adopted_by: str | None = None,
     ) -> bool:
         """Compare-and-set on status so a double click (or the web page and a CLI at
         once) can't resolve the same rule twice."""
@@ -1343,6 +1359,12 @@ class TraceStore:
         if evidence is not None:
             sets.append("evidence_json = ?")
             params.append(json.dumps(evidence, ensure_ascii=False))
+        if retire_reason is not None:
+            sets.append("retire_reason = ?")
+            params.append(retire_reason)
+        if adopted_by is not None:
+            sets.append("adopted_by = ?")
+            params.append(adopted_by)
         params.append(rule_id)
         params.extend(expected_statuses)
         with self._connection() as conn:

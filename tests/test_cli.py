@@ -588,3 +588,42 @@ class CollectStatusDataKnownModelsTests(TestCase):
             self.assertIn("sonnet", data["known_models"]["claude"])
             self.assertIn("gemini-3.6-flash-high", data["known_models"]["antigravity"])
             self.assertEqual(set(data["known_models"].keys()), {"claude", "codex", "antigravity"})
+
+
+class NightlyPreferenceNotificationTests(TestCase):
+    def test_the_operator_is_told_what_the_harness_adopted_and_retired(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli import _run_nightly_digest_pass
+        from memtrace_harness.memory_digest import PreferenceChanges
+
+        changes = PreferenceChanges(
+            adopted=[{"id": 7, "text": "回覆一律用繁體中文"}],
+            retired=[{"id": 3, "text": "回覆簡短", "retire_reason": "2026-09-30 被 #7 取代"}],
+            waiting=[{"id": 8, "text": "多的一條"}],
+        )
+        gateway = MagicMock()
+        config = MagicMock(status_server_host="127.0.0.1", status_server_port=8787)
+        with patch("memtrace_harness.cli.run_memory_digests", return_value={"proj": changes}):
+            _run_nightly_digest_pass(
+                config, MagicMock(), None, [], gateway_for_project={"proj": gateway}, status_bus=None
+            )
+
+        message = gateway.notify_all_allowlisted.call_args.args[0]
+        self.assertIn("- [#7] 回覆一律用繁體中文", message)
+        self.assertIn("撤回 [#3] 回覆簡短（2026-09-30 被 #7 取代）", message)
+        self.assertIn("另有 1 條超過每日自動採用上限", message)
+        self.assertIn("直接在聊天裡說", message)
+
+    def test_a_night_with_no_preference_changes_sends_nothing(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli import _run_nightly_digest_pass
+        from memtrace_harness.memory_digest import PreferenceChanges
+
+        gateway = MagicMock()
+        with patch("memtrace_harness.cli.run_memory_digests", return_value={"proj": PreferenceChanges()}):
+            _run_nightly_digest_pass(
+                MagicMock(), MagicMock(), None, [], gateway_for_project={"proj": gateway}, status_bus=None
+            )
+        gateway.notify_all_allowlisted.assert_not_called()

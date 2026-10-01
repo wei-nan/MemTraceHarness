@@ -30,8 +30,22 @@ stable cross-run aggregates and may create proposals; it cannot adopt its own pr
 
 - raw provider output remains in the local trace directory;
 - local SQLite stores run, execution, turn, provider-session and checkpoint references;
-- MemTrace writeback is explicit and draft-only;
+- MemTrace writeback is explicit; conversation archives and nightly digests are written as
+  draft-labelled notes (tags `harness`, `draft`);
+- operator preferences are adopted and retired by the Harness itself, with the safeguards below;
 - missing usage remains `unavailable`, never zero.
+
+**Autonomous operator preferences (explicit operator decision, 2026-10-02).** The Harness derives
+the operator's standing preferences from the operator's own conversations (nightly digest) and
+adopts, replaces and retires them without waiting for approval; the operator corrects one in chat
+(`HARNESS_PREFERENCE_CORRECT::`) or on the status page, which is an after-the-fact view and
+override, not a gate. ENFORCED in code: every change cites the human's own turns and is checked
+against the log; at most 5 rules are adopted per project-day (the rest wait for the operator);
+only the newest 40 are put in front of the chat model; nothing is deleted, so a retired rule stays
+on record and can be restored. This does not extend to Agent Loop gates or Improvement Loop
+proposals, which the Harness still cannot approve for itself. **PLANNED, not implemented:** the same
+autonomy for durable knowledge nodes (a "key-point" layer above the digests); until it ships,
+knowledge the Harness writes to MemTrace stays draft-labelled.
 
 **POLICY_ONLY**:
 

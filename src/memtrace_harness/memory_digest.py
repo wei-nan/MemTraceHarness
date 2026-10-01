@@ -49,6 +49,15 @@ AUTO_CATCH_UP_DAYS = 2
 OPEN_ITEM_MAX_AGE_DAYS = 14
 RECENT_DIGESTS_FOR_CONTEXT = 3
 DIGEST_CONTEXT_CHAR_BUDGET = 6000
+# Preferences are adopted by the Harness itself (nothing waits for the operator), so the
+# damage one bad night can do is bounded: past this many new rules per project-day the
+# rest wait on the status page instead, and only this many rules are put in front of
+# the chat model, newest first.
+MAX_AUTO_ADOPT_PER_PROJECT_DAY = 5
+MAX_PREFERENCES_IN_CONTEXT = 40
+ADOPTED_BY_OPERATOR = "operator"
+ADOPTED_BY_DIGEST = "harness-digest"
+ADOPTED_BY_CHAT = "harness-chat"
 
 # Per-turn caps keep one busy day's prompt bounded; the human's own words get more
 # room than long assistant replies and Agent Loop reports.
@@ -88,9 +97,18 @@ class DigestOutcome:
     digest_date: str
     turn_count: int
     digest: dict[str, Any]
-    candidates_added: int
+    preferences: PreferenceChanges
     provider: str | None = None
     model: str | None = None
+
+
+@dataclass
+class PreferenceChanges:
+    """What one digest did to the operator's standing preferences."""
+
+    adopted: list[dict] = field(default_factory=list)
+    retired: list[dict] = field(default_factory=list)
+    waiting: list[dict] = field(default_factory=list)  # over the per-day cap
 
 
 @dataclass
@@ -202,7 +220,13 @@ def build_digest_prompt(
     turns: list[dict],
     carried_open_items: list[dict],
     schedule_note: str = "",
+    adopted_rules: list[dict] | None = None,
 ) -> str:
+    adopted_text = (
+        "\n".join(f"[{r['id']}] ({'global' if r['scope'] == 'global' else 'project'}) {r['text']}" for r in adopted_rules)
+        if adopted_rules
+        else "(none)"
+    )
     carried = (
         "\n".join(
             f"[{i}] (since {item.get('since', '?')}) {item['text']}"
@@ -221,6 +245,9 @@ def build_digest_prompt(
         "work_session_report = Agent Loop results.\n\n"
         "Open items carried over from earlier days, by index:\n"
         f"{carried}\n\n"
+        "Standing preferences already adopted for this human, by id (global ones apply to "
+        "every project):\n"
+        f"{adopted_text}\n\n"
         + (
             "Scheduled runs that fired this day (a run repeats every few minutes, so only "
             "each schedule's LAST result is in the log below; treat it as a status "
@@ -239,7 +266,8 @@ def build_digest_prompt(
         '  "resolved_open_items": [{"index": 0, "turns": [16]}],\n'
         '  "process_lessons": [{"text": "...", "turns": [17]}],\n'
         '  "preference_candidates": [{"text": "...", "turns": [18], "scope": "global", '
-        f'"category": "other", "explicit": true}}]\n'
+        f'"category": "other", "explicit": true, "replaces": []}}],\n'
+        '  "preference_retirements": [{"id": 3, "turns": [19]}]\n'
         "}\n"
         "Rules:\n"
         "- A user turn may end with （回覆的訊息：「…」）. That quoted text is a message the "
@@ -260,7 +288,13 @@ def build_digest_prompt(
         "project content are NOT preferences; when unsure, leave it out. scope is "
         '"global" when it applies to every project (e.g. reply language) or "project" '
         f"when only to this one. category is one of: {categories}. explicit is true only "
-        "when the human stated it as a rule (e.g. 以後, 一律, 不要再, always).\n"
+        "when the human stated it as a rule (e.g. 以後, 一律, 不要再, always). These are "
+        "adopted automatically, so be conservative. Do not repeat an adopted preference "
+        "unchanged; when a candidate refines or contradicts an adopted one, list that "
+        "one's id in `replaces`.\n"
+        "- preference_retirements: adopted preferences (by id) that the human, in THIS "
+        "day's log, explicitly withdrew or contradicted (e.g. 不用了, 那個不要了) without "
+        "giving a replacement. Cite only user turns. When unsure, leave it out.\n"
         "- Write every text field and the summary in Traditional Chinese (繁體中文，台灣用語). "
         "One sentence per item. Never invent anything that is not in the log.\n"
         "- Use [] for an empty list.\n\n"
@@ -312,10 +346,25 @@ def _ground_items(raw: Any, valid_seqs: set[int]) -> _Grounded:
     return grounded
 
 
-def _ground_preferences(raw: Any, all_seqs: set[int], user_seqs: set[int]) -> _Grounded:
+def _ids(raw: Any, valid: set[int]) -> list[int]:
+    out = []
+    for value in raw if isinstance(raw, list) else []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number in valid and number not in out:
+            out.append(number)
+    return out
+
+
+def _ground_preferences(
+    raw: Any, all_seqs: set[int], user_seqs: set[int], adopted_ids: set[int]
+) -> _Grounded:
     """Stricter than _ground_items: every cited turn must exist AND be the human's
     own. One citation of an assistant or report turn discards the whole candidate —
-    that is exactly how a stock-analysis reply once became a 'preference'."""
+    that is exactly how a stock-analysis reply once became a 'preference'. `replaces`
+    keeps only ids that really are adopted preferences."""
     grounded = _Grounded()
     if not isinstance(raw, list):
         return grounded
@@ -336,8 +385,23 @@ def _ground_preferences(raw: Any, all_seqs: set[int], user_seqs: set[int]) -> _G
                 "scope": "project" if item.get("scope") == "project" else "global",
                 "category": category if category in PREFERENCE_CATEGORIES else "other",
                 "explicit": item.get("explicit") is True,
+                "replaces": _ids(item.get("replaces"), adopted_ids),
             }
         )
+    return grounded
+
+
+def _ground_retirements(raw: Any, user_seqs: set[int], adopted_ids: set[int]) -> _Grounded:
+    grounded = _Grounded()
+    if not isinstance(raw, list):
+        return grounded
+    for item in raw:
+        cited = _cited_turns(item.get("turns")) if isinstance(item, dict) else []
+        rule_ids = _ids([item.get("id")], adopted_ids) if isinstance(item, dict) else []
+        if not rule_ids or not cited or any(t not in user_seqs for t in cited):
+            grounded.dropped += 1
+            continue
+        grounded.items.append({"id": rule_ids[0], "turns": sorted(set(cited))})
     return grounded
 
 
@@ -347,9 +411,10 @@ def ground_digest(
     digest_date: str,
     turns: list[dict],
     carried_open_items: list[dict],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    adopted_ids: set[int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate one model answer against that day's turns. Returns (digest, grounded
-    preference candidates)."""
+    preference candidates, grounded preference retirements)."""
     all_seqs = {int(t["turn_seq"]) for t in turns}
     user_seqs = {int(t["turn_seq"]) for t in turns if t["speaker"] == "user"}
 
@@ -357,8 +422,13 @@ def ground_digest(
     facts = _ground_items(raw.get("facts"), all_seqs)
     new_open = _ground_items(raw.get("new_open_items"), all_seqs)
     lessons = _ground_items(raw.get("process_lessons"), all_seqs)
-    preferences = _ground_preferences(raw.get("preference_candidates"), all_seqs, user_seqs)
-    dropped = decisions.dropped + facts.dropped + new_open.dropped + lessons.dropped + preferences.dropped
+    adopted = adopted_ids or set()
+    preferences = _ground_preferences(raw.get("preference_candidates"), all_seqs, user_seqs, adopted)
+    retirements = _ground_retirements(raw.get("preference_retirements"), user_seqs, adopted)
+    dropped = (
+        decisions.dropped + facts.dropped + new_open.dropped + lessons.dropped
+        + preferences.dropped + retirements.dropped
+    )
 
     resolved_turns: dict[int, list[int]] = {}
     for item in raw.get("resolved_open_items") or []:
@@ -400,26 +470,52 @@ def ground_digest(
         "preference_candidate_count": len(preferences.items),
         "discarded_ungrounded": dropped,
     }
-    return digest, preferences.items
+    return digest, preferences.items, retirements.items
 
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", "", text).strip("。.!！").lower()
 
 
-def _store_preference_candidates(
+def visible_rules(rules: list[dict], project: str) -> list[dict]:
+    return [r for r in rules if r["scope"] == "global" or r["project"] == project]
+
+
+def apply_preference_changes(
     trace_store: TraceStore,
     project: str,
     digest_date: str,
     candidates: list[dict[str, Any]],
+    retirements: list[dict[str, Any]],
     turns: list[dict],
-) -> int:
+) -> PreferenceChanges:
+    """The Harness adopts and retires the operator's standing preferences on its own;
+    nothing waits for a click. What keeps that safe: every change cites the human's own
+    turns (checked before this runs), at most MAX_AUTO_ADOPT_PER_PROJECT_DAY rules are
+    adopted per project-day, nothing is deleted (a retired rule stays on record and can
+    be restored from the status page), and the human can correct any rule in chat.
+
+    Safe to run twice for the same day: a rule already adopted is not added again, and a
+    rule already retired is skipped."""
+    changes = PreferenceChanges()
     content_by_seq = {int(t["turn_seq"]): str(t["content"]) for t in turns}
+
+    def retire(rule_id: int, reason: str) -> None:
+        if trace_store.update_preference_rule(
+            rule_id, status="retired", expected_statuses=("adopted",), retire_reason=reason
+        ):
+            rule = trace_store.get_preference_rule(rule_id)
+            if rule is not None:
+                changes.retired.append(rule)
+
+    for retirement in retirements:
+        quote = content_by_seq.get(retirement["turns"][0], "")[:120]
+        retire(retirement["id"], f"{digest_date} 你在對話中撤回（turn #{retirement['turns'][0]}）：{quote}")
+
     known = {
-        _normalize(r["text"])
-        for r in trace_store.list_preference_rules(statuses=("pending", "adopted"))
+        _normalize(r["text"]) for r in trace_store.list_preference_rules(statuses=("pending", "adopted"))
     }
-    added = 0
+    adopted_today = 0
     for candidate in candidates:
         key = _normalize(candidate["text"])
         if key in known:
@@ -429,7 +525,8 @@ def _store_preference_candidates(
             {"date": digest_date, "turn_seq": seq, "quote": content_by_seq[seq][:300]}
             for seq in candidate["turns"]
         ]
-        trace_store.add_preference_candidate(
+        auto = adopted_today < MAX_AUTO_ADOPT_PER_PROJECT_DAY
+        rule_id = trace_store.add_preference_candidate(
             project=project,
             scope=candidate["scope"],
             category=candidate["category"],
@@ -437,9 +534,19 @@ def _store_preference_candidates(
             evidence=evidence,
             explicit=candidate["explicit"],
             source_digest_date=digest_date,
+            status="adopted" if auto else "pending",
+            adopted_by=ADOPTED_BY_DIGEST if auto else None,
         )
-        added += 1
-    return added
+        rule = trace_store.get_preference_rule(rule_id)
+        assert rule is not None
+        if not auto:
+            changes.waiting.append(rule)
+            continue
+        adopted_today += 1
+        changes.adopted.append(rule)
+        for old_id in candidate["replaces"]:
+            retire(old_id, f"{digest_date} 被 #{rule_id} 取代")
+    return changes
 
 
 def run_digest_for_date(
@@ -457,9 +564,10 @@ def run_digest_for_date(
     carried = list(previous["digest"].get("open_items") or []) if previous else []
 
     turns, conversation_turns, schedule_note = split_schedule_activity(turns)
+    adopted_rules = visible_rules(trace_store.list_preference_rules(statuses=("adopted",)), project)
     if turns:
         stdout, provider, model = call_model(
-            build_digest_prompt(project, digest_date, turns, carried, schedule_note)
+            build_digest_prompt(project, digest_date, turns, carried, schedule_note, adopted_rules)
         )
         raw = _extract_json_object(stdout)
     else:
@@ -468,9 +576,16 @@ def run_digest_for_date(
         # isn't retried forever, and keep carrying the open items forward.
         provider = model = None
         raw = {"summary": "（這天只有排程觸發，沒有對話，也沒有執行結果。）"}
-    digest, candidates = ground_digest(
-        raw, digest_date=digest_date, turns=turns, carried_open_items=carried
+    digest, candidates, retirements = ground_digest(
+        raw,
+        digest_date=digest_date,
+        turns=turns,
+        carried_open_items=carried,
+        adopted_ids={r["id"] for r in adopted_rules},
     )
+    changes = apply_preference_changes(trace_store, project, digest_date, candidates, retirements, turns)
+    digest["preferences_adopted"] = len(changes.adopted)
+    digest["preferences_retired"] = len(changes.retired)
     trace_store.save_memory_digest(
         project=project,
         digest_date=digest_date,
@@ -479,13 +594,12 @@ def run_digest_for_date(
         turn_count=conversation_turns,
         digest=digest,
     )
-    added = _store_preference_candidates(trace_store, project, digest_date, candidates, turns)
     return DigestOutcome(
         project=project,
         digest_date=digest_date,
         turn_count=conversation_turns,
         digest=digest,
-        candidates_added=added,
+        preferences=changes,
         provider=provider,
         model=model,
     )
@@ -655,6 +769,9 @@ _PREFERENCE_TRANSITIONS = {
     "adopt": (("pending",), "adopted"),
     "dismiss": (("pending",), "dismissed"),
     "retire": (("adopted",), "retired"),
+    # Undo a retirement — the Harness retires rules on its own, so the operator needs a
+    # way back that doesn't depend on the digest re-deriving the rule.
+    "restore": (("retired",), "adopted"),
 }
 
 
@@ -666,9 +783,10 @@ def resolve_preference(
     text: str | None = None,
     scope: str | None = None,
 ) -> dict[str, Any]:
-    """The only way a preference takes or loses effect: an operator action. Raises
-    ValueError for an unknown action, a missing rule, or a rule not in a state that
-    action applies to (e.g. already adopted by an earlier click)."""
+    """An operator action on a preference (the Harness also adopts and retires rules on
+    its own; this is how the operator overrides that). Raises ValueError for an unknown
+    action, a missing rule, or a rule not in a state that action applies to (e.g. already
+    adopted by an earlier click)."""
     if action not in _PREFERENCE_TRANSITIONS:
         raise ValueError(f"unsupported action {action!r}")
     if scope is not None and scope not in ("global", "project"):
@@ -683,6 +801,8 @@ def resolve_preference(
         expected_statuses=expected,
         text=edited_text if action == "adopt" else None,
         scope=scope if action == "adopt" else None,
+        retire_reason={"retire": "你在狀態網頁撤銷", "restore": ""}.get(action),
+        adopted_by=ADOPTED_BY_OPERATOR if action in ("adopt", "restore") else None,
     ):
         rule = trace_store.get_preference_rule(rule_id)
         if rule is None:
@@ -694,14 +814,12 @@ def resolve_preference(
 
 
 def adopted_preferences_for(trace_store: TraceStore, project: str) -> list[dict]:
-    return [
-        r
-        for r in trace_store.list_preference_rules(statuses=("adopted",))
-        if r["scope"] == "global" or r["project"] == project
-    ]
+    return visible_rules(trace_store.list_preference_rules(statuses=("adopted",)), project)
 
 
-def render_preference_rules(rules: list[dict], *, with_scope: bool = False) -> str:
+def render_preference_rules(
+    rules: list[dict], *, with_scope: bool = False, with_ids: bool = False
+) -> str:
     by_category: dict[str, list[dict]] = {}
     for rule in rules:
         by_category.setdefault(rule["category"], []).append(rule)
@@ -712,20 +830,63 @@ def render_preference_rules(rules: list[dict], *, with_scope: bool = False) -> s
         lines.append(f"{PREFERENCE_CATEGORY_LABELS[category]}：")
         for rule in by_category[category]:
             scope = f"（僅 {rule['project']}）" if with_scope and rule["scope"] == "project" else ""
-            lines.append(f"- {rule['text']}{scope}")
+            label = f"[#{rule['id']}] " if with_ids else ""
+            lines.append(f"- {label}{rule['text']}{scope}")
     return "\n".join(lines)
 
 
-def preference_context_for(trace_store: TraceStore, project: str) -> str:
-    return render_preference_rules(adopted_preferences_for(trace_store, project))
+def preference_context_for(trace_store: TraceStore, project: str, *, with_ids: bool = False) -> str:
+    """Newest MAX_PREFERENCES_IN_CONTEXT adopted rules, grouped by category."""
+    rules = sorted(adopted_preferences_for(trace_store, project), key=lambda r: r["id"], reverse=True)
+    return render_preference_rules(rules[:MAX_PREFERENCES_IN_CONTEXT], with_ids=with_ids)
+
+
+PREFERENCE_CORRECT_MARKER = "HARNESS_PREFERENCE_CORRECT::"
+
+
+def apply_chat_preference_correction(
+    trace_store: TraceStore, project: str, payload: str, user_text: str, today: str
+) -> str | None:
+    """A correction the chat model judged the human just made. payload is
+    "<id>::retire" or "<id>::replace::<corrected text>". Only an adopted rule this project
+    can see is touched; anything malformed or stale is ignored (returns None) rather than
+    guessed at. Returns a one-line confirmation to show the human."""
+    parts = [p.strip() for p in payload.split("::", 2)]
+    if len(parts) < 2 or not parts[0].lstrip("#").isdigit():
+        return None
+    rule_id, action = int(parts[0].lstrip("#")), parts[1].lower()
+    rule = trace_store.get_preference_rule(rule_id)
+    if rule is None or rule["status"] != "adopted" or rule not in visible_rules([rule], project):
+        return None
+    quote = user_text.strip().replace("\n", " ")[:120]
+    if action == "retire":
+        if not trace_store.update_preference_rule(
+            rule_id, status="retired", expected_statuses=("adopted",),
+            retire_reason=f"{today} 你在聊天中更正：{quote}",
+        ):
+            return None
+        return f"🧠 已撤回偏好 #{rule_id}：{rule['text']}（到狀態網頁可以恢復）"
+    if action == "replace" and len(parts) == 3 and parts[2]:
+        new_id = trace_store.add_preference_candidate(
+            project=rule["project"], scope=rule["scope"], category=rule["category"], text=parts[2],
+            evidence=[{"date": today, "turn_seq": None, "quote": user_text.strip()[:300]}],
+            explicit=True, source_digest_date=today, status="adopted", adopted_by=ADOPTED_BY_CHAT,
+        )
+        trace_store.update_preference_rule(
+            rule_id, status="retired", expected_statuses=("adopted",),
+            retire_reason=f"{today} 被 #{new_id} 取代（你在聊天中更正）",
+        )
+        return f"🧠 已更正偏好 #{rule_id}：{rule['text']} → {parts[2]}（新的是 #{new_id}）"
+    return None
 
 
 def sync_operator_profile(trace_store: TraceStore, memtrace_client, workspace_id: str) -> None:
     """Rewrite (never append to) the operator profile node from the adopted rules."""
     rules = trace_store.list_preference_rules(statuses=("adopted",))
     body = (
-        "Operator preferences adopted by the operator on the Harness status page "
-        "(rewritten on every adopt/retire).\n\n"
+        "Operator preferences the Harness adopted from the operator's own conversations "
+        "(rewritten whenever one is adopted, replaced or retired; the operator can retire "
+        "any of them on the status page or by correcting it in chat).\n\n"
         + (render_preference_rules(rules, with_scope=True) or "（尚無已採用的偏好）")
     )
     existing = memtrace_client.search_nodes(
