@@ -617,12 +617,17 @@ def _make_preference_classifier(config: HarnessConfig, working_directory: Path):
 
     def classify(contents: list[str]) -> list[bool]:
         prompt = (
-            "Below are chat messages from a conversation log, numbered in order. For "
-            "each one, decide if it reveals something about how this human wants to be "
-            "worked with — a stated preference, an instruction about interaction style, "
-            "tone, formatting, or approval habits, or a standing rule for how the "
-            "assistant should behave — versus messages that are only about the project's "
-            "own work, or ordinary small talk with no such signal.\n\n"
+            "Below are messages a human sent to their assistant, numbered in order. "
+            "For each one, decide if it states a STANDING preference about how this "
+            "human wants to be worked with — something meant to keep applying to "
+            "future conversations, such as interaction style, tone, language, "
+            "formatting, approval habits, or a lasting rule or permission for how the "
+            "assistant should behave.\n"
+            "Answer OTHER for: a one-off request or question about the current task "
+            "(e.g. \"look this up\", \"is there no record of it?\"), anything only about "
+            "the project's own work or data, pasted material, and small talk. A "
+            "preference must read as a rule for next time, not an instruction for "
+            "right now. When unsure, answer OTHER.\n\n"
             f"Reply with EXACTLY {len(contents)} lines, one per message in the same "
             "order, each line either the single word PREFERENCE or the single word "
             "OTHER and nothing else.\n\n"

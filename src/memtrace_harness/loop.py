@@ -1287,9 +1287,11 @@ def controller_task(
             "directory — and waste the turn), and MemTrace search is how you'd look up "
             f"the KB equivalent instead.{write_permission}"
             "The task envelope's goal, the loop-snapshot context, and (when present) the "
-            "project-scope and prior-discussion context items below are what you start "
-            "from. The prior-discussion item is only a recent rolling window of this "
-            "project's chat/decision history, not a full search — when that isn't enough "
+            "project-scope, knowledge-base-locations, and prior-discussion context items "
+            "below are what you start from. The prior-discussion item is only a recent "
+            "rolling window of this project's chat/decision history, not a full search; "
+            "older history lives in the cold-memory workspace named by the "
+            "knowledge-base-locations item — when that isn't enough "
             "(e.g. the goal references a specific past conversation/task/decision by name "
             "and it isn't in the window below, or references a KB node id), decide for "
             "yourself whether a MemTrace search would actually resolve it before asking a "
@@ -1324,7 +1326,8 @@ def controller_task(
                 item
                 for item in task.context_items
                 # harness_resume_envelope: an actual same-conversation resume
-                # checkpoint. "context": project scope + recent prior-discussion
+                # checkpoint. "context": project scope + knowledge-base locations +
+                # recent prior-discussion
                 # (see TelegramGateway._project_context_items()) — added 2026-09-05
                 # after Controller kept saying "I don't have context" for goals like
                 # "接續 chat_3077a492 的任務" that only make sense with recent

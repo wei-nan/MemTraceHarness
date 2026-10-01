@@ -204,6 +204,13 @@ class ControllerTaskContextTests(TestCase):
                     source="harness",
                 ),
                 ContextItem(
+                    ref="harness:knowledge-bases:Beri",
+                    title="Knowledge-base locations",
+                    body="Cold memory: `ws_memory`",
+                    content_type="context",
+                    source="harness",
+                ),
+                ContextItem(
                     ref="harness:prior-discussion:Beri",
                     title="Prior discussion",
                     body="Earlier substantive context: ...",
@@ -229,6 +236,7 @@ class ControllerTaskContextTests(TestCase):
         result = controller_task(base_task, stage="start", stages=[])
         refs = {item.ref for item in result.context_items}
         self.assertIn("harness:project-scope:Beri", refs)
+        self.assertIn("harness:knowledge-bases:Beri", refs)
         self.assertIn("harness:prior-discussion:Beri", refs)
         self.assertIn("harness:resume:conv_1", refs)
         # Still excludes unrelated artifact-type items — Controller's sandbox isn't

@@ -193,12 +193,19 @@ class PrimarySessionManager:
             return []
 
         turns = [PrimarySessionTurn(**d) for d in unconsolidated_data]
+        # Only the human's own words can state how the human wants to be worked
+        # with. Assistant replies, system decisions and work-session reports used to
+        # go through the classifier too, and a full stock-analysis reply plus a
+        # "Resumed loop ... needs_human" status line ended up merged into the
+        # profile that every chat reply is told to follow (found 2026-10-01).
+        # Non-user turns are still marked done below, just never classified.
+        candidates = [t for t in turns if t.speaker == "user"]
         promoted: list[PrimarySessionTurn] = []
-        if classify_fn:
+        if classify_fn and candidates:
             try:
-                flags = classify_fn([t.content for t in turns])
-                if len(flags) == len(turns):
-                    promoted = [t for t, is_preference in zip(turns, flags) if is_preference]
+                flags = classify_fn([t.content for t in candidates])
+                if len(flags) == len(candidates):
+                    promoted = [t for t, is_preference in zip(candidates, flags) if is_preference]
             except Exception:
                 pass  # fail closed: classifier errors never block consolidation itself
 
