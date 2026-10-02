@@ -38,6 +38,32 @@ class HarnessConfig:
     # something else). 0 disables.
     approval_ttl_hours: int = 12
 
+    def chat_command(
+        self,
+        provider: str,
+        model: str | None,
+        prompt: str,
+        *,
+        claude_allowed_tools: str | None = None,
+    ) -> list[str]:
+        """argv for one plain, non-interactive "answer this prompt" call — the quick
+        chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
+        Antigravity take `--print <prompt>`; Codex has no --print at all (it exits 2
+        with a usage error), so until 2026-10-02 picking Codex as a chat model silently
+        failed on every message and fell back. Codex answers through `codex exec`,
+        read-only and ephemeral, printing only the final message on stdout."""
+        command = [self.command_for(provider)]
+        if provider == "codex":
+            command += ["exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never"]
+            if model:
+                command += ["--model", model]
+            return command + [prompt]
+        if provider == "claude" and claude_allowed_tools:
+            command += ["--allowedTools", claude_allowed_tools]
+        if model:
+            command += ["--model", model]
+        return command + ["--print", prompt]
+
     def command_for(self, provider: str) -> str:
         if provider == "claude":
             return self.claude_command

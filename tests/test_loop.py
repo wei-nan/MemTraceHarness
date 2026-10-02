@@ -1060,6 +1060,11 @@ class _FakeChatConfig:
     def command_for(self, provider: str) -> str:
         return provider
 
+    # The real argv builder, against this fake's command_for.
+    from memtrace_harness.config import HarnessConfig as _HarnessConfig
+
+    chat_command = _HarnessConfig.chat_command
+
 
 class MalformedOutputRepairTests(TestCase):
     def setUp(self) -> None:

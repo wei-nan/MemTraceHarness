@@ -625,10 +625,7 @@ def _classify_via_model(
     if not contents or not candidates:
         return [False] * len(contents)
     for provider, model in candidates:
-        cmd = [config.command_for(provider)]
-        if model:
-            cmd.extend(["--model", model])
-        cmd.extend(["--print", prompt])
+        cmd = config.chat_command(provider, model, prompt)
         result = CliProcessRunner().run(cmd, cwd=working_directory, timeout_seconds=60)
         if result.return_code != 0 or not result.stdout.strip():
             continue
@@ -663,6 +660,54 @@ def _make_chat_classifier(config: HarnessConfig, project_name: str, working_dire
     return classify
 
 
+# The main thread no longer polls Telegram (see start_bot_pollers), it only runs the
+# timed housekeeping, so it just wakes up this often to see whether anything is due.
+MAIN_LOOP_TICK_SECONDS = 1.0
+# A getUpdates call that comes back empty this fast failed (network error, Telegram
+# hiccup) rather than long-polling; back off instead of spinning on it.
+POLL_FAILURE_BACKOFF_SECONDS = 3.0
+
+
+def _poll_bot_forever(gw: TelegramGateway, stop_event: threading.Event, *, poll_timeout: int, status_bus) -> None:
+    label = ", ".join(p.name for p in gw.projects) or "unassigned"
+    while not stop_event.is_set():
+        started = time.monotonic()
+        processed = 0
+        try:
+            processed = gw.poll_once(timeout=poll_timeout)
+            if processed:
+                print(f"[{label}] processed {processed} update(s)", flush=True)
+                if status_bus is not None:
+                    status_bus.publish()
+        except Exception:
+            logger.exception(f"[{label}] gateway poll cycle failed; continuing")
+        if not processed and time.monotonic() - started < 1.0:
+            stop_event.wait(POLL_FAILURE_BACKOFF_SECONDS)
+
+
+def start_bot_pollers(
+    gateways: list[TelegramGateway], stop_event: threading.Event, *, poll_timeout: int, status_bus=None
+) -> list[threading.Thread]:
+    """One long-polling thread per bot. Until 2026-10-02 a single loop polled the bots
+    one after another, each getUpdates blocking up to poll_timeout (30s) when that bot
+    had nothing new, and answered messages in the same loop: with four bots a message
+    could wait ~90s before it was even read, and one bot's 2-minute reply held up all
+    the others. Each bot still handles its own messages in order."""
+    threads = []
+    for gw in gateways:
+        label = ", ".join(p.name for p in gw.projects) or "unassigned"
+        thread = threading.Thread(
+            target=_poll_bot_forever,
+            args=(gw, stop_event),
+            kwargs={"poll_timeout": poll_timeout, "status_bus": status_bus},
+            name=f"telegram-poll-{label}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
 # How often the gateway loop checks whether a nightly memory digest is due. Cheap when
 # nothing is due (SQLite reads only); the digest itself runs in its own thread so a
 # multi-minute model call never stalls Telegram polling.
@@ -686,10 +731,7 @@ def make_digest_model_caller(config: HarnessConfig, project_name: str):
     def call(prompt: str) -> tuple[str, str | None, str | None]:
         errors = []
         for provider, model in candidates:
-            cmd = [config.command_for(provider)]
-            if model:
-                cmd.extend(["--model", model])
-            cmd.extend(["--print", prompt])
+            cmd = config.chat_command(provider, model, prompt)
             result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=DIGEST_TIMEOUT_SECONDS)
             if result.return_code == 0 and result.stdout.strip():
                 return result.stdout, provider, model
@@ -940,11 +982,10 @@ def _serve_gateway_loop(
     if status_server is not None:
         print(f"Status dashboard: http://{config.status_server_host}:{config.status_server_port}")
 
-    stop_requested = False
+    stop_event = threading.Event()
 
     def _handle_stop(signum: int, frame: object) -> None:
-        nonlocal stop_requested
-        stop_requested = True
+        stop_event.set()
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
@@ -967,22 +1008,14 @@ def _serve_gateway_loop(
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
-    while not stop_requested:
-        for gw in gateways:
-            if stop_requested:
-                break
-            label = ", ".join(p.name for p in gw.projects) or "unassigned"
-            try:
-                processed = gw.poll_once(timeout=poll_timeout)
-                if processed:
-                    print(f"[{label}] processed {processed} update(s)")
-                    if status_bus is not None:
-                        status_bus.publish()
-            except Exception:
-                logger.exception(f"[{label}] gateway poll cycle failed; continuing")
-
-        if stop_requested:
+    pollers = start_bot_pollers(gateways, stop_event, poll_timeout=poll_timeout, status_bus=status_bus)
+    first_tick = True
+    while not stop_event.is_set():
+        # Telegram is polled by one thread per bot (start_bot_pollers); this thread only
+        # runs the timed housekeeping below, checking about once a second.
+        if not first_tick and stop_event.wait(MAIN_LOOP_TICK_SECONDS):
             break
+        first_tick = False
 
         now = time.monotonic()
         if now - last_scan >= scan_interval:
@@ -1085,7 +1118,13 @@ def _serve_gateway_loop(
                 digest_thread.start()
             last_digest_check = now
 
-    _drain_inflight_agent_loops(config.shutdown_grace_seconds)
+    # One shutdown budget for both: let each bot finish the message it is handling (an
+    # idle long-poll returns within poll_timeout), then give in-flight Agent Loop runs
+    # whatever is left. Stays inside launchd's ExitTimeOut.
+    deadline = time.monotonic() + config.shutdown_grace_seconds
+    for poller in pollers:
+        poller.join(timeout=max(0.0, deadline - time.monotonic()))
+    _drain_inflight_agent_loops(max(1, int(deadline - time.monotonic())))
 
     if status_server is not None:
         status_server.shutdown()
@@ -1472,6 +1511,24 @@ def _slugify(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "project"
 
 
+def _merge_model_catalog(config: "HarnessConfig", configured: dict[str, set[str]]) -> dict[str, list[str]]:
+    """What each provider CLI currently offers (newest first, see model_catalog.py),
+    followed by anything configured here that the catalog doesn't list. A catalog
+    failure only means the menu falls back to the configured models."""
+    from memtrace_harness.model_catalog import provider_models
+
+    try:
+        catalog = provider_models(config)
+    except Exception:
+        logger.exception("model catalog lookup failed; using configured models only")
+        catalog = {}
+    merged: dict[str, list[str]] = {}
+    for provider, models in configured.items():
+        offered = list(catalog.get(provider) or [])
+        merged[provider] = offered + sorted(m for m in models if m not in offered)
+    return merged
+
+
 # How many recent nightly digests per project the status page shows.
 STATUS_DIGEST_DAYS = 7
 # How many of the most recently retired preferences the status page lists (with a way back).
@@ -1673,7 +1730,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
             "retired": recently_retired,
             "category_labels": PREFERENCE_CATEGORY_LABELS,
         },
-        "known_models": {p: sorted(models) for p, models in known_models.items()},
+        "known_models": _merge_model_catalog(config, known_models),
     }
 
 
@@ -1689,8 +1746,13 @@ def update_chat_model_for_project(
     HARNESS_CHAT_PROVIDER/_MODEL a project without one is currently falling back to;
     there is no "already dedicated" case to refuse the way role-profiles has, since
     adding one more project-specific override never affects any other project. Only
-    the primary candidate is touched, never HARNESS_CHAT_FALLBACKS_<PROJECT>. Like
-    any other .env change, this only takes effect on this process's next restart."""
+    the primary candidate is touched, never HARNESS_CHAT_FALLBACKS_<PROJECT>.
+
+    Takes effect immediately, not on the next restart: chat_candidates_for() reads
+    os.environ on every call, and the dashboard runs inside the gateway process, so
+    the same values are set there too. Until 2026-10-02 only .env was written, so the
+    page re-rendered the still-running old model right after "saved" — it looked as if
+    the save had bounced back."""
     from memtrace_harness.config import project_chat_model_env_var, project_chat_provider_env_var
 
     if provider not in PROVIDERS:
@@ -1703,13 +1765,12 @@ def update_chat_model_for_project(
     if scope is None:
         raise ValueError(f"unknown project {project_name!r}")
 
-    _write_env_updates(
-        Path(".env"),
-        {
-            project_chat_provider_env_var(scope.name): provider,
-            project_chat_model_env_var(scope.name): model,
-        },
-    )
+    updates = {
+        project_chat_provider_env_var(scope.name): provider,
+        project_chat_model_env_var(scope.name): model,
+    }
+    _write_env_updates(Path(".env"), updates)
+    os.environ.update(updates)
 
 
 def update_role_profile_for_project(

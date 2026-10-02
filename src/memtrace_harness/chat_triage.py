@@ -144,10 +144,7 @@ class ChatTriage:
         )
         provider = self.config.chat_provider
         model = self.config.chat_model
-        cmd = [self.config.command_for(provider)]
-        if model:
-            cmd.extend(["--model", model])
-        cmd.extend(["--print", prompt])
+        cmd = self.config.chat_command(provider, model, prompt)
         working_dir = self.projects[0].working_directory
         res = runner.run(cmd, cwd=working_dir, timeout_seconds=10)
         if res.return_code == 0 and res.stdout:
