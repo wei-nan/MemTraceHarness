@@ -710,10 +710,7 @@ class AgentLoopRunner:
         )
         from memtrace_harness.cli_process import CliProcessRunner
 
-        command = [self.config.command_for(self.config.chat_provider)]
-        if self.config.chat_model:
-            command.extend(["--model", self.config.chat_model])
-        command.extend(["--print", prompt])
+        command = self.config.chat_command(self.config.chat_provider, self.config.chat_model, prompt)
         try:
             result = CliProcessRunner().run(
                 command,

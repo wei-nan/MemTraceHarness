@@ -435,7 +435,7 @@ document.addEventListener("click", function (e) {
       btn.disabled = false;
       if (res.ok) {
         statusEl.className = "rp-status ok";
-        statusEl.textContent = "已儲存，重啟 gateway 後生效";
+        statusEl.textContent = "已儲存，立即生效";
       } else {
         statusEl.className = "rp-status err";
         statusEl.textContent = res.body.error || "儲存失敗";

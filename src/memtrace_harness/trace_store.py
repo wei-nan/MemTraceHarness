@@ -864,6 +864,7 @@ class TraceStore:
             self._ensure_column(conn, "primary_sessions_hot_log", "schedule_id", "TEXT")
             self._retag_legacy_schedule_turns(conn)
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
+            self._ensure_column(conn, "schedules", "paused_until", "TEXT")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
@@ -1789,11 +1790,12 @@ class TraceStore:
             "next_run_at": row[11],
             "last_run_at": row[12],
             "last_run_status": row[13],
+            "paused_until": row[14],
         }
 
     _SCHEDULE_COLUMNS = (
         "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, end_time_of_day, "
-        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status"
+        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status, paused_until"
     )
 
     def get_schedule(self, schedule_id: str) -> dict | None:
@@ -1817,8 +1819,9 @@ class TraceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 f"SELECT {self._SCHEDULE_COLUMNS} FROM schedules "
-                "WHERE active = 1 AND next_run_at <= ? ORDER BY next_run_at ASC",
-                (now.isoformat(),),
+                "WHERE active = 1 AND next_run_at <= ? "
+                "AND (paused_until IS NULL OR paused_until <= ?) ORDER BY next_run_at ASC",
+                (now.isoformat(), now.isoformat()),
             ).fetchall()
         return [self._schedule_row_to_dict(row) for row in rows]
 
@@ -1826,6 +1829,24 @@ class TraceStore:
         with self._connection() as conn:
             cur = conn.execute(
                 "UPDATE schedules SET active = 0 WHERE id = ? AND active = 1", (schedule_id,)
+            )
+            return cur.rowcount > 0
+
+    def pause_schedule(self, schedule_id: str, *, paused_until: datetime, next_run_at: datetime) -> bool:
+        """Keep the row (so it can be resumed) but stop it firing until `paused_until`;
+        next_run_at is moved past the pause so it doesn't fire immediately on expiry."""
+        with self._connection() as conn:
+            cur = conn.execute(
+                "UPDATE schedules SET paused_until = ?, next_run_at = ? WHERE id = ? AND active = 1",
+                (paused_until.isoformat(), next_run_at.isoformat(), schedule_id),
+            )
+            return cur.rowcount > 0
+
+    def resume_schedule(self, schedule_id: str, *, next_run_at: datetime) -> bool:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "UPDATE schedules SET paused_until = NULL, next_run_at = ? WHERE id = ? AND active = 1",
+                (next_run_at.isoformat(), schedule_id),
             )
             return cur.rowcount > 0
 

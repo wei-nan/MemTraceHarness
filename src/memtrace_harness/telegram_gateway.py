@@ -843,6 +843,10 @@ class TelegramGateway:
 
     _TASK_START_MARKER = "HARNESS_TASK_START::"
     _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
+    _SCHEDULE_PAUSE_MARKER = "HARNESS_SCHEDULE_PAUSE::"
+    _SCHEDULE_RESUME_MARKER = "HARNESS_SCHEDULE_RESUME::"
+    _SCHEDULE_CANCEL_MARKER = "HARNESS_SCHEDULE_CANCEL::"
+    _PAUSE_INDEFINITELY = datetime(9999, 12, 31, tzinfo=timezone.utc)
 
     _CHAT_MEMTRACE_READ_TOOLS = (
         "mcp__memtrace__search_nodes,mcp__memtrace__get_node,"
@@ -918,21 +922,19 @@ class TelegramGateway:
             "週五觸發。同一則回覆不要同時輸出這一行和上面的任務啟動標記。不確定使用者是否"
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
             "裡把細節問清楚。\n\n"
+            f"{self._schedule_control_notice(scope)}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
         for provider, model in candidates:
-            cmd = [self.config.command_for(provider)]
-            if provider == "claude":
-                # Headless `claude --print` has nobody to approve a tool prompt, so an
-                # un-allowlisted MCP call is just refused (and the model then made up a
-                # "waiting for approval" story — 2026-09-30 貿聯 lookup). MemTrace's
-                # read-only lookups are safe to pre-allow; writes stay unavailable.
-                cmd.extend(["--allowedTools", self._CHAT_MEMTRACE_READ_TOOLS])
-            if model:
-                cmd.extend(["--model", model])
-            cmd.extend(["--print", prompt])
+            # Headless `claude --print` has nobody to approve a tool prompt, so an
+            # un-allowlisted MCP call is just refused (and the model then made up a
+            # "waiting for approval" story — 2026-09-30 貿聯 lookup). MemTrace's
+            # read-only lookups are safe to pre-allow; writes stay unavailable.
+            cmd = self.config.chat_command(
+                provider, model, prompt, claude_allowed_tools=self._CHAT_MEMTRACE_READ_TOOLS
+            )
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():
                 if failures:
@@ -946,6 +948,7 @@ class TelegramGateway:
                 confirmations = self._apply_preference_corrections(scope, corrections, text)
                 reply_text, goal = self._extract_task_start(stdout)
                 reply_text, schedule_directive = self._extract_schedule_start(reply_text)
+                reply_text, schedule_controls = self._extract_schedule_controls(reply_text)
                 if confirmations:
                     reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
@@ -961,6 +964,8 @@ class TelegramGateway:
                     self._start_or_queue_task(scope, goal, chat_id)
                 if schedule_directive:
                     self._create_schedule(scope, chat_id, schedule_directive)
+                for action, payload in schedule_controls:
+                    self._apply_schedule_control(scope, chat_id, action, payload)
                 return reply
             detail = result.error or result.stderr.strip() or f"exit code {result.return_code}"
             failures.append(f"{provider}/{model or '預設模型'}：{detail}")
@@ -1029,6 +1034,117 @@ class TelegramGateway:
         """Pull a trailing "HARNESS_SCHEDULE_START::<kind>::<spec>::<goal>" line out of
         a model reply."""
         return cls._extract_marker_line(raw, cls._SCHEDULE_START_MARKER)
+
+    def _schedule_control_notice(self, scope: ProjectScope) -> str:
+        """Tell the chat model which schedules exist and how to actually pause, resume or
+        cancel one. Without this the model could only SAY it had paused a schedule
+        (2026-10-02: 「已為您暫停」 while the 10-minute run kept firing)."""
+        rows = self.approval_manager.trace_store.list_schedules(scope.name)
+        if not rows:
+            return ""
+        tz = ZoneInfo(self.config.schedule_timezone)
+        lines = []
+        for row in rows:
+            spec = self._row_spec(row)
+            state = ""
+            if row.get("paused_until"):
+                state = "（已暫停" + self._paused_until_text(row["paused_until"], tz) + "）"
+            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal'][:80]}")
+        return (
+            "這個專案目前的排程：\n" + "\n".join(lines) + "\n"
+            "你自己無法停止排程，只有輸出下列標記行（各自另起一行、放在回覆最後）harness 才會真的"
+            "執行；沒有輸出標記就等於沒有做，所以絕對不要在沒輸出標記的情況下說「已暫停/已取消」。"
+            f"暫停：「{self._SCHEDULE_PAUSE_MARKER}<排程id>::<恢復時間>」，恢復時間是台北時間的"
+            "YYYY-MM-DD（當天 00:00 恢復）或 YYYY-MM-DD HH:MM，使用者沒講何時恢復就寫 indefinite"
+            "（直到使用者要求恢復）；明天繼續就填明天的日期。"
+            f"提前恢復：「{self._SCHEDULE_RESUME_MARKER}<排程id>」。"
+            f"永久取消：「{self._SCHEDULE_CANCEL_MARKER}<排程id>」。"
+            "使用者說「暫停」「明天再繼續」用暫停；說「取消」「不要了」用取消。\n\n"
+        )
+
+    @staticmethod
+    def _row_spec(row: dict) -> ScheduleSpec:
+        return ScheduleSpec(
+            kind=row["kind"],
+            interval_seconds=row["interval_seconds"],
+            time_of_day=row["time_of_day"],
+            end_time_of_day=row.get("end_time_of_day"),
+        )
+
+    @classmethod
+    def _paused_until_text(cls, paused_until: str, tz: ZoneInfo) -> str:
+        until = datetime.fromisoformat(paused_until)
+        if until >= cls._PAUSE_INDEFINITELY:
+            return "，直到你要求恢復"
+        return "，" + until.astimezone(tz).strftime("%Y-%m-%d %H:%M") + " 恢復"
+
+    def _extract_schedule_controls(self, raw: str) -> tuple[str, list[tuple[str, str]]]:
+        """Pull every pause/resume/cancel marker line out of a model reply."""
+        markers = {
+            "pause": self._SCHEDULE_PAUSE_MARKER,
+            "resume": self._SCHEDULE_RESUME_MARKER,
+            "cancel": self._SCHEDULE_CANCEL_MARKER,
+        }
+        kept, controls = [], []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            for action, marker in markers.items():
+                if stripped.startswith(marker):
+                    controls.append((action, stripped[len(marker):].strip()))
+                    break
+            else:
+                kept.append(line)
+        return "\n".join(kept).rstrip(), controls
+
+    def _apply_schedule_control(
+        self, scope: ProjectScope, chat_id: int, action: str, payload: str
+    ) -> None:
+        """Execute one pause/resume/cancel directive and confirm the real outcome to the
+        chat; failures are reported, never raised (this runs inside the reply path)."""
+        trace_store = self.approval_manager.trace_store
+        schedule_id, _, extra = (p.strip() for p in payload.partition("::"))
+        row = trace_store.get_schedule(schedule_id)
+        if row is None or not row["active"] or row["project"] != scope.name:
+            self.send_message(chat_id, f"⚠️ 找不到可操作的排程 {schedule_id}，狀態沒有改變。")
+            return
+        tz = ZoneInfo(self.config.schedule_timezone)
+        now = datetime.now(timezone.utc)
+        spec = self._row_spec(row)
+        try:
+            if action == "cancel":
+                trace_store.deactivate_schedule(schedule_id)
+                self.send_message(chat_id, f"✅ 已取消排程 {schedule_id}。")
+            elif action == "resume":
+                next_run_at = compute_next_run(spec, after=now, tz=tz)
+                trace_store.resume_schedule(schedule_id, next_run_at=next_run_at)
+                local_next = next_run_at.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+                self.send_message(chat_id, f"▶️ 已恢復排程 {schedule_id}，下次執行：{local_next}。")
+            else:
+                if not extra or extra.lower() == "indefinite":
+                    until = self._PAUSE_INDEFINITELY
+                    next_run_at = compute_next_run(spec, after=now, tz=tz)
+                else:
+                    until = self._parse_pause_until(extra, tz)
+                    next_run_at = compute_next_run(spec, after=max(until, now), tz=tz)
+                    # compute_next_run is strictly after its anchor; an interval anchored
+                    # on `until` would skip the first slot, so fire at `until` itself.
+                    if spec.kind == "interval":
+                        next_run_at = max(until, now)
+                trace_store.pause_schedule(schedule_id, paused_until=until, next_run_at=next_run_at)
+                self.send_message(
+                    chat_id,
+                    f"⏸ 已暫停排程 {schedule_id}"
+                    f"{self._paused_until_text(until.isoformat(), tz)}。用 /schedules 查看。",
+                )
+        except Exception as exc:
+            logger.exception(f"schedule {action} for {schedule_id} failed")
+            self.send_message(chat_id, f"⚠️ 排程 {schedule_id} 操作失敗，狀態沒有改變：{exc}")
+
+    @staticmethod
+    def _parse_pause_until(value: str, tz: ZoneInfo) -> datetime:
+        value = value.strip()
+        fmt = "%Y-%m-%d %H:%M" if " " in value else "%Y-%m-%d"
+        return datetime.strptime(value, fmt).replace(tzinfo=tz).astimezone(timezone.utc)
 
     def _create_schedule(self, scope: ProjectScope, chat_id: int, directive: str) -> None:
         """Parse a HARNESS_SCHEDULE_START directive's "<kind>::<spec>::<goal>" payload,
@@ -1120,9 +1236,10 @@ class TelegramGateway:
                 end_time_of_day=row.get("end_time_of_day"),
             )
             next_local = datetime.fromisoformat(row["next_run_at"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
-            lines.append(
-                f"- {row['id']}：{describe_schedule(spec)}，下次 {next_local}。任務：{row['goal'][:80]}"
-            )
+            state = f"，下次 {next_local}"
+            if row.get("paused_until"):
+                state = "，⏸ 已暫停" + self._paused_until_text(row["paused_until"], tz)
+            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal'][:80]}")
         lines.append("用 /schedule_cancel <id> 取消。")
         return "\n".join(lines)
 

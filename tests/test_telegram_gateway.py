@@ -669,6 +669,77 @@ def _build_schedule_gateway(tmp_path: Path):
     return gateway, trace_store, scope
 
 
+class ScheduleControlMarkerTests(TestCase):
+    def _chat(self, gateway, reply: str, text: str) -> str:
+        from unittest.mock import patch, MagicMock
+        from memtrace_harness.cli_process import ProcessResult
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"ok": true, "result": []}'
+        mock_response.__enter__.return_value = mock_response
+        model_reply = ProcessResult(
+            command=[], return_code=0, stdout=reply, stderr="",
+            started_at="2026-10-02T00:00:00+00:00", completed_at="2026-10-02T00:00:01+00:00",
+            duration_ms=500,
+        )
+        with patch("urllib.request.urlopen", return_value=mock_response), patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run", return_value=model_reply
+        ):
+            return gateway.process_update(
+                {"update_id": 400, "message": {"chat": {"id": 12345}, "text": text}}
+            )
+
+    def _make(self, trace_store, scope) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        return trace_store.create_schedule(
+            project=scope.name, workspace_id=scope.workspace_id, goal="check prices",
+            kind="interval", interval_seconds=600, chat_id=12345,
+            next_run_at=datetime.now(timezone.utc) - timedelta(seconds=5),
+        )
+
+    def test_pause_marker_really_stops_the_schedule_firing(self) -> None:
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, trace_store, scope = _build_schedule_gateway(Path(tmp_dir))
+            sid = self._make(trace_store, scope)
+            self.assertEqual(len(trace_store.list_due_schedules(datetime.now(timezone.utc))), 1)
+
+            result = self._chat(
+                gateway, f"好的，已暫停。\nHARNESS_SCHEDULE_PAUSE::{sid}::indefinite", "先暫停排程，明天再繼續"
+            )
+
+            self.assertNotIn("HARNESS_SCHEDULE_PAUSE", result)
+            self.assertEqual(trace_store.list_due_schedules(datetime.now(timezone.utc)), [])
+            self.assertTrue(trace_store.get_schedule(sid)["active"])
+
+    def test_resume_marker_makes_it_fire_again_after_pause(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, trace_store, scope = _build_schedule_gateway(Path(tmp_dir))
+            sid = self._make(trace_store, scope)
+            self._chat(gateway, f"ok\nHARNESS_SCHEDULE_PAUSE::{sid}::indefinite", "暫停")
+            self._chat(gateway, f"ok\nHARNESS_SCHEDULE_RESUME::{sid}", "繼續")
+
+            row = trace_store.get_schedule(sid)
+            self.assertIsNone(row["paused_until"])
+            later = datetime.now(timezone.utc) + timedelta(seconds=700)
+            self.assertEqual(len(trace_store.list_due_schedules(later)), 1)
+
+    def test_cancel_marker_deactivates_and_unknown_id_changes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, trace_store, scope = _build_schedule_gateway(Path(tmp_dir))
+            sid = self._make(trace_store, scope)
+
+            self._chat(gateway, "ok\nHARNESS_SCHEDULE_CANCEL::sched_nope", "取消")
+            self.assertTrue(trace_store.get_schedule(sid)["active"])
+
+            self._chat(gateway, f"ok\nHARNESS_SCHEDULE_CANCEL::{sid}", "取消")
+            self.assertEqual(trace_store.list_schedules(scope.name), [])
+
+
 class ScheduleCommandTests(TestCase):
     def test_model_deciding_to_start_a_schedule_creates_a_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

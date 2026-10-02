@@ -582,7 +582,12 @@ class CollectStatusDataKnownModelsTests(TestCase):
                 project_index_path=idx, chat_provider="antigravity",
                 chat_model="gemini-3.6-flash-high", unattended_write_requires_approval=True,
             )
-            data = _collect_status_data(config)
+            # No real CLI in unit tests: the provider catalog (agy models, Codex's
+            # cache) is stubbed out, so this checks the configured-models half alone.
+            from unittest.mock import patch
+
+            with patch("memtrace_harness.model_catalog.provider_models", return_value={}):
+                data = _collect_status_data(config)
 
             self.assertIn("gpt-5.6-luna", data["known_models"]["codex"])
             self.assertIn("sonnet", data["known_models"]["claude"])
@@ -627,3 +632,111 @@ class NightlyPreferenceNotificationTests(TestCase):
                 MagicMock(), MagicMock(), None, [], gateway_for_project={"proj": gateway}, status_bus=None
             )
         gateway.notify_all_allowlisted.assert_not_called()
+
+
+class ChatCommandTests(TestCase):
+    """Codex has no --print (it exits 2 with a usage error), so choosing Codex as a
+    chat model used to fail on every message and silently fall back (2026-10-02)."""
+
+    def _config(self):
+        from unittest.mock import MagicMock
+
+        from memtrace_harness.config import HarnessConfig
+
+        config = MagicMock(spec=HarnessConfig)
+        config.command_for.side_effect = lambda p: f"/bin/{p}"
+        return config
+
+    def test_codex_answers_through_exec_read_only(self) -> None:
+        from memtrace_harness.config import HarnessConfig
+
+        cmd = HarnessConfig.chat_command(self._config(), "codex", "gpt-6-luna", "你好")
+        self.assertEqual(
+            cmd,
+            ["/bin/codex", "exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
+             "--color", "never", "--model", "gpt-6-luna", "你好"],
+        )
+        self.assertNotIn("--print", cmd)
+
+    def test_claude_and_antigravity_keep_print_and_only_claude_gets_the_tool_allowlist(self) -> None:
+        from memtrace_harness.config import HarnessConfig
+
+        config = self._config()
+        self.assertEqual(
+            HarnessConfig.chat_command(config, "claude", "haiku", "p", claude_allowed_tools="mcp__x"),
+            ["/bin/claude", "--allowedTools", "mcp__x", "--model", "haiku", "--print", "p"],
+        )
+        self.assertEqual(
+            HarnessConfig.chat_command(config, "antigravity", None, "p", claude_allowed_tools="mcp__x"),
+            ["/bin/antigravity", "--print", "p"],
+        )
+
+
+class BotPollerTests(TestCase):
+    """2026-10-02: four bots were polled one after another (each long-poll blocking up
+    to 30s) and messages were answered in the same loop, so a message could wait ~90s
+    before it was even read, and one bot's slow reply held up every other bot."""
+
+    def _gateway(self, name: str, poll):
+        from unittest.mock import MagicMock
+
+        gw = MagicMock()
+        project = MagicMock()
+        project.name = name
+        gw.projects = [project]
+        gw.poll_once.side_effect = poll
+        return gw
+
+    def test_a_busy_bot_does_not_hold_up_the_others(self) -> None:
+        import threading
+
+        from memtrace_harness.cli import start_bot_pollers
+
+        stop = threading.Event()
+        release_slow = threading.Event()
+        fast_handled = threading.Event()
+
+        def slow_poll(timeout):
+            release_slow.wait(5)  # e.g. a 2-minute chat reply in progress
+            return 0
+
+        def fast_poll(timeout):
+            fast_handled.set()
+            stop.wait(0.05)
+            return 1
+
+        slow, fast = self._gateway("Slow", slow_poll), self._gateway("Fast", fast_poll)
+        threads = start_bot_pollers([slow, fast], stop, poll_timeout=30)
+        try:
+            self.assertTrue(fast_handled.wait(2), "the fast bot was blocked behind the slow one")
+            self.assertFalse(release_slow.is_set())
+        finally:
+            stop.set()
+            release_slow.set()
+            for t in threads:
+                t.join(5)
+        self.assertTrue(all(not t.is_alive() for t in threads))
+        self.assertEqual({t.name for t in threads}, {"telegram-poll-Slow", "telegram-poll-Fast"})
+
+    def test_a_failing_poll_backs_off_instead_of_spinning(self) -> None:
+        import threading
+        from unittest.mock import patch
+
+        from memtrace_harness import cli
+
+        stop = threading.Event()
+        calls = []
+
+        def broken(timeout):
+            calls.append(1)
+            raise RuntimeError("network down")
+
+        gw = self._gateway("Broken", broken)
+        with patch.object(cli, "POLL_FAILURE_BACKOFF_SECONDS", 0.2):
+            threads = cli.start_bot_pollers([gw], stop, poll_timeout=30)
+            stop.wait(0.5)
+            stop.set()
+            for t in threads:
+                t.join(2)
+        self.assertLessEqual(len(calls), 4)
+        self.assertGreaterEqual(len(calls), 1)
