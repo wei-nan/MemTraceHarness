@@ -998,6 +998,44 @@ class KnowledgeBaseLocationsTests(TestCase):
             self.assertIn("spec workspace `ws_test` itself", body)
 
 
+class TopicRecallWiringTests(TestCase):
+    def test_briefs_reach_the_chat_prompt_and_chat_messages_start_a_recall(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli_process import ProcessResult
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, trace_store, scope = _build_schedule_gateway(Path(tmp_dir))
+            trace_store.insert_topic_brief(
+                project="test_proj", title="訂閱驗證", summary="上次談到要先驗證收據", fresh=False,
+                related=[{"node_id": "mem_aaa", "workspace_id": "ws", "title": "舊討論", "why": "同主題", "date": "2026-09-20"}],
+                source_turns=[1], provider="claude", model="m",
+                expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            )
+            trace_store.add_recall_pending("test_proj", 1)
+            identity = gateway._identity_context(scope)
+            self.assertIn("上次談到要先驗證收據", identity)
+            self.assertIn("mem_aaa", identity)
+            self.assertIn("整理中", identity)
+
+            gateway.topic_recall = MagicMock()
+            response = MagicMock()
+            response.read.return_value = b'{"ok": true, "result": []}'
+            response.__enter__.return_value = response
+            reply = ProcessResult(
+                command=[], return_code=0, stdout="好的", stderr="",
+                started_at="2026-10-03T00:00:00+00:00", completed_at="2026-10-03T00:00:01+00:00", duration_ms=1,
+            )
+            with patch("urllib.request.urlopen", return_value=response), patch(
+                "memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply
+            ):
+                gateway.process_update(
+                    {"update_id": 9, "message": {"chat": {"id": 12345}, "text": "訂閱驗證要怎麼做"}}
+                )
+            gateway.topic_recall.start.assert_called_once_with(scope, 12345, "訂閱驗證要怎麼做")
+
+
 class MemoryInjectionTests(TestCase):
     def test_only_adopted_preferences_and_recent_digests_reach_chat_and_agent_loop(self) -> None:
         from memtrace_harness.memory_digest import resolve_preference

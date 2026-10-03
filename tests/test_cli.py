@@ -9,6 +9,8 @@ from memtrace_harness.cli import (
     update_chat_model_for_project,
     update_digest_fallbacks_for_project,
     update_digest_model_for_project,
+    update_recall_fallbacks_for_project,
+    update_recall_model_for_project,
     update_role_profile_for_project,
 )
 from memtrace_harness.config import (
@@ -568,6 +570,38 @@ class UpdateChatModelForProjectTests(TestCase):
             update_digest_fallbacks_for_project(config, "TestProj", "openai/gpt-5")
         with self.assertRaises(ValueError):
             update_digest_fallbacks_for_project(config, "TestProj", "codex")
+
+    def test_recall_model_and_fallbacks_write_their_own_vars(self) -> None:
+        import os
+
+        from memtrace_harness.config import (
+            project_recall_fallbacks_env_var,
+            project_recall_model_env_var,
+            project_recall_provider_env_var,
+        )
+
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        for name in (
+            project_recall_provider_env_var("TestProj"),
+            project_recall_model_env_var("TestProj"),
+            project_recall_fallbacks_env_var("TestProj"),
+        ):
+            self.addCleanup(os.environ.pop, name, None)
+
+        update_recall_model_for_project(config, "TestProj", "claude", "claude-sonnet-5-5")
+        update_recall_fallbacks_for_project(config, "TestProj", "codex/gpt-5.6-sol")
+
+        self.assertEqual(
+            config.recall_candidates_for("TestProj"),
+            (("claude", "claude-sonnet-5-5"), ("codex", "gpt-5.6-sol")),
+        )
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        self.assertNotIn("HARNESS_DIGEST_", env_text)
+        with self.assertRaises(ValueError):
+            update_recall_fallbacks_for_project(config, "TestProj", "openai/gpt-5")
+        with self.assertRaises(ValueError):
+            update_recall_model_for_project(config, "TestProj", "openai", "x")
 
     def test_rejects_unknown_provider(self) -> None:
         tmp_path = self._chdir_to_temp()

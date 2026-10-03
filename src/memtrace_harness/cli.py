@@ -23,6 +23,7 @@ from memtrace_harness.adapter_factory import (
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
+from memtrace_harness.topic_recall import TopicRecallService
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.loop import AgentLoopRunner
@@ -582,6 +583,16 @@ def gateway_command(args: argparse.Namespace) -> int:
     for token, group_projects in groups.items():
         triage = ChatTriage(group_projects)
         gw = TelegramGateway(config, approval_mgr, triage, primary_session_mgr, group_projects, memtrace_client, bot_token=token)
+        gw.topic_recall = TopicRecallService(
+            config,
+            trace_store,
+            memtrace_client,
+            call_model_factory=lambda project: make_recall_model_caller(config, project),
+            send=gw.send_message,
+            record_push=lambda project, text, _mgr=primary_session_mgr: _mgr.record_turn(
+                project=project, speaker="assistant", turn_type="chat", content=text
+            ),
+        )
         gateways.append(gw)
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
@@ -738,6 +749,35 @@ def make_digest_model_caller(config: HarnessConfig, project_name: str):
                 return result.stdout, provider, model
             errors.append(f"{provider}/{model}: exit {result.return_code}")
         raise DigestError("no digest candidate produced a digest (" + "; ".join(errors) + ")")
+
+    return call
+
+
+def make_recall_model_caller(config: HarnessConfig, project_name: str):
+    """One call through that project's recall candidates (its own stronger model, see
+    HarnessConfig.recall_candidates_for), in order. Like the digest it runs in a neutral
+    directory so no repo-scoped CLI instructions leak in, but unlike the digest it may use
+    MemTrace's read-only tools to dig past the search hits the harness already supplied."""
+    from memtrace_harness.topic_recall import RECALL_TIMEOUT_SECONDS, RecallError
+
+    candidates = config.recall_candidates_for(project_name)
+    sandbox = (config.trace_root / "recall-workspace").resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+
+    def call(prompt: str) -> tuple[str, str | None, str | None]:
+        errors = []
+        for provider, model in candidates:
+            cmd = config.chat_command(
+                provider,
+                model,
+                prompt,
+                claude_allowed_tools=TelegramGateway._CHAT_MEMTRACE_READ_TOOLS,
+            )
+            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=RECALL_TIMEOUT_SECONDS)
+            if result.return_code == 0 and result.stdout.strip():
+                return result.stdout, provider, model
+            errors.append(f"{provider}/{model}: exit {result.return_code}")
+        raise RecallError("no recall candidate answered (" + "; ".join(errors) + ")")
 
     return call
 
@@ -1548,6 +1588,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         project_chat_provider_env_var,
         project_digest_provider_env_var,
         project_memory_workspace_env_var,
+        project_recall_provider_env_var,
         project_role_profiles_env_var,
     )
 
@@ -1618,6 +1659,13 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         digest_is_own = bool(
             os.getenv(project_digest_provider_env_var(scope.name)) or config.digest_provider
         )
+        recall_candidates = config.recall_candidates_for(scope.name)
+        recall_is_own = bool(
+            os.getenv(project_recall_provider_env_var(scope.name)) or config.recall_provider
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        topic_briefs = trace_store.list_active_topic_briefs(scope.name, now_iso)
+        recall_state = trace_store.get_recall_state(scope.name)
 
         role_profiles_entries: list[dict] | None = None
         role_profiles_error: str | None = None
@@ -1637,7 +1685,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         except Exception as exc:
             role_profiles_error = str(exc)
 
-        for provider, model in (*chat_candidates, *digest_candidates):
+        for provider, model in (*chat_candidates, *digest_candidates, *recall_candidates):
             if provider in known_models and model:
                 known_models[provider].add(model)
         for entry in role_profiles_entries or []:
@@ -1665,6 +1713,25 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                     {"provider": p, "model": m or None} for p, m in digest_candidates
                 ],
                 "digest_is_own": digest_is_own,
+                "recall_candidates": [
+                    {"provider": p, "model": m or None} for p, m in recall_candidates
+                ],
+                "recall_is_own": recall_is_own,
+                "recall_enabled": config.recall_enabled,
+                "recall_state": recall_state,
+                "topic_briefs": [
+                    {
+                        "id": b["id"],
+                        "title": b["title"],
+                        "summary": b["summary"],
+                        "fresh": b["fresh"],
+                        "related": b["related"],
+                        "updated_at": b["updated_at"],
+                        "expires_at": b["expires_at"],
+                        "pushed": b["pushed_at"] is not None,
+                    }
+                    for b in topic_briefs
+                ],
                 "role_profiles": role_profiles_entries,
                 "role_profiles_error": role_profiles_error,
                 "turn_count": turn_count,
@@ -1838,6 +1905,48 @@ def update_digest_fallbacks_for_project(
     updates = {
         project_digest_fallbacks_env_var(scope.name): ",".join(f"{p}/{m}" for p, m in pairs)
     }
+    _write_env_updates(Path(".env"), updates)
+    os.environ.update(updates)
+
+
+def update_recall_model_for_project(
+    config: "HarnessConfig", project_name: str, provider: str, model: str
+) -> None:
+    """Same as update_digest_model_for_project(), for the background topic-recall model
+    (HARNESS_RECALL_PROVIDER_<PROJECT>/_MODEL_<PROJECT>)."""
+    from memtrace_harness.config import project_recall_model_env_var, project_recall_provider_env_var
+
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+    if not model.strip():
+        raise ValueError("model must be a non-empty string")
+    scope = next((p for p in load_project_index(config.project_index_path) if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+    updates = {
+        project_recall_provider_env_var(scope.name): provider,
+        project_recall_model_env_var(scope.name): model,
+    }
+    _write_env_updates(Path(".env"), updates)
+    os.environ.update(updates)
+
+
+def update_recall_fallbacks_for_project(
+    config: "HarnessConfig", project_name: str, fallbacks: str
+) -> None:
+    """Same as update_digest_fallbacks_for_project(), for HARNESS_RECALL_FALLBACKS_<PROJECT>."""
+    from memtrace_harness.config import _parse_chat_fallbacks, project_recall_fallbacks_env_var
+
+    pairs = _parse_chat_fallbacks(fallbacks)
+    for provider, model in pairs:
+        if provider not in PROVIDERS:
+            raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+        if not model:
+            raise ValueError("every fallback needs a model, written provider/model")
+    scope = next((p for p in load_project_index(config.project_index_path) if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+    updates = {project_recall_fallbacks_env_var(scope.name): ",".join(f"{p}/{m}" for p, m in pairs)}
     _write_env_updates(Path(".env"), updates)
     os.environ.update(updates)
 

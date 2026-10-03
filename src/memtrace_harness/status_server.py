@@ -224,7 +224,7 @@ _PAGE_TEMPLATE = """<!doctype html>
 <body>
 <header>
   <h1>MemTrace Harness — 運行狀態</h1>
-  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 可編輯：Agent Loop 角色模型、聊天模型、每日摘要模型、待核准、偏好確認</div>
+  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 可編輯：Agent Loop 角色模型、聊天模型、每日摘要模型、背景回想模型、待核准、偏好確認</div>
 </header>
 <div class="toolbar">
   <input id="search" type="text" placeholder="搜尋專案名稱或對話內容…">
@@ -345,14 +345,45 @@ function renderChatCandidates(project) {
     "（未設定 HARNESS_CHAT_PROVIDER）", "");
 }
 
-function renderDigestFallbackRow(project) {
-  var rest = (project.digest_candidates || []).slice(1).map(function (c) {
+function renderFallbackRow(project, candidates, inputClass, saveClass) {
+  var rest = (candidates || []).slice(1).map(function (c) {
     return c.provider + "/" + (c.model || "");
   }).join(",");
   return '<div class="rp-row"><span class="hint">備援（provider/model，逗號分隔，留空＝無）</span> ' +
-    '<input class="digest-fallbacks" type="text" size="38" value="' + esc(rest) + '" placeholder="codex/gpt-5.6-sol">' +
-    '<button class="digest-fallbacks-save" data-project="' + esc(project.name) + '">儲存</button>' +
+    '<input class="fallbacks-input ' + inputClass + '" type="text" size="38" value="' + esc(rest) + '" placeholder="codex/gpt-5.6-sol">' +
+    '<button class="' + saveClass + '" data-project="' + esc(project.name) + '">儲存</button>' +
     '<span class="rp-status"></span></div>';
+}
+
+function renderDigestFallbackRow(project) {
+  return renderFallbackRow(project, project.digest_candidates, "digest-fallbacks", "digest-fallbacks-save");
+}
+
+function renderRecallCandidates(project) {
+  var note = project.recall_enabled === false ? "背景回想已停用（HARNESS_RECALL_ENABLED=false）。"
+    : (project.recall_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型。");
+  return renderModelCandidates(project, project.recall_candidates, "recall-model-save", "（未設定）", note) +
+    renderFallbackRow(project, project.recall_candidates, "recall-fallbacks", "recall-fallbacks-save");
+}
+
+function renderTopicBriefs(project) {
+  var list = project.topic_briefs || [];
+  var st = project.recall_state || {};
+  var head = '<div class="section-label">主題簡報（短效期，' + list.length + ' 份有效' +
+    (st.pending ? "，整理中 " + st.pending : "") + ")</div>";
+  var err = st.last_error ? '<div class="warn">⚠️ 上次背景整理失敗：' + esc(st.last_error) + "</div>" : "";
+  if (!list.length) return head + err + '<div class="empty">（目前沒有有效的主題簡報）</div>';
+  return head + err + list.map(function (b) {
+    var key = "brief:" + project.name + ":" + b.id;
+    var related = (b.related || []).map(function (r) {
+      return '<div class="evidence-item">' + esc((r.date ? r.date + " " : "") + (r.title || r.node_id)) +
+        "（" + esc(r.node_id) + "）：" + esc(r.why) + "</div>";
+    }).join("");
+    return '<details class="digest" data-key="' + esc(key) + '"' + detailsOpen(key) + "><summary>" +
+      esc(b.title) + (b.fresh ? "（全新主題）" : "") + (b.pushed ? " · 已推送" : "") +
+      " · 到期 " + esc((b.expires_at || "").slice(0, 16).replace("T", " ")) + "</summary>" +
+      '<div class="digest-body">' + esc(b.summary) + related + "</div></details>";
+  }).join("");
 }
 
 function renderDigestCandidates(project) {
@@ -438,17 +469,19 @@ document.addEventListener("click", function (e) {
 });
 
 document.addEventListener("click", function (e) {
-  if (!e.target.classList.contains("digest-fallbacks-save")) return;
+  var fbEndpoint = e.target.classList.contains("digest-fallbacks-save") ? "/api/digest-fallbacks"
+    : e.target.classList.contains("recall-fallbacks-save") ? "/api/recall-fallbacks" : null;
+  if (!fbEndpoint) return;
   var btn = e.target;
   var row = btn.closest(".rp-row");
   var statusEl = row.querySelector(".rp-status");
   statusEl.className = "rp-status";
   statusEl.textContent = "儲存中…";
   btn.disabled = true;
-  fetch("/api/digest-fallbacks", {
+  fetch(fbEndpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: btn.getAttribute("data-project"), fallbacks: row.querySelector(".digest-fallbacks").value })
+    body: JSON.stringify({ project: btn.getAttribute("data-project"), fallbacks: row.querySelector(".fallbacks-input").value })
   })
     .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
     .then(function (res) {
@@ -465,7 +498,8 @@ document.addEventListener("click", function (e) {
 
 document.addEventListener("click", function (e) {
   var endpoint = e.target.classList.contains("chat-model-save") ? "/api/chat-model"
-    : e.target.classList.contains("digest-model-save") ? "/api/digest-model" : null;
+    : e.target.classList.contains("digest-model-save") ? "/api/digest-model"
+    : e.target.classList.contains("recall-model-save") ? "/api/recall-model" : null;
   if (!endpoint) return;
   var btn = e.target;
   var row = btn.closest(".rp-row");
@@ -797,9 +831,10 @@ function renderDigests(project) {
 function renderModelSettings(project) {
   var key = "models:" + project.name;
   return '<details class="models" data-key="' + esc(key) + '"' + detailsOpen(key) + ">" +
-    "<summary>模型設定（聊天 / 每日摘要 / Agent Loop 角色）</summary>" +
+    "<summary>模型設定（聊天 / 每日摘要 / 背景回想 / Agent Loop 角色）</summary>" +
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
+    '<div class="section-label">背景回想模型</div>' + renderRecallCandidates(project) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
     "</details>";
 }
@@ -829,6 +864,7 @@ function renderProject(project, q) {
     '<span class="chip' + ((project.schedules || []).length ? " on" : "") + '">排程: ' + (project.schedules || []).length + "</span>" +
     "</div>" +
     renderModelSettings(project) +
+    renderTopicBriefs(project) +
     renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + ')</div>' +
     renderTurns(project.recent_turns, q) +
@@ -977,6 +1013,10 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             self._handle_make_role_profiles_independent()
         elif parsed.path == "/api/chat-model":
             self._handle_update_chat_model()
+        elif parsed.path == "/api/recall-model":
+            self._handle_update_stage_model("recall-model")
+        elif parsed.path == "/api/recall-fallbacks":
+            self._handle_update_stage_model("recall-fallbacks")
         elif parsed.path == "/api/digest-fallbacks":
             self._handle_update_digest_fallbacks()
         elif parsed.path == "/api/digest-model":
@@ -1085,6 +1125,37 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("status dashboard failed to update a digest model")
             self._send_json(500, {"error": "internal error updating the digest model"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True})
+
+    def _handle_update_stage_model(self, kind: str) -> None:
+        """Recall model / fallbacks: same body shapes as the digest endpoints."""
+        from memtrace_harness.cli import (
+            update_recall_fallbacks_for_project,
+            update_recall_model_for_project,
+        )
+
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+            if kind == "recall-model":
+                args = (str(payload["provider"]), str(payload["model"]))
+                update = update_recall_model_for_project
+            else:
+                args = (str(payload["fallbacks"]),)
+                update = update_recall_fallbacks_for_project
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            update(self.config, project, *args)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to update the recall model settings")
+            self._send_json(500, {"error": "internal error updating the recall model"})
             return
         self.bus.publish()
         self._send_json(200, {"ok": True})
