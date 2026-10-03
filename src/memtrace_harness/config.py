@@ -25,6 +25,12 @@ class HarnessConfig:
     unattended_write_requires_approval: bool
     harness_memory_workspace_id: str | None = None
     chat_fallbacks: tuple[tuple[str, str], ...] = ()
+    # Nightly memory digest model, independent of the chat model: the digest is a
+    # once-a-day consolidation that decides what becomes long-term memory, so it can
+    # afford a stronger model than the quick chat reply. Unset -> chat candidates.
+    digest_provider: str | None = None
+    digest_model: str | None = None
+    digest_fallbacks: tuple[tuple[str, str], ...] = ()
     operator_preference_workspace_id: str | None = None
     status_server_enabled: bool = True
     status_server_host: str = "127.0.0.1"
@@ -97,6 +103,25 @@ class HarnessConfig:
             return ()
         return ((provider, model), *fallbacks)
 
+    def digest_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for that project's nightly memory digest:
+        HARNESS_DIGEST_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT> if set,
+        else the shared HARNESS_DIGEST_PROVIDER/MODEL/FALLBACKS. When no digest provider
+        is configured at either level it falls back to chat_candidates_for(), the
+        behavior before the digest got its own model. A configured digest chain is used
+        as-is — it never silently degrades into the (weaker) chat chain."""
+        provider = os.getenv(project_digest_provider_env_var(project_name)) or self.digest_provider
+        if not provider:
+            return self.chat_candidates_for(project_name)
+        model = os.getenv(project_digest_model_env_var(project_name)) or self.digest_model
+        fallbacks_override = os.getenv(project_digest_fallbacks_env_var(project_name))
+        fallbacks = (
+            _parse_chat_fallbacks(fallbacks_override)
+            if fallbacks_override is not None
+            else self.digest_fallbacks
+        )
+        return ((provider, model or ""), *fallbacks)
+
     def role_profiles_file_for(self, project_name: str) -> Path | None:
         """Per-project role-profile override (e.g. a different fallback order), read
         from the Harness's own env — not from harness-scope.md, so the target project's
@@ -137,6 +162,9 @@ class HarnessConfig:
             unattended_write_requires_approval=unattended_approval_str not in {"false", "0", "no"},
             harness_memory_workspace_id=os.getenv("HARNESS_MEMORY_WORKSPACE_ID"),
             chat_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_CHAT_FALLBACKS", "")),
+            digest_provider=os.getenv("HARNESS_DIGEST_PROVIDER") or None,
+            digest_model=os.getenv("HARNESS_DIGEST_MODEL") or None,
+            digest_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_DIGEST_FALLBACKS", "")),
             operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
             status_server_enabled=os.getenv("HARNESS_STATUS_SERVER_ENABLED", "true").lower()
             not in {"false", "0", "no"},
@@ -222,6 +250,21 @@ def project_chat_model_env_var(project_name: str) -> str:
 def project_chat_fallbacks_env_var(project_name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
     return f"HARNESS_CHAT_FALLBACKS_{slug}"
+
+
+def project_digest_provider_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_DIGEST_PROVIDER_{slug}"
+
+
+def project_digest_model_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_DIGEST_MODEL_{slug}"
+
+
+def project_digest_fallbacks_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_DIGEST_FALLBACKS_{slug}"
 
 
 def _positive_int(value: str | None, default: int) -> int:
