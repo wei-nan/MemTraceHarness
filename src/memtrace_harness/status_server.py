@@ -147,6 +147,9 @@ _PAGE_TEMPLATE = """<!doctype html>
   .turn:last-child { border-bottom: none; }
   .turn .meta { color: var(--muted); font-size: 0.72rem; }
   .turn .content { margin-top: 0.1rem; }
+  .turn .content.full { white-space: pre-wrap; }
+  details.turn-full summary { cursor: pointer; list-style: none; }
+  details.turn-full[open] summary { display: none; }
   .turn.match .content { background: #3a3410; }
   .empty { color: var(--muted); font-style: italic; }
   .approval { padding: 0.25rem 0; }
@@ -427,7 +430,7 @@ function renderSchedules(project) {
       ? "每 " + s.interval_seconds + " 秒"
       : (s.kind === "daily" ? "每天 " : "每個工作日 ") + window;
     return '<div class="schedule"><span class="id">' + esc(s.id) + "</span> — " + esc(freq) +
-      '<div class="meta">下次 ' + esc(s.next_run_at) + " · " + esc(s.goal.slice(0, 60)) + "</div></div>";
+      '<div class="meta">下次 ' + esc(s.next_run_at) + " · " + esc(s.goal) + "</div></div>";
   }).join("");
   return '<div class="section-label">排程 <span class="badge">' + list.length + "</span></div>" + rows;
 }
@@ -598,14 +601,26 @@ document.addEventListener("click", function (e) {
     });
 });
 
-function renderTurns(turns, q) {
+var TURN_PREVIEW_CHARS = 200;
+
+function renderTurns(turns, q, projectName) {
   if (!turns || !turns.length) return '<div class="empty">尚無對話紀錄</div>';
   q = (q || "").toLowerCase();
   return turns.map(function (t) {
     var isMatch = q && t.content.toLowerCase().indexOf(q) !== -1;
+    var body;
+    if (t.content.length <= TURN_PREVIEW_CHARS) {
+      body = '<div class="content">' + esc(t.content) + "</div>";
+    } else {
+      // Long turns show a preview with an ellipsis and open to the full text (the
+      // preview used to cut at 200 characters with no sign anything was missing).
+      var key = "turn:" + projectName + ":" + t.created_at;
+      body = '<details class="turn-full" data-key="' + esc(key) + '"' + detailsOpen(key) + ">" +
+        '<summary class="content">' + esc(t.content.slice(0, TURN_PREVIEW_CHARS)) + "…（展開全文）</summary>" +
+        '<div class="content full">' + esc(t.content) + "</div></details>";
+    }
     return '<div class="turn' + (isMatch ? " match" : "") + '">' +
-      '<div class="meta">[' + esc(t.created_at) + "] " + esc(t.speaker) + "</div>" +
-      '<div class="content">' + esc(t.content.slice(0, 200)) + "</div></div>";
+      '<div class="meta">[' + esc(t.created_at) + "] " + esc(t.speaker) + "</div>" + body + "</div>";
   }).join("");
 }
 
@@ -614,7 +629,7 @@ function renderApprovals(list, projectName) {
   return '<div class="section-label">待核准 <span class="badge">' + list.length + "</span></div>" +
     list.map(function (a) {
       return '<div class="approval">' +
-        '<div><span class="id">' + esc(a.id) + "</span> — " + esc(a.reason) + " — " + esc(a.proposed_action.slice(0, 60)) + "</div>" +
+        '<div><span class="id">' + esc(a.id) + "</span> — " + esc(a.reason) + " — " + esc(a.proposed_action) + "</div>" +
         '<div class="approval-actions">' +
         '<button class="approval-btn approve" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="approve">✅ 核准</button>' +
         '<button class="approval-btn reject" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="reject">❌ 拒絕</button>' +
@@ -867,7 +882,7 @@ function renderProject(project, q) {
     renderTopicBriefs(project) +
     renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + ')</div>' +
-    renderTurns(project.recent_turns, q) +
+    renderTurns(project.recent_turns, q, project.name) +
     renderDigests(project) +
     lock + pipelineSection + renderApprovals(project.pending_approvals, project.name) +
     "</div></div>";

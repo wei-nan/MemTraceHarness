@@ -54,19 +54,29 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 3500
 
 
 def _split_telegram_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split text into <=limit-char chunks, preferring to break on line boundaries so
-    a long report (e.g. a backtest summary) arrives as multiple readable messages
-    instead of being silently truncated or rejected by Telegram."""
+    """Split text into <=limit-char chunks so a long report arrives as several readable
+    messages instead of being truncated or rejected by Telegram. Breaks at the last
+    paragraph/line boundary that fits, else the last sentence end, else the last space;
+    only text with none of those (one unbroken run longer than `limit`) is cut hard."""
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
     remaining = text
     while len(remaining) > limit:
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at <= 0:
+        window = remaining[:limit]
+        split_at = max(window.rfind("\n\n"), window.rfind("\n"))
+        if split_at < limit // 4:
+            split_at = max(
+                (window.rfind(mark) + len(mark) for mark in ("。", "！", "？", ". ", "! ", "? ")
+                 if window.rfind(mark) != -1),
+                default=-1,
+            )
+        if split_at < limit // 4:
+            split_at = window.rfind(" ")
+        if split_at < limit // 4:
             split_at = limit
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:].lstrip("\n")
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n ")
     if remaining:
         chunks.append(remaining)
     return chunks
@@ -604,7 +614,7 @@ class TelegramGateway:
             try:
                 summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id)
                 msg = (
-                    f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation[:200]}\n\n"
+                    f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation}\n\n"
                     f"🧩 {self._model_summary(summary)}"
                 )
                 self._report_run_outcome(
@@ -633,7 +643,7 @@ class TelegramGateway:
         default_tracker.register(
             thread, workspace_id=ws_id, conversation_id=conv_id, trace_store=trace_store
         )
-        return f"任務已在背景開始執行：{goal[:80]}"
+        return f"任務已在背景開始執行：{goal}"
 
     def _knowledge_base_locations(self, scope: ProjectScope) -> str:
         """Where this project's knowledge lives in MemTrace — shared by the chat
@@ -1059,7 +1069,7 @@ class TelegramGateway:
             state = ""
             if row.get("paused_until"):
                 state = "（已暫停" + self._paused_until_text(row["paused_until"], tz) + "）"
-            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal'][:80]}")
+            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal']}")
         return (
             "這個專案目前的排程：\n" + "\n".join(lines) + "\n"
             "你自己無法停止排程，只有輸出下列標記行（各自另起一行、放在回覆最後）harness 才會真的"
@@ -1198,7 +1208,7 @@ class TelegramGateway:
             chat_id,
             f"⏰ 已建立排程 {schedule_id}（{describe_schedule(parsed)}）。"
             f"下次執行時間：{local_next}（{self.config.schedule_timezone}）。\n"
-            f"任務內容：{goal[:120]}\n"
+            f"任務內容：{goal}\n"
             f"用 /schedules 查看，/schedule_cancel {schedule_id} 取消。",
         )
 
@@ -1249,7 +1259,7 @@ class TelegramGateway:
             state = f"，下次 {next_local}"
             if row.get("paused_until"):
                 state = "，⏸ 已暫停" + self._paused_until_text(row["paused_until"], tz)
-            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal'][:80]}")
+            lines.append(f"- {row['id']}：{describe_schedule(spec)}{state}。任務：{row['goal']}")
         lines.append("用 /schedule_cancel <id> 取消。")
         return "\n".join(lines)
 
@@ -1429,7 +1439,7 @@ class TelegramGateway:
                     summary=summary,
                     final_text=(
                         f"🔄 對話 {req_data.conversation_id} 已繼續執行。結果：{summary.status}"
-                        f"（{summary.recommendation[:120]}）\n\n🧩 {self._model_summary(summary)}"
+                        f"（{summary.recommendation}）\n\n🧩 {self._model_summary(summary)}"
                     ),
                 )
             except Exception:
