@@ -901,7 +901,7 @@ class AgentLoopRunner:
         REJECT->developer_revision_task machinery unchanged: this only needs to look
         like a normal gate artifact to the rest of run(), not literally be a model
         response."""
-        detail = (verification.get("stderr_tail") or verification.get("stdout_tail") or "")[:1_500]
+        detail = verification.get("stderr_tail") or verification.get("stdout_tail") or ""
         reason = (
             "Verification command timed out"
             if verification.get("timed_out")
@@ -1041,7 +1041,7 @@ class AgentLoopRunner:
             self.alert_callback(
                 f"⚠️ {profile_id} 角色的 CLI 無法啟動：{failed}。{follow_up}\n"
                 "請檢查該 CLI 的安裝或路徑（例如 App 更新後執行檔位置改變）。\n"
-                f"錯誤：{(detail[0] if detail else '(no error text)')[:300]}"
+                f"錯誤：{detail[0] if detail else '(no error text)'}"
             )
         except Exception:
             logger.exception("failed to deliver cli_unavailable alert")
@@ -1090,14 +1090,14 @@ class AgentLoopRunner:
             error_detail = result.response.execution.error
             detail = f"{result.profile_id} CLI execution did not succeed; the loop stopped."
             if error_detail:
-                detail += f"\nError: {str(error_detail)[:300]}"
+                detail += f"\nError: {error_detail}"
             return self._summary(task, trace_id, stages, "failed", detail)
         if result.artifact is None:
             # No parseable JSON — the best a human can act on here is what the model
             # actually said, not just "it was invalid" (this is exactly the shape of
             # the 2026-08-12 Claude plan-mode diversion bug: the model's real content
             # existed, just wasn't in a form the loop could parse as its verdict).
-            raw_snippet = (result.response.final_text or "").strip()[:400]
+            raw_snippet = (result.response.final_text or "").strip()
             detail = f"{result.profile_id} returned invalid structured output; no stage advanced."
             if raw_snippet:
                 detail += f"\nModel said:\n{raw_snippet}"
@@ -1634,10 +1634,10 @@ def summarize_plan_needs_human(label: str, value: dict[str, Any]) -> str:
     lines = [f"{label}: plan needs human input before it's ready."]
     plan_text = value.get("plan")
     if isinstance(plan_text, str) and plan_text.strip():
-        lines.append(plan_text.strip()[:2000])
+        lines.append(plan_text.strip())
     if questions:
         lines.append("Open questions:")
-        lines.extend(f"- {q}" for q in questions[:10])
+        lines.extend(f"- {q}" for q in questions)
     return "\n".join(lines)
 
 
@@ -1699,9 +1699,9 @@ def summarize_invalid_artifact(label: str, artifact: dict[str, Any] | None) -> s
     if not artifact:
         return f"{label}: no structured output was returned."
     try:
-        preview = json.dumps(artifact, ensure_ascii=False)[:600]
+        preview = json.dumps(artifact, ensure_ascii=False, indent=2)
     except TypeError:
-        preview = str(artifact)[:600]
+        preview = str(artifact)
     return f"{label}: structured output was returned but failed schema validation.\nRaw output:\n{preview}"
 
 
@@ -1719,8 +1719,7 @@ def summarize_gate_artifact(label: str, artifact: dict[str, Any] | None) -> str:
     lines = [f"{label} verdict: {verdict}" + (f" ({reason_code})" if reason_code else "")]
     findings = artifact.get("findings")
     if isinstance(findings, list) and findings:
-        shown = findings[:3]
-        for item in shown:
+        for item in findings:
             if not isinstance(item, dict):
                 continue
             severity = item.get("severity", "?")
@@ -1738,17 +1737,13 @@ def summarize_gate_artifact(label: str, artifact: dict[str, Any] | None) -> str:
                 or item.get("detail")
                 or item.get("explanation")
                 or ""
-            )[:220]
+            )
             lines.append(f"- [{severity}] {description}")
-        if len(findings) > len(shown):
-            lines.append(f"...and {len(findings) - len(shown)} more finding(s)")
     unverified = artifact.get("unverified_items")
     if isinstance(unverified, list) and unverified:
         lines.append("Open questions:")
-        for item in unverified[:3]:
-            lines.append(f"- {str(item)[:220]}")
-        if len(unverified) > 3:
-            lines.append(f"...and {len(unverified) - 3} more open question(s)")
+        for item in unverified:
+            lines.append(f"- {item}")
     return "\n".join(lines)
 
 
