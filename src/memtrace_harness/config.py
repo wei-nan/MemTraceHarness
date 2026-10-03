@@ -31,6 +31,14 @@ class HarnessConfig:
     digest_provider: str | None = None
     digest_model: str | None = None
     digest_fallbacks: tuple[tuple[str, str], ...] = ()
+    # Topic recall (the slow path behind chat: topic judgement + cold-memory exploration
+    # -> short-lived briefs, topic_recall.py). Unset -> the digest chain, so it gets the
+    # stronger model without any extra setting.
+    recall_enabled: bool = True
+    recall_provider: str | None = None
+    recall_model: str | None = None
+    recall_fallbacks: tuple[tuple[str, str], ...] = ()
+    recall_ttl_hours: int = 72
     operator_preference_workspace_id: str | None = None
     status_server_enabled: bool = True
     status_server_host: str = "127.0.0.1"
@@ -122,6 +130,24 @@ class HarnessConfig:
         )
         return ((provider, model or ""), *fallbacks)
 
+    def recall_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for that project's topic recall:
+        HARNESS_RECALL_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT> if set,
+        else the shared HARNESS_RECALL_*; with none configured at all it uses the digest
+        chain (itself falling back to chat). Same rule as digest_candidates_for(): a
+        configured chain is used as-is and never degrades into a weaker one."""
+        provider = os.getenv(project_recall_provider_env_var(project_name)) or self.recall_provider
+        if not provider:
+            return self.digest_candidates_for(project_name)
+        model = os.getenv(project_recall_model_env_var(project_name)) or self.recall_model
+        fallbacks_override = os.getenv(project_recall_fallbacks_env_var(project_name))
+        fallbacks = (
+            _parse_chat_fallbacks(fallbacks_override)
+            if fallbacks_override is not None
+            else self.recall_fallbacks
+        )
+        return ((provider, model or ""), *fallbacks)
+
     def role_profiles_file_for(self, project_name: str) -> Path | None:
         """Per-project role-profile override (e.g. a different fallback order), read
         from the Harness's own env — not from harness-scope.md, so the target project's
@@ -165,6 +191,12 @@ class HarnessConfig:
             digest_provider=os.getenv("HARNESS_DIGEST_PROVIDER") or None,
             digest_model=os.getenv("HARNESS_DIGEST_MODEL") or None,
             digest_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_DIGEST_FALLBACKS", "")),
+            recall_enabled=os.getenv("HARNESS_RECALL_ENABLED", "true").lower()
+            not in {"false", "0", "no"},
+            recall_provider=os.getenv("HARNESS_RECALL_PROVIDER") or None,
+            recall_model=os.getenv("HARNESS_RECALL_MODEL") or None,
+            recall_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_RECALL_FALLBACKS", "")),
+            recall_ttl_hours=_positive_int(os.getenv("HARNESS_RECALL_TTL_HOURS"), 72),
             operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
             status_server_enabled=os.getenv("HARNESS_STATUS_SERVER_ENABLED", "true").lower()
             not in {"false", "0", "no"},
@@ -265,6 +297,21 @@ def project_digest_model_env_var(project_name: str) -> str:
 def project_digest_fallbacks_env_var(project_name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
     return f"HARNESS_DIGEST_FALLBACKS_{slug}"
+
+
+def project_recall_provider_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_RECALL_PROVIDER_{slug}"
+
+
+def project_recall_model_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_RECALL_MODEL_{slug}"
+
+
+def project_recall_fallbacks_env_var(project_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
+    return f"HARNESS_RECALL_FALLBACKS_{slug}"
 
 
 def _positive_int(value: str | None, default: int) -> int:

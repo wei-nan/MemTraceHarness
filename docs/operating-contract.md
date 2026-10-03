@@ -47,6 +47,21 @@ proposals, which the Harness still cannot approve for itself. **PLANNED, not imp
 autonomy for durable knowledge nodes (a "key-point" layer above the digests); until it ships,
 knowledge the Harness writes to MemTrace stays draft-labelled.
 
+**Topic recall (explicit operator decision, 2026-10-03).** Behind chat, a slower background
+model (`HARNESS_RECALL_*`, default: the digest chain) judges each human message's topic
+(continue an active topic / new topic / small talk), explores the cold-memory and spec
+workspaces for earlier discussion, and writes a short-lived *topic brief* to local SQLite
+(`topic_briefs`); the chat model reads the briefs on its next turn, marked 整理中 while a run is
+pending, and is told to use one only if the current message is about that topic. ENFORCED in
+code: every related node a brief cites must be a search hit the harness supplied or be confirmed
+to exist in MemTrace (anything else is dropped, and no push is sent for dropped nodes); briefs
+expire after `HARNESS_RECALL_TTL_HOURS` (default 72, sliding — a topic that comes up again is
+extended); at most one recall run per project at a time; a topic with no history is stored as
+fresh and never pushed. Briefs are local drafts and never written to MemTrace by this path.
+The model may push one Telegram message when it found a connection the human likely no longer
+has in mind. **PLANNED, not implemented:** a reverse index so the nightly digest can mark which
+older items a day's topics continued.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

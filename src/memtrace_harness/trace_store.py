@@ -843,6 +843,31 @@ class TraceStore:
                     resolved_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS topic_briefs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    fresh INTEGER NOT NULL DEFAULT 0,
+                    related_json TEXT NOT NULL DEFAULT '[]',
+                    source_turns_json TEXT NOT NULL DEFAULT '[]',
+                    provider TEXT,
+                    model TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    pushed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS topic_recall_state (
+                    project TEXT PRIMARY KEY,
+                    pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_run_at TEXT,
+                    last_error TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_topic_briefs_project
+                    ON topic_briefs(project, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_turns_conversation
                     ON turns(conversation_id, id);
                 CREATE INDEX IF NOT EXISTS idx_checkpoints_conversation
@@ -1138,6 +1163,140 @@ class TraceStore:
                 (project, digest_date),
             ).fetchone()
         return int(row[0]) if row else int(cur.lastrowid or 0)
+
+    # --- topic recall: short-lived topic briefs (topic_recall.py) -----------------------
+
+    _BRIEF_COLUMNS = (
+        "id, project, title, summary, fresh, related_json, source_turns_json, provider, "
+        "model, created_at, updated_at, expires_at, pushed_at"
+    )
+
+    @staticmethod
+    def _brief_row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "project": row[1],
+            "title": row[2],
+            "summary": row[3],
+            "fresh": bool(row[4]),
+            "related": json.loads(row[5]),
+            "source_turns": json.loads(row[6]),
+            "provider": row[7],
+            "model": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
+            "expires_at": row[11],
+            "pushed_at": row[12],
+        }
+
+    def insert_topic_brief(
+        self,
+        *,
+        project: str,
+        title: str,
+        summary: str,
+        fresh: bool,
+        related: list[dict],
+        source_turns: list[int],
+        provider: str | None,
+        model: str | None,
+        expires_at: str,
+    ) -> int:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO topic_briefs (project, title, summary, fresh, related_json, "
+                "source_turns_json, provider, model, created_at, updated_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project, title, summary, int(fresh),
+                    json.dumps(related, ensure_ascii=False),
+                    json.dumps(source_turns), provider, model, now, now, expires_at,
+                ),
+            )
+        return int(cur.lastrowid or 0)
+
+    def update_topic_brief(
+        self,
+        brief_id: int,
+        *,
+        summary: str,
+        related: list[dict],
+        source_turns: list[int],
+        provider: str | None,
+        model: str | None,
+        expires_at: str,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE topic_briefs SET summary = ?, related_json = ?, source_turns_json = ?, "
+                "provider = ?, model = ?, updated_at = ?, expires_at = ?, "
+                "fresh = CASE WHEN ? = '[]' THEN fresh ELSE 0 END WHERE id = ?",
+                (
+                    summary, json.dumps(related, ensure_ascii=False), json.dumps(source_turns),
+                    provider, model, utc_now_iso(), expires_at,
+                    json.dumps(related, ensure_ascii=False), brief_id,
+                ),
+            )
+
+    def extend_topic_brief(self, brief_id: int, expires_at: str) -> None:
+        """The topic came up again: keep the brief alive without changing its content."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE topic_briefs SET expires_at = ?, updated_at = ? WHERE id = ?",
+                (expires_at, utc_now_iso(), brief_id),
+            )
+
+    def mark_topic_brief_pushed(self, brief_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE topic_briefs SET pushed_at = ? WHERE id = ?", (utc_now_iso(), brief_id)
+            )
+
+    def list_active_topic_briefs(self, project: str, now_iso: str) -> list[dict]:
+        """Briefs not yet expired, most recently touched first."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._BRIEF_COLUMNS} FROM topic_briefs WHERE project = ? AND "
+                "expires_at > ? ORDER BY updated_at DESC, id DESC",
+                (project, now_iso),
+            ).fetchall()
+        return [self._brief_row_to_dict(r) for r in rows]
+
+    def add_recall_pending(self, project: str, delta: int) -> int:
+        """Count of recall runs queued or running for the project (clamped at 0)."""
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO topic_recall_state (project, pending_count) VALUES (?, MAX(0, ?)) "
+                "ON CONFLICT(project) DO UPDATE SET pending_count = MAX(0, pending_count + ?)",
+                (project, delta, delta),
+            )
+            row = conn.execute(
+                "SELECT pending_count FROM topic_recall_state WHERE project = ?", (project,)
+            ).fetchone()
+        return int(row[0])
+
+    def finish_recall_run(self, project: str, error: str | None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO topic_recall_state (project, pending_count, last_run_at, last_error) "
+                "VALUES (?, 0, ?, ?) ON CONFLICT(project) DO UPDATE SET "
+                "last_run_at = excluded.last_run_at, last_error = excluded.last_error",
+                (project, utc_now_iso(), error),
+            )
+
+    def get_recall_state(self, project: str) -> dict:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT pending_count, last_run_at, last_error FROM topic_recall_state "
+                "WHERE project = ?",
+                (project,),
+            ).fetchone()
+        return (
+            {"pending": int(row[0]), "last_run_at": row[1], "last_error": row[2]}
+            if row
+            else {"pending": 0, "last_run_at": None, "last_error": None}
+        )
 
     def get_memory_digest(self, project: str, digest_date: str) -> dict | None:
         with self._connection() as conn:

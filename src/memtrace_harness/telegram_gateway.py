@@ -29,6 +29,7 @@ from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
+from memtrace_harness.topic_recall import BRIEFS_HEADER, render_briefs_context
 from memtrace_harness.trace_store import TraceStore
 
 if TYPE_CHECKING:
@@ -124,6 +125,10 @@ class TelegramGateway:
         self.primary_session_mgr = primary_session_mgr
         self.projects = projects
         self.memtrace_client = memtrace_client
+        # The background topic-recall service (topic_recall.py). Wired in by the serve
+        # command; None here means chat simply runs without the slow path, which is also
+        # what keeps unit tests from ever starting a real model call in a thread.
+        self.topic_recall = None
         # Each process invocation is a fresh instance (the gateway is a one-shot poll,
         # scheduled externally), so the update offset has to be persisted across runs —
         # otherwise every run would refetch and reprocess the same historical messages.
@@ -449,6 +454,8 @@ class TelegramGateway:
                 content=text if not quoted else f"{text}\n{self._quote_marker(quoted)}",
             )
             self.send_chat_action(chat_id, "typing")
+            if self.topic_recall is not None:
+                self.topic_recall.start(scope, chat_id, text)
 
             # A native swipe-reply to a pending approval's own message is
             # unambiguous (the human deliberately picked that message to reply
@@ -690,6 +697,9 @@ class TelegramGateway:
         digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
         if digests:
             parts.append(f"{_DIGESTS_HEADER}\n\n{digests}")
+        briefs = render_briefs_context(self.primary_session_mgr.trace_store, scope.name)
+        if briefs:
+            parts.append(f"{BRIEFS_HEADER}:\n\n{briefs}")
         rehydration = self.primary_session_mgr.get_rehydration_context(
             scope.name, tz=ZoneInfo(self.config.schedule_timezone)
         )
