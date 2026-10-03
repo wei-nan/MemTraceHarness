@@ -720,11 +720,12 @@ _digest_failures: dict[tuple[str, str], float] = {}
 
 
 def make_digest_model_caller(config: HarnessConfig, project_name: str):
-    """One tool-less call through that project's chat candidates, in order. Runs in a
+    """One tool-less call through that project's digest candidates (its own model,
+    independent of chat; chat candidates only when none is configured), in order. Runs in a
     neutral empty directory (like Controller's sandbox) rather than the project repo,
     so a provider CLI's own repo-scoped instructions or auto-memory can't leak into
     the digest."""
-    candidates = config.chat_candidates_for(project_name)
+    candidates = config.digest_candidates_for(project_name)
     sandbox = (config.trace_root / "digest-workspace").resolve()
     sandbox.mkdir(parents=True, exist_ok=True)
 
@@ -736,7 +737,7 @@ def make_digest_model_caller(config: HarnessConfig, project_name: str):
             if result.return_code == 0 and result.stdout.strip():
                 return result.stdout, provider, model
             errors.append(f"{provider}/{model}: exit {result.return_code}")
-        raise DigestError("no chat candidate produced a digest (" + "; ".join(errors) + ")")
+        raise DigestError("no digest candidate produced a digest (" + "; ".join(errors) + ")")
 
     return call
 
@@ -1545,6 +1546,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
     from memtrace_harness.config import (
         project_bot_token_env_var,
         project_chat_provider_env_var,
+        project_digest_provider_env_var,
         project_memory_workspace_env_var,
         project_role_profiles_env_var,
     )
@@ -1612,6 +1614,10 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         )
 
         chat_candidates = config.chat_candidates_for(scope.name)
+        digest_candidates = config.digest_candidates_for(scope.name)
+        digest_is_own = bool(
+            os.getenv(project_digest_provider_env_var(scope.name)) or config.digest_provider
+        )
 
         role_profiles_entries: list[dict] | None = None
         role_profiles_error: str | None = None
@@ -1631,7 +1637,7 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         except Exception as exc:
             role_profiles_error = str(exc)
 
-        for provider, model in chat_candidates:
+        for provider, model in (*chat_candidates, *digest_candidates):
             if provider in known_models and model:
                 known_models[provider].add(model)
         for entry in role_profiles_entries or []:
@@ -1655,6 +1661,10 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                 "chat_candidates": [
                     {"provider": p, "model": m or None} for p, m in chat_candidates
                 ],
+                "digest_candidates": [
+                    {"provider": p, "model": m or None} for p, m in digest_candidates
+                ],
+                "digest_is_own": digest_is_own,
                 "role_profiles": role_profiles_entries,
                 "role_profiles_error": role_profiles_error,
                 "turn_count": turn_count,
@@ -1768,6 +1778,65 @@ def update_chat_model_for_project(
     updates = {
         project_chat_provider_env_var(scope.name): provider,
         project_chat_model_env_var(scope.name): model,
+    }
+    _write_env_updates(Path(".env"), updates)
+    os.environ.update(updates)
+
+
+def update_digest_model_for_project(
+    config: "HarnessConfig", project_name: str, provider: str, model: str
+) -> None:
+    """Set a project's nightly-memory-digest model, independent of its chat model, via
+    the status dashboard's POST /api/digest-model. Same mechanism as
+    update_chat_model_for_project(): a project-specific HARNESS_DIGEST_PROVIDER_<PROJECT>
+    /_MODEL_<PROJECT> override written to .env and applied to os.environ so it takes
+    effect immediately (digest_candidates_for() reads os.environ on every call). Only
+    the primary candidate is touched, never HARNESS_DIGEST_FALLBACKS_<PROJECT>."""
+    from memtrace_harness.config import project_digest_model_env_var, project_digest_provider_env_var
+
+    if provider not in PROVIDERS:
+        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+    if not model.strip():
+        raise ValueError("model must be a non-empty string")
+
+    projects = load_project_index(config.project_index_path)
+    scope = next((p for p in projects if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+
+    updates = {
+        project_digest_provider_env_var(scope.name): provider,
+        project_digest_model_env_var(scope.name): model,
+    }
+    _write_env_updates(Path(".env"), updates)
+    os.environ.update(updates)
+
+
+def update_digest_fallbacks_for_project(
+    config: "HarnessConfig", project_name: str, fallbacks: str
+) -> None:
+    """Set a project's nightly-digest fallback chain from the status dashboard
+    (POST /api/digest-fallbacks): `fallbacks` is the same "provider/model,provider/model"
+    text HARNESS_DIGEST_FALLBACKS takes, written as the project-specific
+    HARNESS_DIGEST_FALLBACKS_<PROJECT> override and applied to os.environ at once. An
+    empty string is a real value — it clears the chain for that project instead of
+    falling back to the shared one."""
+    from memtrace_harness.config import _parse_chat_fallbacks, project_digest_fallbacks_env_var
+
+    pairs = _parse_chat_fallbacks(fallbacks)
+    for provider, model in pairs:
+        if provider not in PROVIDERS:
+            raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
+        if not model:
+            raise ValueError("every fallback needs a model, written provider/model")
+
+    projects = load_project_index(config.project_index_path)
+    scope = next((p for p in projects if p.name == project_name), None)
+    if scope is None:
+        raise ValueError(f"unknown project {project_name!r}")
+
+    updates = {
+        project_digest_fallbacks_env_var(scope.name): ",".join(f"{p}/{m}" for p, m in pairs)
     }
     _write_env_updates(Path(".env"), updates)
     os.environ.update(updates)

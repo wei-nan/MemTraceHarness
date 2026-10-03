@@ -7,12 +7,17 @@ from memtrace_harness.cli import (
     build_parser,
     create_dedicated_role_profiles_file,
     update_chat_model_for_project,
+    update_digest_fallbacks_for_project,
+    update_digest_model_for_project,
     update_role_profile_for_project,
 )
 from memtrace_harness.config import (
     HarnessConfig,
     project_chat_model_env_var,
     project_chat_provider_env_var,
+    project_digest_fallbacks_env_var,
+    project_digest_model_env_var,
+    project_digest_provider_env_var,
     project_role_profiles_env_var,
 )
 
@@ -525,6 +530,44 @@ class UpdateChatModelForProjectTests(TestCase):
         self.assertIn(
             f"{project_chat_model_env_var('TestProj')}=gemini-3.8-flash-high", env_text
         )
+
+    def test_digest_model_writes_its_own_vars_and_leaves_chat_alone(self) -> None:
+        import os
+
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        for var in (project_digest_provider_env_var("TestProj"), project_digest_model_env_var("TestProj")):
+            self.addCleanup(os.environ.pop, var, None)
+
+        update_digest_model_for_project(config, "TestProj", "claude", "sonnet")
+
+        env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+        self.assertIn(f"{project_digest_provider_env_var('TestProj')}=claude", env_text)
+        self.assertIn(f"{project_digest_model_env_var('TestProj')}=sonnet", env_text)
+        self.assertNotIn("HARNESS_CHAT_", env_text)
+        self.assertEqual(config.digest_candidates_for("TestProj"), (("claude", "sonnet"),))
+
+    def test_digest_fallbacks_roundtrip_and_clear(self) -> None:
+        import os
+
+        tmp_path = self._chdir_to_temp()
+        config = self._build_config(tmp_path)
+        var = project_digest_fallbacks_env_var("TestProj")
+        for name in (var, project_digest_provider_env_var("TestProj"), project_digest_model_env_var("TestProj")):
+            self.addCleanup(os.environ.pop, name, None)
+        update_digest_model_for_project(config, "TestProj", "claude", "sonnet")
+
+        update_digest_fallbacks_for_project(config, "TestProj", "codex/gpt-5.6-sol, claude/opus")
+        self.assertEqual(
+            config.digest_candidates_for("TestProj"),
+            (("claude", "sonnet"), ("codex", "gpt-5.6-sol"), ("claude", "opus")),
+        )
+        update_digest_fallbacks_for_project(config, "TestProj", "")
+        self.assertEqual(config.digest_candidates_for("TestProj"), (("claude", "sonnet"),))
+        with self.assertRaises(ValueError):
+            update_digest_fallbacks_for_project(config, "TestProj", "openai/gpt-5")
+        with self.assertRaises(ValueError):
+            update_digest_fallbacks_for_project(config, "TestProj", "codex")
 
     def test_rejects_unknown_provider(self) -> None:
         tmp_path = self._chdir_to_temp()

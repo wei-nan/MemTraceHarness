@@ -209,8 +209,9 @@ _PAGE_TEMPLATE = """<!doctype html>
   .pref-btn.restore { background: var(--chip); color: var(--text); }
   .tag-explicit { color: var(--live); }
   .tag-inferred { color: var(--warn); }
-  details.evidence summary, details.digest summary { cursor: pointer; color: var(--accent); font-size: 0.78rem; }
+  details.evidence summary, details.digest summary, details.models summary { cursor: pointer; color: var(--accent); font-size: 0.78rem; }
   .evidence-item { font-size: 0.75rem; color: var(--muted); padding: 0.15rem 0 0.15rem 0.6rem; border-left: 2px solid var(--border); margin: 0.2rem 0; white-space: pre-wrap; }
+  details.models { margin: 0.4rem 0; }
   details.digest { border-bottom: 1px solid var(--border); padding: 0.3rem 0; }
   details.digest:last-child { border-bottom: none; }
   .digest-body { font-size: 0.8rem; padding: 0.3rem 0 0.2rem 0.6rem; }
@@ -223,7 +224,7 @@ _PAGE_TEMPLATE = """<!doctype html>
 <body>
 <header>
   <h1>MemTrace Harness — 運行狀態</h1>
-  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 可編輯：Agent Loop 角色模型、聊天模型、待核准、偏好確認</div>
+  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新 · 可編輯：Agent Loop 角色模型、聊天模型、每日摘要模型、待核准、偏好確認</div>
 </header>
 <div class="toolbar">
   <input id="search" type="text" placeholder="搜尋專案名稱或對話內容…">
@@ -324,20 +325,41 @@ function readModelEditRow(row) {
   return { provider: provider, model: model };
 }
 
-function renderChatCandidates(project) {
-  var list = project.chat_candidates;
+function renderModelCandidates(project, list, saveClass, emptyText, note) {
   var display = (!list || !list.length)
-    ? '<div class="empty">（未設定 HARNESS_CHAT_PROVIDER）</div>'
+    ? '<div class="empty">' + emptyText + "</div>"
     : '<div class="chips">' + list.map(function (c) {
         return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
       }).join(" -> ") + "</div>";
   var current = list && list.length ? list[0] : { provider: "claude", model: "" };
   var editRow = '<div class="rp-row">' +
     modelEditRowHtml(current.provider, current.model) +
-    '<button class="chat-model-save" data-project="' + esc(project.name) + '">儲存</button>' +
+    '<button class="' + saveClass + '" data-project="' + esc(project.name) + '">儲存</button>' +
     '<span class="rp-status"></span>' +
     "</div>";
-  return display + editRow;
+  return display + (note ? '<div class="hint">' + note + "</div>" : "") + editRow;
+}
+
+function renderChatCandidates(project) {
+  return renderModelCandidates(project, project.chat_candidates, "chat-model-save",
+    "（未設定 HARNESS_CHAT_PROVIDER）", "");
+}
+
+function renderDigestFallbackRow(project) {
+  var rest = (project.digest_candidates || []).slice(1).map(function (c) {
+    return c.provider + "/" + (c.model || "");
+  }).join(",");
+  return '<div class="rp-row"><span class="hint">備援（provider/model，逗號分隔，留空＝無）</span> ' +
+    '<input class="digest-fallbacks" type="text" size="38" value="' + esc(rest) + '" placeholder="codex/gpt-5.6-sol">' +
+    '<button class="digest-fallbacks-save" data-project="' + esc(project.name) + '">儲存</button>' +
+    '<span class="rp-status"></span></div>';
+}
+
+function renderDigestCandidates(project) {
+  return renderModelCandidates(project, project.digest_candidates, "digest-model-save",
+    "（未設定）",
+    project.digest_is_own ? "" : "尚未獨立設定，目前沿用聊天模型；儲存後摘要才會改用自己的模型。") +
+    renderDigestFallbackRow(project);
 }
 
 function renderRoleProfiles(project) {
@@ -416,7 +438,35 @@ document.addEventListener("click", function (e) {
 });
 
 document.addEventListener("click", function (e) {
-  if (!e.target.classList.contains("chat-model-save")) return;
+  if (!e.target.classList.contains("digest-fallbacks-save")) return;
+  var btn = e.target;
+  var row = btn.closest(".rp-row");
+  var statusEl = row.querySelector(".rp-status");
+  statusEl.className = "rp-status";
+  statusEl.textContent = "儲存中…";
+  btn.disabled = true;
+  fetch("/api/digest-fallbacks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: btn.getAttribute("data-project"), fallbacks: row.querySelector(".digest-fallbacks").value })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      statusEl.className = "rp-status " + (res.ok ? "ok" : "err");
+      statusEl.textContent = res.ok ? "已儲存，立即生效" : (res.body.error || "儲存失敗");
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "rp-status err";
+      statusEl.textContent = "儲存失敗（連線問題）";
+    });
+});
+
+document.addEventListener("click", function (e) {
+  var endpoint = e.target.classList.contains("chat-model-save") ? "/api/chat-model"
+    : e.target.classList.contains("digest-model-save") ? "/api/digest-model" : null;
+  if (!endpoint) return;
   var btn = e.target;
   var row = btn.closest(".rp-row");
   var project = btn.getAttribute("data-project");
@@ -425,7 +475,7 @@ document.addEventListener("click", function (e) {
   statusEl.className = "rp-status";
   statusEl.textContent = "儲存中…";
   btn.disabled = true;
-  fetch("/api/chat-model", {
+  fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project: project, provider: picked.provider, model: picked.model })
@@ -742,6 +792,18 @@ function renderDigests(project) {
   }).join("");
 }
 
+// All model settings live in one collapsed block; opening it is the "I want to edit"
+// gesture. Open state is remembered per project across the live re-renders.
+function renderModelSettings(project) {
+  var key = "models:" + project.name;
+  return '<details class="models" data-key="' + esc(key) + '"' + detailsOpen(key) + ">" +
+    "<summary>模型設定（聊天 / 每日摘要 / Agent Loop 角色）</summary>" +
+    '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
+    '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
+    '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
+    "</details>";
+}
+
 function renderProject(project, q) {
   var collapsed = state.collapsed[project.name] ? " collapsed" : "";
   var visible = matchesQuery(project, q) ? "" : " hidden";
@@ -766,8 +828,7 @@ function renderProject(project, q) {
     '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "專屬" : "預設") + "</span>" +
     '<span class="chip' + ((project.schedules || []).length ? " on" : "") + '">排程: ' + (project.schedules || []).length + "</span>" +
     "</div>" +
-    '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
-    '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
+    renderModelSettings(project) +
     renderSchedules(project) +
     '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + ')</div>' +
     renderTurns(project.recent_turns, q) +
@@ -916,6 +977,10 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
             self._handle_make_role_profiles_independent()
         elif parsed.path == "/api/chat-model":
             self._handle_update_chat_model()
+        elif parsed.path == "/api/digest-fallbacks":
+            self._handle_update_digest_fallbacks()
+        elif parsed.path == "/api/digest-model":
+            self._handle_update_digest_model()
         elif parsed.path == "/api/approval":
             self._handle_approval_action()
         elif parsed.path == "/api/preference":
@@ -997,6 +1062,51 @@ class _StatusRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             logger.exception("status dashboard failed to update a chat model")
             self._send_json(500, {"error": "internal error updating the chat model"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True})
+
+    def _handle_update_digest_model(self) -> None:
+        from memtrace_harness.cli import update_digest_model_for_project
+
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+            provider = str(payload["provider"])
+            model = str(payload["model"])
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            update_digest_model_for_project(self.config, project, provider, model)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to update a digest model")
+            self._send_json(500, {"error": "internal error updating the digest model"})
+            return
+        self.bus.publish()
+        self._send_json(200, {"ok": True})
+
+    def _handle_update_digest_fallbacks(self) -> None:
+        from memtrace_harness.cli import update_digest_fallbacks_for_project
+
+        payload = self._read_json_body()
+        try:
+            project = str(payload["project"])
+            fallbacks = str(payload["fallbacks"])
+        except (TypeError, KeyError):
+            self._send_json(400, {"error": "malformed request body"})
+            return
+        try:
+            update_digest_fallbacks_for_project(self.config, project, fallbacks)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except Exception:
+            logger.exception("status dashboard failed to update digest fallbacks")
+            self._send_json(500, {"error": "internal error updating the digest fallbacks"})
             return
         self.bus.publish()
         self._send_json(200, {"ok": True})
