@@ -34,6 +34,7 @@ from memtrace_harness.schemas import ContextItem, TaskEnvelope
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
+    cancel_order,
     load_api_key,
     mcp_server_spec,
     order_projects,
@@ -606,17 +607,21 @@ class TelegramGateway:
     def _order_summary(order: dict) -> str:
         side = "買進" if order["action"] == "Buy" else "賣出"
         unit = "股（盤中零股）" if order["is_odd_lot"] else "張"
-        return (
+        text = (
             f"{side} {order['symbol']}｜{order['quantity']} {unit}｜限價 {order['price']:g}"
             f"｜預估金額 {order['estimated_value']:,.0f} 元"
         )
+        if order.get("kind") == "cancel":
+            return f"撤銷委託 {order['target_order_id']}（{text}）"
+        return text
 
     @staticmethod
-    def _order_keyboard(intent_id: str) -> list[list[dict[str, str]]]:
+    def _order_keyboard(intent_id: str, kind: str = "order") -> list[list[dict[str, str]]]:
+        confirm, abort = ("✅ 確認撤單", "❌ 不撤單") if kind == "cancel" else ("✅ 確認下單", "❌ 取消")
         return [
             [
-                {"text": "✅ 確認下單", "callback_data": f"order_confirm:{intent_id}"},
-                {"text": "❌ 取消", "callback_data": f"order_cancel:{intent_id}"},
+                {"text": confirm, "callback_data": f"order_confirm:{intent_id}"},
+                {"text": abort, "callback_data": f"order_cancel:{intent_id}"},
             ]
         ]
 
@@ -642,20 +647,29 @@ class TelegramGateway:
         ones nobody confirmed in time."""
         trace_store = self.approval_manager.trace_store
         for order in trace_store.claim_pending_order_intents([p.name for p in self.projects]):
-            text = (
-                f"🛒 待確認委託（{order['project']}）\n"
-                f"{self._order_summary(order)}\n"
-                f"有效至：{order['expires_at']}\n\n"
-                "這是模型提出的委託，還沒有送到券商。按「確認下單」才會送出；不按、按取消、"
-                "或時間到都不會下單。"
-            )
+            if order["kind"] == "cancel":
+                text = (
+                    f"🗑 待確認撤單（{order['project']}）\n"
+                    f"{self._order_summary(order)}\n"
+                    f"有效至：{order['expires_at']}\n\n"
+                    "這是模型提出的撤單，還沒有送到券商。按「確認撤單」才會送出；不按、按「不撤單」、"
+                    "或時間到都不會撤單。"
+                )
+            else:
+                text = (
+                    f"🛒 待確認委託（{order['project']}）\n"
+                    f"{self._order_summary(order)}\n"
+                    f"有效至：{order['expires_at']}\n\n"
+                    "這是模型提出的委託，還沒有送到券商。按「確認下單」才會送出；不按、按取消、"
+                    "或時間到都不會下單。"
+                )
             shown = False
             if order["telegram_message_id"] is not None and order["telegram_chat_id"] is not None:
                 # Re-shown: the earlier buttons are stale clutter higher up the chat.
                 self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
             for cid in self.allowed_chat_ids:
                 message_id = self.send_message_with_keyboard(
-                    cid, text, self._order_keyboard(order["intent_id"])
+                    cid, text, self._order_keyboard(order["intent_id"], order["kind"])
                 )
                 if message_id is not None:
                     trace_store.set_order_intent_message(
@@ -670,10 +684,13 @@ class TelegramGateway:
                 self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
                 self.send_message(
                     order["telegram_chat_id"],
-                    f"⌛ 委託已過期，沒有下單：{self._order_summary(order)}",
+                    f"⌛ {'撤單' if order['kind'] == 'cancel' else '委託'}已過期，沒有"
+                    f"{'撤單' if order['kind'] == 'cancel' else '下單'}：{self._order_summary(order)}",
                 )
             self._record_order_turn(
-                order["project"], f"委託已過期、沒有下單：{self._order_summary(order)}"
+                order["project"],
+                f"{'撤單' if order['kind'] == 'cancel' else '委託'}已過期、沒有"
+                f"{'撤單' if order['kind'] == 'cancel' else '下單'}：{self._order_summary(order)}",
             )
 
     def _resolve_order_action(
@@ -688,7 +705,11 @@ class TelegramGateway:
             if not trace_store.transition_order_intent(intent_id, ("awaiting",), "cancelled"):
                 return f"這筆委託已經是「{order['status']}」，沒有變動。"
             trace_store.finish_order_intent(intent_id, "cancelled")
-            result = f"❌ 已取消，沒有下單：{summary}"
+            result = (
+                f"❌ 已取消，沒有撤單：{summary}"
+                if order["kind"] == "cancel"
+                else f"❌ 已取消，沒有下單：{summary}"
+            )
         else:
             result = self._confirm_order(order, summary)
         if message_id is not None:
@@ -707,7 +728,9 @@ class TelegramGateway:
             return f"這筆委託已經是「{current['status'] if current else '未知'}」，沒有再送出。"
         if self._order_expired(order):
             trace_store.finish_order_intent(intent_id, "expired")
-            return f"⌛ 委託已過期，沒有下單：{summary}"
+            return f"⌛ 已過期，沒有送出：{summary}"
+        if order["kind"] == "cancel":
+            return self._send_cancel(order, summary)
         try:
             placed = submit_order(
                 intent_id,
@@ -730,6 +753,30 @@ class TelegramGateway:
             f"券商委託編號：{placed.get('order_id', '?')}｜狀態：{placed.get('status', '?')}"
             + (f"｜已成交 {filled}" if filled else "")
             + "\n成交結果之後可以問我（我會用 list_orders 幫你查）。"
+        )
+
+    def _send_cancel(self, order: dict, summary: str) -> str:
+        """The human tapped confirm on a cancel proposal: send the DELETE (once — the caller
+        already won the compare-and-set)."""
+        trace_store = self.approval_manager.trace_store
+        intent_id = order["intent_id"]
+        try:
+            sent = cancel_order(
+                order["target_order_id"],
+                base_url=os.getenv("HARNESS_TAIWANTRADE_API_URL", TAIWANTRADE_DEFAULT_URL),
+                api_key=load_api_key(),
+            )
+        except ProxyError as exc:
+            trace_store.finish_order_intent(intent_id, "failed", {"error": str(exc)})
+            return (
+                f"❌ 撤單沒有成功送出：{summary}\n原因：{exc}\n"
+                "（如果原因是委託已成交或已不存在，代表它已經不能撤了——到券商 App 或請我用 "
+                "get_positions 確認持股。）"
+            )
+        trace_store.finish_order_intent(intent_id, "submitted", sent)
+        return (
+            f"✅ 已送出撤單要求：{summary}\n"
+            "撤單是否真的生效要等券商回報；稍後可以請我查（list_orders，並對照 get_positions）。"
         )
 
     def _start_or_queue_task(
@@ -1203,7 +1250,11 @@ class TelegramGateway:
                 "所以：使用者要下單時，先確認股票、買賣方向、數量、價格都清楚（缺價格就問，不要自己"
                 "猜；使用者說「開盤價」但還沒有開盤價時，如實說還沒有，請他給價格），再呼叫工具，然後"
                 "告訴使用者「已提出委託，請到 Telegram 按確認」。不要說已經下單，也不要叫使用者去券商"
-                "App 自己下。你不能改單或撤單。\n"
+                "App 自己下。\n"
+                "撤單：用 `request_order_cancel`（先用 list_orders 找到委託編號），一樣只是提出撤單，"
+                "使用者在 Telegram 按「確認撤單」後才會送出。注意：系統記錄的委託狀態可能落後券商"
+                "（已成交的單可能還顯示 PendingSubmit），判斷有沒有成交要以 get_positions 為準；已成交的單"
+                "撤不了，如實告訴使用者。你不能改單。\n"
             )
         else:
             notice += "這些工具只能查詢，不能下單、改單或撤單；要交易請告訴使用者自己操作。\n"

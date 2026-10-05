@@ -408,4 +408,5 @@ button tap can send the order, at most once per intent (compare-and-set on the i
 unconfirmed proposal expires with TaiwanTrade's own TTL (5 min) and is reported as not placed. A
 harness-side per-order value limit applies on top of TaiwanTrade's own risk limits
 (`HARNESS_TAIWANTRADE_MAX_ORDER_VALUE`, default 100000 TWD). The API key needs TaiwanTrade's `trade`
-scope. Cancelling or amending an existing order is not available.
+scope. The model can also propose **cancelling** an order (`request_order_cancel`), confirmed the same
+way (the gateway, not the model, sends the `DELETE`). Amending an order is not available.

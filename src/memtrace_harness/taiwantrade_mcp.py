@@ -15,10 +15,11 @@ Boundaries enforced here (not left to the prompt):
   ticker cannot smuggle in ``../trade/orders``.
 
 Orders (opt-in per project, ``HARNESS_TAIWANTRADE_ORDER_PROJECTS``): the only write-ish tool
-is ``create_order_intent``. It creates a TaiwanTrade *intent* — nothing reaches the broker — and
-hands the one-time confirmation token to the harness database, never to the model. Only the
-gateway can turn an intent into an order, and only when the human taps the Telegram confirm
-button (``submit_order``). So an order always needs the human, however the model behaves.
+is ``create_order_intent`` (and ``request_order_cancel`` for an existing order). They create a
+TaiwanTrade *intent* / a cancel *request* — nothing reaches the broker — and hand the one-time
+confirmation token to the harness database, never to the model. Only the gateway can turn either
+into a real order or cancellation, and only when the human taps the Telegram confirm button
+(``submit_order`` / ``cancel_order``). So a trade always needs the human, however the model behaves.
 
 Run: ``python -m memtrace_harness.taiwantrade_mcp`` (speaks JSON-RPC over stdin/stdout).
 """
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 import os
 import re
 import sys
@@ -35,6 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -164,6 +167,21 @@ ORDER_TOOL = Tool(
         Param("order_type", r"ROD|IOC|FOK", "ROD (default) / IOC / FOK; odd-lot is ROD only", required=False),
     ),
 )
+
+
+CANCEL_TOOL_NAME = "request_order_cancel"
+CANCEL_TOOL = Tool(
+    CANCEL_TOOL_NAME,
+    "Propose cancelling an existing order for the user to confirm. This does NOT cancel it: the user "
+    "gets a confirm/cancel button in Telegram and only their tap sends the cancellation to the broker; "
+    "the result is reported to them automatically. Find the order_id with list_orders first. The local "
+    "order status can lag the broker (a filled order may still read PendingSubmit); get_positions shows "
+    "what is actually held.",
+    "/trade/orders",
+    (Param("order_id", r"[0-9A-Za-z_-]{1,64}", "Order id from list_orders"),),
+)
+_TERMINAL_STATUSES = ("Filled", "Cancelled", "Failed", "Rejected", "Inactive")
+CANCEL_REQUEST_TTL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -301,6 +319,100 @@ def create_order_intent(
         },
         ensure_ascii=False,
     )
+
+
+def create_cancel_request(
+    arguments: dict[str, Any],
+    *,
+    context: OrderContext,
+    base_url: str,
+    api_key: str,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    now: datetime | None = None,
+) -> str:
+    """Record a proposal to cancel an existing order. Reads today's orders (a GET) to find it
+    and show the human what would be cancelled; sends nothing to the broker."""
+    if not api_key:
+        raise ProxyError("TaiwanTrade API key is not configured for the proxy")
+    unknown = set(arguments) - {"order_id"}
+    if unknown:
+        raise ProxyError(f"unexpected arguments: {', '.join(sorted(unknown))}")
+    order_id = str(arguments.get("order_id") or "").strip()
+    if not re.fullmatch(CANCEL_TOOL.params[0].pattern, order_id):
+        raise ProxyError("invalid value for order_id")
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/trade/orders",
+        headers={"X-API-KEY": api_key, "Accept": "application/json"},
+        method="GET",
+    )
+    with opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        orders = json.loads(response.read().decode("utf-8", errors="replace"))
+    match = next((o for o in orders if str(o.get("order_id")) == order_id), None)
+    if match is None:
+        raise ProxyError(f"no order {order_id} among today's orders; check list_orders")
+    status = str(match.get("status") or "")
+    if status.rsplit(".", 1)[-1] in _TERMINAL_STATUSES:
+        raise ProxyError(f"order {order_id} is already {status}; there is nothing to cancel")
+    existing = context.store.find_open_cancel_request(order_id)
+    if existing:
+        context.store.reshow_order_intent(existing["intent_id"])
+        request_id = existing["intent_id"]
+        note = (
+            "A cancel proposal for this order is already waiting for the user; its buttons were "
+            "sent to their Telegram again. Tell the user to check the latest Telegram message. "
+            "Do not create it again."
+        )
+    else:
+        request_id = "cancel-" + uuid.uuid4().hex[:16]
+        expires = (now or datetime.now(timezone.utc)) + timedelta(seconds=CANCEL_REQUEST_TTL_SECONDS)
+        context.store.create_cancel_request(
+            intent_id=request_id,
+            project=context.project,
+            target_order_id=order_id,
+            symbol=str(match.get("symbol")),
+            action=str(match.get("action")),
+            price=float(match.get("price") or 0),
+            quantity=int(match.get("quantity") or 0),
+            is_odd_lot=bool(match.get("is_odd_lot")),
+            expires_at=expires.isoformat(),
+        )
+        note = (
+            "Cancel proposal created and NOT yet sent. The user has been sent a confirm/cancel "
+            "button in Telegram; the cancellation is only sent if they tap confirm, and the result "
+            "is reported to them automatically. Tell the user to check Telegram."
+        )
+    return json.dumps(
+        {
+            "request_id": request_id,
+            "order_id": order_id,
+            "symbol": match.get("symbol"),
+            "action": match.get("action"),
+            "price": match.get("price"),
+            "quantity": match.get("quantity"),
+            "order_status_as_recorded": status,
+            "note": note,
+        },
+        ensure_ascii=False,
+    )
+
+
+def cancel_order(
+    order_id: str,
+    *,
+    base_url: str,
+    api_key: str,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> dict[str, Any]:
+    """Send a confirmed cancellation. Called by the gateway after the human's tap — never
+    reachable from a tool."""
+    if not re.fullmatch(r"[0-9A-Za-z_-]{1,64}", order_id):
+        raise ProxyError("invalid order id")
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/trade/orders/" + urllib.parse.quote(order_id, safe=""),
+        headers={"X-API-KEY": api_key, "Accept": "application/json"},
+        method="DELETE",
+    )
+    return _send(request, opener)
 
 
 def submit_order(
@@ -452,13 +564,22 @@ def handle_message(
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        tools = [*TOOLS, ORDER_TOOL] if order_context else TOOLS
+        tools = [*TOOLS, ORDER_TOOL, CANCEL_TOOL] if order_context else TOOLS
         return ok({"tools": [_tool_schema(tool) for tool in tools]})
     if method == "tools/call":
         params = message.get("params") or {}
         try:
             if order_context and params.get("name") == ORDER_TOOL_NAME:
                 text = create_order_intent(
+                    params.get("arguments") or {},
+                    context=order_context,
+                    base_url=base_url,
+                    api_key=api_key_loader(),
+                    opener=opener,
+                )
+                return ok({"content": [{"type": "text", "text": text}]})
+            if order_context and params.get("name") == CANCEL_TOOL_NAME:
+                text = create_cancel_request(
                     params.get("arguments") or {},
                     context=order_context,
                     base_url=base_url,

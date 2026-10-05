@@ -148,11 +148,14 @@ class OrderProxyTests(TestCase):
         ]
         self.assertNotIn("create_order_intent", listing(None))
         self.assertIn("create_order_intent", listing(self.ctx))
-        # No place/confirm/cancel tool for the model in either case.
+        # The model may only *propose* a trade or a cancellation; nothing it can call places,
+        # confirms, cancels or amends for real.
+        proposals = {"create_order_intent", "request_order_cancel"}
+        self.assertEqual(set(listing(self.ctx)) - set(listing(None)), proposals)
         for name in listing(self.ctx):
-            self.assertNotIn("place", name)
-            self.assertNotIn("confirm", name)
-            self.assertNotIn("cancel", name)
+            if name not in proposals:
+                for word in ("place", "confirm", "cancel", "amend", "submit", "delete", "update"):
+                    self.assertNotIn(word, name)
 
     def test_calling_the_order_tool_without_an_enabled_project_is_an_error(self) -> None:
         reply = tw.handle_message(
@@ -351,3 +354,152 @@ class ChatNoticeTests(TestCase):
         self.assertIn("不要說已經下單", enabled)
         self.assertNotIn("create_order_intent", other)
         self.assertIn("不能下單", other)
+
+
+def orders_opener(orders: list, seen: list | None = None):
+    def opener(request, timeout=None):
+        if seen is not None:
+            seen.append(request)
+        return FakeResponse(json.dumps(orders).encode())
+
+    return opener
+
+
+OPEN_ORDER = {
+    "order_id": "89dd094d", "symbol": "2327", "action": "Buy", "price": 649.0, "quantity": 1,
+    "is_odd_lot": True, "status": "OrderStatus.PendingSubmit",
+}
+
+
+class CancelProposalProxyTests(TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+        self.ctx = tw.OrderContext(project="TWTradingStrategy", store=self.store)
+
+    def _request(self, order_id="89dd094d", orders=None, seen=None):
+        return tw.create_cancel_request(
+            {"order_id": order_id}, context=self.ctx, base_url="http://x/api/v1", api_key="k",
+            opener=orders_opener(orders if orders is not None else [OPEN_ORDER], seen),
+        )
+
+    def test_it_records_a_proposal_and_only_reads_the_order_list(self) -> None:
+        seen: list = []
+        text = self._request(seen=seen)
+        self.assertEqual([(r.method, r.full_url) for r in seen], [("GET", "http://x/api/v1/trade/orders")])
+        data = json.loads(text)
+        self.assertIn("NOT yet sent", data["note"])
+        row = self.store.get_order_intent(data["request_id"])
+        self.assertEqual(
+            (row["kind"], row["target_order_id"], row["status"], row["symbol"], row["confirmation_token"]),
+            ("cancel", "89dd094d", "pending", "2327", None),
+        )
+
+    def test_an_unknown_or_finished_order_cannot_be_proposed_for_cancel(self) -> None:
+        with self.assertRaises(tw.ProxyError) as caught:
+            self._request(order_id="nope")
+        self.assertIn("no order", str(caught.exception))
+        for status in ("OrderStatus.Filled", "Cancelled", "OrderStatus.Failed"):
+            with self.subTest(status=status), self.assertRaises(tw.ProxyError):
+                self._request(orders=[{**OPEN_ORDER, "status": status}])
+
+    def test_asking_twice_reshows_the_same_proposal_instead_of_creating_another(self) -> None:
+        first = json.loads(self._request())["request_id"]
+        self.store.claim_pending_order_intents(["TWTradingStrategy"])    # shown: awaiting
+        second = json.loads(self._request())
+        self.assertEqual(second["request_id"], first)
+        self.assertIn("again", second["note"])
+        self.assertEqual(self.store.get_order_intent(first)["status"], "pending")
+
+    def test_a_malformed_order_id_is_rejected(self) -> None:
+        for bad in ("../orders", "a b", "x" * 80, ""):
+            with self.subTest(bad=bad), self.assertRaises(tw.ProxyError):
+                self._request(order_id=bad)
+
+    def test_cancel_order_sends_a_delete_for_exactly_that_order(self) -> None:
+        seen: list = []
+
+        def opener(request, timeout=None):
+            seen.append(request)
+            return FakeResponse(json.dumps({"detail": "Cancel request sent", "order_id": "89dd094d"}).encode())
+
+        out = tw.cancel_order("89dd094d", base_url="http://x/api/v1", api_key="k", opener=opener)
+        self.assertEqual(out["detail"], "Cancel request sent")
+        self.assertEqual((seen[0].method, seen[0].full_url), ("DELETE", "http://x/api/v1/trade/orders/89dd094d"))
+        with self.assertRaises(tw.ProxyError):
+            tw.cancel_order("../x", base_url="http://x/api/v1", api_key="k", opener=opener)
+
+
+class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
+    """Same gateway, same safeguards, for a cancel proposal."""
+
+    def _propose_cancel(self, request_id="cancel-1") -> None:
+        self.store.create_cancel_request(
+            intent_id=request_id, project=self.project, target_order_id="89dd094d", symbol="2327",
+            action="Buy", price=649.0, quantity=1, is_odd_lot=True,
+            expires_at=(datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        )
+
+    def test_the_cancel_proposal_is_shown_with_its_own_buttons_and_nothing_is_sent(self) -> None:
+        self._propose_cancel()
+        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+            self.gateway.process_order_intents()
+        cancel.assert_not_called()
+        _, text, keyboard = self.gateway.send_message_with_keyboard.call_args.args
+        self.assertIn("待確認撤單", text)
+        self.assertIn("89dd094d", text)
+        self.assertEqual([b["text"] for b in keyboard[0]], ["✅ 確認撤單", "❌ 不撤單"])
+
+    def test_confirm_sends_one_delete_and_reports_it(self) -> None:
+        self._propose_cancel()
+        self.gateway.process_order_intents()
+        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
+            "memtrace_harness.telegram_gateway.cancel_order", return_value={"detail": "Cancel request sent"}
+        ) as cancel:
+            first = self._tap("order_confirm", "cancel-1")
+            second = self._tap("order_confirm", "cancel-1")
+        cancel.assert_called_once()
+        self.assertEqual(cancel.call_args.args, ("89dd094d",))
+        self.assertIn("已送出撤單要求", first)
+        self.assertIn("沒有再送出", second)
+        self.assertTrue(any("已送出撤單要求" in t for t in self._turns()))
+
+    def test_declining_sends_nothing(self) -> None:
+        self._propose_cancel()
+        self.gateway.process_order_intents()
+        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+            result = self._tap("order_cancel", "cancel-1")
+        cancel.assert_not_called()
+        self.assertIn("沒有撤單", result)
+
+    def test_a_cancel_the_broker_refuses_is_reported_with_the_reason(self) -> None:
+        self._propose_cancel()
+        self.gateway.process_order_intents()
+        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
+            "memtrace_harness.telegram_gateway.cancel_order",
+            side_effect=tw.ProxyError("TaiwanTrade returned HTTP 400: order already filled"),
+        ):
+            result = self._tap("order_confirm", "cancel-1")
+        self.assertIn("撤單沒有成功送出", result)
+        self.assertIn("already filled", result)
+        self.assertEqual(self.store.get_order_intent("cancel-1")["status"], "failed")
+
+    def test_an_expired_cancel_proposal_is_never_sent(self) -> None:
+        self.store.create_cancel_request(
+            intent_id="cancel-old", project=self.project, target_order_id="89dd094d", symbol="2327",
+            action="Buy", price=649.0, quantity=1, is_odd_lot=True,
+            expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+        )
+        self.store.transition_order_intent("cancel-old", ("pending",), "awaiting")
+        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+            result = self._tap("order_confirm", "cancel-old")
+        cancel.assert_not_called()
+        self.assertIn("過期", result)
+
+    def test_the_chat_model_is_told_about_the_cancel_tool(self) -> None:
+        env = {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/k", "HARNESS_TAIWANTRADE_ORDER_PROJECTS": "P"}
+        with patch.dict("os.environ", env, clear=True):
+            notice = TelegramGateway._taiwantrade_notice("P")
+        self.assertIn("request_order_cancel", notice)
+        self.assertIn("get_positions 為準", notice)

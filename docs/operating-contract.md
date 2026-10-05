@@ -93,7 +93,8 @@ only a button tap from an allowlisted Telegram chat sends the order (`POST /trad
 once per intent; an unconfirmed proposal expires and is reported as not placed; the result of every
 confirmed, cancelled, failed or expired order is sent to the human and written to the chat log;
 Agent Loop roles never get the tool; a per-order value limit (default 100000 TWD) applies on top of
-TaiwanTrade's own risk limits. **Not implemented:** cancelling/amending orders, market orders.
+TaiwanTrade's own risk limits. A cancellation is proposed the same way (`request_order_cancel`) and sent
+only on the human's tap (the gateway makes the `DELETE`). **Not implemented:** amending orders, market orders.
 
 **POLICY_ONLY**:
 
