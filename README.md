@@ -334,8 +334,8 @@ same files; further tasks wait in a queue and start as slots free up. A schedule
 if its previous run is still running (or queued) the next occurrence is skipped. When a task finishes,
 the converge-stage Controller sees what it would bring back and may choose `merge`; the harness merges
 the branch into the checkout's base branch only if that checkout is clean, and stops for a human on
-conflict. Projects that are not git repositories (or set `max_workers: 1`) edit in place, one task at
-a time. Two overlapping *scans* of the same project are still serialized, and two *different*
+conflict. Projects that are not git repositories, have no commit yet, or set `max_workers: 1` edit in place, one
+task at a time. Two overlapping *scans* of the same project are still serialized, and two *different*
 projects always run independently.
 
 ## Traces

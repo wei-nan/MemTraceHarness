@@ -765,6 +765,8 @@ class ChatCommandTests(TestCase):
         self.assertIn("read-only", codex)  # the sandbox stays read-only
         self.assertTrue(any(a.startswith("mcp_servers.taiwantrade.command=") for a in codex))
         self.assertTrue(any("/keys/tw" in a for a in codex))  # a path, never the key itself
+        # exec mode has approval=never: without this the MCP call is rejected outright.
+        self.assertIn('mcp_servers.taiwantrade.default_tools_approval_mode="approve"', codex)
         self.assertEqual(claude[claude.index("--allowedTools") + 1], "mcp__x,mcp__taiwantrade")
         self.assertIn("--mcp-config", claude)
         # No opt-in env var -> nothing attached even when asked for.

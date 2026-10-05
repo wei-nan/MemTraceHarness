@@ -85,6 +85,19 @@ def is_git_repo(path: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def has_commits(path: Path) -> bool:
+    """False for a freshly `git init`-ed repo whose HEAD is still unborn: there is no
+    commit to branch a worktree from."""
+    try:
+        return _git(path, "rev-parse", "--verify", "--quiet", "HEAD", timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def can_use_worktrees(path: Path) -> bool:
+    return is_git_repo(path) and has_commits(path)
+
+
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "project"
 
