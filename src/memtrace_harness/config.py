@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,7 @@ class HarnessConfig:
         prompt: str,
         *,
         claude_allowed_tools: str | None = None,
+        taiwantrade: bool = False,
     ) -> list[str]:
         """argv for one plain, non-interactive "answer this prompt" call — the quick
         chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
@@ -67,11 +71,28 @@ class HarnessConfig:
         failed on every message and fell back. Codex answers through `codex exec`,
         read-only and ephemeral, printing only the final message on stdout."""
         command = [self.command_for(provider)]
+        # The read-only TaiwanTrade proxy (taiwantrade_mcp.py) is an MCP server, which the
+        # CLI spawns outside its tool sandbox — the only way a sandboxed chat model can
+        # reach 127.0.0.1:8000. Opt-in, and only for the chat reply (taiwantrade=True):
+        # digests, classifiers and JSON repair have no use for trading data.
+        proxy = mcp_server_spec() if taiwantrade else None
         if provider == "codex":
             command += ["exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never"]
+            if proxy:
+                env_toml = ",".join(f"{k}={json.dumps(v)}" for k, v in proxy["env"].items())
+                command += [
+                    "--config", f"mcp_servers.taiwantrade.command={json.dumps(proxy['command'])}",
+                    "--config", f"mcp_servers.taiwantrade.args={json.dumps(proxy['args'])}",
+                    "--config", f"mcp_servers.taiwantrade.env={{{env_toml}}}",
+                ]
             if model:
                 command += ["--model", model]
             return command + [prompt]
+        if provider == "claude" and proxy:
+            command += ["--mcp-config", json.dumps({"mcpServers": {"taiwantrade": proxy}})]
+            claude_allowed_tools = ",".join(
+                filter(None, [claude_allowed_tools, "mcp__taiwantrade"])
+            )
         if provider == "claude" and claude_allowed_tools:
             command += ["--allowedTools", claude_allowed_tools]
         if model:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any
 
 from memtrace_harness.adapters.cli import CliModelAdapter
 from memtrace_harness.cli_process import ProcessResult
 from memtrace_harness.schemas import TaskEnvelope, TokenUsage
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 
 
 class CodexCliAdapter(CliModelAdapter):
@@ -37,6 +39,19 @@ class CodexCliAdapter(CliModelAdapter):
         if self.output_schema_path:
             command.extend(["--output-schema", str(self.output_schema_path)])
         command.extend(["--sandbox", self.permission])
+        # Read-only TaiwanTrade proxy: Codex spawns MCP servers outside its sandbox, so
+        # the agent can query 127.0.0.1:8000 without the sandbox gaining network access.
+        taiwantrade = mcp_server_spec()
+        if taiwantrade:
+            prefix = "mcp_servers.taiwantrade"
+            env_toml = ",".join(f"{k}={json.dumps(v)}" for k, v in taiwantrade["env"].items())
+            command.extend(
+                [
+                    "--config", f"{prefix}.command={json.dumps(taiwantrade['command'])}",
+                    "--config", f"{prefix}.args={json.dumps(taiwantrade['args'])}",
+                    "--config", f"{prefix}.env={{{env_toml}}}",
+                ]
+            )
         if self.context_policy in {"loop-snapshot", "gate-evidence-only"}:
             command.append("--ignore-user-config")
         if self.context_policy == "loop-snapshot":

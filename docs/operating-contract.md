@@ -62,6 +62,27 @@ The model may push one Telegram message when it found a connection the human lik
 has in mind. **PLANNED, not implemented:** a reverse index so the nightly digest can mark which
 older items a day's topics continued.
 
+**Concurrent tasks per project (explicit operator decision, 2026-10-05).** A project runs up to
+`max_workers` governed tasks at once (`harness-scope.md`, default 3; 1 restores one-at-a-time).
+ENFORCED in code: slots are claimed atomically in SQLite (`workspace_locks`, one row per running
+task), so the limit holds across threads; a task that finds every slot busy waits in a persistent
+FIFO queue (`task_queue`) and is started when a slot frees, including after a gateway restart; a
+schedule whose previous run is still running *or still queued* is skipped for that cycle rather than
+queued behind itself (other schedules are unaffected); an approved conversation waits for a slot
+the same way. Each task in a git project runs in its own `git worktree` on branch
+`harness/<conversation_id>` (`worktrees.py`), so concurrent Developers never edit the same files;
+a project that is not a git repository, or has `max_workers: 1`, edits its checkout in place.
+Worktrees branch from the checkout's HEAD, so uncommitted or git-ignored files are not in them —
+`worktree_setup_command` (run in the fresh worktree with `HARNESS_REPO_ROOT` set) is the hook for
+that. The converge-stage Controller is told what a finished task would bring back (commits, files,
+whether it merges cleanly, whether the base moved) and may choose `merge`: the harness then merges
+the branch into the checkout's base branch itself, but only when that checkout is clean and still on
+that branch, and aborts on conflict (leaving the work on its branch and stopping for a human). Work
+that is not merged, or whose run stopped for a human, keeps its worktree. One editing provider per
+run is unchanged: this isolates *tasks* from each other, it is not provider fan-out inside a run.
+**Not implemented:** automatically resolving merge conflicts, pruning worktrees of abandoned or
+failed-with-changes runs, and the unattended scanner still wants the whole project idle.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;
@@ -185,4 +206,5 @@ must not approve or adopt the proposal, change Agent Loop policy, or lower the q
 3. provider-specific reset/retry-after parsing;
 4. backlog polling and paused-run wakeup (POLICY_ONLY via Telegram Gateway & UnattendedScanner);
 5. scheduled/wave Improvement aggregation with deduplication;
-6. isolated-worktree multi-writer execution.
+6. isolated-worktree multi-provider fan-out inside one run (per-task worktrees already isolate
+   concurrent tasks; see "Concurrent tasks per project").

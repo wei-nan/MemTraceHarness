@@ -7,6 +7,7 @@ from typing import Any
 from memtrace_harness.adapters.cli import CliModelAdapter
 from memtrace_harness.cli_process import ProcessResult
 from memtrace_harness.schemas import TaskEnvelope, TokenUsage
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 
 
 class ClaudeCliAdapter(CliModelAdapter):
@@ -47,6 +48,12 @@ class ClaudeCliAdapter(CliModelAdapter):
             if self.role_profile_id == "controller"
             else ""
         )
+        # Read-only TaiwanTrade proxy: an MCP server, which runs outside the sandbox.
+        # Every role gets it, Controller included (operator's call, 2026-10-05).
+        taiwantrade = mcp_server_spec()
+        if taiwantrade:
+            command.extend(["--mcp-config", json.dumps({"mcpServers": {"taiwantrade": taiwantrade}})])
+            read_tools += ",mcp__taiwantrade"
         if self.permission == "read-only":
             # NOT --permission-mode plan: that mode is built for an interactive human
             # session (it can hand off to ExitPlanMode, or — observed 2026-08-12 on a

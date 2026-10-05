@@ -11,7 +11,9 @@ Hard project boundaries:
 - `MemTraceClient` is only the MemTrace MCP control-plane client; it is not a model transport.
 - Preserve raw provider output in the local trace store and write only summaries/references to
   MemTrace.
-- Keep one editing provider per run until isolated-worktree fan-out is implemented.
+- Keep one editing provider per run until isolated-worktree fan-out is implemented. (Concurrent
+  *tasks* each get their own worktree — see "Concurrent tasks per project" in the operating
+  contract — but a single run still has one editing provider.)
 - Never claim missing token usage is zero. Preserve `complete`, `partial`, or `unavailable`.
 - Unit tests must inject subprocess output and must not consume model quota.
 - Harness output remains draft evidence; it cannot approve its own Agent Loop gate or Improvement
