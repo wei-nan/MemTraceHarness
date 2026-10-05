@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -816,12 +816,17 @@ class TelegramGateway:
         # development work is made in conversation with the model itself (see
         # _chat_reply_and_maybe_start_task()) — by the time this is called, that
         # decision has already been made together with the human in the chat.
-        self.send_message(
-            chat_id,
-            f"🔧 已開始執行「{scope.name}」的任務，可能需要幾分鐘，完成後會通知你（這段期間仍可以正常對話）。",
-        )
+        # Say WHICH task started: with several schedules (and chat tasks) running, a bare
+        # "a task started" can't be told apart.
+        self.send_message(chat_id, self._task_started_text(scope, goal, schedule_id))
         self._launch_task(scope, conv_id, goal, chat_id, schedule_id)
         return f"任務已在背景開始執行：{goal}"
+
+    @staticmethod
+    def _task_started_text(scope: ProjectScope, goal: str, schedule_id: str | None) -> str:
+        if schedule_id:
+            return f"⏰ 排程 {schedule_id} 開始執行：{goal}"
+        return f"🔧 開始執行「{scope.name}」：{goal}"
 
     def _launch_task(
         self, scope: ProjectScope, conv_id: str, goal: str, chat_id: int, schedule_id: str | None
@@ -925,12 +930,24 @@ class TelegramGateway:
     # ---- per-task git worktrees (see worktrees.py)
 
     def _slot_limit(self, scope: ProjectScope) -> int:
-        """How many tasks of this project may run at once. Tasks only run side by side
-        when each can have its own worktree; a project that can't (not a git repo, or no
-        commit yet) is limited to one, since they would all edit the same folder."""
-        if scope.max_workers <= 1 or not can_use_worktrees(scope.working_directory):
-            return 1
-        return scope.max_workers
+        """How many tasks of this project may run at once: what harness-scope.md says. A
+        project that can't give each task its own worktree (not a git repo, or no commit
+        yet) still runs that many side by side; only its *development* is serialized, by
+        the edit lock (see _edit_lock_for)."""
+        return max(1, scope.max_workers)
+
+    def _edit_lock_for(
+        self, scope: ProjectScope, conv_id: str, worktree: TaskWorktree | None, trace_store: TraceStore
+    ) -> tuple[Callable[[], bool], Callable[[], None]] | None:
+        """A task that has its own worktree, or the whole project to itself, edits freely.
+        Otherwise it shares one folder with its siblings and takes turns to develop."""
+        if worktree is not None or self._slot_limit(scope) <= 1:
+            return None
+        ws_id = scope.workspace_id
+        return (
+            lambda: trace_store.acquire_edit_lock(ws_id, conv_id),
+            lambda: trace_store.release_edit_lock(ws_id, conv_id),
+        )
 
     def _worktree_manager(self) -> WorktreeManager:
         return WorktreeManager(self.config.trace_root / "worktrees")
@@ -1706,6 +1723,7 @@ class TelegramGateway:
             worktree=worktree,
             worktree_manager=self._worktree_manager() if worktree else None,
             repo_root=scope.working_directory if worktree else None,
+            edit_lock=self._edit_lock_for(scope, conv_id, worktree, self.approval_manager.trace_store),
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
         note = self._finalize_worktree(scope, conv_id, worktree, summary.status)
@@ -1789,8 +1807,8 @@ class TelegramGateway:
         # than leaving the user staring at silence after the "Approval update:
         # approved" message.
         self.notify_all_allowlisted(
-            f"🔧 已核准，開始執行「{matching_scope.name if matching_scope else req_data.workspace}」，"
-            "可能需要幾分鐘，完成後會通知你（這段期間仍可以正常對話）。"
+            f"🔧 已核准，繼續執行「{matching_scope.name if matching_scope else req_data.workspace}」："
+            f"{req_data.resume_goal or req_data.proposed_action or req_data.reason}"
         )
         # resume_goal (the original request) beats proposed_action (a human-readable
         # summary of why it stopped) — approving must continue the actual task, not
@@ -1880,6 +1898,11 @@ class TelegramGateway:
                     worktree=worktree,
                     worktree_manager=self._worktree_manager() if worktree else None,
                     repo_root=matching_scope.working_directory if worktree and matching_scope else None,
+                    edit_lock=(
+                        self._edit_lock_for(matching_scope, req_data.conversation_id, worktree, trace_store)
+                        if matching_scope is not None
+                        else None
+                    ),
                 )
                 summary = runner.run(
                     task,

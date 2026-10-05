@@ -419,16 +419,19 @@ class TaiwanTradeChatNoticeTests(TestCase):
 
 
 class NoWorktreeFallbackTests(TestCase):
+    """A project that cannot give each task its own worktree still gets all its worker slots;
+    only development is serialized (by the edit lock)."""
+
     def _gateway(self, root: Path):
         gateway, store, scope = _build_schedule_gateway(root)
         scope.max_workers = 3
         gateway.send_message = MagicMock()
         return gateway, store, scope
 
-    def test_a_non_git_project_runs_one_task_at_a_time_whatever_max_workers_says(self) -> None:
+    def test_a_non_git_project_still_gets_every_slot_and_works_in_place(self) -> None:
         with TemporaryDirectory() as tmp:
             gateway, store, scope = self._gateway(Path(tmp))
-            self.assertEqual(gateway._slot_limit(scope), 1)
+            self.assertEqual(gateway._slot_limit(scope), 3)
             self.assertEqual(gateway._provision_workdir(scope, "c1"), (scope.working_directory, None))
 
     def test_a_git_repo_with_no_commit_yet_is_treated_the_same(self) -> None:
@@ -440,7 +443,7 @@ class NoWorktreeFallbackTests(TestCase):
             (repo / "untracked.txt").write_text("x")
             gateway, store, scope = self._gateway(root)
             scope.working_directory = repo
-            self.assertEqual(gateway._slot_limit(scope), 1)
+            self.assertEqual(gateway._slot_limit(scope), 3)
             # No "cannot read HEAD" crash: it just works in place.
             self.assertEqual(gateway._provision_workdir(scope, "c1"), (repo, None))
 
@@ -453,3 +456,117 @@ class NoWorktreeFallbackTests(TestCase):
             self.assertEqual(gateway._slot_limit(scope), 3)
             scope.max_workers = 1
             self.assertEqual(gateway._slot_limit(scope), 1)
+
+    def test_three_tasks_run_side_by_side_in_a_project_without_worktrees(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = self._gateway(Path(tmp))
+            release = threading.Event()
+            started: list[str] = []
+
+            def fake_run(scope, conv_id, goal, schedule_id=None):
+                started.append(goal)
+                release.wait(timeout=10)
+                return MagicMock(conversation_id=conv_id, status="succeeded", recommendation="ok")
+
+            gateway._run_new_task = fake_run
+            gateway._report_run_outcome = MagicMock()
+            gateway._model_summary = MagicMock(return_value="m")
+            self.addCleanup(release.set)
+            for goal in ("a", "b", "c", "d"):
+                gateway._start_or_queue_task(scope, goal, 12345)
+            for _ in range(200):
+                if len(started) >= 3:
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(sorted(started), ["a", "b", "c"])            # the 4th waits, not the 2nd
+            self.assertEqual(len(store.list_queued_tasks(scope.workspace_id)), 1)
+            release.set()
+            for _ in range(20):
+                alive = [t for t in threading.enumerate() if t.name.startswith("agent-loop-")]
+                if not alive:
+                    break
+                for t in alive:
+                    t.join(timeout=5)
+
+    def test_only_a_task_sharing_the_folder_gets_the_edit_lock(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = self._gateway(Path(tmp))
+            shared = gateway._edit_lock_for(scope, "c1", None, store)
+            self.assertIsNotNone(shared)
+            acquire, release = shared
+            store.acquire_task_slot(scope.workspace_id, "c1", max_slots=3)
+            self.assertTrue(acquire())
+            release()
+            self.assertIsNone(store.get_edit_lock(scope.workspace_id))
+            # Its own worktree: no lock. One worker: nothing to share: no lock.
+            self.assertIsNone(gateway._edit_lock_for(scope, "c1", MagicMock(), store))
+            scope.max_workers = 1
+            self.assertIsNone(gateway._edit_lock_for(scope, "c1", None, store))
+
+    def test_the_runner_is_given_the_edit_lock_when_the_folder_is_shared(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = self._gateway(Path(tmp))
+            with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
+                "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
+            ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+                runner.return_value.run.return_value = MagicMock(
+                    conversation_id="c1", status="succeeded", recommendation="ok"
+                )
+                gateway._run_new_task(scope, "c1", "改程式")
+            self.assertIsNotNone(runner.call_args.kwargs["edit_lock"])
+
+
+class EditLockStoreTests(TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+        for conv in ("a", "b"):
+            self.store.acquire_task_slot("ws", conv, max_slots=3)
+
+    def test_only_one_task_may_develop_at_a_time_and_it_can_retake_its_own_lock(self) -> None:
+        self.assertTrue(self.store.acquire_edit_lock("ws", "a"))
+        self.assertTrue(self.store.acquire_edit_lock("ws", "a"))
+        self.assertFalse(self.store.acquire_edit_lock("ws", "b"))
+        self.store.release_edit_lock("ws", "a")
+        self.assertTrue(self.store.acquire_edit_lock("ws", "b"))
+
+    def test_another_project_has_its_own_lock(self) -> None:
+        self.store.acquire_task_slot("other", "x", max_slots=3)
+        self.assertTrue(self.store.acquire_edit_lock("ws", "a"))
+        self.assertTrue(self.store.acquire_edit_lock("other", "x"))
+
+    def test_finishing_a_task_frees_its_edit_lock_with_its_slot(self) -> None:
+        self.store.acquire_edit_lock("ws", "a")
+        self.store.release_workspace_lock("ws", "a")
+        self.assertTrue(self.store.acquire_edit_lock("ws", "b"))
+
+    def test_a_lock_whose_owner_lost_its_slot_is_taken_over(self) -> None:
+        self.store.acquire_edit_lock("ws", "a")
+        with self.store._connection() as conn:       # the process died: slot row gone, lock row left
+            conn.execute("DELETE FROM workspace_locks WHERE conversation_id = 'a'")
+        self.assertTrue(self.store.acquire_edit_lock("ws", "b"))
+
+
+class TaskStartedMessageTests(TestCase):
+    def test_a_scheduled_start_names_the_schedule_and_what_it_does(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = _build_schedule_gateway(Path(tmp))
+            gateway.send_message = MagicMock()
+            gateway._launch_task = MagicMock()
+            gateway._start_or_queue_task(scope, "每10分鐘檢查庫存報價", 12345, schedule_id="sched_75c5981703")
+            text = gateway.send_message.call_args.args[1]
+            self.assertIn("sched_75c5981703", text)
+            self.assertIn("每10分鐘檢查庫存報價", text)
+            self.assertNotIn("可能需要幾分鐘", text)
+
+    def test_a_chat_task_start_says_what_started_without_the_boilerplate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = _build_schedule_gateway(Path(tmp))
+            gateway.send_message = MagicMock()
+            gateway._launch_task = MagicMock()
+            gateway._start_or_queue_task(scope, "修改移動停利公式", 12345)
+            text = gateway.send_message.call_args.args[1]
+            self.assertIn("修改移動停利公式", text)
+            self.assertNotIn("可能需要幾分鐘", text)
+            self.assertNotIn("sched_", text)

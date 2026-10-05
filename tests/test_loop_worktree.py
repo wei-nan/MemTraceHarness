@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import MagicMock
 
 from memtrace_harness.loop import AgentLoopRunner, controller_task
 from memtrace_harness.schemas import TaskEnvelope
@@ -119,3 +120,80 @@ class WorktreeLoopTests(TestCase):
     def test_without_a_worktree_the_converge_stage_is_unchanged(self) -> None:
         task = controller_task(self.task, stage="converge", stages=[])
         self.assertIn("['finish', 'ask_human']", task.goal)
+
+
+class SharedFolderEditLockTests(TestCase):
+    """Tasks that share one folder (no worktree) take turns to develop; nothing else waits."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = TraceStore(Path(self._tmp.name) / "t.sqlite3")
+        self.task = TaskEnvelope(task_id="t", workspace_id="ws", goal="Edit", risk_level="medium")
+
+    def _adapters(self, controller):
+        return {
+            "controller": QueueAdapter("controller", "codex", "m", controller),
+            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
+            "planner-escalation": QueueAdapter("planner-escalation", "claude", "opus", []),
+            "red-team": QueueAdapter("red-team", "codex", "m", [passed_gate(), passed_gate()]),
+            "developer": QueueAdapter("developer", "antigravity", "g", [completed_development()]),
+        }
+
+    def _runner(self, adapters, results, **kwargs):
+        calls = []
+
+        def acquire():
+            calls.append("acquire")
+            return results.pop(0) if results else True
+
+        return (
+            AgentLoopRunner(
+                adapters=adapters, trace_store=self.store,
+                edit_lock=(acquire, lambda: calls.append("release")),
+                edit_lock_poll_seconds=0, sleep=lambda _s: calls.append("wait"), **kwargs,
+            ),
+            calls,
+        )
+
+    def test_development_waits_for_the_other_task_then_proceeds_and_releases(self) -> None:
+        adapters = self._adapters(
+            [{"action": "run_planner", "reason": "go"}, {"action": "finish", "reason": "done"}]
+        )
+        runner, calls = self._runner(adapters, [False, False, True])
+        summary = runner.run(self.task)
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(calls, ["acquire", "wait", "acquire", "wait", "acquire", "release"])
+
+    def test_it_gives_up_with_a_clear_message_if_the_other_task_never_finishes(self) -> None:
+        adapters = self._adapters([{"action": "run_planner", "reason": "go"}])
+        runner, calls = self._runner(adapters, [False] * 50, edit_lock_wait_seconds=0)
+        summary = runner.run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("Another development task", summary.recommendation)
+        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertNotIn("release", calls)          # never held it, nothing to release
+
+    def test_an_operational_task_never_asks_for_the_lock(self) -> None:
+        adapters = self._adapters([{"action": "run_operational_action", "reason": "just check"}])
+        runner, calls = self._runner(adapters, [False] * 50)
+        summary = runner.run(self.task)
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(calls, [])
+
+    def test_the_lock_is_released_even_if_the_run_raises(self) -> None:
+        adapters = self._adapters(
+            [{"action": "run_planner", "reason": "go"}, {"action": "finish", "reason": "done"}]
+        )
+        adapters["developer"].run = MagicMock(side_effect=RuntimeError("boom"))
+        runner, calls = self._runner(adapters, [True])
+        with self.assertRaises(RuntimeError):
+            runner.run(self.task)
+        self.assertEqual(calls, ["acquire", "release"])
+
+    def test_without_an_edit_lock_nothing_changes(self) -> None:
+        adapters = self._adapters(
+            [{"action": "run_planner", "reason": "go"}, {"action": "finish", "reason": "done"}]
+        )
+        summary = AgentLoopRunner(adapters=adapters, trace_store=self.store).run(self.task)
+        self.assertEqual(summary.status, "succeeded")

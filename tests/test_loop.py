@@ -16,6 +16,7 @@ from memtrace_harness.loop import (
     _is_technical_output_failure,
     _plan_structure_ok,
     controller_task,
+    gate_task,
     summarize_invalid_artifact,
     summarize_plan_needs_human,
     valid_plan,
@@ -675,6 +676,93 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "needs_human")
         self.assertEqual(len(adapters["planner-escalation"].calls), 0)
         self.assertEqual(len(adapters["developer"].calls), 0)
+
+    def _g1_implementation_gap(self) -> dict:
+        return {
+            "verdict": "REJECT",
+            "reason_code": "implementation_gap",
+            "findings": [{"description": "the feature does not exist in the repository yet"}],
+            "unverified_items": [],
+            "confidence": 0.98,
+        }
+
+    def test_g1_judges_the_plan_not_the_missing_implementation(self) -> None:
+        goal_g1 = gate_task(self.task, "G1", ready_plan()).goal
+        goal_g2 = gate_task(self.task, "G2", completed_development(), ready_plan()).goal
+        self.assertIn("PLAN gate", goal_g1)
+        self.assertIn("NEVER a finding", goal_g1)
+        self.assertNotIn("PLAN gate", goal_g2)
+        self.assertIn("IMPLEMENTATION gate", goal_g2)
+        self.assertIn("CORRECTION", gate_task(self.task, "G1", ready_plan(), rescope=True).goal)
+        self.assertNotIn("CORRECTION", goal_g1)
+
+    def test_g1_implementation_gap_is_asked_again_not_sent_to_plan_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["red-team"] = QueueAdapter(
+            "red-team", "codex", "gpt-5.6-sol",
+            [self._g1_implementation_gap(), passed_gate(), passed_gate()],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path)
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        stages = [stage.stage for stage in summary.stages]
+        self.assertIn("g1-rescope", stages)
+        self.assertNotIn("plan-revision", stages)
+        self.assertEqual(len(adapters["planner"].calls), 1)          # no revision round
+        self.assertIn("CORRECTION", adapters["red-team"].calls[1].goal)
+
+    def test_g1_implementation_gap_twice_stops_without_a_pointless_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["red-team"] = QueueAdapter(
+            "red-team", "codex", "gpt-5.6-sol",
+            [self._g1_implementation_gap(), self._g1_implementation_gap()],
+        )
+
+        summary = AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path)
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("cannot apply before any code exists", summary.recommendation)
+        self.assertEqual(len(adapters["planner"].calls), 1)
+        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertNotIn("plan-revision", [stage.stage for stage in summary.stages])
+
+    def test_g1_test_gap_is_treated_the_same_way(self) -> None:
+        adapters = self._adapters()
+        gap = {**self._g1_implementation_gap(), "reason_code": "test_gap"}
+        adapters["red-team"] = QueueAdapter(
+            "red-team", "codex", "gpt-5.6-sol", [gap, passed_gate(), passed_gate()]
+        )
+        summary = AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path)
+        ).run(self.task)
+        self.assertEqual(summary.status, "succeeded")
+        self.assertIn("g1-rescope", [stage.stage for stage in summary.stages])
+
+    def test_a_genuine_plan_defect_still_gets_its_revision(self) -> None:
+        # acceptance_gap is a real plan defect: unchanged behavior, no rescope round.
+        adapters = self._adapters()
+        adapters["planner"] = QueueAdapter(
+            "planner", "claude", "sonnet", [ready_plan("first"), ready_plan("revised")]
+        )
+        adapters["red-team"] = QueueAdapter(
+            "red-team", "codex", "gpt-5.6-sol",
+            [
+                {**self._g1_implementation_gap(), "reason_code": "acceptance_gap"},
+                passed_gate(),
+                passed_gate(),
+            ],
+        )
+        summary = AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path)
+        ).run(self.task)
+        stages = [stage.stage for stage in summary.stages]
+        self.assertIn("plan-revision", stages)
+        self.assertNotIn("g1-rescope", stages)
 
     def test_g1_acceptance_gap_gets_one_sonnet_revision_not_opus(self) -> None:
         adapters = self._adapters()
