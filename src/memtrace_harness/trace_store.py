@@ -938,6 +938,8 @@ class TraceStore:
             self._ensure_column(conn, "preference_rules", "retire_reason", "TEXT")
             self._ensure_column(conn, "memory_digests", "node_dirty", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "memory_digests", "edges_synced", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "order_intents", "kind", "TEXT NOT NULL DEFAULT 'order'")
+            self._ensure_column(conn, "order_intents", "target_order_id", "TEXT")
             self._ensure_column(conn, "primary_sessions_hot_log", "schedule_id", "TEXT")
             self._retag_legacy_schedule_turns(conn)
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
@@ -2046,7 +2048,7 @@ class TraceStore:
     _ORDER_COLUMNS = (
         "intent_id, project, symbol, action, price, quantity, is_odd_lot, price_type, "
         "order_type, estimated_value, risk_json, confirmation_token, status, expires_at, "
-        "telegram_chat_id, telegram_message_id, result_json, created_at"
+        "telegram_chat_id, telegram_message_id, result_json, created_at, kind, target_order_id"
     )
 
     @staticmethod
@@ -2059,6 +2061,7 @@ class TraceStore:
             "status": row[12], "expires_at": row[13], "telegram_chat_id": row[14],
             "telegram_message_id": row[15],
             "result": json.loads(row[16]) if row[16] else None, "created_at": row[17],
+            "kind": row[18], "target_order_id": row[19],
         }
 
     def create_order_intent(
@@ -2092,6 +2095,45 @@ class TraceStore:
                     json.dumps(risk, ensure_ascii=False), confirmation_token, expires_at, now, now,
                 ),
             ).rowcount > 0
+
+    def create_cancel_request(
+        self,
+        *,
+        intent_id: str,
+        project: str,
+        target_order_id: str,
+        symbol: str,
+        action: str,
+        price: float,
+        quantity: int,
+        is_odd_lot: bool,
+        expires_at: str,
+    ) -> None:
+        """A proposal to cancel an existing order. Same life cycle as a new-order proposal
+        (shown with buttons, sent only on the human's tap), but there is no token: the
+        cancel is a DELETE the gateway makes itself."""
+        now = utc_now_iso()
+        estimated = round(price * quantity * (1 if is_odd_lot else 1000), 2)
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO order_intents (intent_id, project, symbol, action, price, "
+                "quantity, is_odd_lot, price_type, order_type, estimated_value, risk_json, "
+                "confirmation_token, status, expires_at, created_at, updated_at, kind, "
+                "target_order_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'LMT', 'ROD', ?, '{}', NULL, "
+                "'pending', ?, ?, ?, 'cancel', ?)",
+                (intent_id, project, symbol, action, price, quantity, int(is_odd_lot),
+                 estimated, expires_at, now, now, target_order_id),
+            )
+
+    def find_open_cancel_request(self, target_order_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._ORDER_COLUMNS} FROM order_intents WHERE kind = 'cancel' "
+                "AND target_order_id = ? AND status IN ('pending', 'awaiting', 'confirming') "
+                "ORDER BY created_at DESC LIMIT 1",
+                (target_order_id,),
+            ).fetchone()
+        return self._order_row_to_dict(row) if row else None
 
     def get_order_intent(self, intent_id: str) -> dict | None:
         with self._connection() as conn:
