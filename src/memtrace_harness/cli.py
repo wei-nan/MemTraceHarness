@@ -1080,6 +1080,12 @@ def _serve_gateway_loop(
                 gw.drain_task_queues()
             except Exception:
                 logger.exception("draining the task queue failed; continuing")
+            # Shows orders the model proposed (with confirm/cancel buttons) and closes
+            # the ones nobody confirmed in time.
+            try:
+                gw.process_order_intents()
+            except Exception:
+                logger.exception("processing proposed orders failed; continuing")
 
         if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
             for gw in gateways:

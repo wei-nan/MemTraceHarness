@@ -374,7 +374,7 @@ $env:PYTHONPATH = "src"
 
 Tests inject deterministic subprocess results and mock external HTTP/API connections; they do not launch Claude, Codex, or Antigravity, nor do they hit Telegram servers.
 
-## TaiwanTrade read-only proxy
+## TaiwanTrade proxy (read-only, plus confirm-first orders)
 
 Agent CLIs run sandboxed with no network, so they cannot reach `127.0.0.1:8000`. Harness ships a
 stdio MCP server (`python -m memtrace_harness.taiwantrade_mcp`) that the CLI spawns *outside* its
@@ -388,3 +388,24 @@ export HARNESS_TAIWANTRADE_API_URL=http://127.0.0.1:8000/api/v1   # optional, th
 ```
 
 Only the key *path* is passed to the CLI. All roles, Controller included, receive the server; the Controller prompt is amended to allow it.
+
+### Orders: the model proposes, you confirm in Telegram
+
+Placing an order is off by default. List a project in `HARNESS_TAIWANTRADE_ORDER_PROJECTS`
+(comma-separated, e.g. `TWTradingStrategy`) and only that project's **chat** gets one extra tool,
+`create_order_intent` (limit orders; odd-lot quantity is in shares). Agent Loop roles never get it.
+
+```text
+model --create_order_intent--> TaiwanTrade /trade/order-intents   (nothing reaches the broker)
+        one-time confirmation token -> harness SQLite, NOT to the model
+gateway --> Telegram: "買進 2327 | 1 股 | 限價 628" [✅ 確認下單] [❌ 取消]
+you tap confirm --> gateway calls /trade/orders with the token --> result sent to you and logged
+```
+
+The confirmation is enforced in code, not by the prompt: the model has no tool that places, confirms,
+cancels or amends an order; the token never enters the model's context; only an allowlisted chat's
+button tap can send the order, at most once per intent (compare-and-set on the intent's status); an
+unconfirmed proposal expires with TaiwanTrade's own TTL (5 min) and is reported as not placed. A
+harness-side per-order value limit applies on top of TaiwanTrade's own risk limits
+(`HARNESS_TAIWANTRADE_MAX_ORDER_VALUE`, default 100000 TWD). The API key needs TaiwanTrade's `trade`
+scope. Cancelling or amending an existing order is not available.

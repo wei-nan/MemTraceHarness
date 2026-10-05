@@ -805,6 +805,30 @@ class TraceStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS order_intents (
+                    intent_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    is_odd_lot INTEGER NOT NULL,
+                    price_type TEXT NOT NULL,
+                    order_type TEXT NOT NULL,
+                    estimated_value REAL NOT NULL,
+                    risk_json TEXT NOT NULL DEFAULT '{}',
+                    confirmation_token TEXT,
+                    status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    telegram_chat_id INTEGER,
+                    telegram_message_id INTEGER,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_order_intents_status
+                    ON order_intents(status, project);
                 CREATE INDEX IF NOT EXISTS idx_workspace_locks_ws
                     ON workspace_locks(workspace_id);
                 CREATE INDEX IF NOT EXISTS idx_task_queue_ws
@@ -2013,6 +2037,137 @@ class TraceStore:
             conn.execute(
                 "DELETE FROM conversation_worktrees WHERE conversation_id = ?", (conversation_id,)
             )
+
+    # ---- order intents: a trade the model proposed, waiting for the human's button.
+    # Status flow: pending -> awaiting (shown in Telegram) -> confirming -> submitted|failed,
+    # or awaiting -> cancelled|expired. Every move is a compare-and-set so a double tap or a
+    # second gateway can never send the same order twice.
+
+    _ORDER_COLUMNS = (
+        "intent_id, project, symbol, action, price, quantity, is_odd_lot, price_type, "
+        "order_type, estimated_value, risk_json, confirmation_token, status, expires_at, "
+        "telegram_chat_id, telegram_message_id, result_json, created_at"
+    )
+
+    @staticmethod
+    def _order_row_to_dict(row: tuple) -> dict:
+        return {
+            "intent_id": row[0], "project": row[1], "symbol": row[2], "action": row[3],
+            "price": row[4], "quantity": row[5], "is_odd_lot": bool(row[6]),
+            "price_type": row[7], "order_type": row[8], "estimated_value": row[9],
+            "risk": json.loads(row[10] or "{}"), "confirmation_token": row[11],
+            "status": row[12], "expires_at": row[13], "telegram_chat_id": row[14],
+            "telegram_message_id": row[15],
+            "result": json.loads(row[16]) if row[16] else None, "created_at": row[17],
+        }
+
+    def create_order_intent(
+        self,
+        *,
+        intent_id: str,
+        project: str,
+        symbol: str,
+        action: str,
+        price: float,
+        quantity: int,
+        is_odd_lot: bool,
+        price_type: str,
+        order_type: str,
+        estimated_value: float,
+        risk: dict,
+        confirmation_token: str,
+        expires_at: str,
+    ) -> bool:
+        """False when this intent is already recorded (a retried proposal)."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            return conn.execute(
+                "INSERT OR IGNORE INTO order_intents (intent_id, project, symbol, action, price, "
+                "quantity, is_odd_lot, price_type, order_type, estimated_value, risk_json, "
+                "confirmation_token, status, expires_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (
+                    intent_id, project, symbol, action, price, quantity, int(is_odd_lot),
+                    price_type, order_type, estimated_value,
+                    json.dumps(risk, ensure_ascii=False), confirmation_token, expires_at, now, now,
+                ),
+            ).rowcount > 0
+
+    def get_order_intent(self, intent_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._ORDER_COLUMNS} FROM order_intents WHERE intent_id = ?", (intent_id,)
+            ).fetchone()
+        return self._order_row_to_dict(row) if row else None
+
+    def transition_order_intent(
+        self, intent_id: str, from_statuses: tuple[str, ...], to_status: str
+    ) -> bool:
+        marks = ",".join("?" for _ in from_statuses)
+        with self._connection() as conn:
+            return conn.execute(
+                f"UPDATE order_intents SET status = ?, updated_at = ? "
+                f"WHERE intent_id = ? AND status IN ({marks})",
+                (to_status, utc_now_iso(), intent_id, *from_statuses),
+            ).rowcount > 0
+
+    def claim_pending_order_intents(self, projects: list[str]) -> list[dict]:
+        """Take the proposals no gateway has shown yet for these projects."""
+        if not projects:
+            return []
+        marks = ",".join("?" for _ in projects)
+        with self._connection() as conn:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT intent_id FROM order_intents WHERE status = 'pending' "
+                    f"AND project IN ({marks}) ORDER BY created_at",
+                    projects,
+                )
+            ]
+        claimed = [i for i in ids if self.transition_order_intent(i, ("pending",), "awaiting")]
+        return [d for d in (self.get_order_intent(i) for i in claimed) if d]
+
+    def reshow_order_intent(self, intent_id: str) -> bool:
+        """The model proposed the same still-pending order again: have the gateway send the
+        confirm buttons once more (at the bottom of the chat, where the human is looking)."""
+        return self.transition_order_intent(intent_id, ("awaiting",), "pending")
+
+    def set_order_intent_message(self, intent_id: str, *, chat_id: int, message_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE order_intents SET telegram_chat_id = ?, telegram_message_id = ? "
+                "WHERE intent_id = ?",
+                (chat_id, message_id, intent_id),
+            )
+
+    def finish_order_intent(self, intent_id: str, status: str, result: dict | None = None) -> None:
+        """Record the outcome and drop the one-time token: it is useless afterwards and
+        shouldn't sit in the database."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE order_intents SET status = ?, result_json = ?, confirmation_token = NULL, "
+                "updated_at = ? WHERE intent_id = ?",
+                (status, json.dumps(result, ensure_ascii=False) if result else None,
+                 utc_now_iso(), intent_id),
+            )
+
+    def expire_order_intents(self, now_iso: str) -> list[dict]:
+        """Proposals nobody confirmed in time. Returned so the gateway can tell the human."""
+        with self._connection() as conn:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT intent_id FROM order_intents WHERE status IN ('pending', 'awaiting') "
+                    "AND expires_at <= ?",
+                    (now_iso,),
+                )
+            ]
+        expired = [i for i in ids if self.transition_order_intent(i, ("pending", "awaiting"), "expired")]
+        rows = [d for d in (self.get_order_intent(i) for i in expired) if d]
+        for row in rows:
+            self.finish_order_intent(row["intent_id"], "expired")
+        return rows
 
     def get_latest_turn(self, conversation_id: str) -> dict | None:
         """Most recently completed Agent Loop stage for a conversation — written by

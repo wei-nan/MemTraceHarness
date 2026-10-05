@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -30,7 +31,14 @@ from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
-from memtrace_harness.taiwantrade_mcp import mcp_server_spec
+from memtrace_harness.taiwantrade_mcp import (
+    DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
+    ProxyError,
+    load_api_key,
+    mcp_server_spec,
+    order_projects,
+    submit_order,
+)
 from memtrace_harness.topic_recall import BRIEFS_HEADER, render_briefs_context
 from memtrace_harness.trace_store import TraceStore
 from memtrace_harness.worktrees import TaskWorktree, WorktreeManager, can_use_worktrees
@@ -580,10 +588,149 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id, text="無法辨識的按鈕")
             return None
+        if action in {"order_confirm", "order_cancel"}:
+            result = self._resolve_order_action(
+                action, request_id, chat_id, source_message.get("message_id")
+            )
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         result = self._resolve_approval_action(request_id, action, chat_id, None)
         if callback_id:
             self.answer_callback_query(callback_id, text=result[:200])
         return result
+
+    # ---- orders the model proposed (see taiwantrade_mcp.py): shown here, sent only on a tap
+
+    @staticmethod
+    def _order_summary(order: dict) -> str:
+        side = "買進" if order["action"] == "Buy" else "賣出"
+        unit = "股（盤中零股）" if order["is_odd_lot"] else "張"
+        return (
+            f"{side} {order['symbol']}｜{order['quantity']} {unit}｜限價 {order['price']:g}"
+            f"｜預估金額 {order['estimated_value']:,.0f} 元"
+        )
+
+    @staticmethod
+    def _order_keyboard(intent_id: str) -> list[list[dict[str, str]]]:
+        return [
+            [
+                {"text": "✅ 確認下單", "callback_data": f"order_confirm:{intent_id}"},
+                {"text": "❌ 取消", "callback_data": f"order_cancel:{intent_id}"},
+            ]
+        ]
+
+    @staticmethod
+    def _order_expired(order: dict) -> bool:
+        try:
+            expires = datetime.fromisoformat(str(order["expires_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            return False  # TaiwanTrade enforces the real deadline when the order is submitted
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= datetime.now(timezone.utc)
+
+    def _record_order_turn(self, project: str, content: str) -> None:
+        """Write the outcome into the project's chat log so the chat model knows what
+        happened to the order it proposed (it never sees the confirmation itself)."""
+        self.primary_session_mgr.record_turn(
+            project=project, speaker="system", turn_type="dev_report", content=content
+        )
+
+    def process_order_intents(self) -> None:
+        """Gateway tick: put newly proposed orders in front of the human, and close the
+        ones nobody confirmed in time."""
+        trace_store = self.approval_manager.trace_store
+        for order in trace_store.claim_pending_order_intents([p.name for p in self.projects]):
+            text = (
+                f"🛒 待確認委託（{order['project']}）\n"
+                f"{self._order_summary(order)}\n"
+                f"有效至：{order['expires_at']}\n\n"
+                "這是模型提出的委託，還沒有送到券商。按「確認下單」才會送出；不按、按取消、"
+                "或時間到都不會下單。"
+            )
+            shown = False
+            if order["telegram_message_id"] is not None and order["telegram_chat_id"] is not None:
+                # Re-shown: the earlier buttons are stale clutter higher up the chat.
+                self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
+            for cid in self.allowed_chat_ids:
+                message_id = self.send_message_with_keyboard(
+                    cid, text, self._order_keyboard(order["intent_id"])
+                )
+                if message_id is not None:
+                    trace_store.set_order_intent_message(
+                        order["intent_id"], chat_id=cid, message_id=message_id
+                    )
+                    shown = True
+            if not shown:
+                # Telegram unreachable: put it back so the next tick tries again.
+                trace_store.transition_order_intent(order["intent_id"], ("awaiting",), "pending")
+        for order in trace_store.expire_order_intents(datetime.now(timezone.utc).isoformat()):
+            if order["telegram_message_id"] is not None and order["telegram_chat_id"] is not None:
+                self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
+                self.send_message(
+                    order["telegram_chat_id"],
+                    f"⌛ 委託已過期，沒有下單：{self._order_summary(order)}",
+                )
+            self._record_order_turn(
+                order["project"], f"委託已過期、沒有下單：{self._order_summary(order)}"
+            )
+
+    def _resolve_order_action(
+        self, action: str, intent_id: str, chat_id: int, message_id: int | None
+    ) -> str:
+        trace_store = self.approval_manager.trace_store
+        order = trace_store.get_order_intent(intent_id)
+        if order is None or order["project"] not in {p.name for p in self.projects}:
+            return "找不到這筆委託。"
+        summary = self._order_summary(order)
+        if action == "order_cancel":
+            if not trace_store.transition_order_intent(intent_id, ("awaiting",), "cancelled"):
+                return f"這筆委託已經是「{order['status']}」，沒有變動。"
+            trace_store.finish_order_intent(intent_id, "cancelled")
+            result = f"❌ 已取消，沒有下單：{summary}"
+        else:
+            result = self._confirm_order(order, summary)
+        if message_id is not None:
+            self.clear_message_keyboard(chat_id, message_id)
+        self.send_message(chat_id, result)
+        self._record_order_turn(order["project"], result)
+        return result
+
+    def _confirm_order(self, order: dict, summary: str) -> str:
+        """The human tapped confirm: send the order. Everything past the compare-and-set
+        runs at most once per intent, so a double tap cannot place it twice."""
+        trace_store = self.approval_manager.trace_store
+        intent_id = order["intent_id"]
+        if not trace_store.transition_order_intent(intent_id, ("awaiting",), "confirming"):
+            current = trace_store.get_order_intent(intent_id)
+            return f"這筆委託已經是「{current['status'] if current else '未知'}」，沒有再送出。"
+        if self._order_expired(order):
+            trace_store.finish_order_intent(intent_id, "expired")
+            return f"⌛ 委託已過期，沒有下單：{summary}"
+        try:
+            placed = submit_order(
+                intent_id,
+                order["confirmation_token"],
+                base_url=os.getenv("HARNESS_TAIWANTRADE_API_URL", TAIWANTRADE_DEFAULT_URL),
+                api_key=load_api_key(),
+            )
+        except ProxyError as exc:
+            trace_store.finish_order_intent(intent_id, "failed", {"error": str(exc)})
+            warning = (
+                "\n⚠️ 券商那邊的狀態不明，請先到券商 App 確認有沒有這筆委託，不要重複下單。"
+                if "HTTP 502" in str(exc)
+                else ""
+            )
+            return f"❌ 委託沒有成功送出：{summary}\n原因：{exc}{warning}"
+        trace_store.finish_order_intent(intent_id, "submitted", placed)
+        filled = placed.get("filled_qty")
+        return (
+            f"✅ 已送出委託：{summary}\n"
+            f"券商委託編號：{placed.get('order_id', '?')}｜狀態：{placed.get('status', '?')}"
+            + (f"｜已成交 {filled}" if filled else "")
+            + "\n成交結果之後可以問我（我會用 list_orders 幫你查）。"
+        )
 
     def _start_or_queue_task(
         self, scope: ProjectScope, goal: str, chat_id: int, schedule_id: str | None = None
@@ -1035,20 +1182,32 @@ class TelegramGateway:
     )
 
     @staticmethod
-    def _taiwantrade_notice() -> str:
+    def _taiwantrade_notice(project: str | None = None) -> str:
         """Tell the chat model it has the read-only TaiwanTrade tools. Without this it
         tries `curl 127.0.0.1:8000` from its network-less sandbox, fails, and reports a
         connection error even though the proxy tools were attached and working."""
         if not mcp_server_spec():
             return ""
-        return (
+        notice = (
             "你有唯讀的 MCP 工具 `taiwantrade`（get_balance 銀行餘額、get_positions 庫存持股、"
             "get_quotes 即時報價、get_stock_daily、list_orders、get_settlements 等）。使用者要查"
             "餘額、持股、報價或委託時，請直接呼叫這些工具；不要用 shell/curl 連 127.0.0.1:8000——"
-            "你的沙盒沒有網路，那樣一定會失敗，而且你不需要也不應該讀取任何金鑰檔。這些工具只能"
-            "查詢，不能下單、改單或撤單；要交易請告訴使用者自己操作。工具如果回傳錯誤，就如實"
-            "轉述那個錯誤訊息。\n\n"
+            "你的沙盒沒有網路，那樣一定會失敗，而且你不需要也不應該讀取任何金鑰檔。工具如果回傳"
+            "錯誤，就如實轉述那個錯誤訊息。\n"
         )
+        if project and project.lower() in order_projects():
+            notice += (
+                "下單：你可以用 `create_order_intent` 提出委託（限價單；盤中零股要設 is_odd_lot=true，"
+                "數量單位是股）。它不會真的下單——只會建立一筆待確認的委託，系統會在 Telegram 給使用者"
+                "「確認／取消」按鈕，使用者按確認後才會送到券商，結果也會由系統自動回報給使用者。"
+                "所以：使用者要下單時，先確認股票、買賣方向、數量、價格都清楚（缺價格就問，不要自己"
+                "猜；使用者說「開盤價」但還沒有開盤價時，如實說還沒有，請他給價格），再呼叫工具，然後"
+                "告訴使用者「已提出委託，請到 Telegram 按確認」。不要說已經下單，也不要叫使用者去券商"
+                "App 自己下。你不能改單或撤單。\n"
+            )
+        else:
+            notice += "這些工具只能查詢，不能下單、改單或撤單；要交易請告訴使用者自己操作。\n"
+        return notice + "\n"
 
     def _chat_reply_and_maybe_start_task(
         self, scope: ProjectScope, chat_id: int, text: str, quoted_text: str | None = None
@@ -1120,7 +1279,7 @@ class TelegramGateway:
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
             "裡把細節問清楚。\n\n"
             f"{self._schedule_control_notice(scope)}"
-            f"{self._taiwantrade_notice()}"
+            f"{self._taiwantrade_notice(scope.name)}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"使用者訊息：{text}"
         )
@@ -1134,6 +1293,7 @@ class TelegramGateway:
                 provider, model, prompt,
                 claude_allowed_tools=self._CHAT_MEMTRACE_READ_TOOLS,
                 taiwantrade=True,
+                order_project=scope.name,
             )
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():

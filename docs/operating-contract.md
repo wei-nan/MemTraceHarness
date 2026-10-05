@@ -84,6 +84,17 @@ run is unchanged: this isolates *tasks* from each other, it is not provider fan-
 **Not implemented:** automatically resolving merge conflicts, pruning worktrees of abandoned or
 failed-with-changes runs, and the unattended scanner still wants the whole project idle.
 
+**Orders proposed by the chat model (explicit operator decision, 2026-10-05).** For a project
+listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a limit order
+(`create_order_intent`); a human must confirm it. ENFORCED in code: the tool only creates a
+TaiwanTrade order intent, which never reaches the broker; the one-time confirmation token goes to the
+harness database and never to the model; the model has no tool to place, confirm, cancel or amend;
+only a button tap from an allowlisted Telegram chat sends the order (`POST /trade/orders`), at most
+once per intent; an unconfirmed proposal expires and is reported as not placed; the result of every
+confirmed, cancelled, failed or expired order is sent to the human and written to the chat log;
+Agent Loop roles never get the tool; a per-order value limit (default 100000 TWD) applies on top of
+TaiwanTrade's own risk limits. **Not implemented:** cancelling/amending orders, market orders.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;
