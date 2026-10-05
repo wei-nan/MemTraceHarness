@@ -63,6 +63,7 @@ class HarnessConfig:
         *,
         claude_allowed_tools: str | None = None,
         taiwantrade: bool = False,
+        order_project: str | None = None,
     ) -> list[str]:
         """argv for one plain, non-interactive "answer this prompt" call — the quick
         chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
@@ -75,7 +76,13 @@ class HarnessConfig:
         # CLI spawns outside its tool sandbox — the only way a sandboxed chat model can
         # reach 127.0.0.1:8000. Opt-in, and only for the chat reply (taiwantrade=True):
         # digests, classifiers and JSON repair have no use for trading data.
-        proxy = mcp_server_spec() if taiwantrade else None
+        # order_project (the chat's project) also lets the model *propose* orders, if the
+        # operator allowed that project; the human still has to confirm in Telegram.
+        proxy = (
+            mcp_server_spec(order_project=order_project, trace_db_path=self.trace_db_path)
+            if taiwantrade
+            else None
+        )
         if provider == "codex":
             command += ["exec", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only", "--color", "never"]
             if proxy:

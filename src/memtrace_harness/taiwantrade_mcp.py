@@ -14,15 +14,23 @@ Boundaries enforced here (not left to the prompt):
 - Path arguments are validated against a strict pattern before being substituted, so a
   ticker cannot smuggle in ``../trade/orders``.
 
+Orders (opt-in per project, ``HARNESS_TAIWANTRADE_ORDER_PROJECTS``): the only write-ish tool
+is ``create_order_intent``. It creates a TaiwanTrade *intent* — nothing reaches the broker — and
+hands the one-time confirmation token to the harness database, never to the model. Only the
+gateway can turn an intent into an order, and only when the human taps the Telegram confirm
+button (``submit_order``). So an order always needs the human, however the model behaves.
+
 Run: ``python -m memtrace_harness.taiwantrade_mcp`` (speaks JSON-RPC over stdin/stdout).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -130,6 +138,212 @@ class ProxyError(RuntimeError):
     pass
 
 
+# ---------------------------------------------------------------------------- orders
+
+# Harness-side ceiling per order, on top of TaiwanTrade's own risk limits. Set
+# HARNESS_TAIWANTRADE_MAX_ORDER_VALUE (TWD) to change it.
+DEFAULT_MAX_ORDER_VALUE = 100_000
+INTENT_IDEMPOTENCY_WINDOW_SECONDS = 300
+LOT_SIZE = 1000
+
+ORDER_TOOL_NAME = "create_order_intent"
+ORDER_TOOL = Tool(
+    ORDER_TOOL_NAME,
+    "Propose a stock order for the user to confirm. This does NOT place the order: it creates a "
+    "pending order and the user gets a confirm/cancel button in Telegram; only their tap sends it "
+    "to the broker, and the result is reported to them automatically. Limit orders only. For an "
+    "intraday odd-lot order set is_odd_lot=true and quantity is in shares (1-999); otherwise "
+    "quantity is in lots (張, 1000 shares each).",
+    "/trade/order-intents",
+    (
+        Param("symbol", r"\d{4,6}", "Taiwan stock code, e.g. 2327"),
+        Param("action", r"Buy|Sell", "Buy or Sell"),
+        Param("price", r"\d{1,6}(\.\d{1,2})?", "Limit price per share, > 0"),
+        Param("quantity", r"\d{1,4}", "Shares if is_odd_lot=true, otherwise lots"),
+        Param("is_odd_lot", r"true|false", "true for intraday odd-lot (shares)", required=False),
+        Param("order_type", r"ROD|IOC|FOK", "ROD (default) / IOC / FOK; odd-lot is ROD only", required=False),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class OrderContext:
+    """What the proxy needs to propose orders. Present only for a project the operator
+    explicitly allowed (see mcp_server_spec); absent means the order tool does not exist."""
+
+    project: str
+    store: Any  # TraceStore
+    max_order_value: float = DEFAULT_MAX_ORDER_VALUE
+
+
+def _order_args(arguments: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(arguments) - {p.name for p in ORDER_TOOL.params}
+    if unknown:
+        raise ProxyError(f"unexpected arguments: {', '.join(sorted(unknown))}")
+    values: dict[str, Any] = {}
+    for param in ORDER_TOOL.params:
+        raw = arguments.get(param.name)
+        if raw is None or raw == "":
+            if param.required:
+                raise ProxyError(f"missing required argument: {param.name}")
+            continue
+        text = str(raw).strip().lower() if param.name == "is_odd_lot" else str(raw).strip()
+        if not re.fullmatch(param.pattern, text):
+            raise ProxyError(f"invalid value for {param.name}")
+        values[param.name] = text
+    return values
+
+
+def create_order_intent(
+    arguments: dict[str, Any],
+    *,
+    context: OrderContext,
+    base_url: str,
+    api_key: str,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    now: float | None = None,
+) -> str:
+    """Create the intent at TaiwanTrade and park its confirmation token in the harness DB.
+    Returns the model-facing text: the proposal's details, never the token."""
+    if not api_key:
+        raise ProxyError("TaiwanTrade API key is not configured for the proxy")
+    args = _order_args(arguments)
+    odd_lot = args.get("is_odd_lot", "false") == "true"
+    price = float(args["price"])
+    quantity = int(args["quantity"])
+    if price <= 0 or quantity <= 0:
+        raise ProxyError("price and quantity must be positive")
+    estimated = round(price * quantity * (1 if odd_lot else LOT_SIZE), 2)
+    if estimated > context.max_order_value:
+        raise ProxyError(
+            f"order value {estimated:,.0f} TWD is above the harness limit of "
+            f"{context.max_order_value:,.0f} TWD per order; ask the user to place it themselves "
+            "or to raise HARNESS_TAIWANTRADE_MAX_ORDER_VALUE"
+        )
+    order_type = args.get("order_type", "ROD")
+    body = {
+        "symbol": args["symbol"],
+        "action": args["action"],
+        "price": price,
+        "quantity": quantity,
+        "price_type": "LMT",
+        "order_type": order_type,
+        "is_odd_lot": odd_lot,
+    }
+    # The same proposal repeated within the intent's lifetime (a model retry) must map to the
+    # same intent, or the human would be asked to confirm one order twice.
+    bucket = int((time.time() if now is None else now) // INTENT_IDEMPOTENCY_WINDOW_SECONDS)
+    fingerprint = json.dumps([context.project, body, bucket], sort_keys=True)
+    idempotency_key = "harness-" + hashlib.sha256(fingerprint.encode()).hexdigest()[:40]
+
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/trade/order-intents",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "X-API-KEY": api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Idempotency-Key": idempotency_key,
+        },
+        method="POST",
+    )
+    intent = _send(request, opener)
+    intent_id = str(intent.get("intent_id") or "")
+    token = intent.get("confirmation_token")
+    if not intent_id:
+        raise ProxyError("TaiwanTrade did not return an intent id")
+    status = str(intent.get("status") or "")
+    if token:
+        context.store.create_order_intent(
+            intent_id=intent_id,
+            project=context.project,
+            symbol=body["symbol"],
+            action=body["action"],
+            price=price,
+            quantity=quantity,
+            is_odd_lot=odd_lot,
+            price_type="LMT",
+            order_type=order_type,
+            estimated_value=estimated,
+            risk=intent.get("risk_snapshot") or {},
+            confirmation_token=str(token),
+            expires_at=str(intent.get("expires_at") or ""),
+        )
+        message = (
+            "Order proposal created and NOT yet placed. The user has been sent a confirm/cancel "
+            "button in Telegram; the order is only sent if they tap confirm, and the result is "
+            "reported to them automatically. Tell the user to check Telegram."
+        )
+    else:
+        # Same proposal as one already issued (a retry, or the user asking again). If it is
+        # still waiting for the human, show the confirm buttons again where they will see them.
+        reshown = context.store.reshow_order_intent(intent_id)
+        message = (
+            "This exact proposal already exists and is still waiting for the user; its confirm/cancel "
+            "buttons were sent to their Telegram again. Tell the user to check the latest Telegram "
+            "message. Do not create it again."
+            if reshown
+            else f"An identical proposal was already created in the last few minutes (status {status}); "
+            "no new confirmation was issued. Do not create it again."
+        )
+    return json.dumps(
+        {
+            "intent_id": intent_id,
+            "status": status,
+            "symbol": body["symbol"],
+            "action": body["action"],
+            "price": price,
+            "quantity": quantity,
+            "unit": "shares (odd lot)" if odd_lot else "lots",
+            "estimated_value_twd": estimated,
+            "expires_at": intent.get("expires_at"),
+            "note": message,
+        },
+        ensure_ascii=False,
+    )
+
+
+def submit_order(
+    intent_id: str,
+    token: str,
+    *,
+    base_url: str,
+    api_key: str,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> dict[str, Any]:
+    """Turn a confirmed intent into a real order. Called by the gateway after the human's tap
+    — never reachable from a tool, so a model cannot call it."""
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/trade/orders",
+        data=json.dumps({"intent_id": intent_id, "confirmation_token": token}).encode("utf-8"),
+        headers={
+            "X-API-KEY": api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    return _send(request, opener)
+
+
+def _send(request: urllib.request.Request, opener: Callable[..., Any]) -> dict[str, Any]:
+    try:
+        with opener(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise ProxyError(f"TaiwanTrade returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise ProxyError(f"cannot reach TaiwanTrade: {getattr(exc, 'reason', exc)}") from exc
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ProxyError("TaiwanTrade returned a non-JSON response") from exc
+    if not isinstance(data, dict):
+        raise ProxyError("TaiwanTrade returned an unexpected response")
+    return data
+
+
 def load_api_key(env: dict[str, str] | None = None) -> str:
     env = env if env is not None else dict(os.environ)
     key_file = env.get("HARNESS_TAIWANTRADE_API_KEY_FILE")
@@ -217,6 +431,7 @@ def handle_message(
     base_url: str,
     api_key_loader: Callable[[], str],
     opener: Callable[..., Any] = urllib.request.urlopen,
+    order_context: OrderContext | None = None,
 ) -> dict[str, Any] | None:
     method = message.get("method")
     msg_id = message.get("id")
@@ -237,10 +452,20 @@ def handle_message(
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        return ok({"tools": [_tool_schema(tool) for tool in TOOLS]})
+        tools = [*TOOLS, ORDER_TOOL] if order_context else TOOLS
+        return ok({"tools": [_tool_schema(tool) for tool in tools]})
     if method == "tools/call":
         params = message.get("params") or {}
         try:
+            if order_context and params.get("name") == ORDER_TOOL_NAME:
+                text = create_order_intent(
+                    params.get("arguments") or {},
+                    context=order_context,
+                    base_url=base_url,
+                    api_key=api_key_loader(),
+                    opener=opener,
+                )
+                return ok({"content": [{"type": "text", "text": text}]})
             text = call_tool(
                 str(params.get("name", "")),
                 params.get("arguments") or {},
@@ -262,6 +487,7 @@ def serve(stdin=None, stdout=None) -> None:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     base_url = os.getenv("HARNESS_TAIWANTRADE_API_URL", DEFAULT_BASE_URL)
+    order_context = _order_context_from_env(os.environ)
     for line in stdin:
         line = line.strip()
         if not line:
@@ -270,19 +496,49 @@ def serve(stdin=None, stdout=None) -> None:
             message = json.loads(line)
         except json.JSONDecodeError:
             continue
-        reply = handle_message(message, base_url=base_url, api_key_loader=load_api_key)
+        reply = handle_message(
+            message, base_url=base_url, api_key_loader=load_api_key, order_context=order_context
+        )
         if reply is not None:
             stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
             stdout.flush()
 
 
+def order_projects(env: dict[str, str] | None = None) -> set[str]:
+    """Projects the operator allowed to propose orders (HARNESS_TAIWANTRADE_ORDER_PROJECTS,
+    comma-separated project names). Empty by default: nobody can trade."""
+    env = env if env is not None else dict(os.environ)
+    raw = env.get("HARNESS_TAIWANTRADE_ORDER_PROJECTS", "")
+    return {name.strip().lower() for name in raw.split(",") if name.strip()}
+
+
+def _order_context_from_env(env: Any) -> OrderContext | None:
+    project = env.get("HARNESS_ORDER_PROJECT")
+    db_path = env.get("HARNESS_TRACE_DB")
+    if not project or not db_path:
+        return None
+    from memtrace_harness.trace_store import TraceStore
+
+    try:
+        limit = float(env.get("HARNESS_TAIWANTRADE_MAX_ORDER_VALUE") or DEFAULT_MAX_ORDER_VALUE)
+    except ValueError:
+        limit = DEFAULT_MAX_ORDER_VALUE
+    return OrderContext(project=project, store=TraceStore(Path(db_path)), max_order_value=limit)
+
+
 def mcp_server_spec(
-    env: dict[str, str] | None = None, *, python: str | None = None
+    env: dict[str, str] | None = None,
+    *,
+    python: str | None = None,
+    order_project: str | None = None,
+    trace_db_path: Path | str | None = None,
 ) -> dict[str, Any] | None:
     """Launch spec for this server, or None when the operator hasn't opted in.
 
     Opt-in is HARNESS_TAIWANTRADE_API_KEY_FILE — only a *path* is handed to the CLI, so the
-    key never appears in a command line or MCP config.
+    key never appears in a command line or MCP config. ``order_project`` additionally turns on
+    the order-proposal tool, but only if that project is listed in
+    HARNESS_TAIWANTRADE_ORDER_PROJECTS and the caller says where the harness database is.
     """
     env = env if env is not None else dict(os.environ)
     key_file = env.get("HARNESS_TAIWANTRADE_API_KEY_FILE")
@@ -291,6 +547,11 @@ def mcp_server_spec(
     server_env = {"HARNESS_TAIWANTRADE_API_KEY_FILE": key_file}
     if env.get("HARNESS_TAIWANTRADE_API_URL"):
         server_env["HARNESS_TAIWANTRADE_API_URL"] = env["HARNESS_TAIWANTRADE_API_URL"]
+    if order_project and trace_db_path and order_project.lower() in order_projects(env):
+        server_env["HARNESS_ORDER_PROJECT"] = order_project
+        server_env["HARNESS_TRACE_DB"] = str(Path(trace_db_path).resolve())
+        if env.get("HARNESS_TAIWANTRADE_MAX_ORDER_VALUE"):
+            server_env["HARNESS_TAIWANTRADE_MAX_ORDER_VALUE"] = env["HARNESS_TAIWANTRADE_MAX_ORDER_VALUE"]
     return {
         "command": python or sys.executable,
         "args": ["-m", "memtrace_harness.taiwantrade_mcp"],

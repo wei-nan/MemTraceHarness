@@ -722,6 +722,7 @@ class ChatCommandTests(TestCase):
 
         config = MagicMock(spec=HarnessConfig)
         config.command_for.side_effect = lambda p: f"/bin/{p}"
+        config.trace_db_path = Path("/tmp/harness-test.sqlite3")
         return config
 
     def test_codex_answers_through_exec_read_only(self) -> None:
