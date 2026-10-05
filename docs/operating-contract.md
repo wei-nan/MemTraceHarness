@@ -71,7 +71,8 @@ schedule whose previous run is still running *or still queued* is skipped for th
 queued behind itself (other schedules are unaffected); an approved conversation waits for a slot
 the same way. Each task in a git project runs in its own `git worktree` on branch
 `harness/<conversation_id>` (`worktrees.py`), so concurrent Developers never edit the same files;
-a project that is not a git repository, or has `max_workers: 1`, edits its checkout in place.
+a project that is not a git repository, has no commit yet to branch from, or has `max_workers: 1`
+edits its checkout in place and is limited to one task at a time (they would share one folder).
 Worktrees branch from the checkout's HEAD, so uncommitted or git-ignored files are not in them —
 `worktree_setup_command` (run in the fresh worktree with `HARNESS_REPO_ROOT` set) is the hook for
 that. The converge-stage Controller is told what a finished task would bring back (commits, files,

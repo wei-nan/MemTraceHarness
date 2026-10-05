@@ -84,6 +84,10 @@ class HarnessConfig:
                     "--config", f"mcp_servers.taiwantrade.command={json.dumps(proxy['command'])}",
                     "--config", f"mcp_servers.taiwantrade.args={json.dumps(proxy['args'])}",
                     "--config", f"mcp_servers.taiwantrade.env={{{env_toml}}}",
+                    # `codex exec` runs with approval=never, so an MCP tool call that needs
+                    # approval simply fails ("approval required but unavailable"). Every
+                    # tool of this proxy is a read-only GET, so approve them up front.
+                    "--config", 'mcp_servers.taiwantrade.default_tools_approval_mode="approve"',
                 ]
             if model:
                 command += ["--model", model]

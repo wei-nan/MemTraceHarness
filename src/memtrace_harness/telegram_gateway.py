@@ -30,9 +30,10 @@ from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 from memtrace_harness.topic_recall import BRIEFS_HEADER, render_briefs_context
 from memtrace_harness.trace_store import TraceStore
-from memtrace_harness.worktrees import TaskWorktree, WorktreeManager, is_git_repo
+from memtrace_harness.worktrees import TaskWorktree, WorktreeManager, can_use_worktrees
 
 if TYPE_CHECKING:
     from memtrace_harness.approval import ApprovalManager
@@ -593,8 +594,9 @@ class TelegramGateway:
         ws_id = scope.workspace_id
         trace_store = self.approval_manager.trace_store
         conv_id = f"chat_{uuid4().hex[:8]}"
+        slot_limit = self._slot_limit(scope)
         outcome = trace_store.acquire_task_slot(
-            ws_id, conv_id, max_slots=scope.max_workers, schedule_id=schedule_id
+            ws_id, conv_id, max_slots=slot_limit, schedule_id=schedule_id
         )
         if outcome == "duplicate_schedule":
             logger.info(f"schedule {schedule_id} is still running; skipping this occurrence")
@@ -610,7 +612,7 @@ class TelegramGateway:
             )
             position = sum(1 for q in trace_store.list_queued_tasks(ws_id) if q["id"] <= queue_id)
             msg = (
-                f"「{scope.name}」的 {scope.max_workers} 個任務位都在忙，這個任務已排入佇列"
+                f"「{scope.name}」的 {slot_limit} 個任務位都在忙，這個任務已排入佇列"
                 f"（第 {position} 位），有空位時會自動開始。"
             )
             self.send_message(chat_id, msg)
@@ -693,7 +695,7 @@ class TelegramGateway:
                 conv_id = item["conversation_id"] or f"chat_{uuid4().hex[:8]}"
                 if (
                     trace_store.acquire_task_slot(
-                        ws_id, conv_id, max_slots=scope.max_workers,
+                        ws_id, conv_id, max_slots=self._slot_limit(scope),
                         schedule_id=item["schedule_id"], check_queue=False,
                     )
                     != "acquired"
@@ -728,6 +730,14 @@ class TelegramGateway:
 
     # ---- per-task git worktrees (see worktrees.py)
 
+    def _slot_limit(self, scope: ProjectScope) -> int:
+        """How many tasks of this project may run at once. Tasks only run side by side
+        when each can have its own worktree; a project that can't (not a git repo, or no
+        commit yet) is limited to one, since they would all edit the same folder."""
+        if scope.max_workers <= 1 or not can_use_worktrees(scope.working_directory):
+            return 1
+        return scope.max_workers
+
     def _worktree_manager(self) -> WorktreeManager:
         return WorktreeManager(self.config.trace_root / "worktrees")
 
@@ -746,7 +756,9 @@ class TelegramGateway:
                 base_commit=recorded["base_commit"],
             )
             return worktree.path, worktree
-        if scope.max_workers <= 1 or not is_git_repo(scope.working_directory):
+        if scope.max_workers <= 1 or not can_use_worktrees(scope.working_directory):
+            # One worker, not a git repo, or a repo with no commit yet to branch from
+            # (TWTradingStrategy): edit in place, one task at a time per checkout.
             return scope.working_directory, None
         manager = self._worktree_manager()
         worktree = manager.create(scope.working_directory, scope.name, conv_id)
@@ -1022,6 +1034,22 @@ class TelegramGateway:
         "mcp__memtrace__list_nodes,mcp__memtrace__traverse"
     )
 
+    @staticmethod
+    def _taiwantrade_notice() -> str:
+        """Tell the chat model it has the read-only TaiwanTrade tools. Without this it
+        tries `curl 127.0.0.1:8000` from its network-less sandbox, fails, and reports a
+        connection error even though the proxy tools were attached and working."""
+        if not mcp_server_spec():
+            return ""
+        return (
+            "你有唯讀的 MCP 工具 `taiwantrade`（get_balance 銀行餘額、get_positions 庫存持股、"
+            "get_quotes 即時報價、get_stock_daily、list_orders、get_settlements 等）。使用者要查"
+            "餘額、持股、報價或委託時，請直接呼叫這些工具；不要用 shell/curl 連 127.0.0.1:8000——"
+            "你的沙盒沒有網路，那樣一定會失敗，而且你不需要也不應該讀取任何金鑰檔。這些工具只能"
+            "查詢，不能下單、改單或撤單；要交易請告訴使用者自己操作。工具如果回傳錯誤，就如實"
+            "轉述那個錯誤訊息。\n\n"
+        )
+
     def _chat_reply_and_maybe_start_task(
         self, scope: ProjectScope, chat_id: int, text: str, quoted_text: str | None = None
     ) -> str:
@@ -1092,6 +1120,7 @@ class TelegramGateway:
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
             "裡把細節問清楚。\n\n"
             f"{self._schedule_control_notice(scope)}"
+            f"{self._taiwantrade_notice()}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"使用者訊息：{text}"
         )
@@ -1505,7 +1534,7 @@ class TelegramGateway:
         outcome = trace_store.acquire_task_slot(
             req_data.workspace,
             req_data.conversation_id,
-            max_slots=matching_scope.max_workers if matching_scope else 1,
+            max_slots=self._slot_limit(matching_scope) if matching_scope else 1,
         )
         if outcome == "already_running":
             # Either a double-tapped approval (a thread is running it) or a slot the

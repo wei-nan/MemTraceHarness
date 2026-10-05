@@ -165,6 +165,11 @@ class GatewayTaskSchedulingTests(TestCase):
         gateway, store, scope = _build_schedule_gateway(Path(self._tmp.name))
         scope.max_workers = max_workers
         gateway.send_message = MagicMock()
+        # The fixture folder isn't a git repo; pretend it can use worktrees so the
+        # configured worker count applies (the real fallback is tested below).
+        patcher = patch("memtrace_harness.telegram_gateway.can_use_worktrees", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # Hold every started task open so slots stay taken until the test releases them.
         self.release = threading.Event()
         self.started: list[str] = []
@@ -342,6 +347,9 @@ class ResumeSlotTests(TestCase):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         gateway, store, scope = _build_schedule_gateway(Path(tmp.name))
+        patcher = patch("memtrace_harness.telegram_gateway.can_use_worktrees", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         gateway.notify_all_allowlisted = MagicMock()
         gateway._launch_resume = MagicMock()
         req = gateway.approval_manager.request_approval(
@@ -396,3 +404,52 @@ class ResumeSlotTests(TestCase):
         gateway._launch_resume.assert_called_once()
         self.assertEqual(gateway._launch_resume.call_args.args[1], "ans")
         self.assertEqual(store.list_queued_tasks(scope.workspace_id), [])
+
+
+class TaiwanTradeChatNoticeTests(TestCase):
+    def test_chat_model_is_told_about_the_tools_only_when_the_proxy_is_on(self) -> None:
+        from memtrace_harness.telegram_gateway import TelegramGateway
+
+        with patch.dict("os.environ", {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/keys/tw"}):
+            notice = TelegramGateway._taiwantrade_notice()
+        self.assertIn("get_balance", notice)
+        self.assertIn("不要用 shell/curl", notice)
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(TelegramGateway._taiwantrade_notice(), "")
+
+
+class NoWorktreeFallbackTests(TestCase):
+    def _gateway(self, root: Path):
+        gateway, store, scope = _build_schedule_gateway(root)
+        scope.max_workers = 3
+        gateway.send_message = MagicMock()
+        return gateway, store, scope
+
+    def test_a_non_git_project_runs_one_task_at_a_time_whatever_max_workers_says(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = self._gateway(Path(tmp))
+            self.assertEqual(gateway._slot_limit(scope), 1)
+            self.assertEqual(gateway._provision_workdir(scope, "c1"), (scope.working_directory, None))
+
+    def test_a_git_repo_with_no_commit_yet_is_treated_the_same(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "fresh"
+            repo.mkdir()
+            git(repo, "init", "-b", "main")
+            (repo / "untracked.txt").write_text("x")
+            gateway, store, scope = self._gateway(root)
+            scope.working_directory = repo
+            self.assertEqual(gateway._slot_limit(scope), 1)
+            # No "cannot read HEAD" crash: it just works in place.
+            self.assertEqual(gateway._provision_workdir(scope, "c1"), (repo, None))
+
+    def test_a_repo_with_a_commit_gets_the_configured_number_of_slots(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = make_repo(root)
+            gateway, store, scope = self._gateway(root)
+            scope.working_directory = repo
+            self.assertEqual(gateway._slot_limit(scope), 3)
+            scope.max_workers = 1
+            self.assertEqual(gateway._slot_limit(scope), 1)

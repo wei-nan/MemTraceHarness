@@ -50,6 +50,9 @@ class CodexCliAdapter(CliModelAdapter):
                     "--config", f"{prefix}.command={json.dumps(taiwantrade['command'])}",
                     "--config", f"{prefix}.args={json.dumps(taiwantrade['args'])}",
                     "--config", f"{prefix}.env={{{env_toml}}}",
+                    # approval=never in exec mode would otherwise reject the MCP call;
+                    # every tool of this proxy is a read-only GET.
+                    "--config", f'{prefix}.default_tools_approval_mode="approve"',
                 ]
             )
         if self.context_policy in {"loop-snapshot", "gate-evidence-only"}:
