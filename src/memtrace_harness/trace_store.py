@@ -784,6 +784,12 @@ class TraceStore:
                     schedule_id TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS edit_locks (
+                    workspace_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    locked_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS task_queue (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     workspace_id TEXT NOT NULL,
@@ -1904,15 +1910,60 @@ class TraceStore:
         self, workspace_id: str, conversation_id: str | None = None
     ) -> None:
         """Free one task's slot, or — with no conversation_id — every slot of the
-        workspace (shutdown and operator recovery, where the owner is unknown)."""
+        workspace (shutdown and operator recovery, where the owner is unknown). A
+        development lock held by the released task goes with it."""
         with self._connection() as conn:
             if conversation_id is None:
                 conn.execute("DELETE FROM workspace_locks WHERE workspace_id = ?", (workspace_id,))
+                conn.execute("DELETE FROM edit_locks WHERE workspace_id = ?", (workspace_id,))
             else:
                 conn.execute(
                     "DELETE FROM workspace_locks WHERE workspace_id = ? AND conversation_id = ?",
                     (workspace_id, conversation_id),
                 )
+                conn.execute(
+                    "DELETE FROM edit_locks WHERE workspace_id = ? AND conversation_id = ?",
+                    (workspace_id, conversation_id),
+                )
+
+    def acquire_edit_lock(self, workspace_id: str, conversation_id: str) -> bool:
+        """The right to change a project's files in place. A project that cannot give each
+        task its own worktree lets any number of tasks run side by side (checking, querying,
+        running scripts), but only one at a time may *develop*: this lock is that turn.
+        Re-entrant for the same conversation. A lock whose owner no longer holds a slot
+        (its process was killed) is stale and is taken over."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM edit_locks WHERE workspace_id = ? AND conversation_id NOT IN "
+                "(SELECT conversation_id FROM workspace_locks)",
+                (workspace_id,),
+            )
+            holder = conn.execute(
+                "SELECT conversation_id FROM edit_locks WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if holder is not None:
+                return holder[0] == conversation_id
+            conn.execute(
+                "INSERT INTO edit_locks (workspace_id, conversation_id, locked_at) VALUES (?, ?, ?)",
+                (workspace_id, conversation_id, utc_now_iso()),
+            )
+            return True
+
+    def release_edit_lock(self, workspace_id: str, conversation_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM edit_locks WHERE workspace_id = ? AND conversation_id = ?",
+                (workspace_id, conversation_id),
+            )
+
+    def get_edit_lock(self, workspace_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT conversation_id, locked_at FROM edit_locks WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        return {"conversation_id": row[0], "locked_at": row[1]} if row else None
 
     def list_workspace_locks(self, workspace_id: str) -> list[dict]:
         with self._connection() as conn:

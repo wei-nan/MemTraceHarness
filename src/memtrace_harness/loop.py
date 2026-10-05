@@ -61,7 +61,20 @@ class AgentLoopRunner:
         worktree: TaskWorktree | None = None,
         worktree_manager: WorktreeManager | None = None,
         repo_root: Path | None = None,
+        edit_lock: tuple[Callable[[], bool], Callable[[], None]] | None = None,
+        edit_lock_wait_seconds: float = 3600.0,
+        edit_lock_poll_seconds: float = 5.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        # (acquire, release) for a project whose tasks share one folder (no worktree): the
+        # Developer stage waits for it, so two tasks never edit the same files, while every
+        # other kind of task keeps running alongside. None when this task has the folder to
+        # itself (its own worktree, or the project runs one task at a time).
+        self.edit_lock = edit_lock
+        self.edit_lock_wait_seconds = edit_lock_wait_seconds
+        self.edit_lock_poll_seconds = edit_lock_poll_seconds
+        self._sleep = sleep
+        self._edit_lock_held = False
         # A task running in its own git worktree (see worktrees.py): `working_directory`
         # is then that worktree, `repo_root` the project's main checkout the finished
         # branch has to be merged back into. Controller's converge stage is told about
@@ -98,6 +111,54 @@ class AgentLoopRunner:
         self._validate_adapters()
 
     def run(
+        self,
+        task: TaskEnvelope,
+        *,
+        writeback: bool = False,
+        conversation_id: str | None = None,
+    ) -> LoopSummary:
+        try:
+            return self._run(task, writeback=writeback, conversation_id=conversation_id)
+        finally:
+            self._release_edit_lock()
+
+    def _acquire_edit_lock(
+        self, task: TaskEnvelope, trace_id: str, stages: list[LoopStageResult]
+    ) -> LoopSummary | None:
+        """Wait for the right to edit the shared folder. None once held (or when this task
+        needs no lock); a needs_human summary if another development task never lets go."""
+        if self.edit_lock is None or self._edit_lock_held:
+            return None
+        acquire, _ = self.edit_lock
+        deadline = time.monotonic() + self.edit_lock_wait_seconds
+        waited = False
+        while not acquire():
+            if time.monotonic() >= deadline:
+                return self._summary(
+                    task,
+                    trace_id,
+                    stages,
+                    "needs_human",
+                    "Another development task has been editing this project's files for over "
+                    f"{int(self.edit_lock_wait_seconds // 60)} minutes, so this one could not start "
+                    "its development stage. It can be resumed once that task finishes.",
+                )
+            waited = True
+            self._sleep(self.edit_lock_poll_seconds)
+        self._edit_lock_held = True
+        if waited:
+            logger.info(f"{self._conversation_id}: got the project's edit lock after waiting")
+        return None
+
+    def _release_edit_lock(self) -> None:
+        if self.edit_lock is not None and self._edit_lock_held:
+            self._edit_lock_held = False
+            try:
+                self.edit_lock[1]()
+            except Exception:
+                logger.exception("releasing the project's edit lock failed")
+
+    def _run(
         self,
         task: TaskEnvelope,
         *,
@@ -236,6 +297,37 @@ class AgentLoopRunner:
 
             gate = normalized_gate(g1.artifact)
             reason_code = str((g1.artifact or {}).get("reason_code", "other"))
+            if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
+                # The gate judged the plan by implementation standards. Revising the plan
+                # cannot satisfy "the code doesn't exist yet", so ask the gate again with
+                # the correction instead of burning a planner revision and a second gate.
+                g1 = self._execute(
+                    task=gate_task(task, "G1", plan.artifact or {}, rescope=True),
+                    trace_id=trace_id,
+                    stages=stages,
+                    stage="g1-rescope",
+                    profile_id="red-team",
+                )
+                stopped = self._stop_after_execution(task, trace_id, stages, g1)
+                if stopped:
+                    return self._persist(stopped, writeback=writeback)
+                gate = normalized_gate(g1.artifact)
+                reason_code = str((g1.artifact or {}).get("reason_code", "other"))
+                if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
+                    return self._persist(
+                        self._summary(
+                            task,
+                            trace_id,
+                            stages,
+                            "needs_human",
+                            "G1 (plan gate) rejected the plan twice for "
+                            f"'{reason_code}', which cannot apply before any code exists — the "
+                            "gate is judging the plan as if it were an implementation, so the plan "
+                            "was not sent back for revision. Its findings, for reference:\n"
+                            + summarize_gate_artifact("G1", g1.artifact),
+                        ),
+                        writeback=writeback,
+                    )
             if gate == "REJECT" and reason_code != "missing_input":
                 use_opus = reason_code == "reasoning_gap"
                 revised_plan = self._execute(
@@ -305,6 +397,10 @@ class AgentLoopRunner:
                     ),
                     writeback=writeback,
                 )
+
+        blocked = self._acquire_edit_lock(task, trace_id, stages)
+        if blocked is not None:
+            return self._persist(blocked, writeback=writeback)
 
         reused_develop = reconstructed.get("develop")
         if reused_develop is not None:
@@ -1508,12 +1604,40 @@ def planner_revision_task(
     )
 
 
+# At G1 the gate is judging a PLAN: nothing has been built yet, so "the code / tests / feature
+# don't exist" is the expected state, not a finding. A Red Team that can read the repo kept
+# rejecting plans with implementation_gap for exactly that, which no plan revision can fix
+# (2026-10-05, chat_0a2de06d: two full plan+gate rounds, then a pointless question to the human).
+G1_MISSCOPED_CODES = {"implementation_gap", "test_gap"}
+
+_G1_SCOPE = (
+    "\nThis is G1, the PLAN gate. No code has been written yet: the repository, its tests and any "
+    "'delivery evidence' are deliberately still in their before-state, so the feature, files or tests "
+    "not existing yet is expected and is NEVER a finding. Do not use reason_code 'implementation_gap' "
+    "or 'test_gap' (those belong to G2, after development). Judge only the plan itself: are the "
+    "acceptance criteria observable and complete, is the approach feasible against the code you can "
+    "read, is the scope right, are risks and failure modes handled, is any required decision or input "
+    "missing or ambiguous. REJECT only for a defect in the plan that a revised plan could fix."
+)
+_G1_RESCOPE = (
+    "\nCORRECTION: your previous G1 verdict rejected this plan with implementation_gap/test_gap, i.e. "
+    "because the implementation or tests do not exist. That cannot apply at the plan gate. Judge the "
+    "plan again from scratch and drop every finding that only says code or tests are absent."
+)
+_G2_SCOPE = (
+    "\nThis is G2, the IMPLEMENTATION gate: development has finished. Judge the Developer's evidence "
+    "and the actual changes against the accepted plan and its acceptance criteria."
+)
+
+
 def gate_task(
     task: TaskEnvelope,
     gate_name: str,
     evidence: dict[str, Any],
     plan: dict[str, Any] | None = None,
     verification: dict[str, Any] | None = None,
+    *,
+    rescope: bool = False,
 ) -> TaskEnvelope:
     items = [artifact_item(f"harness:{gate_name.lower()}-evidence", "Gate evidence", evidence)]
     if plan is not None:
@@ -1545,6 +1669,8 @@ def gate_task(
             "'acceptance_gap', 'security', 'scope_drift', 'implementation_gap', "
             "'test_gap', or 'other'), findings (object array), unverified_items "
             "(string array), and confidence (number). Do not edit files."
+            f"{_G1_SCOPE if gate_name == 'G1' else _G2_SCOPE if gate_name == 'G2' else ''}"
+            f"{_G1_RESCOPE if rescope else ''}"
             f"{verification_note}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
