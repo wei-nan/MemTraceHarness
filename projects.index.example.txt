@@ -1,0 +1,4 @@
+# projects.index.txt
+# Copy to projects.index.txt and list one harness-scope.md path per line.
+/path/to/ProjectA/harness-scope.md
+/path/to/ProjectB/harness-scope.md

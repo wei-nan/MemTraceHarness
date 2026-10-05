@@ -247,6 +247,9 @@ link `node_modules` or copy an `.env`).
 <workspace>\MemTrace\harness-scope.md
 ```
 
+The real `projects.index.txt` holds local paths and is gitignored; copy `projects.index.example.txt`
+to start.
+
 This index file is the only thing that has to live near the Harness install; everything else about a
 project's scope stays in that project's own `harness-scope.md`.
 
