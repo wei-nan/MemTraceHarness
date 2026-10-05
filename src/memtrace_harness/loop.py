@@ -18,6 +18,7 @@ from memtrace_harness.fallback import (
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.output_contracts import output_schema_path
 from memtrace_harness.role_profiles import RoleProfile
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 from memtrace_harness.schemas import (
     ContextItem,
     LoopStageResult,
@@ -30,6 +31,7 @@ from memtrace_harness.schemas import (
     utc_now_iso,
 )
 from memtrace_harness.trace_store import TraceStore
+from memtrace_harness.worktrees import IntegrationReport, TaskWorktree, WorktreeManager
 
 if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
@@ -56,7 +58,18 @@ class AgentLoopRunner:
         config: "HarnessConfig | None" = None,
         agent_loop_enabled: bool = True,
         alert_callback: Callable[[str], None] | None = None,
+        worktree: TaskWorktree | None = None,
+        worktree_manager: WorktreeManager | None = None,
+        repo_root: Path | None = None,
     ) -> None:
+        # A task running in its own git worktree (see worktrees.py): `working_directory`
+        # is then that worktree, `repo_root` the project's main checkout the finished
+        # branch has to be merged back into. Controller's converge stage is told about
+        # the pending merge and may choose "merge"; the harness performs it.
+        self.worktree = worktree
+        self.worktree_manager = worktree_manager
+        self.repo_root = repo_root
+        self.integration: IntegrationReport | None = None
         # Operator-facing out-of-band alert (the gateway wires this to Telegram) for
         # infrastructure faults the operator must fix — currently only a provider CLI
         # that cannot be launched at all, see _alert_cli_unavailable().
@@ -424,8 +437,14 @@ class AgentLoopRunner:
                     writeback=writeback,
                 )
 
+        integration = self._prepare_integration(task)
+        converge_actions = {"finish", "ask_human"} | (
+            {"merge"} if integration is not None and integration.has_changes else set()
+        )
         converge = self._execute(
-            task=controller_task(task, stage="converge", stages=stages),
+            task=controller_task(
+                task, stage="converge", stages=stages, integration=integration
+            ),
             trace_id=trace_id,
             stages=stages,
             stage="converge",
@@ -434,7 +453,7 @@ class AgentLoopRunner:
         stopped = self._stop_after_execution(task, trace_id, stages, converge)
         if stopped:
             return self._persist(stopped, writeback=writeback)
-        if not valid_controller(converge.artifact, {"finish", "ask_human"}):
+        if not valid_controller(converge.artifact, converge_actions):
             return self._persist(
                 self._summary(
                     task,
@@ -445,7 +464,17 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
-        if (converge.artifact or {}).get("action") != "finish":
+        converge_action = (converge.artifact or {}).get("action")
+        merge_note = ""
+        if converge_action == "merge":
+            merged = self._merge_worktree(task)
+            if not merged.ok:
+                return self._persist(
+                    self._summary(task, trace_id, stages, "needs_human", merged.detail),
+                    writeback=writeback,
+                )
+            merge_note = f" {merged.detail}"
+        elif converge_action != "finish":
             return self._persist(
                 self._summary(
                     task,
@@ -457,6 +486,12 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
+        elif integration is not None and integration.has_changes:
+            merge_note = (
+                f" The task's changes are on branch '{integration.branch}' in "
+                f"{self.working_directory} and have NOT been merged into "
+                f"'{integration.base_branch}'."
+            )
         return self._persist(
             self._summary(
                 task,
@@ -466,9 +501,46 @@ class AgentLoopRunner:
                 (
                     "The bounded local loop completed with draft evidence. This does not assert "
                     "a MemTrace server-side gate or task-state transition."
+                    + merge_note
                 ),
             ),
             writeback=writeback,
+        )
+
+    def _prepare_integration(self, task: TaskEnvelope) -> IntegrationReport | None:
+        """Commit what Developer left in the task's worktree and work out what merging
+        it back would involve. None when this task is not running in a worktree."""
+        if not (self.worktree and self.worktree_manager and self.repo_root):
+            return None
+        try:
+            self.worktree_manager.commit_all(
+                self.worktree, f"harness: {task.goal.strip().splitlines()[0][:72]}"
+            )
+            self.integration = self.worktree_manager.integration_report(
+                self.repo_root, self.worktree
+            )
+        except Exception:
+            logger.exception("could not prepare the worktree integration report")
+            return None
+        return self.integration
+
+    def _merge_worktree(self, task: TaskEnvelope):
+        from memtrace_harness.worktrees import MergeResult
+
+        if not (self.worktree and self.worktree_manager and self.repo_root):
+            return MergeResult(False, "Controller chose merge, but this task has no worktree.", [])
+        result = self.worktree_manager.merge(
+            self.repo_root,
+            self.worktree,
+            f"Merge {self.worktree.branch}: {task.goal.strip().splitlines()[0][:72]}",
+        )
+        if result.ok or not result.conflicts:
+            return result
+        return MergeResult(
+            False,
+            result.detail + " Conflicting files: " + ", ".join(result.conflicts[:20])
+            + f". The work stays on branch '{self.worktree.branch}'.",
+            result.conflicts,
         )
 
     def _run_operational_action(
@@ -1195,6 +1267,7 @@ def controller_task(
     stage: str,
     stages: list[LoopStageResult],
     agent_loop_enabled: bool = True,
+    integration: IntegrationReport | None = None,
 ) -> TaskEnvelope:
     snapshot = {
         "task_id": task.task_id,
@@ -1218,6 +1291,8 @@ def controller_task(
             allowed.insert(0, "run_planner")
     else:
         allowed = ["finish", "ask_human"]
+        if integration is not None and integration.has_changes:
+            allowed.insert(1, "merge")
     # run_planner starts the full plan-then-review development loop (Planner/G1/
     # Developer/G2) — pick it only for a request that actually changes this project's
     # code. run_operational_action skips straight to Developer and reports its result
@@ -1252,6 +1327,28 @@ def controller_task(
     # reports "succeeded") may write to MemTrace — update_node/create_node are
     # explicitly disallowed for every other stage/role, so this is the one place
     # the KB reflects a task actually finishing, decided by the user.
+    integration_notice = ""
+    if integration is not None and integration.has_changes:
+        snapshot["integration"] = integration.to_dict()
+        integration_notice = (
+            "This task ran in its own git worktree, so its changes are NOT in the project's "
+            "main checkout yet: they sit on the branch described by `integration` in the "
+            "loop snapshot, and something has to merge them. Choose \"merge\" and the "
+            "harness will merge that branch into the base branch for you (it refuses and "
+            "reports back if the main checkout has uncommitted changes, or if the merge "
+            "conflicts). Choose \"finish\" only if the work should deliberately stay "
+            "unmerged on its branch; choose \"ask_human\" if `merges_cleanly` is false or "
+            "you doubt the change should land. Say in `reason` why.\n"
+        )
+    # Opt-in read-only market-data proxy (see taiwantrade_mcp.py); without this sentence the
+    # "no other tool" rule below would stop Controller from ever using it.
+    taiwantrade_tools = (
+        " and the read-only `taiwantrade` market-data tools (quotes, daily data, screens, "
+        "positions, balance) when the goal needs live TaiwanTrade data — it cannot place or "
+        "change orders"
+        if mcp_server_spec()
+        else ""
+    )
     write_permission = (
         "\nThis is the converge stage (the loop finished, G2 already passed): you MAY "
         "also call MemTrace's update_node (or create_node if no existing node fits) to "
@@ -1275,7 +1372,7 @@ def controller_task(
             "which do have real repo access), not something you can or should verify "
             "yourself.\n"
             "Do not call any tool other than MemTrace's own lookup tools "
-            "(search_nodes, get_node, list_nodes, traverse) — no file read, no directory "
+            f"(search_nodes, get_node, list_nodes, traverse){taiwantrade_tools} — no file read, no directory "
             "listing, no git command, no web search, no browser, nothing else. This "
             "explicitly includes AGENTS.md, CLAUDE.md, an \"operating contract\", "
             "architecture docs, or any other convention you might normally check first: "
@@ -1303,6 +1400,7 @@ def controller_task(
             "immediately answer the JSON decision anyway using whatever you already have; "
             "a partial answer is always better than none.\n"
             f"{operational_action_notice}"
+            f"{integration_notice}"
             "The JSON schema enforced on this call's output is shared by both controller "
             "stages (start and converge) and therefore lists a wider action enum than is "
             "valid right now — it will not stop you from picking a value that's wrong for "

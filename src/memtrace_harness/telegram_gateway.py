@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -31,6 +32,7 @@ from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_s
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
 from memtrace_harness.topic_recall import BRIEFS_HEADER, render_briefs_context
 from memtrace_harness.trace_store import TraceStore
+from memtrace_harness.worktrees import TaskWorktree, WorktreeManager, is_git_repo
 
 if TYPE_CHECKING:
     from memtrace_harness.approval import ApprovalManager
@@ -530,7 +532,9 @@ class TelegramGateway:
             if req_data.status == "approved":
                 self._resume_approved_conversation(req_data, reason_or_answer)
             elif req_data.status in {"rejected", "expired"}:
-                self.approval_manager.trace_store.release_workspace_lock(req_data.workspace)
+                self.approval_manager.trace_store.release_workspace_lock(
+                    req_data.workspace, req_data.conversation_id
+                )
         return msg
 
     def expire_stale_approvals(self, ttl_hours: int, now: datetime | None = None) -> list[str]:
@@ -583,16 +587,32 @@ class TelegramGateway:
     def _start_or_queue_task(
         self, scope: ProjectScope, goal: str, chat_id: int, schedule_id: str | None = None
     ) -> str:
+        """Start a governed task now if the project has a free worker slot, otherwise
+        queue it. A schedule whose previous run is still running (or still queued) is
+        skipped instead — it must never pile up behind itself."""
         ws_id = scope.workspace_id
         trace_store = self.approval_manager.trace_store
-        if trace_store.get_workspace_lock(ws_id) is not None:
-            msg = f"工作區 {ws_id}（{scope.name}）目前有任務正在執行中，請等它結束後再試一次。"
-            self.send_message(chat_id, msg)
-            return msg
-
         conv_id = f"chat_{uuid4().hex[:8]}"
-        if not trace_store.acquire_workspace_lock(ws_id, conv_id):
-            msg = f"工作區 {ws_id}（{scope.name}）目前有任務正在執行中，請等它結束後再試一次。"
+        outcome = trace_store.acquire_task_slot(
+            ws_id, conv_id, max_slots=scope.max_workers, schedule_id=schedule_id
+        )
+        if outcome == "duplicate_schedule":
+            logger.info(f"schedule {schedule_id} is still running; skipping this occurrence")
+            return f"排程 {schedule_id} 上一輪尚未結束，本輪略過。"
+        if outcome != "acquired":
+            queue_id = trace_store.enqueue_task(
+                workspace_id=ws_id,
+                kind="new",
+                payload={"goal": goal},
+                conversation_id=None,
+                schedule_id=schedule_id,
+                chat_id=chat_id,
+            )
+            position = sum(1 for q in trace_store.list_queued_tasks(ws_id) if q["id"] <= queue_id)
+            msg = (
+                f"「{scope.name}」的 {scope.max_workers} 個任務位都在忙，這個任務已排入佇列"
+                f"（第 {position} 位），有空位時會自動開始。"
+            )
             self.send_message(chat_id, msg)
             return msg
 
@@ -600,15 +620,23 @@ class TelegramGateway:
         # development work is made in conversation with the model itself (see
         # _chat_reply_and_maybe_start_task()) — by the time this is called, that
         # decision has already been made together with the human in the chat.
-        # Runs in a background thread so this bot's poll loop — and therefore ordinary
-        # chat on it — isn't blocked for the minutes a governed loop can take. The
-        # workspace lock (already acquired above) is what actually prevents a second
-        # task from starting on the same workspace while this one runs; it's released
-        # inside the thread once the run finishes, not here.
         self.send_message(
             chat_id,
             f"🔧 已開始執行「{scope.name}」的任務，可能需要幾分鐘，完成後會通知你（這段期間仍可以正常對話）。",
         )
+        self._launch_task(scope, conv_id, goal, chat_id, schedule_id)
+        return f"任務已在背景開始執行：{goal}"
+
+    def _launch_task(
+        self, scope: ProjectScope, conv_id: str, goal: str, chat_id: int, schedule_id: str | None
+    ) -> None:
+        """Run an already-slotted task in a background thread so this bot's poll loop —
+        and therefore ordinary chat on it — isn't blocked for the minutes a governed loop
+        can take. The slot (acquired by the caller) is what keeps a project within its
+        worker limit; it is released here once the run finishes, which also starts the
+        next queued task."""
+        ws_id = scope.workspace_id
+        trace_store = self.approval_manager.trace_store
 
         def _run() -> None:
             try:
@@ -635,15 +663,136 @@ class TelegramGateway:
                         schedule_id=schedule_id,
                     )
             finally:
-                trace_store.release_workspace_lock(ws_id)
+                trace_store.release_workspace_lock(ws_id, conv_id)
                 default_tracker.unregister(thread)
+                self._drain_task_queue(scope)
 
         thread = threading.Thread(target=_run, name=f"agent-loop-{conv_id}", daemon=True)
         thread.start()
         default_tracker.register(
             thread, workspace_id=ws_id, conversation_id=conv_id, trace_store=trace_store
         )
-        return f"任務已在背景開始執行：{goal}"
+
+    def drain_task_queues(self) -> None:
+        """Start queued tasks wherever a worker slot is free. Also called on the gateway
+        tick, so work queued before a restart is picked up again."""
+        trace_store = self.approval_manager.trace_store
+        queued = set(trace_store.queued_workspace_ids())
+        for scope in self.projects:
+            if scope.workspace_id in queued:
+                self._drain_task_queue(scope)
+
+    def _drain_task_queue(self, scope: ProjectScope) -> None:
+        trace_store = self.approval_manager.trace_store
+        ws_id = scope.workspace_id
+        try:
+            while True:
+                item = trace_store.peek_next_queued_task(ws_id)
+                if item is None:
+                    return
+                conv_id = item["conversation_id"] or f"chat_{uuid4().hex[:8]}"
+                if (
+                    trace_store.acquire_task_slot(
+                        ws_id, conv_id, max_slots=scope.max_workers,
+                        schedule_id=item["schedule_id"], check_queue=False,
+                    )
+                    != "acquired"
+                ):
+                    return
+                if not trace_store.claim_queued_task(item["id"]):
+                    trace_store.release_workspace_lock(ws_id, conv_id)  # another drainer took it
+                    continue
+                try:
+                    self._start_queued_item(scope, item, conv_id)
+                except Exception:
+                    logger.exception(f"could not start queued task {item['id']} for '{scope.name}'")
+                    trace_store.release_workspace_lock(ws_id, conv_id)
+        except Exception:
+            logger.exception(f"draining the task queue for '{scope.name}' failed")
+
+    def _start_queued_item(self, scope: ProjectScope, item: dict, conv_id: str) -> None:
+        chat_id = item["chat_id"]
+        if item["kind"] == "resume":
+            req = self.approval_manager.get_request(item["payload"]["request_id"])
+            if req is None or req.status != "approved":
+                self.approval_manager.trace_store.release_workspace_lock(scope.workspace_id, conv_id)
+                return
+            self._launch_resume(req, item["payload"].get("answer"))
+            return
+        goal = item["payload"]["goal"]
+        if chat_id is not None:
+            self.send_message(
+                chat_id, f"▶️ 輪到排隊中的任務了，開始執行「{scope.name}」：{goal[:80]}"
+            )
+        self._launch_task(scope, conv_id, goal, chat_id, item["schedule_id"])
+
+    # ---- per-task git worktrees (see worktrees.py)
+
+    def _worktree_manager(self) -> WorktreeManager:
+        return WorktreeManager(self.config.trace_root / "worktrees")
+
+    def _provision_workdir(self, scope: ProjectScope, conv_id: str) -> tuple[Path, TaskWorktree | None]:
+        """Where this task's agents run. With more than one worker slot and a git
+        project, that is a private worktree on its own branch (reused when the
+        conversation already has one, e.g. after an approval); otherwise the project
+        checkout itself, as before."""
+        trace_store = self.approval_manager.trace_store
+        recorded = trace_store.get_conversation_worktree(conv_id)
+        if recorded and Path(recorded["path"]).is_dir():
+            worktree = TaskWorktree(
+                path=Path(recorded["path"]),
+                branch=recorded["branch"],
+                base_branch=recorded["base_branch"],
+                base_commit=recorded["base_commit"],
+            )
+            return worktree.path, worktree
+        if scope.max_workers <= 1 or not is_git_repo(scope.working_directory):
+            return scope.working_directory, None
+        manager = self._worktree_manager()
+        worktree = manager.create(scope.working_directory, scope.name, conv_id)
+        if scope.worktree_setup_command:
+            try:
+                manager.run_setup_command(
+                    worktree, scope.working_directory, scope.worktree_setup_command, 600
+                )
+            except Exception:
+                manager.remove(scope.working_directory, worktree)
+                raise
+        trace_store.record_conversation_worktree(
+            conv_id,
+            workspace_id=scope.workspace_id,
+            path=str(worktree.path),
+            branch=worktree.branch,
+            base_branch=worktree.base_branch,
+            base_commit=worktree.base_commit,
+        )
+        return worktree.path, worktree
+
+    def _finalize_worktree(
+        self, scope: ProjectScope, conv_id: str, worktree: TaskWorktree | None, status: str
+    ) -> str:
+        """After a run: keep whatever still needs a human or a later merge, drop the
+        rest. Returns a note about unmerged work to append to the report ("" if none)."""
+        if worktree is None:
+            return ""
+        manager = self._worktree_manager()
+        repo = scope.working_directory
+        trace_store = self.approval_manager.trace_store
+        try:
+            manager.commit_all(worktree, "harness: changes left in the worktree")
+            ahead = manager.commits_ahead(repo, worktree)
+            if ahead == 0 and status in {"succeeded", "failed"}:
+                manager.remove(repo, worktree)
+                trace_store.delete_conversation_worktree(conv_id)
+                return ""
+            if ahead > 0 and status in {"succeeded", "failed"}:
+                return (
+                    f"\n\n📂 變更在分支 {worktree.branch}（{worktree.path}），"
+                    f"尚未合併進 {worktree.base_branch or '主工作目錄'}。"
+                )
+        except Exception:
+            logger.exception(f"finalizing the worktree of {conv_id} failed")
+        return ""
 
     def _knowledge_base_locations(self, scope: ProjectScope) -> str:
         """Where this project's knowledge lives in MemTrace — shared by the chat
@@ -953,7 +1102,9 @@ class TelegramGateway:
             # "waiting for approval" story — 2026-09-30 貿聯 lookup). MemTrace's
             # read-only lookups are safe to pre-allow; writes stay unavailable.
             cmd = self.config.chat_command(
-                provider, model, prompt, claude_allowed_tools=self._CHAT_MEMTRACE_READ_TOOLS
+                provider, model, prompt,
+                claude_allowed_tools=self._CHAT_MEMTRACE_READ_TOOLS,
+                taiwantrade=True,
             )
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():
@@ -1231,6 +1382,18 @@ class TelegramGateway:
         if chat_id is None:
             logger.error(f"schedule {schedule['id']} has no chat_id to notify; skipping this run")
             return
+        if self.approval_manager.trace_store.schedule_in_flight(schedule["id"]):
+            # Its previous run hasn't finished: skip this occurrence rather than stack a
+            # second copy of the same schedule. Logged for the chat model, not pushed.
+            self.primary_session_mgr.record_turn(
+                project=scope.name,
+                speaker="system",
+                turn_type=SCHEDULE_TRIGGER,
+                content=f"排程 {schedule['id']} 觸發，但上一輪尚未結束，本輪略過。",
+                schedule_id=schedule["id"],
+            )
+            logger.info(f"schedule {schedule['id']} is still running; skipping this occurrence")
+            return
         self.primary_session_mgr.record_turn(
             project=scope.name,
             speaker="system",
@@ -1280,10 +1443,11 @@ class TelegramGateway:
             source="telegram-chat",
         )
         profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
+        work_dir, worktree = self._provision_workdir(scope, conv_id)
         candidate_adapters = build_role_adapter_candidates(
             profiles=profiles,
             config=self.config,
-            working_directory=scope.working_directory,
+            working_directory=work_dir,
             timeout_seconds=self.config.cli_timeout_seconds,
         )
         runner = AgentLoopRunner(
@@ -1293,14 +1457,20 @@ class TelegramGateway:
             trace_store=self.approval_manager.trace_store,
             memtrace_client=self.memtrace_client,
             approval_manager=self.approval_manager,
-            working_directory=scope.working_directory,
+            working_directory=work_dir,
             verify_command=scope.verify_command,
             verify_timeout_seconds=scope.verify_timeout_seconds or 1200,
             config=self.config,
             agent_loop_enabled=scope.agent_loop_enabled,
             alert_callback=self.notify_all_allowlisted,
+            worktree=worktree,
+            worktree_manager=self._worktree_manager() if worktree else None,
+            repo_root=scope.working_directory if worktree else None,
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
+        note = self._finalize_worktree(scope, conv_id, worktree, summary.status)
+        if note and worktree and worktree.branch not in summary.recommendation:
+            summary = replace(summary, recommendation=summary.recommendation + note)
         if schedule_id:
             self.primary_session_mgr.record_turn(
                 project=scope.name,
@@ -1330,10 +1500,50 @@ class TelegramGateway:
         if not working_dir.is_dir():
             logger.error(f"Cannot resume conversation {req_data.conversation_id}: working dir {working_dir} invalid")
             return
-        matching_scope = next(
+        matching_scope = self._scope_for_resume(req_data, working_dir)
+        trace_store = self.approval_manager.trace_store
+        outcome = trace_store.acquire_task_slot(
+            req_data.workspace,
+            req_data.conversation_id,
+            max_slots=matching_scope.max_workers if matching_scope else 1,
+        )
+        if outcome == "already_running":
+            # Either a double-tapped approval (a thread is running it) or a slot the
+            # unattended scanner reserved while it waited for this very approval — that
+            # one is handed over to the resumed run.
+            if any(
+                e["conversation_id"] == req_data.conversation_id
+                for e in default_tracker.snapshot()
+            ):
+                self.notify_all_allowlisted(f"對話 {req_data.conversation_id} 已經在執行中。")
+                return
+            outcome = "acquired"
+        if outcome != "acquired":
+            trace_store.enqueue_task(
+                workspace_id=req_data.workspace,
+                kind="resume",
+                payload={"request_id": req_data.id, "answer": answer},
+                conversation_id=req_data.conversation_id,
+                chat_id=req_data.telegram_chat_id,
+            )
+            self.notify_all_allowlisted(
+                f"✅ 已核准，但「{matching_scope.name if matching_scope else req_data.workspace}」"
+                "的任務位都在忙，已排入佇列，有空位時會自動繼續。"
+            )
+            return
+        self._launch_resume(req_data, answer)
+
+    def _scope_for_resume(self, req_data: ApprovalRequestData, working_dir: Path):
+        return next(
             (s for s in self.projects if s.workspace_id == req_data.workspace or s.working_directory.resolve() == working_dir),
             None,
         )
+
+    def _launch_resume(self, req_data: ApprovalRequestData, answer: str | None = None) -> None:
+        """Continue an approved conversation in a background thread. The caller already
+        holds the conversation's worker slot; this releases it when the run ends."""
+        working_dir = Path(req_data.working_directory).resolve()
+        matching_scope = self._scope_for_resume(req_data, working_dir)
         # Runs in a background thread — see _run() below — so this doesn't block the
         # poll loop for the minutes a governed run can take; say so up front rather
         # than leaving the user staring at silence after the "Approval update:
@@ -1396,10 +1606,18 @@ class TelegramGateway:
                     self.config.role_profiles_file_for(matching_scope.name) if matching_scope else None
                 )
                 profiles = load_role_profiles(profiles_file)
+                worktree: TaskWorktree | None = None
+                run_dir = working_dir
+                if matching_scope is not None:
+                    # Same worktree as the run that stopped (the approval carries its
+                    # path), or a fresh one for a conversation that never had one.
+                    run_dir, worktree = self._provision_workdir(
+                        matching_scope, req_data.conversation_id
+                    )
                 candidate_adapters = build_role_adapter_candidates(
                     profiles=profiles,
                     config=self.config,
-                    working_directory=working_dir,
+                    working_directory=run_dir,
                     timeout_seconds=self.config.cli_timeout_seconds,
                 )
                 runner = AgentLoopRunner(
@@ -1409,7 +1627,7 @@ class TelegramGateway:
                     trace_store=trace_store,
                     memtrace_client=self.memtrace_client,
                     approval_manager=self.approval_manager,
-                    working_directory=working_dir,
+                    working_directory=run_dir,
                     verify_command=matching_scope.verify_command if matching_scope else None,
                     verify_timeout_seconds=(
                         (matching_scope.verify_timeout_seconds if matching_scope else None) or 1200
@@ -1419,12 +1637,21 @@ class TelegramGateway:
                         matching_scope.agent_loop_enabled if matching_scope else True
                     ),
                     alert_callback=self.notify_all_allowlisted,
+                    worktree=worktree,
+                    worktree_manager=self._worktree_manager() if worktree else None,
+                    repo_root=matching_scope.working_directory if worktree and matching_scope else None,
                 )
                 summary = runner.run(
                     task,
                     writeback=True,
                     conversation_id=req_data.conversation_id,
                 )
+                if matching_scope is not None:
+                    note = self._finalize_worktree(
+                        matching_scope, req_data.conversation_id, worktree, summary.status
+                    )
+                    if note and worktree and worktree.branch not in summary.recommendation:
+                        summary = replace(summary, recommendation=summary.recommendation + note)
                 project_name = matching_scope.name if matching_scope else req_data.workspace
 
                 self.primary_session_mgr.record_turn(
@@ -1448,8 +1675,10 @@ class TelegramGateway:
                     f"⚠️ 對話 {req_data.conversation_id} 恢復執行時發生未預期錯誤，請查看日誌。"
                 )
             finally:
-                trace_store.release_workspace_lock(req_data.workspace)
+                trace_store.release_workspace_lock(req_data.workspace, req_data.conversation_id)
                 default_tracker.unregister(thread)
+                if matching_scope is not None:
+                    self._drain_task_queue(matching_scope)
 
         thread = threading.Thread(
             target=_run, name=f"agent-loop-resume-{req_data.conversation_id}", daemon=True

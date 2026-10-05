@@ -1073,6 +1073,14 @@ def _serve_gateway_loop(
                 logger.exception("scan pass failed; continuing")
             last_scan = now
 
+        for gw in gateways:
+            # Picks up queued tasks wherever a worker slot is free — including work
+            # queued before a restart.
+            try:
+                gw.drain_task_queues()
+            except Exception:
+                logger.exception("draining the task queue failed; continuing")
+
         if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
             for gw in gateways:
                 try:
@@ -1210,7 +1218,9 @@ def _drain_inflight_agent_loops(grace_seconds: int) -> None:
             "/ raw trace logs once the new process is up."
         )
         try:
-            entry["trace_store"].release_workspace_lock(entry["workspace_id"])
+            entry["trace_store"].release_workspace_lock(
+                entry["workspace_id"], entry["conversation_id"]
+            )
         except Exception:
             logger.exception("failed to force-release workspace lock during shutdown")
 
@@ -1631,7 +1641,9 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
         turn_count = len(trace_store.get_primary_session_turns(session_id))
         pending_goal = len(trace_store.get_unconsolidated_turns(session_id))
         digests = trace_store.list_memory_digests(scope.name, limit=STATUS_DIGEST_DAYS)
-        lock = trace_store.get_workspace_lock(scope.workspace_id)
+        locks = trace_store.list_workspace_locks(scope.workspace_id)
+        lock = locks[0] if locks else None
+        queued_tasks = trace_store.list_queued_tasks(scope.workspace_id)
         pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
         recent_turns = trace_store.get_recent_primary_session_turns(session_id, limit=5)
         schedules = trace_store.list_schedules(scope.name)
@@ -1765,6 +1777,26 @@ def _collect_status_data(config: "HarnessConfig") -> dict:
                     if lock
                     else None
                 ),
+                "max_workers": scope.max_workers,
+                "locks": [
+                    {
+                        "conversation_id": item["conversation_id"],
+                        "locked_at": item["locked_at"],
+                        "schedule_id": item["schedule_id"],
+                        "latest_turn": trace_store.get_latest_turn(item["conversation_id"]),
+                    }
+                    for item in locks
+                ],
+                "queue": [
+                    {
+                        "id": item["id"],
+                        "kind": item["kind"],
+                        "schedule_id": item["schedule_id"],
+                        "goal": (item["payload"].get("goal") or item["conversation_id"] or "")[:120],
+                        "created_at": item["created_at"],
+                    }
+                    for item in queued_tasks
+                ],
                 "pipeline_conversation_id": pipeline_conversation_id,
                 "pipeline": pipeline,
                 "pending_approvals": [
@@ -2111,9 +2143,10 @@ def _render_status_text(data: dict) -> str:
             for turn in project["recent_turns"]:
                 content_preview = turn["content"].replace("\n", " ")[:80]
                 lines.append(f"      [{turn['created_at']}] {turn['speaker']}: {content_preview}")
-        if project["lock"]:
-            lock = project["lock"]
-            lines.append(f"    ⚠️  workspace 鎖定中：conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
+        if project["locks"]:
+            lines.append(f"    ⚠️  執行中 {len(project['locks'])}/{project['max_workers']} 個任務位：")
+        for lock in project["locks"]:
+            lines.append(f"    ⚠️  conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
             turn = lock["latest_turn"]
             if turn:
                 lines.append(
@@ -2122,6 +2155,10 @@ def _render_status_text(data: dict) -> str:
                 )
             else:
                 lines.append("       最新進度：尚未有階段完成（可能剛啟動或卡在第一個階段）")
+        if project["queue"]:
+            lines.append(f"    ⏳ 佇列中 {len(project['queue'])} 個任務：")
+            for queued in project["queue"]:
+                lines.append(f"       - {queued['goal']}")
         if project["pending_approvals"]:
             lines.append(f"    ⚠️  待核准請求 {len(project['pending_approvals'])} 筆：")
             for req in project["pending_approvals"]:

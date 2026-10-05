@@ -5,6 +5,9 @@ from pathlib import Path
 import re
 
 
+DEFAULT_MAX_WORKERS = 3
+
+
 @dataclass
 class ProjectScope:
     name: str
@@ -19,6 +22,13 @@ class ProjectScope:
     verify_timeout_seconds: int | None = None
     github_repo: str | None = None
     agent_loop_enabled: bool = True
+    # How many tasks of this project may run at once. Each runs in its own git
+    # worktree; 1 keeps the old one-task-at-a-time behavior, editing the checkout in
+    # place. A project that is not a git repository always runs one task at a time.
+    max_workers: int = DEFAULT_MAX_WORKERS
+    # Optional shell command run inside a fresh worktree to make it usable (link
+    # node_modules, copy an .env — whatever git does not carry over).
+    worktree_setup_command: str | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:
@@ -70,6 +80,14 @@ class ProjectScope:
         agent_loop_str = _extract_field(content, "agent_loop")
         agent_loop_enabled = (agent_loop_str or "").strip().lower() != "disabled"
 
+        max_workers_str = _extract_field(content, "max_workers", "worker_slots")
+        max_workers = (
+            max(1, int(max_workers_str))
+            if max_workers_str and max_workers_str.strip().isdigit()
+            else DEFAULT_MAX_WORKERS
+        )
+        worktree_setup_command = _extract_field(content, "worktree_setup_command")
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -83,6 +101,8 @@ class ProjectScope:
             verify_timeout_seconds=verify_timeout_seconds,
             github_repo=github_repo,
             agent_loop_enabled=agent_loop_enabled,
+            max_workers=max_workers,
+            worktree_setup_command=worktree_setup_command,
         )
 
 

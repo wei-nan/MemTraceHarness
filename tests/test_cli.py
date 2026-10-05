@@ -748,6 +748,30 @@ class ChatCommandTests(TestCase):
             ["/bin/antigravity", "--print", "p"],
         )
 
+    def test_taiwantrade_proxy_is_attached_to_the_chat_reply_only_when_opted_in(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.config import HarnessConfig
+
+        config = self._config()
+        env = {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/keys/tw"}
+        with patch.dict("os.environ", env):
+            plain = HarnessConfig.chat_command(config, "codex", "m", "p")
+            codex = HarnessConfig.chat_command(config, "codex", "m", "p", taiwantrade=True)
+            claude = HarnessConfig.chat_command(
+                config, "claude", "haiku", "p", claude_allowed_tools="mcp__x", taiwantrade=True
+            )
+        # Not requested -> never attached; digests/classifiers don't get trading data.
+        self.assertNotIn("mcp_servers.taiwantrade.command=", " ".join(plain))
+        self.assertIn("read-only", codex)  # the sandbox stays read-only
+        self.assertTrue(any(a.startswith("mcp_servers.taiwantrade.command=") for a in codex))
+        self.assertTrue(any("/keys/tw" in a for a in codex))  # a path, never the key itself
+        self.assertEqual(claude[claude.index("--allowedTools") + 1], "mcp__x,mcp__taiwantrade")
+        self.assertIn("--mcp-config", claude)
+        # No opt-in env var -> nothing attached even when asked for.
+        with patch.dict("os.environ", {}, clear=True):
+            off = HarnessConfig.chat_command(config, "codex", "m", "p", taiwantrade=True)
+        self.assertNotIn("mcp_servers.taiwantrade.command=", " ".join(off))
+
 
 class BotPollerTests(TestCase):
     """2026-10-02: four bots were polled one after another (each long-poll blocking up

@@ -571,6 +571,7 @@ class TraceStore:
 
     def _init_db(self) -> None:
         with self._connection() as conn:
+            self._migrate_workspace_locks(conn)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -777,10 +778,37 @@ class TraceStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS workspace_locks (
-                    workspace_id TEXT PRIMARY KEY,
-                    conversation_id TEXT NOT NULL,
-                    locked_at TEXT NOT NULL
+                    conversation_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    locked_at TEXT NOT NULL,
+                    schedule_id TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS task_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    conversation_id TEXT,
+                    schedule_id TEXT,
+                    chat_id INTEGER,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS conversation_worktrees (
+                    conversation_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    base_branch TEXT,
+                    base_commit TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_workspace_locks_ws
+                    ON workspace_locks(workspace_id);
+                CREATE INDEX IF NOT EXISTS idx_task_queue_ws
+                    ON task_queue(workspace_id, id);
 
                 CREATE TABLE IF NOT EXISTS telegram_gateway_state (
                     bot_token_hash TEXT PRIMARY KEY,
@@ -928,6 +956,34 @@ class TraceStore:
             )
             self._ensure_column(conn, "loop_stages", "fallback_from_model", "TEXT")
             self._ensure_column(conn, "loop_stages", "checkpoint_id", "TEXT")
+
+    @staticmethod
+    def _migrate_workspace_locks(conn: sqlite3.Connection) -> None:
+        """workspace_locks used to be keyed by workspace_id (one running task per
+        workspace). It is now keyed by conversation_id so a project can run several
+        tasks at once; rebuild an old table in place, keeping any lock rows."""
+        columns = list(conn.execute("PRAGMA table_info(workspace_locks)"))
+        if not columns:
+            return
+        primary_key = {row[1] for row in columns if row[5]}
+        if primary_key == {"conversation_id"}:
+            return
+        conn.execute("ALTER TABLE workspace_locks RENAME TO workspace_locks_legacy")
+        conn.execute(
+            """
+            CREATE TABLE workspace_locks (
+                conversation_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                locked_at TEXT NOT NULL,
+                schedule_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_locks (conversation_id, workspace_id, locked_at) "
+            "SELECT conversation_id, workspace_id, locked_at FROM workspace_locks_legacy"
+        )
+        conn.execute("DROP TABLE workspace_locks_legacy")
 
     @staticmethod
     def _retag_legacy_schedule_turns(conn: sqlite3.Connection) -> None:
@@ -1765,24 +1821,198 @@ class TraceStore:
             )
             return cursor.rowcount > 0
 
-    def acquire_workspace_lock(self, workspace_id: str, conversation_id: str) -> bool:
-        now = utc_now_iso()
+    def acquire_task_slot(
+        self,
+        workspace_id: str,
+        conversation_id: str,
+        *,
+        max_slots: int = 1,
+        schedule_id: str | None = None,
+        check_queue: bool = True,
+    ) -> str:
+        """Claim one of a workspace's `max_slots` concurrent-task slots, atomically.
+
+        Returns "acquired", "already_running" (this conversation already holds a slot),
+        "full" (every slot is taken — the caller may queue), or
+        "duplicate_schedule" (this schedule's previous run is still running, or is
+        still waiting in the queue — the caller must skip this occurrence rather than
+        queue it, so a slow schedule never piles up behind itself). `check_queue=False`
+        is for the queue drain, which is starting the very item that sits in the queue."""
         with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if schedule_id:
+                running = conn.execute(
+                    "SELECT 1 FROM workspace_locks WHERE schedule_id = ? LIMIT 1",
+                    (schedule_id,),
+                ).fetchone()
+                if running:
+                    return "duplicate_schedule"
+                if check_queue and conn.execute(
+                    "SELECT 1 FROM task_queue WHERE schedule_id = ? LIMIT 1", (schedule_id,)
+                ).fetchone():
+                    return "duplicate_schedule"
+            taken = conn.execute(
+                "SELECT COUNT(*) FROM workspace_locks WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()[0]
+            if taken >= max(1, max_slots):
+                return "full"
             try:
                 conn.execute(
-                    """
-                    INSERT INTO workspace_locks (workspace_id, conversation_id, locked_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (workspace_id, conversation_id, now),
+                    "INSERT INTO workspace_locks (conversation_id, workspace_id, locked_at, schedule_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (conversation_id, workspace_id, utc_now_iso(), schedule_id),
                 )
-                return True
             except sqlite3.IntegrityError:
-                return False
+                # This very conversation already holds a slot (a double-tapped approval).
+                return "already_running"
+            return "acquired"
 
-    def release_workspace_lock(self, workspace_id: str) -> None:
+    def acquire_workspace_lock(self, workspace_id: str, conversation_id: str) -> bool:
+        """Exclusive claim of a whole workspace (one slot) — used by the unattended
+        scanner, which proposes one task at a time."""
+        return (
+            self.acquire_task_slot(workspace_id, conversation_id, max_slots=1) == "acquired"
+        )
+
+    def release_workspace_lock(
+        self, workspace_id: str, conversation_id: str | None = None
+    ) -> None:
+        """Free one task's slot, or — with no conversation_id — every slot of the
+        workspace (shutdown and operator recovery, where the owner is unknown)."""
         with self._connection() as conn:
-            conn.execute("DELETE FROM workspace_locks WHERE workspace_id = ?", (workspace_id,))
+            if conversation_id is None:
+                conn.execute("DELETE FROM workspace_locks WHERE workspace_id = ?", (workspace_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM workspace_locks WHERE workspace_id = ? AND conversation_id = ?",
+                    (workspace_id, conversation_id),
+                )
+
+    def list_workspace_locks(self, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT workspace_id, conversation_id, locked_at, schedule_id FROM workspace_locks "
+                "WHERE workspace_id = ? ORDER BY locked_at, conversation_id",
+                (workspace_id,),
+            ).fetchall()
+        return [
+            {"workspace_id": r[0], "conversation_id": r[1], "locked_at": r[2], "schedule_id": r[3]}
+            for r in rows
+        ]
+
+    def schedule_in_flight(self, schedule_id: str) -> bool:
+        """True while this schedule has a task running or waiting in the queue."""
+        with self._connection() as conn:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM workspace_locks WHERE schedule_id = ? "
+                    "UNION ALL SELECT 1 FROM task_queue WHERE schedule_id = ? LIMIT 1",
+                    (schedule_id, schedule_id),
+                ).fetchone()
+            )
+
+    def enqueue_task(
+        self,
+        *,
+        workspace_id: str,
+        kind: str,
+        payload: dict,
+        conversation_id: str | None = None,
+        schedule_id: str | None = None,
+        chat_id: int | None = None,
+    ) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO task_queue (workspace_id, kind, conversation_id, schedule_id, "
+                "chat_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    workspace_id, kind, conversation_id, schedule_id, chat_id,
+                    json.dumps(payload, ensure_ascii=False), utc_now_iso(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    @staticmethod
+    def _queue_row_to_dict(row: tuple) -> dict:
+        return {
+            "id": row[0],
+            "workspace_id": row[1],
+            "kind": row[2],
+            "conversation_id": row[3],
+            "schedule_id": row[4],
+            "chat_id": row[5],
+            "payload": json.loads(row[6]),
+            "created_at": row[7],
+        }
+
+    _QUEUE_COLUMNS = (
+        "id, workspace_id, kind, conversation_id, schedule_id, chat_id, payload_json, created_at"
+    )
+
+    def peek_next_queued_task(self, workspace_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._QUEUE_COLUMNS} FROM task_queue WHERE workspace_id = ? "
+                "ORDER BY id LIMIT 1",
+                (workspace_id,),
+            ).fetchone()
+        return self._queue_row_to_dict(row) if row else None
+
+    def claim_queued_task(self, queue_id: int) -> bool:
+        """Remove a queue entry; False when another drainer already took it."""
+        with self._connection() as conn:
+            return conn.execute("DELETE FROM task_queue WHERE id = ?", (queue_id,)).rowcount > 0
+
+    def list_queued_tasks(self, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._QUEUE_COLUMNS} FROM task_queue WHERE workspace_id = ? ORDER BY id",
+                (workspace_id,),
+            ).fetchall()
+        return [self._queue_row_to_dict(r) for r in rows]
+
+    def queued_workspace_ids(self) -> list[str]:
+        with self._connection() as conn:
+            return [
+                r[0] for r in conn.execute("SELECT DISTINCT workspace_id FROM task_queue")
+            ]
+
+    def record_conversation_worktree(
+        self,
+        conversation_id: str,
+        *,
+        workspace_id: str,
+        path: str,
+        branch: str,
+        base_branch: str | None,
+        base_commit: str | None,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO conversation_worktrees (conversation_id, workspace_id, "
+                "path, branch, base_branch, base_commit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (conversation_id, workspace_id, path, branch, base_branch, base_commit, utc_now_iso()),
+            )
+
+    def get_conversation_worktree(self, conversation_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT conversation_id, workspace_id, path, branch, base_branch, base_commit "
+                "FROM conversation_worktrees WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "conversation_id": row[0], "workspace_id": row[1], "path": row[2],
+            "branch": row[3], "base_branch": row[4], "base_commit": row[5],
+        }
+
+    def delete_conversation_worktree(self, conversation_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM conversation_worktrees WHERE conversation_id = ?", (conversation_id,)
+            )
 
     def get_latest_turn(self, conversation_id: str) -> dict | None:
         """Most recently completed Agent Loop stage for a conversation — written by
@@ -1894,14 +2124,10 @@ class TraceStore:
         }
 
     def get_workspace_lock(self, workspace_id: str) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT workspace_id, conversation_id, locked_at FROM workspace_locks WHERE workspace_id = ?",
-                (workspace_id,),
-            ).fetchone()
-        if not row:
-            return None
-        return {"workspace_id": row[0], "conversation_id": row[1], "locked_at": row[2]}
+        """The oldest running task of a workspace, or None when nothing is running.
+        A workspace can now hold several (see list_workspace_locks)."""
+        locks = self.list_workspace_locks(workspace_id)
+        return locks[0] if locks else None
 
     def create_schedule(
         self,

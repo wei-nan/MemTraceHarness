@@ -680,9 +680,19 @@ function renderPipeline(pipeline) {
   return '<div class="pipeline">' + steps.join('<div class="step-connector"></div>') + '</div>';
 }
 
-function renderLock(lock) {
-  return '<div class="warn">⚠️ workspace 鎖定中，conversation_id=' + esc(lock.conversation_id) +
-    "，開始於 " + esc(lock.locked_at) + '</div>';
+function renderLock(project) {
+  var locks = project.locks || [];
+  var html = locks.map(function (lock) {
+    return '<div class="warn">⚠️ 執行中，conversation_id=' + esc(lock.conversation_id) +
+      (lock.schedule_id ? "（排程 " + esc(lock.schedule_id) + "）" : "") +
+      "，開始於 " + esc(lock.locked_at) + '</div>';
+  }).join("");
+  var queue = project.queue || [];
+  if (queue.length) {
+    html += '<div class="lock-progress">⏳ 佇列中 ' + queue.length + " 個：" +
+      queue.map(function (q) { return esc(q.goal); }).join("、") + "</div>";
+  }
+  return html;
 }
 
 function openStageDetail(turnId) {
@@ -858,8 +868,11 @@ function renderProject(project, q) {
   var collapsed = state.collapsed[project.name] ? " collapsed" : "";
   var visible = matchesQuery(project, q) ? "" : " hidden";
   var d = project.dedicated;
-  var runningBadge = project.lock ? '<span class="badge running">執行中</span>' : "";
-  var lock = project.lock ? renderLock(project.lock) : "";
+  var running = (project.locks || []).length;
+  var runningBadge = running
+    ? '<span class="badge running">執行中 ' + running + "/" + project.max_workers + "</span>"
+    : "";
+  var lock = running || (project.queue || []).length ? renderLock(project) : "";
   var pipelineSection = "";
   if (project.pipeline_conversation_id) {
     var pipelineHint = project.lock

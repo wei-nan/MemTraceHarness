@@ -231,7 +231,10 @@ Required: `workspace_id` (the MemTrace workspace this project's specs/decisions 
 `working_directory` (defaults to the folder the `harness-scope.md` file is in), `name` (defaults to
 the working-directory folder name), `default_risk_level` (`low`/`medium`/`high`, defaults to
 `medium`), `off_limits` (comma-separated phrases the Harness refuses to act on even inside the working
-tree).
+tree), `max_workers` (how many tasks of this project may run at once, default `3`; extra tasks queue,
+and `1` keeps one-at-a-time editing in place), `worktree_setup_command` (shell command run inside a
+task's fresh git worktree, with `HARNESS_REPO_ROOT` set to the main checkout, to make it usable — e.g.
+link `node_modules` or copy an `.env`).
 
 ### 2. Build the project index
 
@@ -325,10 +328,15 @@ No, you do not need multiple clones of `MemTraceHarness`. One installation (one 
 
 The Harness itself stays a single install; what varies per project is only which folder it's told to
 operate in for that turn (`--working-directory` for `run`/`loop`, or the resolved `working_directory`
-from `harness-scope.md` for `gateway`/`scan`). The one thing that is still single-writer per project
-is the Agent Loop itself — the Developer role only ever writes into one working tree at a time per
-project, so two overlapping scans of the *same* project are serialized by the workspace lock
-described above; two *different* projects run independently in the same pass.
+from `harness-scope.md` for `gateway`/`scan`). A project runs up to `max_workers` tasks at once (default
+3), each in its own `git worktree` on branch `harness/<conversation_id>` so Developers never edit the
+same files; further tasks wait in a queue and start as slots free up. A schedule never overlaps itself:
+if its previous run is still running (or queued) the next occurrence is skipped. When a task finishes,
+the converge-stage Controller sees what it would bring back and may choose `merge`; the harness merges
+the branch into the checkout's base branch only if that checkout is clean, and stops for a human on
+conflict. Projects that are not git repositories (or set `max_workers: 1`) edit in place, one task at
+a time. Two overlapping *scans* of the same project are still serialized, and two *different*
+projects always run independently.
 
 ## Traces
 
@@ -365,3 +373,18 @@ $env:PYTHONPATH = "src"
 ```
 
 Tests inject deterministic subprocess results and mock external HTTP/API connections; they do not launch Claude, Codex, or Antigravity, nor do they hit Telegram servers.
+
+## TaiwanTrade read-only proxy
+
+Agent CLIs run sandboxed with no network, so they cannot reach `127.0.0.1:8000`. Harness ships a
+stdio MCP server (`python -m memtrace_harness.taiwantrade_mcp`) that the CLI spawns *outside* its
+sandbox. It exposes only a GET allowlist (quotes, daily/intraday data, screens, positions,
+balance, order *listing*); order placement/cancel/amend, auth/key management and watchlist writes
+are not reachable. Opt in by writing the API key to a file (`chmod 600`) and setting:
+
+```bash
+export HARNESS_TAIWANTRADE_API_KEY_FILE=~/.config/memtrace-harness/taiwantrade.key
+export HARNESS_TAIWANTRADE_API_URL=http://127.0.0.1:8000/api/v1   # optional, this is the default
+```
+
+Only the key *path* is passed to the CLI. All roles, Controller included, receive the server; the Controller prompt is amended to allow it.

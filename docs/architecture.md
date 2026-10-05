@@ -77,7 +77,8 @@ advertise stream JSON are parsed conservatively as partial until their schema is
 
 - The single-run command requires exactly one provider. The bounded loop runs multiple read-only
   roles serially but grants write access only to the Gemini developer. Cross-provider replay or
-  parallel editing still requires isolated worktrees.
+  parallel editing inside one run still requires isolated worktrees; concurrent *tasks* of one project
+  already run in separate per-task git worktrees (see the operating contract).
 - `probe` calls only `--version` and does not send a model prompt.
 - The harness never uses `shell=True` or injects credentials into argv.
 - Claude and Codex receive the task through stdin, avoiding OS command-line disclosure and Windows
