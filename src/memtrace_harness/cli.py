@@ -597,7 +597,17 @@ def gateway_command(args: argparse.Namespace) -> int:
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
 
-    scanner = UnattendedScanner(config, trace_store, projects, memtrace_client, gateway_for_project, approval_mgr)
+    scanner = UnattendedScanner(
+        config,
+        trace_store,
+        projects,
+        memtrace_client,
+        gateway_for_project,
+        approval_mgr,
+        record_push=lambda project, text, _mgr=primary_session_mgr: _mgr.record_turn(
+            project=project, speaker="assistant", turn_type="chat", content=text
+        ),
+    )
 
     if args.serve:
         return _serve_gateway_loop(
