@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from datetime import timedelta
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
@@ -67,6 +68,7 @@ class UnattendedScanner:
         self.memtrace_client = memtrace_client
         self.gateway = gateway
         self.approval_mgr = approval_mgr
+        self._notified_stalled: set[str] = set()
 
     def _gateway_for(self, scope: ProjectScope) -> TelegramGateway | None:
         """Resolve the bot that owns this project. `gateway` may be a single shared
@@ -185,6 +187,22 @@ class UnattendedScanner:
             return self._find_ready_github_issues(scope)
         return self._find_ready_task_nodes(scope, run_id=run_id)
 
+    def _notify_stalled(self, scope: ProjectScope, stalled: list[dict[str, Any]]) -> None:
+        """Tell the operator once per item (per process) that an already-run item is
+        still open and is being withheld, so the repeat is surfaced instead of
+        silently suppressed — the human decides: close it, or resume via /clarify."""
+        gw = self._gateway_for(scope)
+        for item in stalled:
+            item_id = str(item.get("id"))
+            if item_id in self._notified_stalled:
+                continue
+            self._notified_stalled.add(item_id)
+            if gw:
+                gw.notify_all_allowlisted(
+                    f"「{item.get('title') or item_id}」（{item_id}）近期已跑過一輪但 issue 仍開啟，"
+                    "我不會再重複提案。若已完成請關閉 issue，需要續做請用 /clarify 回覆該任務。"
+                )
+
     def run_scan_pass(self) -> dict[str, str]:
         results: dict[str, str] = {}
         for scope in self.projects:
@@ -204,7 +222,18 @@ class UnattendedScanner:
 
             candidates = self._find_ready_candidates(scope, run_id=conv_id)
             declined = self.trace_store.list_recently_declined_stage_refs(ws_id, "unattended_write")
-            candidates = [c for c in candidates if str(c.get("id")) not in declined]
+            # An approved item whose run ended needs_human/stop is still an open,
+            # unassigned issue, so without this it is re-proposed every scan pass
+            # (Beri#176 was run 5 times on 2026-10-06). Follow-ups on it go through
+            # /clarify resume, not a fresh scan proposal.
+            recently_run = self.trace_store.list_recently_approved_stage_refs(
+                ws_id, "unattended_write", within=timedelta(days=3)
+            )
+            stalled = [c for c in candidates if str(c.get("id")) in recently_run]
+            candidates = [
+                c for c in candidates if str(c.get("id")) not in declined | recently_run
+            ]
+            self._notify_stalled(scope, stalled)
 
             if not candidates:
                 self.trace_store.release_workspace_lock(ws_id)
