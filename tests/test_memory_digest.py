@@ -632,3 +632,28 @@ class FormatLogCompletenessTest(TestCase):
             for i in range(20)
         ]
         self.assertIn("截斷", _format_log(turns))
+
+
+class StateGroundedReviewTest(TestCase):
+    def test_stale_may_cite_schedule_state_but_decided_may_not(self) -> None:
+        carried = [
+            {"text": "monitor schedule failing", "turns": [1], "since": "2026-09-29"},
+            {"text": "decided on state alone", "turns": [1], "since": "2026-09-29"},
+            {"text": "stale on a made-up schedule", "turns": [1], "since": "2026-09-29"},
+        ]
+        digest, _, _ = ground_digest(
+            {
+                "open_item_review": [
+                    {"index": 0, "status": "stale", "reason": "排程已停用", "turns": [], "state_refs": ["sched_a"]},
+                    {"index": 1, "status": "decided", "reason": "x", "turns": [], "state_refs": ["sched_a"]},
+                    {"index": 2, "status": "stale", "reason": "y", "turns": [], "state_refs": ["sched_zzz"]},
+                ],
+            },
+            digest_date="2026-09-30",
+            turns=_turns("user"),
+            carried_open_items=carried,
+            state_ids={"sched_a"},
+        )
+        self.assertEqual([i["text"] for i in digest["resolved_items"]], ["monitor schedule failing"])
+        self.assertEqual(digest["resolved_items"][0]["resolved_state_refs"], ["sched_a"])
+        self.assertTrue(all(i["needs_operator"] for i in digest["open_items"]))

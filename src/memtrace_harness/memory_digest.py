@@ -219,6 +219,23 @@ def split_schedule_activity(turns: list[dict]) -> tuple[list[dict], int, str]:
     return kept, len(conversation), note
 
 
+def _schedule_state(trace_store: TraceStore, project: str) -> tuple[str, set[str]]:
+    """What the project's schedules are doing right now: every active one, plus inactive
+    ones that ran recently, so an open item about a since-stopped monitor can be closed
+    on the strength of that fact rather than only on something said that day."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    rows = [
+        s for s in trace_store.list_schedules(project, active_only=False)
+        if s["active"] or (s.get("last_run_at") or "") >= cutoff
+    ][:25]
+    lines = [
+        f"- {s['id']} [{'active' if s['active'] else 'inactive'}] {s['goal'][:80]}"
+        f"（上次執行 {s.get('last_run_at') or '從未'}）"
+        for s in rows
+    ]
+    return "\n".join(lines), {s["id"] for s in rows}
+
+
 def build_digest_prompt(
     project: str,
     digest_date: str,
@@ -226,6 +243,7 @@ def build_digest_prompt(
     carried_open_items: list[dict],
     schedule_note: str = "",
     adopted_rules: list[dict] | None = None,
+    state_snapshot: str = "",
 ) -> str:
     adopted_text = (
         "\n".join(f"[{r['id']}] ({'global' if r['scope'] == 'global' else 'project'}) {r['text']}" for r in adopted_rules)
@@ -261,6 +279,14 @@ def build_digest_prompt(
             if schedule_note
             else ""
         )
+        + (
+            "Current state of this project's schedules (as of when this digest runs, not as "
+            "of the day). An open item whose premise is a schedule listed here as inactive "
+            "may be reviewed as `stale` citing that schedule's id in `state_refs`:\n"
+            f"{state_snapshot}\n\n"
+            if state_snapshot
+            else ""
+        )
         +
         "Return ONLY one JSON object, no prose and no code fence, with exactly these keys:\n"
         "{\n"
@@ -269,7 +295,7 @@ def build_digest_prompt(
         '  "facts": [{"text": "...", "turns": [13]}],\n'
         '  "new_open_items": [{"text": "...", "turns": [14]}],\n'
         '  "resolved_open_items": [{"index": 0, "turns": [16]}],\n'
-        '  "open_item_review": [{"index": 1, "status": "stale", "reason": "...", "turns": [16]}],\n'
+        '  "open_item_review": [{"index": 1, "status": "stale", "reason": "...", "turns": [16], "state_refs": []}],\n'
         '  "process_lessons": [{"text": "...", "turns": [17]}],\n'
         '  "preference_candidates": [{"text": "...", "turns": [18], "scope": "global", '
         f'"category": "other", "explicit": true, "replaces": []}}],\n'
@@ -293,7 +319,8 @@ def build_digest_prompt(
         "stopped, the failure it concerns was fixed); reason = why. status "
         "`needs_operator`: it is still real and only the human can decide or supply "
         "something; reason = the one decision or input needed. `decided` and `stale` must "
-        "cite turns from THIS day's log that show it, otherwise use `needs_operator` or "
+        "cite turns from THIS day's log that show it (a `stale` item may instead cite "
+        "`state_refs` ids from the schedule state above), otherwise use `needs_operator` or "
         "leave the item out. Items you leave out stay open unchanged. Do not use "
         "resolved_open_items for these; it is only for items completed in this day's log.\n"
         "- process_lessons: how the harness, models, or tools behaved (for example a "
@@ -428,6 +455,7 @@ def ground_digest(
     turns: list[dict],
     carried_open_items: list[dict],
     adopted_ids: set[int] | None = None,
+    state_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate one model answer against that day's turns. Returns (digest, grounded
     preference candidates, grounded preference retirements)."""
@@ -478,10 +506,17 @@ def ground_digest(
         if not 0 <= index < len(carried_open_items) or status not in REVIEW_STATUSES or not reason:
             dropped += 1
             continue
-        if status in ("decided", "stale") and not turns_cited:
+        raw_refs = item.get("state_refs")
+        state_refs = (
+            sorted({str(r) for r in raw_refs if str(r) in (state_ids or set())})
+            if isinstance(raw_refs, list)
+            else []
+        )
+        grounded = bool(turns_cited) or (status == "stale" and bool(state_refs))
+        if status in ("decided", "stale") and not grounded:
             # Ungrounded verdicts must not close anything: ask the human instead.
-            status, turns_cited = "needs_operator", []
-        reviews[index] = {"status": status, "reason": reason, "turns": turns_cited}
+            status, turns_cited, state_refs = "needs_operator", [], []
+        reviews[index] = {"status": status, "reason": reason, "turns": turns_cited, "state_refs": state_refs}
 
     day = date.fromisoformat(digest_date)
     open_items, resolved_items, expired_items = [], [], []
@@ -497,6 +532,7 @@ def ground_digest(
                     "resolved_on": digest_date,
                     "resolved_turns": review["turns"],
                     "resolution": review["status"],
+                    **({"resolved_state_refs": review["state_refs"]} if review["state_refs"] else {}),
                     "resolution_reason": review["reason"],
                 }
             )
@@ -617,10 +653,13 @@ def run_digest_for_date(
     carried = list(previous["digest"].get("open_items") or []) if previous else []
 
     turns, conversation_turns, schedule_note = split_schedule_activity(turns)
+    state_snapshot, state_ids = _schedule_state(trace_store, project)
     adopted_rules = visible_rules(trace_store.list_preference_rules(statuses=("adopted",)), project)
     if turns:
         stdout, provider, model = call_model(
-            build_digest_prompt(project, digest_date, turns, carried, schedule_note, adopted_rules)
+            build_digest_prompt(
+                project, digest_date, turns, carried, schedule_note, adopted_rules, state_snapshot
+            )
         )
         raw = _extract_json_object(stdout)
     else:
@@ -635,6 +674,7 @@ def run_digest_for_date(
         turns=turns,
         carried_open_items=carried,
         adopted_ids={r["id"] for r in adopted_rules},
+        state_ids=state_ids,
     )
     changes = apply_preference_changes(trace_store, project, digest_date, candidates, retirements, turns)
     digest["preferences_adopted"] = len(changes.adopted)
