@@ -120,6 +120,37 @@ class GroundingTests(TestCase):
         self.assertEqual([i["text"] for i in digest["expired_items"]], ["ancient"])
         self.assertEqual(digest["discarded_ungrounded"], 2)
 
+    def test_open_item_review_closes_only_grounded_verdicts_and_flags_the_rest(self) -> None:
+        carried = [
+            {"text": "stale grounded", "turns": [1], "since": "2026-09-29"},
+            {"text": "decided grounded", "turns": [1], "since": "2026-09-29"},
+            {"text": "stale without evidence", "turns": [1], "since": "2026-09-29"},
+            {"text": "needs human", "turns": [1], "since": "2026-09-29"},
+            {"text": "not mentioned", "turns": [1], "since": "2026-09-29"},
+        ]
+        digest, _, _ = ground_digest(
+            {
+                "open_item_review": [
+                    {"index": 0, "status": "stale", "reason": "已出清", "turns": [2]},
+                    {"index": 1, "status": "decided", "reason": "決定不做", "turns": [1]},
+                    {"index": 2, "status": "stale", "reason": "感覺過時", "turns": []},
+                    {"index": 3, "status": "needs_operator", "reason": "要選區間", "turns": []},
+                    {"index": 7, "status": "stale", "reason": "越界", "turns": [1]},
+                ],
+            },
+            digest_date="2026-09-30",
+            turns=_turns("user", "user"),
+            carried_open_items=carried,
+        )
+        self.assertEqual([i["text"] for i in digest["resolved_items"]], ["stale grounded", "decided grounded"])
+        self.assertEqual([i["resolution"] for i in digest["resolved_items"]], ["stale", "decided"])
+        still_open = {i["text"]: i for i in digest["open_items"]}
+        self.assertEqual(list(still_open), ["stale without evidence", "needs human", "not mentioned"])
+        self.assertTrue(still_open["stale without evidence"]["needs_operator"])
+        self.assertTrue(still_open["needs human"]["needs_operator"])
+        self.assertNotIn("needs_operator", still_open["not mentioned"])
+        self.assertEqual(digest["discarded_ungrounded"], 1)
+
 
 class DigestRunTests(TestCase):
     def setUp(self) -> None:

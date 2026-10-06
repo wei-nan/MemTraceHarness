@@ -47,6 +47,7 @@ DIGEST_HOUR = 2
 # model call.
 AUTO_CATCH_UP_DAYS = 2
 OPEN_ITEM_MAX_AGE_DAYS = 14
+REVIEW_STATUSES = ("decided", "stale", "needs_operator")
 RECENT_DIGESTS_FOR_CONTEXT = 3
 DIGEST_CONTEXT_CHAR_BUDGET = 6000
 # Preferences are adopted by the Harness itself (nothing waits for the operator), so the
@@ -268,6 +269,7 @@ def build_digest_prompt(
         '  "facts": [{"text": "...", "turns": [13]}],\n'
         '  "new_open_items": [{"text": "...", "turns": [14]}],\n'
         '  "resolved_open_items": [{"index": 0, "turns": [16]}],\n'
+        '  "open_item_review": [{"index": 1, "status": "stale", "reason": "...", "turns": [16]}],\n'
         '  "process_lessons": [{"text": "...", "turns": [17]}],\n'
         '  "preference_candidates": [{"text": "...", "turns": [18], "scope": "global", '
         f'"category": "other", "explicit": true, "replaces": []}}],\n'
@@ -284,6 +286,16 @@ def build_digest_prompt(
         "remembering (data, results, configuration). new_open_items: questions or tasks "
         "raised and not finished this day. resolved_open_items: carried items this day's "
         "log shows were resolved, cited by their index and the resolving turns.\n"
+        "- open_item_review: go through EVERY carried open item and say which of these it is. "
+        "status `decided`: the log shows the human or the harness actually settled it "
+        "(reason = what was decided). status `stale`: its premise no longer holds (for "
+        "example the position it concerns was sold, the schedule it concerns was "
+        "stopped, the failure it concerns was fixed); reason = why. status "
+        "`needs_operator`: it is still real and only the human can decide or supply "
+        "something; reason = the one decision or input needed. `decided` and `stale` must "
+        "cite turns from THIS day's log that show it, otherwise use `needs_operator` or "
+        "leave the item out. Items you leave out stay open unchanged. Do not use "
+        "resolved_open_items for these; it is only for items completed in this day's log.\n"
         "- process_lessons: how the harness, models, or tools behaved (for example a "
         "model timing out or a step failing), not project content.\n"
         "- preference_candidates: ONLY standing preferences the human (speaker user) "
@@ -450,12 +462,49 @@ def ground_digest(
             continue
         resolved_turns[index] = turns_cited
 
+    reviews: dict[int, dict[str, Any]] = {}
+    for item in raw.get("open_item_review") or []:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        status = item.get("status")
+        reason = str(item.get("reason") or "").strip()
+        turns_cited = sorted({t for t in _cited_turns(item.get("turns")) if t in all_seqs})
+        if not 0 <= index < len(carried_open_items) or status not in REVIEW_STATUSES or not reason:
+            dropped += 1
+            continue
+        if status in ("decided", "stale") and not turns_cited:
+            # Ungrounded verdicts must not close anything: ask the human instead.
+            status, turns_cited = "needs_operator", []
+        reviews[index] = {"status": status, "reason": reason, "turns": turns_cited}
+
     day = date.fromisoformat(digest_date)
     open_items, resolved_items, expired_items = [], [], []
     for index, item in enumerate(carried_open_items):
         if index in resolved_turns:
             resolved_items.append({**item, "resolved_on": digest_date, "resolved_turns": resolved_turns[index]})
             continue
+        review = reviews.get(index)
+        if review and review["status"] in ("decided", "stale"):
+            resolved_items.append(
+                {
+                    **item,
+                    "resolved_on": digest_date,
+                    "resolved_turns": review["turns"],
+                    "resolution": review["status"],
+                    "resolution_reason": review["reason"],
+                }
+            )
+            continue
+        if review and review["status"] == "needs_operator":
+            item = {**item, "needs_operator": True, "operator_question": review["reason"]}
+        else:
+            item = {k: v for k, v in item.items() if k not in ("needs_operator", "operator_question")}
         since = item.get("since") or digest_date
         if (day - date.fromisoformat(since)).days > OPEN_ITEM_MAX_AGE_DAYS:
             expired_items.append(item)
@@ -616,7 +665,8 @@ def _bullets(items: list[dict], *, with_since: bool = False) -> list[str]:
     lines = []
     for item in items:
         suffix = f"（自 {item['since']}）" if with_since and item.get("since") else ""
-        lines.append(f"- {item['text']}{suffix}")
+        tag = f"【待你決定：{item.get('operator_question', '')}】" if item.get("needs_operator") else ""
+        lines.append(f"- {item['text']}{suffix}{tag}")
     return lines
 
 
@@ -639,7 +689,13 @@ def render_digest_markdown(project: str, digest_date: str, digest: dict[str, Any
             refs = item.get("turns") or item.get("resolved_turns") or []
             since = f"（自 {item['since']}）" if with_since and item.get("since") else ""
             ref_text = f" [turns {', '.join(str(r) for r in refs)}]" if refs else ""
-            parts.append(f"- {item['text']}{since}{ref_text}")
+            tag = ""
+            if item.get("needs_operator"):
+                tag = f"【待你決定：{item.get('operator_question', '')}】"
+            elif item.get("resolution"):
+                label = {"decided": "已決議", "stale": "已過時"}.get(item["resolution"], "")
+                tag = f"【{label}：{item.get('resolution_reason', '')}】"
+            parts.append(f"- {item['text']}{since}{tag}{ref_text}")
     parts += [
         "",
         f"_Harness nightly digest (draft). Ungrounded items discarded: "
