@@ -582,3 +582,22 @@ class DigestModelSelectionTests(TestCase):
             self.assertEqual(
                 config.digest_candidates_for("myproj"), (("codex", "gpt-6"), ("claude", "opus"))
             )
+
+
+class FormatLogCompletenessTest(TestCase):
+    def test_day_that_fits_the_budget_is_not_truncated(self) -> None:
+        from memtrace_harness.memory_digest import _format_log
+
+        long_report = "報告" * 1500  # 3000 chars, over the 1200 per-turn cap
+        turns = [{"turn_seq": 1, "speaker": "work_session_report", "content": long_report}]
+        self.assertNotIn("截斷", _format_log(turns))
+        self.assertIn(long_report, _format_log(turns))
+
+    def test_oversized_day_falls_back_to_per_turn_caps(self) -> None:
+        from memtrace_harness.memory_digest import _format_log
+
+        turns = [
+            {"turn_seq": i, "speaker": "work_session_report", "content": "x" * 15_000}
+            for i in range(20)
+        ]
+        self.assertIn("截斷", _format_log(turns))

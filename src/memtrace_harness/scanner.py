@@ -4,7 +4,7 @@ import json
 import logging
 import subprocess
 from datetime import timedelta
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -61,6 +61,7 @@ class UnattendedScanner:
         memtrace_client: MemTraceClient | None = None,
         gateway: TelegramGateway | dict[str, TelegramGateway] | None = None,
         approval_mgr: ApprovalManager | None = None,
+        record_push: Callable[[str, str], Any] | None = None,
     ) -> None:
         self.config = config
         self.trace_store = trace_store
@@ -69,6 +70,9 @@ class UnattendedScanner:
         self.gateway = gateway
         self.approval_mgr = approval_mgr
         self._notified_stalled: set[str] = set()
+        # Writes what the scanner pushed to the operator into the project's chat log,
+        # so the nightly digest and the chat model see the whole day, not just replies.
+        self._record_push = record_push
 
     def _gateway_for(self, scope: ProjectScope) -> TelegramGateway | None:
         """Resolve the bot that owns this project. `gateway` may be a single shared
@@ -187,6 +191,14 @@ class UnattendedScanner:
             return self._find_ready_github_issues(scope)
         return self._find_ready_task_nodes(scope, run_id=run_id)
 
+    def _log_push(self, scope: ProjectScope, text: str) -> None:
+        if self._record_push is None:
+            return
+        try:
+            self._record_push(scope.name, text)
+        except Exception as exc:
+            logger.error(f"Failed to record scanner push for {scope.name}: {exc}")
+
     def _notify_stalled(self, scope: ProjectScope, stalled: list[dict[str, Any]]) -> None:
         """Tell the operator once per item (per process) that an already-run item is
         still open and is being withheld, so the repeat is surfaced instead of
@@ -197,11 +209,13 @@ class UnattendedScanner:
             if item_id in self._notified_stalled:
                 continue
             self._notified_stalled.add(item_id)
+            text = (
+                f"「{item.get('title') or item_id}」（{item_id}）近期已跑過一輪但 issue 仍開啟，"
+                "我不會再重複提案。若已完成請關閉 issue，需要續做請用 /clarify 回覆該任務。"
+            )
             if gw:
-                gw.notify_all_allowlisted(
-                    f"「{item.get('title') or item_id}」（{item_id}）近期已跑過一輪但 issue 仍開啟，"
-                    "我不會再重複提案。若已完成請關閉 issue，需要續做請用 /clarify 回覆該任務。"
-                )
+                gw.notify_all_allowlisted(text)
+            self._log_push(scope, text)
 
     def run_scan_pass(self) -> dict[str, str]:
         results: dict[str, str] = {}
@@ -283,6 +297,7 @@ class UnattendedScanner:
             gw = self._gateway_for(scope)
             if gw:
                 gw.notify_approval_request(req)
+            self._log_push(scope, proposed_action)
             # Keep lock active while waiting for approval — released either by the
             # reject path (frees the workspace so the next scan pass can offer the
             # next candidate) or once the approved run finishes.

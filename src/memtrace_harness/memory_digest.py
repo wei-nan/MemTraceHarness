@@ -65,6 +65,8 @@ _USER_TURN_CHAR_CAP = 2000
 _OTHER_TURN_CHAR_CAP = 1200
 _PROMPT_LOG_CHAR_BUDGET = 120_000
 _SQUEEZED_OTHER_TURN_CHAR_CAP = 400
+# Used while the whole day fits the budget: effectively no truncation.
+_FULL_TURN_CHAR_CAP = 20_000
 
 PREFERENCE_CATEGORIES = (
     "language_format",
@@ -172,17 +174,19 @@ def _format_turn(turn: dict, cap: int) -> str:
 
 
 def _format_log(turns: list[dict]) -> str:
-    lines = [
-        _format_turn(t, _USER_TURN_CHAR_CAP if t["speaker"] == "user" else _OTHER_TURN_CHAR_CAP)
-        for t in turns
-    ]
-    if sum(len(line) for line in lines) > _PROMPT_LOG_CHAR_BUDGET:
+    """The whole day, verbatim, whenever it fits the prompt budget; per-turn caps only
+    come in as a fallback so one busy day cannot blow the prompt up."""
+    tiers = (
+        (_FULL_TURN_CHAR_CAP, _FULL_TURN_CHAR_CAP),
+        (_USER_TURN_CHAR_CAP, _OTHER_TURN_CHAR_CAP),
+        (_USER_TURN_CHAR_CAP, _SQUEEZED_OTHER_TURN_CHAR_CAP),
+    )
+    for user_cap, other_cap in tiers:
         lines = [
-            _format_turn(
-                t, _USER_TURN_CHAR_CAP if t["speaker"] == "user" else _SQUEEZED_OTHER_TURN_CHAR_CAP
-            )
-            for t in turns
+            _format_turn(t, user_cap if t["speaker"] == "user" else other_cap) for t in turns
         ]
+        if sum(len(line) for line in lines) <= _PROMPT_LOG_CHAR_BUDGET:
+            break
     return "\n".join(lines)
 
 
