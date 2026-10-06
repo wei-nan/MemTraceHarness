@@ -803,6 +803,7 @@ def run_memory_digests(
     dry_run: bool = False,
     respect_retry_backoff: bool = False,
     log=print,
+    triage_out: dict[str, list[dict]] | None = None,
 ) -> dict[str, PreferenceChanges]:
     """Shared by the gateway's nightly trigger and the `memory-digest` command.
     Returns {project: the preferences the Harness adopted / retired / left waiting}. One
@@ -838,6 +839,12 @@ def run_memory_digests(
             total.adopted += outcome.preferences.adopted
             total.retired += outcome.preferences.retired
             total.waiting += outcome.preferences.waiting
+            if triage_out is not None:
+                reviewed = [
+                    i for i in outcome.digest["resolved_items"] if i.get("resolution") in ("decided", "stale")
+                ] + [i for i in outcome.digest["open_items"] if i.get("needs_operator")]
+                if reviewed:
+                    triage_out.setdefault(scope.name, []).extend(reviewed)
             log(
                 f"[{scope.name}] digested {d}: {outcome.turn_count} turn(s), "
                 f"{len(outcome.digest['decisions'])} decision(s), "
@@ -877,6 +884,24 @@ def _describe_preference_changes(changes: PreferenceChanges, limit: int = 8) -> 
     return lines
 
 
+def _describe_open_item_triage(project: str, items: list[dict]) -> str:
+    decided = [i for i in items if i.get("resolution") == "decided"]
+    stale = [i for i in items if i.get("resolution") == "stale"]
+    asking = [i for i in items if i.get("needs_operator")]
+    lines = [f"🗂 [{project}] 昨晚整理了未結事項，想跟你確認："]
+    if decided:
+        lines.append("已決議（我已關閉）：")
+        lines += [f"- {i['text']} → {i.get('resolution_reason', '')}" for i in decided[:10]]
+    if stale:
+        lines.append("已過時（我已關閉）：")
+        lines += [f"- {i['text']} → {i.get('resolution_reason', '')}" for i in stale[:10]]
+    if asking:
+        lines.append("需要你決定：")
+        lines += [f"- {i['text']} → {i.get('operator_question', '')}" for i in asking[:12]]
+    lines.append("我關錯的請直接回覆告訴我，我會重新打開；要決定的事回覆我，我們可以一起討論。")
+    return "\n".join(lines)
+
+
 def _run_nightly_digest_pass(
     config: HarnessConfig,
     trace_store: TraceStore,
@@ -886,6 +911,7 @@ def _run_nightly_digest_pass(
     gateway_for_project: dict[str, TelegramGateway],
     status_bus,
 ) -> None:
+    triage: dict[str, list[dict]] = {}
     try:
         changed = run_memory_digests(
             config,
@@ -894,12 +920,26 @@ def _run_nightly_digest_pass(
             projects,
             max_days_back=AUTO_CATCH_UP_DAYS,
             respect_retry_backoff=True,
+            triage_out=triage,
         )
     except Exception:
         logger.exception("nightly memory digest pass failed")
         return
     if status_bus is not None:
         status_bus.publish()
+    for project, items in triage.items():
+        gw = gateway_for_project.get(project)
+        if gw is None:
+            continue
+        text = _describe_open_item_triage(project, items)
+        try:
+            gw.notify_all_allowlisted(text)
+            # Into the chat log too, so the chat model can discuss it when the operator replies.
+            gw.primary_session_mgr.record_turn(
+                project=project, speaker="assistant", turn_type="chat", content=text
+            )
+        except Exception:
+            logger.exception(f"[{project}] notifying about the open-item review failed")
     per_gateway: dict[int, tuple[TelegramGateway, PreferenceChanges]] = {}
     for project, changes in changed.items():
         gw = gateway_for_project.get(project)
