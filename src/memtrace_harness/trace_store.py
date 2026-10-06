@@ -1794,6 +1794,24 @@ class TraceStore:
             ).fetchall()
         return {row[0] for row in rows}
 
+    def list_recently_approved_stage_refs(
+        self, workspace_id: str, reason: str, *, within: timedelta
+    ) -> set[str]:
+        """stage_ref values already approved (so already run) within `within` — lets the
+        unattended scanner stop re-proposing a backlog item whose run ended in
+        needs_human/stop while the underlying issue stays open and unassigned."""
+        cutoff = (datetime.now(timezone.utc) - within).isoformat()
+        with self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT stage_ref FROM approval_requests
+                WHERE workspace = ? AND reason = ? AND status = 'approved'
+                  AND stage_ref IS NOT NULL AND responded_at >= ?
+                """,
+                (workspace_id, reason, cutoff),
+            ).fetchall()
+        return {row[0] for row in rows}
+
     def set_approval_telegram_message(
         self, request_id: str, *, chat_id: int, message_id: int
     ) -> None:

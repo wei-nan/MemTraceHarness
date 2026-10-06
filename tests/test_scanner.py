@@ -281,6 +281,63 @@ class ScannerTests(TestCase):
                 ).fetchone()[0]
             self.assertEqual(stage_ref, "mem_newer")
 
+    def test_run_scan_pass_skips_an_already_approved_task_and_offers_the_next_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_scanner.sqlite3"
+            trace_store = TraceStore(db_path)
+            config = self._scanner_config(db_path, tmp_path)
+            scope = ProjectScope(
+                name="proj_test",
+                workspace_id="ws_scan",
+                working_directory=tmp_path,
+                scope_file_path=tmp_path / "harness-scope.md",
+            )
+            ready_body = (
+                '{"checkpoint": "build", "current_stage": "dev", '
+                '"gate_state": {"latest_verdict": "PASS"}}'
+            )
+            mock_memtrace = MagicMock()
+            mock_memtrace.search_nodes.return_value = [
+                {
+                    "id": "mem_older",
+                    "title": "舊的任務",
+                    "tags": ["task", "status:open"],
+                    "body": ready_body,
+                    "created_at": "2026-09-01T00:00:00Z",
+                },
+                {
+                    "id": "mem_newer",
+                    "title": "新的任務",
+                    "tags": ["task", "status:open"],
+                    "body": ready_body,
+                    "created_at": "2026-09-02T00:00:00Z",
+                },
+            ]
+            approval_mgr = ApprovalManager(trace_store, {123})
+            scanner = UnattendedScanner(
+                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr
+            )
+
+            # Operator approves the first-proposed (oldest) task and the lock frees up.
+            res = scanner.run_scan_pass()
+            self.assertEqual(res.get("ws_scan"), "found_2_items")
+            with trace_store._connection() as conn:
+                first_id = conn.execute(
+                    "SELECT id FROM approval_requests WHERE workspace = 'ws_scan'"
+                ).fetchone()[0]
+            self.assertTrue(approval_mgr.trace_store.resolve_approval_request(first_id, "approved"))
+            trace_store.release_workspace_lock("ws_scan")
+
+            # Next scan pass must skip the already-run node and propose the next one.
+            res2 = scanner.run_scan_pass()
+            self.assertEqual(res2.get("ws_scan"), "found_1_items")
+            with trace_store._connection() as conn:
+                stage_ref = conn.execute(
+                    "SELECT stage_ref FROM approval_requests WHERE workspace = 'ws_scan' AND status = 'pending'"
+                ).fetchone()[0]
+            self.assertEqual(stage_ref, "mem_newer")
+
     def test_find_ready_github_issues_filters_assigned_and_sorts_oldest_first(self) -> None:
         # 2026-09-05: GitHub Issues replaced MemTrace Task Nodes as Beri's backlog
         # source. Readiness = open AND unassigned.
