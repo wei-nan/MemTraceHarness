@@ -30,6 +30,7 @@ from memtrace_harness.kb_gardening import (
     run_gardening_pass,
     workspaces_to_garden,
 )
+from memtrace_harness.kb_promotion import PROMOTION_TIMEOUT_SECONDS, run_promotion_pass
 from memtrace_harness.trigger_review import make_review_caller
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
@@ -613,6 +614,13 @@ def gateway_command(args: argparse.Namespace) -> int:
             name=f"kb-garden-{scope.name}",
             daemon=True,
         ).start()
+        gw.promote_now = lambda scope, chat_id, _gw=gw: threading.Thread(
+            target=run_knowledge_promotion,
+            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
+            kwargs={"only_project": scope.name, "chat_id": chat_id},
+            name=f"kb-promote-{scope.name}",
+            daemon=True,
+        ).start()
         gateways.append(gw)
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
@@ -966,6 +974,54 @@ def run_knowledge_gardening(
                 gw.notify_garden_outcome(outcome, chat_id)
             except Exception:
                 logger.exception(f"[{project}] reporting the tidying pass failed")
+    return ran
+
+
+def run_knowledge_promotion(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    projects: list,
+    gateway_for_project: dict[str, TelegramGateway],
+    *,
+    only_project: str | None = None,
+    chat_id: int | None = None,
+) -> int:
+    """Promote a project's cold-memory findings into its specification workspace as conclusion
+    notes and an overview (kb_promotion.py). Run on demand (/promote). Returns the passes run."""
+    if memtrace_client is None:
+        return 0
+    ran = 0
+    for scope in projects:
+        if only_project is not None and scope.name != only_project:
+            continue
+        try:
+            outcome = run_promotion_pass(
+                client=memtrace_client,
+                trace_store=trace_store,
+                project=scope.name,
+                spec_workspace_id=scope.workspace_id,
+                memory_workspace_id=config.memory_workspace_id_for(scope.name, scope.workspace_id),
+                purpose=scope.raw_markdown,
+                caller=make_review_caller(config, scope.name, timeout_seconds=PROMOTION_TIMEOUT_SECONDS),
+            )
+        except Exception:
+            logger.exception(f"[{scope.name}] promoting research conclusions failed")
+            gw = gateway_for_project.get(scope.name)
+            if gw is not None and chat_id is not None:
+                gw.send_message(chat_id, "📚 整理研究結論時發生錯誤，請看日誌。")
+            continue
+        gw = gateway_for_project.get(scope.name)
+        if outcome is None:
+            if gw is not None and chat_id is not None:
+                gw.send_message(chat_id, f"📚 [{scope.name}] 沒有可整理的來源（沒有獨立的冷記憶工作區、沒有每日摘要，或模型沒有給出可用的答案）。")
+            continue
+        ran += 1
+        if gw is not None:
+            try:
+                gw.notify_promotion_outcome(outcome, chat_id)
+            except Exception:
+                logger.exception(f"[{scope.name}] reporting the promotion pass failed")
     return ran
 
 

@@ -209,6 +209,28 @@ shown to the model but not acted on by the harness), undoing non-delete ops (ret
 links, pin), and moving content between workspaces. **Unverified against live models:** that the Controller
 model produces a useful map and sound ops from this prompt; nothing has been run against a live workspace.
 
+**Research conclusions promoted into the specification workspace (explicit operator decision, 2026-10-07).**
+Chats and operational runs never reach a stage where the Controller could record what they found, so
+results lived only in the cold-memory workspace's nightly digests (drafts). `/promote [project]` runs
+`kb_promotion.py`: the Controller reads the digests and the specification workspace's real nodes and proposes
+*conclusion notes* (what was tried, the result with its numbers, how far to trust it) and a *directions
+overview* (one row per strategy or approach with its status — 採用/研究中/淘汰/擱置/未定 — and the node holding its
+detail). **ENFORCED:** every note and every overview row needs verbatim quotes, and the harness checks each
+quote occurs in the digest it names (ignoring whitespace and markdown) — an item with none that checks out is
+dropped with its claim; every number of two digits or more in a note or row must occur in the digests it cites
+(so a recomputed or misremembered figure cannot become knowledge); the provenance section of each note and of
+the overview is written by the harness from the verified quotes; links go only to existing specification
+nodes; at most 8 notes and 15 directions per pass. Notes are written without draft labels (tags `harness`,
+`controller`, `conclusion`), keyed by title so a rerun updates them instead of duplicating; the overview is
+pinned, protected from tidying and given to the Controller and the working roles as context. The model may
+also name existing specification nodes it thinks are out of date; these are only reported to the operator,
+never changed. A pass reports what it wrote with a button that soft-deletes everything it created. Only
+the specification workspace is written; the cold-memory workspace is read. **Not implemented:** running it on
+a schedule (on demand only), reverting an edit to a note a pass wrote earlier, and checking that a note's
+*claims* follow from its quotes beyond the numbers. **Verified on live data (dry run, nothing written):** on
+TWTradingStrategy the Controller model produced 7 notes and 6 directions with every quote verified and all 62
+numbers present in the cited digests.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

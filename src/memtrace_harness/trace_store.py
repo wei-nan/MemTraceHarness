@@ -836,7 +836,28 @@ class TraceStore:
                     project TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'running',
-                    summary TEXT
+                    summary TEXT,
+                    kind TEXT NOT NULL DEFAULT 'garden'
+                );
+
+                -- Nodes the Controller keeps for a workspace besides its map (see kb_promotion.py):
+                -- one overview per (workspace, kind), and the conclusion notes it wrote from
+                -- earlier material, keyed by title so a rerun updates them instead of duplicating.
+                CREATE TABLE IF NOT EXISTS workspace_indexes (
+                    workspace_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, kind)
+                );
+                CREATE TABLE IF NOT EXISTS kb_promotions (
+                    workspace_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    body_hash TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, key)
                 );
                 CREATE TABLE IF NOT EXISTS kb_gardening_actions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1026,6 +1047,7 @@ class TraceStore:
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
             self._ensure_column(conn, "decision_records", "subject", "TEXT")
+            self._ensure_column(conn, "kb_gardening_runs", "kind", "TEXT NOT NULL DEFAULT 'garden'")
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
             self._ensure_column(conn, "model_responses", "stage", "TEXT")
             self._ensure_column(conn, "model_responses", "sequence", "INTEGER")
@@ -1752,11 +1774,74 @@ class TraceStore:
                 (workspace_id, node_id, body, utc_now_iso()),
             )
 
-    def start_gardening_run(self, workspace_id: str, project: str) -> int:
+    def get_workspace_index(self, workspace_id: str, kind: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT node_id, body, updated_at FROM workspace_indexes WHERE workspace_id = ? AND kind = ?",
+                (workspace_id, kind),
+            ).fetchone()
+        return {"node_id": row[0], "body": row[1], "updated_at": row[2]} if row else None
+
+    def list_workspace_indexes(self, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT kind, node_id, body, updated_at FROM workspace_indexes WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchall()
+        return [{"kind": r[0], "node_id": r[1], "body": r[2], "updated_at": r[3]} for r in rows]
+
+    def set_workspace_index(self, workspace_id: str, kind: str, node_id: str, body: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO workspace_indexes (workspace_id, kind, node_id, body, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, kind) DO UPDATE SET node_id = excluded.node_id, "
+                "body = excluded.body, updated_at = excluded.updated_at",
+                (workspace_id, kind, node_id, body, utc_now_iso()),
+            )
+
+    def get_promotion(self, workspace_id: str, key: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT node_id, body_hash FROM kb_promotions WHERE workspace_id = ? AND key = ?",
+                (workspace_id, key),
+            ).fetchone()
+        return {"node_id": row[0], "body_hash": row[1]} if row else None
+
+    def list_promotions(self, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT key, node_id, body_hash FROM kb_promotions WHERE workspace_id = ?", (workspace_id,)
+            ).fetchall()
+        return [{"key": r[0], "node_id": r[1], "body_hash": r[2]} for r in rows]
+
+    def set_promotion(self, workspace_id: str, key: str, node_id: str, body_hash: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO kb_promotions (workspace_id, key, node_id, body_hash, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, key) DO UPDATE SET node_id = excluded.node_id, "
+                "body_hash = excluded.body_hash, updated_at = excluded.updated_at",
+                (workspace_id, key, node_id, body_hash, utc_now_iso()),
+            )
+
+    def delete_workspace_index_for_node(self, workspace_id: str, node_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM workspace_indexes WHERE workspace_id = ? AND node_id = ?", (workspace_id, node_id)
+            )
+
+    def delete_promotions_for_nodes(self, workspace_id: str, node_ids: list[str]) -> None:
+        """Forget promotion records whose node was removed (an undo), so a rerun may recreate."""
+        with self._connection() as conn:
+            for node_id in node_ids:
+                conn.execute(
+                    "DELETE FROM kb_promotions WHERE workspace_id = ? AND node_id = ?", (workspace_id, node_id)
+                )
+
+    def start_gardening_run(self, workspace_id: str, project: str, kind: str = "garden") -> int:
         with self._connection() as conn:
             cur = conn.execute(
-                "INSERT INTO kb_gardening_runs (workspace_id, project, started_at) VALUES (?, ?, ?)",
-                (workspace_id, project, utc_now_iso()),
+                "INSERT INTO kb_gardening_runs (workspace_id, project, started_at, kind) VALUES (?, ?, ?, ?)",
+                (workspace_id, project, utc_now_iso(), kind),
             )
             return int(cur.lastrowid)
 
@@ -1771,7 +1856,8 @@ class TraceStore:
         """When this workspace was last tidied successfully (ISO), or None."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ? AND status = 'ok'",
+                "SELECT MAX(started_at) FROM kb_gardening_runs "
+                "WHERE workspace_id = ? AND status = 'ok' AND kind = 'garden'",
                 (workspace_id,),
             ).fetchone()
         return row[0] if row else None
@@ -1780,7 +1866,8 @@ class TraceStore:
         """When a pass over this workspace last started, whatever its outcome (ISO), or None."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ?", (workspace_id,)
+                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ? AND kind = 'garden'",
+                (workspace_id,),
             ).fetchone()
         return row[0] if row else None
 
