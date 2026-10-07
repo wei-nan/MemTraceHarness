@@ -443,12 +443,16 @@ def write_charter(
 # ---- one pass ---------------------------------------------------------------------------
 
 
-def garden_due(trace_store: TraceStore, workspace_id: str, now: datetime | None = None) -> bool:
+def garden_due(
+    trace_store: TraceStore, workspace_id: str, now: datetime | None = None, kind: str = "garden"
+) -> bool:
+    """Whether a pass of this kind (tidying, or promotion) is due on this workspace: a week since
+    the last success, and not within six hours of any attempt."""
     now = now or datetime.now(timezone.utc)
-    attempt = trace_store.last_gardening_attempt(workspace_id)
+    attempt = trace_store.last_gardening_attempt(workspace_id, kind)
     if attempt is not None and now - datetime.fromisoformat(attempt) < RETRY_AFTER_FAILURE:
         return False
-    last = trace_store.last_gardening_success(workspace_id)
+    last = trace_store.last_gardening_success(workspace_id, kind)
     return last is None or now - datetime.fromisoformat(last) >= GARDEN_INTERVAL
 
 

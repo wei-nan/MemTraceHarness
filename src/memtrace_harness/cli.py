@@ -617,7 +617,7 @@ def gateway_command(args: argparse.Namespace) -> int:
         gw.promote_now = lambda scope, chat_id, _gw=gw: threading.Thread(
             target=run_knowledge_promotion,
             args=(config, trace_store, memtrace_client, projects, gateway_for_project),
-            kwargs={"only_project": scope.name, "chat_id": chat_id},
+            kwargs={"only_project": scope.name, "chat_id": chat_id, "force": True},
             name=f"kb-promote-{scope.name}",
             daemon=True,
         ).start()
@@ -986,14 +986,20 @@ def run_knowledge_promotion(
     *,
     only_project: str | None = None,
     chat_id: int | None = None,
+    force: bool = False,
 ) -> int:
     """Promote a project's cold-memory findings into its specification workspace as conclusion
-    notes and an overview (kb_promotion.py). Run on demand (/promote). Returns the passes run."""
+    notes and an overview (kb_promotion.py). On demand (/promote, force=True: always runs and
+    always reports) or from the nightly window (due weekly, and only when the digests have
+    changed since the last pass; the operator is told only if something was written or flagged).
+    Returns the passes run."""
     if memtrace_client is None:
         return 0
     ran = 0
     for scope in projects:
         if only_project is not None and scope.name != only_project:
+            continue
+        if not force and not garden_due(trace_store, scope.workspace_id, kind="promote"):
             continue
         try:
             outcome = run_promotion_pass(
@@ -1004,6 +1010,7 @@ def run_knowledge_promotion(
                 memory_workspace_id=config.memory_workspace_id_for(scope.name, scope.workspace_id),
                 purpose=scope.raw_markdown,
                 caller=make_review_caller(config, scope.name, timeout_seconds=PROMOTION_TIMEOUT_SECONDS),
+                only_if_new=not force,
             )
         except Exception:
             logger.exception(f"[{scope.name}] promoting research conclusions failed")
@@ -1017,7 +1024,8 @@ def run_knowledge_promotion(
                 gw.send_message(chat_id, f"📚 [{scope.name}] 沒有可整理的來源（沒有獨立的冷記憶工作區、沒有每日摘要，或模型沒有給出可用的答案）。")
             continue
         ran += 1
-        if gw is not None:
+        wrote = bool(outcome.created or outcome.updated or outcome.index or outcome.stale or outcome.dropped)
+        if gw is not None and (force or wrote):
             try:
                 gw.notify_promotion_outcome(outcome, chat_id)
             except Exception:
@@ -1220,6 +1228,7 @@ def _serve_gateway_loop(
     last_digest_check = 0.0
     digest_thread: threading.Thread | None = None
     garden_thread: threading.Thread | None = None
+    promote_thread: threading.Thread | None = None
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
@@ -1354,6 +1363,21 @@ def _serve_gateway_loop(
                     daemon=True,
                 )
                 garden_thread.start()
+            # Promoting findings into the specification workspace reads the digests, so it waits
+            # for tonight's digest pass to finish. Due weekly per project, and only if the
+            # digests changed (cli.run_knowledge_promotion).
+            if (
+                (promote_thread is None or not promote_thread.is_alive())
+                and (digest_thread is None or not digest_thread.is_alive())
+                and in_digest_window(datetime.now(schedule_tz))
+            ):
+                promote_thread = threading.Thread(
+                    target=run_knowledge_promotion,
+                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
+                    name="kb-promote",
+                    daemon=True,
+                )
+                promote_thread.start()
             last_digest_check = now
 
     # One shutdown budget for both: let each bot finish the message it is handling (an

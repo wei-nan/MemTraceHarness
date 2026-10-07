@@ -1852,22 +1852,24 @@ class TraceStore:
                 (status, json.dumps(summary, ensure_ascii=False) if summary else None, run_id),
             )
 
-    def last_gardening_success(self, workspace_id: str) -> str | None:
-        """When this workspace was last tidied successfully (ISO), or None."""
+    def last_gardening_success(self, workspace_id: str, kind: str = "garden") -> str | None:
+        """When a pass of this kind (tidying, promotion) over this workspace last succeeded
+        (ISO), or None."""
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT MAX(started_at) FROM kb_gardening_runs "
-                "WHERE workspace_id = ? AND status = 'ok' AND kind = 'garden'",
-                (workspace_id,),
+                "WHERE workspace_id = ? AND status = 'ok' AND kind = ?",
+                (workspace_id, kind),
             ).fetchone()
         return row[0] if row else None
 
-    def last_gardening_attempt(self, workspace_id: str) -> str | None:
-        """When a pass over this workspace last started, whatever its outcome (ISO), or None."""
+    def last_gardening_attempt(self, workspace_id: str, kind: str = "garden") -> str | None:
+        """When a pass of this kind over this workspace last started, whatever its outcome (ISO),
+        or None."""
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ? AND kind = 'garden'",
-                (workspace_id,),
+                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ? AND kind = ?",
+                (workspace_id, kind),
             ).fetchone()
         return row[0] if row else None
 

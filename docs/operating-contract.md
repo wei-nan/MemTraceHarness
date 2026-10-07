@@ -224,9 +224,13 @@ nodes; at most 8 notes and 15 directions per pass. Notes are written without dra
 `controller`, `conclusion`), keyed by title so a rerun updates them instead of duplicating; the overview is
 pinned, protected from tidying and given to the Controller and the working roles as context. The model may
 also name existing specification nodes it thinks are out of date; these are only reported to the operator,
-never changed. A pass reports what it wrote with a button that soft-deletes everything it created. Only
-the specification workspace is written; the cold-memory workspace is read. **Not implemented:** running it on
-a schedule (on demand only), reverting an edit to a note a pass wrote earlier, and checking that a note's
+never changed. A pass reports what it wrote with a button that soft-deletes everything it created. The pass also runs by itself: in the
+nightly window, after the digest pass has finished, per project at most weekly and only when a digest changed
+since the last successful pass (no model call otherwise); every real pass leaves a record, so a failure or a
+skip is not retried for six hours, and the operator is told only if something was written, flagged or
+dropped (`/promote` always runs and always reports). Only the specification workspace is written; the
+cold-memory workspace is read. **Not implemented:** running it on
+reverting an edit to a note a pass wrote earlier, and checking that a note's
 *claims* follow from its quotes beyond the numbers. **Verified on live data (dry run, nothing written):** on
 TWTradingStrategy the Controller model produced 7 notes and 6 directions with every quote verified and all 62
 numbers present in the cited digests.
