@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
@@ -312,7 +313,16 @@ class TelegramGateway:
             logger.error(f"Telegram editMessageReplyMarkup failed: {exc}")
 
     @staticmethod
-    def _approval_keyboard(request_id: str, reason: str) -> list[list[dict[str, str]]]:
+    def _approval_keyboard(
+        request_id: str, reason: str, decision_card: dict | None = None
+    ) -> list[list[dict[str, str]]]:
+        if reason in INFO_NEEDED_REASONS and decision_card:
+            # One button per option (a tap resumes with that option as the answer), then
+            # the same way out as the question-only keyboard below.
+            return [
+                *pick_keyboard_rows(request_id, decision_card),
+                [{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}],
+            ]
         if reason in INFO_NEEDED_REASONS:
             # No "approve" button here — see INFO_NEEDED_REASONS: a bare approve
             # would just resume with the same unchanged goal that produced this
@@ -347,7 +357,9 @@ class TelegramGateway:
         here is a single operator/single chat, so this isn't built out further."""
         for cid in self.allowed_chat_ids:
             message_id = self.send_message_with_keyboard(
-                cid, req.format_telegram_message(), self._approval_keyboard(req.id, req.reason)
+                cid,
+                req.format_telegram_message(),
+                self._approval_keyboard(req.id, req.reason, req.decision_card),
             )
             if message_id is not None:
                 self.approval_manager.record_telegram_message(
@@ -599,6 +611,12 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id)
             return None
+        pick = parse_pick_callback(data)
+        if pick is not None:
+            result = self._resolve_card_pick(pick[0], pick[1], chat_id)
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         action, _, request_id = data.partition(":")
         if not action or not request_id:
             if callback_id:
@@ -615,6 +633,17 @@ class TelegramGateway:
         if callback_id:
             self.answer_callback_query(callback_id, text=result[:200])
         return result
+
+    def _resolve_card_pick(self, request_id: str, index: int, chat_id: int) -> str:
+        """A tap on one option of a decision card: resume the stopped task with that option
+        as the operator's answer, exactly as if they had typed it to /clarify."""
+        req = self.approval_manager.get_request(request_id)
+        if req is None or not req.decision_card:
+            return f"找不到請求 {request_id} 的選項"
+        answer = answer_for_choice(req.decision_card, index)
+        if answer is None:
+            return "無法辨識的選項"
+        return self._resolve_approval_action(request_id, "clarify", chat_id, answer)
 
     # ---- orders the model proposed (see taiwantrade_mcp.py): shown here, sent only on a tap
 

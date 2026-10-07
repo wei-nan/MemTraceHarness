@@ -3,14 +3,90 @@
   "properties": {
     "action": {
       "type": "string",
-      "enum": ["run_planner", "run_operational_action", "ask_human", "stop", "finish", "merge"]
+      "enum": [
+        "run_planner",
+        "run_operational_action",
+        "ask_human",
+        "stop",
+        "finish",
+        "merge"
+      ]
     },
-    "reason": {"type": "string", "maxLength": 1000},
+    "reason": {
+      "type": "string",
+      "maxLength": 1000
+    },
     "searched_history": {
       "type": "boolean",
       "description": "True if you called a MemTrace search/lookup tool during this decision, false if you decided it wasn't needed. Must be honest either way — say so in `reason` too."
+    },
+    "decision_card": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "How to ask the human to decide; null when not stopping for a human.",
+      "properties": {
+        "situation": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "action": {
+                "type": "string",
+                "maxLength": 400
+              },
+              "tradeoff": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "required": [
+              "label",
+              "action",
+              "tradeoff"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "default_if_silent": {
+          "type": "string",
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "situation",
+        "options",
+        "recommended",
+        "reason",
+        "default_if_silent"
+      ],
+      "additionalProperties": false
     }
   },
-  "required": ["action", "reason", "searched_history"],
+  "required": [
+    "action",
+    "reason",
+    "searched_history",
+    "decision_card"
+  ],
   "additionalProperties": false
 }

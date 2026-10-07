@@ -1,24 +1,111 @@
 {
   "type": "object",
   "properties": {
-    "status": {"type": "string", "enum": ["completed", "needs_human", "failed"]},
-    "summary": {"type": "string", "maxLength": 6000},
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "needs_human",
+        "failed"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 6000
+    },
     "changed_files": {
       "type": "array",
       "maxItems": 200,
-      "items": {"type": "string", "maxLength": 1000}
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
     },
     "tests": {
       "type": "array",
       "maxItems": 200,
-      "items": {"type": "string", "maxLength": 2000}
+      "items": {
+        "type": "string",
+        "maxLength": 2000
+      }
     },
     "gaps": {
       "type": "array",
       "maxItems": 50,
-      "items": {"type": "string", "maxLength": 2000}
+      "items": {
+        "type": "string",
+        "maxLength": 2000
+      }
+    },
+    "decision_card": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "How to ask the human to decide; null when not stopping for a human.",
+      "properties": {
+        "situation": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "action": {
+                "type": "string",
+                "maxLength": 400
+              },
+              "tradeoff": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "required": [
+              "label",
+              "action",
+              "tradeoff"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "default_if_silent": {
+          "type": "string",
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "situation",
+        "options",
+        "recommended",
+        "reason",
+        "default_if_silent"
+      ],
+      "additionalProperties": false
     }
   },
-  "required": ["status", "summary", "changed_files", "tests", "gaps"],
+  "required": [
+    "status",
+    "summary",
+    "changed_files",
+    "tests",
+    "gaps",
+    "decision_card"
+  ],
   "additionalProperties": false
 }

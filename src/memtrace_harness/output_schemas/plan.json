@@ -1,22 +1,101 @@
 {
   "type": "object",
   "properties": {
-    "status": {"type": "string", "enum": ["ready", "needs_human"]},
-    "plan": {"type": "string", "maxLength": 12000},
+    "status": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "needs_human"
+      ]
+    },
+    "plan": {
+      "type": "string",
+      "maxLength": 12000
+    },
     "acceptance_criteria": {
       "type": "array",
       "maxItems": 50,
-      "items": {"type": "string", "maxLength": 1000}
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
     },
     "open_questions": {
       "type": "array",
       "maxItems": 20,
-      "items": {"type": "string", "maxLength": 1000}
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
     },
     "scope_exclusions": {
       "type": "array",
       "maxItems": 30,
-      "items": {"type": "string", "maxLength": 1000}
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
+    },
+    "decision_card": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "How to ask the human to decide; null when not stopping for a human.",
+      "properties": {
+        "situation": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "action": {
+                "type": "string",
+                "maxLength": 400
+              },
+              "tradeoff": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "required": [
+              "label",
+              "action",
+              "tradeoff"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "default_if_silent": {
+          "type": "string",
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "situation",
+        "options",
+        "recommended",
+        "reason",
+        "default_if_silent"
+      ],
+      "additionalProperties": false
     }
   },
   "required": [
@@ -24,7 +103,8 @@
     "plan",
     "acceptance_criteria",
     "open_questions",
-    "scope_exclusions"
+    "scope_exclusions",
+    "decision_card"
   ],
   "additionalProperties": false
 }

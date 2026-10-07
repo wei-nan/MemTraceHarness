@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from memtrace_harness.decision_card import render_card
+
 if TYPE_CHECKING:
     from memtrace_harness.trace_store import TraceStore
 
@@ -53,6 +55,7 @@ class ApprovalRequestData:
     resume_goal: str | None = None
     telegram_chat_id: int | None = None
     telegram_message_id: int | None = None
+    decision_card: dict | None = None
 
     def format_telegram_message(self) -> str:
         # No /approve or /reject lines: those are now inline-keyboard buttons attached
@@ -62,6 +65,16 @@ class ApprovalRequestData:
         # resumes the loop only if the reply is an answer — a question to the model, or a reply
         # it is unsure about, leaves the task paused. The /approve, /reject, /clarify commands
         # and the buttons always work.
+        if self.reason in INFO_NEEDED_REASONS and self.decision_card:
+            # The stopped stage wrote its own question (see decision_card.py): show that
+            # instead of the raw artifact dump, with a tappable button per option.
+            return (
+                f"❓ 需要你決定 [{self.id}]\n"
+                f"工作區：{self.workspace}\n\n"
+                f"{render_card(self.decision_card)}\n\n"
+                f"👉 點下面的選項；想換個做法就滑動回覆（swipe-reply）這則訊息、直接寫下你的想法——"
+                f"我會判斷是回答還是提問，只有回答才會帶著它繼續執行。想放棄這個任務按「放棄」。"
+            )
         if self.reason in INFO_NEEDED_REASONS:
             # See INFO_NEEDED_REASONS: leads with "answer, don't tap a button" — a
             # bare approve here would just resume with this same unchanged goal.
@@ -132,6 +145,7 @@ class ApprovalManager:
         proposed_action: str,
         stage_ref: str | None = None,
         resume_goal: str | None = None,
+        decision_card: dict | None = None,
     ) -> ApprovalRequestData:
         if reason not in VALID_REASONS:
             raise ValueError(f"Invalid approval reason: {reason}")
@@ -155,22 +169,28 @@ class ApprovalManager:
             proposed_action=proposed_action,
             stage_ref=stage_ref,
             resume_goal=resume_goal,
+            decision_card=decision_card,
         )
         data = self.trace_store.get_approval_request(req_id)
         assert data is not None
-        return ApprovalRequestData(**data)
+        return self._with_card(data)
+
+    def _with_card(self, data: dict) -> ApprovalRequestData:
+        return ApprovalRequestData(
+            **data, decision_card=self.trace_store.get_approval_decision_card(data["id"])
+        )
 
     def get_request(self, request_id: str) -> ApprovalRequestData | None:
         data = self.trace_store.get_approval_request(request_id)
         if not data:
             return None
-        return ApprovalRequestData(**data)
+        return self._with_card(data)
 
     def get_pending_for_conversation(self, conversation_id: str) -> ApprovalRequestData | None:
         data = self.trace_store.get_pending_approval_request(conversation_id)
         if not data:
             return None
-        return ApprovalRequestData(**data)
+        return self._with_card(data)
 
     def record_telegram_message(self, request_id: str, *, chat_id: int, message_id: int) -> None:
         self.trace_store.set_approval_telegram_message(
@@ -183,7 +203,7 @@ class ApprovalManager:
         data = self.trace_store.get_approval_request_by_message_id(chat_id, message_id)
         if not data:
             return None
-        return ApprovalRequestData(**data)
+        return self._with_card(data)
 
     def respond(
         self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None = None

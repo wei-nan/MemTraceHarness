@@ -1019,6 +1019,58 @@ class AgentLoopRunnerTests(TestCase):
 
         self.assertEqual(requested, ["config_change_required"])
 
+    def _needs_human_plan(self, **extra) -> dict:
+        return {
+            "status": "needs_human",
+            "plan": "blocked on a product decision",
+            "acceptance_criteria": [],
+            "open_questions": ["migrate old rows?"],
+            "scope_exclusions": [],
+            **extra,
+        }
+
+    def _run_stopped_planner(self, plan: dict) -> list[dict]:
+        adapters = self._adapters()
+        adapters["planner"] = QueueAdapter("planner", "claude", "sonnet", [plan])
+        requests: list[dict] = []
+
+        class FakeApprovals:
+            def request_approval(self, **kwargs):
+                requests.append(kwargs)
+
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+            approval_manager=FakeApprovals(),
+        ).run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        return requests
+
+    def test_stopped_stage_decision_card_reaches_the_approval_request(self) -> None:
+        card = {
+            "situation": "舊資料要不要遷移沒有說明。",
+            "options": [
+                {"label": "不遷移", "action": "只對新資料生效", "tradeoff": "舊資料格式不同"},
+                {"label": "遷移", "action": "寫遷移腳本", "tradeoff": "需要備份"},
+            ],
+            "recommended": 0,
+            "reason": "沒有讀取端依賴。",
+            "default_if_silent": "維持暫停。",
+        }
+        requests = self._run_stopped_planner(self._needs_human_plan(decision_card=card))
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["decision_card"], card)
+        self.assertIn("migrate old rows?", requests[0]["proposed_action"])
+
+    def test_stop_without_a_usable_card_falls_back_to_the_old_request(self) -> None:
+        for extra in ({}, {"decision_card": None}, {"decision_card": {"situation": "只有一半"}}):
+            with self.subTest(extra=extra):
+                requests = self._run_stopped_planner(self._needs_human_plan(**extra))
+                self.assertEqual(len(requests), 1)
+                self.assertIsNone(requests[0]["decision_card"])
+
     def test_unlaunchable_cli_falls_back_and_alerts_operator(self) -> None:
         adapters = self._adapters()
         adapters["controller"] = QueueAdapter(
