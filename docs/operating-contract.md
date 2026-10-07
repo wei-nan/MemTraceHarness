@@ -43,9 +43,9 @@ override, not a gate. ENFORCED in code: every change cites the human's own turns
 against the log; at most 5 rules are adopted per project-day (the rest wait for the operator);
 only the newest 40 are put in front of the chat model; nothing is deleted, so a retired rule stays
 on record and can be restored. This does not extend to Agent Loop gates or Improvement Loop
-proposals, which the Harness still cannot approve for itself. **PLANNED, not implemented:** the same
-autonomy for durable knowledge nodes (a "key-point" layer above the digests); until it ships,
-knowledge the Harness writes to MemTrace stays draft-labelled.
+proposals, which the Harness still cannot approve for itself. **PLANNED, not implemented:** a
+"key-point" layer above the digests. Conversation archives, nightly digests and loop drafts are still
+written draft-labelled; what the Controller writes is not (next paragraph).
 
 **Topic recall (explicit operator decision, 2026-10-03).** Behind chat, a slower background
 model (`HARNESS_RECALL_*`, default: the digest chain) judges each human message's topic
@@ -165,6 +165,25 @@ chat-command path like the digest and recall, so its raw output is not kept in t
 quota-bucket/fallback bookkeeping. **Unverified against live models:** that the prompts produce admissible
 verdicts and that the thresholds (3 reports to pause, 12 silent results, 3 deferrals, 7 days) suit real
 schedules; covered by unit tests with injected output only.
+
+**Controller maintains the knowledge base; the operator accepts completions (explicit operator decision,
+2026-10-07).** The converge-stage Controller may propose `kb_updates` (`completion_claims.py`); no role calls
+a MemTrace write tool itself. The harness validates and applies them: a `claim_done` for a node id taken
+from the run's context, and `note` nodes with links, written *without* the draft/human-gate labels (tags
+`harness`, `controller`) — whether a workspace accepts the write is that workspace's own setting, and a
+refusal is reported, not worked around. A claim never edits the original node's body (task nodes carry
+machine-read JSON): it creates a separate completion-claim node linked `extends` to the original and moves
+the original from `status:open` to `status:claimed-done`, rewriting tags only when the node's current tags
+could be read. Every governed run that reaches converge with `finish`/`merge` files a `completion_claims`
+row and is reported with 驗收通過/還沒完成 buttons; nothing is accepted by silence and a claim has no
+deadline. Accepting sets the node to `status:done` and `resolved`; sending it back reopens it, and the
+rejection is kept as a `task_claim` decision which the Controller's precedent lists with a warning ("宣告
+完成，被你退回") so it can calibrate what it declares finished. Operational and schedule runs never reach
+converge and carry no claim. **Not implemented:** promoting repeated rejections into a standing lesson,
+usage statistics for which precedents the Controller relied on (card `basis` is recorded only on the card),
+and Controller-maintained knowledge for tasks that have no node. **Unverified against live models:** that
+a Controller fills `kb_updates` sensibly, and that MemTrace accepts the `tags`/`resolution_status` update
+the harness sends (the read side — `get_node` returning `tags` — was confirmed on a live node).
 
 **POLICY_ONLY**:
 

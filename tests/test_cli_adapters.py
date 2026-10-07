@@ -176,9 +176,9 @@ class CliAdapterTests(TestCase):
         self.assertNotIn("mcp__memtrace__update_node", allowed)
         self.assertNotIn("mcp__memtrace__create_node", allowed)
 
-    def test_claude_controller_role_also_allowlists_memtrace_write_tools(self) -> None:
-        # Only Controller (converge stage) may update/create MemTrace nodes — see
-        # controller_task()'s write_permission note.
+    def test_claude_controller_role_proposes_kb_updates_instead_of_calling_write_tools(self) -> None:
+        # The Controller maintains the knowledge base, but through `kb_updates` that the harness
+        # validates and applies (completion_claims.py) — no role calls a write tool itself.
         adapter = self._adapter(
             ClaudeCliAdapter,
             StaticProcessRunner(process_result("")),
@@ -187,8 +187,9 @@ class CliAdapterTests(TestCase):
         )
         command = adapter.build_command("prompt")
         allowed = command[command.index("--allowedTools") + 1]
-        self.assertIn("mcp__memtrace__update_node", allowed)
-        self.assertIn("mcp__memtrace__create_node", allowed)
+        self.assertIn("mcp__memtrace__search_nodes", allowed)
+        self.assertNotIn("mcp__memtrace__update_node", allowed)
+        self.assertNotIn("mcp__memtrace__create_node", allowed)
 
     def test_codex_usage_limit_error_is_surfaced_for_failure_classification(self) -> None:
         stdout = "\n".join(

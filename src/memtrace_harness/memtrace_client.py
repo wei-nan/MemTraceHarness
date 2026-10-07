@@ -191,6 +191,8 @@ class MemTraceClient:
         node_id: str,
         body: str | None = None,
         title: str | None = None,
+        tags: list[str] | None = None,
+        resolution_status: str | None = None,
         run_id: str | None = None,
         task_id: str | None = None,
         stage: str | None = None,
@@ -200,6 +202,10 @@ class MemTraceClient:
             arguments["body"] = body
         if title is not None:
             arguments["title"] = title
+        if tags is not None:
+            arguments["tags"] = tags
+        if resolution_status is not None:
+            arguments["resolution_status"] = resolution_status
         self.call_tool("update_node", arguments, run_id=run_id, task_id=task_id, stage=stage)
 
     def create_edge(

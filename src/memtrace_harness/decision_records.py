@@ -119,6 +119,8 @@ _OUTCOME_TEXT = {
     "approved": "核准",
     "rejected": "拒絕",
     "abandoned": "放棄這個任務",
+    "claim_accepted": "驗收通過",
+    "claim_rejected": "驗收未通過",
 }
 
 
@@ -149,7 +151,9 @@ def _line(record: dict[str, Any]) -> str:
     choice = record["chosen_text"] or _OUTCOME_TEXT.get(outcome, outcome)
     line = f"- D{record['id']} · {day} · {record['kind']} · {_clip(record['situation'], _SITUATION_CHARS)}"
     line += f" → {_clip(choice, _CHOICE_CHARS)}"
-    if record["followed"] is False and outcome != "rejected":
+    if outcome == "claim_rejected":
+        line += " ⚠ Controller 宣告完成，被你退回"
+    elif record["followed"] is False and outcome != "rejected":
         options, rec = record["options"], record["recommended"]
         label = _recommended_label(options, rec)
         line += f" ⚠ 不同於建議{f'（{label}）' if label else ''}"

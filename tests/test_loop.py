@@ -257,15 +257,16 @@ class ControllerTaskContextTests(TestCase):
         self.assertIn("searched_history", goal_text)
         self.assertIn("no git command", goal_text)
 
-    def test_only_converge_stage_offers_update_node_permission(self) -> None:
+    def test_only_converge_stage_may_propose_kb_updates_and_none_calls_a_write_tool(self) -> None:
         task = TaskEnvelope(
             task_id="task_1", workspace_id="ws_test", goal="do the thing"
         )
         start_goal = controller_task(task, stage="start", stages=[]).goal
         converge_goal = controller_task(task, stage="converge", stages=[]).goal
-        self.assertNotIn("update_node", start_goal)
-        self.assertIn("update_node", converge_goal)
-        self.assertIn("create_node", converge_goal)
+        self.assertIn("kb_updates must be null", start_goal)
+        self.assertIn("claim_done", converge_goal)
+        self.assertIn("You do not call any write tool", converge_goal)
+        self.assertNotIn("claim_done", start_goal)
 
     def test_start_stage_explains_run_operational_action_choice(self) -> None:
         task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
