@@ -193,6 +193,7 @@ class MemTraceClient:
         title: str | None = None,
         tags: list[str] | None = None,
         resolution_status: str | None = None,
+        pinned: bool | None = None,
         run_id: str | None = None,
         task_id: str | None = None,
         stage: str | None = None,
@@ -206,7 +207,35 @@ class MemTraceClient:
             arguments["tags"] = tags
         if resolution_status is not None:
             arguments["resolution_status"] = resolution_status
+        if pinned is not None:
+            arguments["pinned"] = pinned
         self.call_tool("update_node", arguments, run_id=run_id, task_id=task_id, stage=stage)
+
+    def delete_node(
+        self,
+        *,
+        workspace_id: str,
+        node_id: str,
+        reason_category: str = "other",
+        reason_note: str | None = None,
+        run_id: str | None = None,
+        stage: str | None = None,
+    ) -> None:
+        """Move a node to MemTrace's trash: hidden from search and listing but restorable for
+        30 days with restore_node(); not a hard delete."""
+        arguments: dict[str, Any] = {
+            "workspace_id": workspace_id, "node_id": node_id, "reason_category": reason_category,
+        }
+        if reason_note:
+            arguments["reason_note"] = reason_note
+        self.call_tool("delete_node", arguments, run_id=run_id, stage=stage)
+
+    def restore_node(
+        self, *, workspace_id: str, node_id: str, run_id: str | None = None, stage: str | None = None
+    ) -> None:
+        self.call_tool(
+            "restore_node", {"workspace_id": workspace_id, "node_id": node_id}, run_id=run_id, stage=stage
+        )
 
     def create_edge(
         self,

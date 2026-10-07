@@ -818,6 +818,35 @@ class TraceStore:
                     resolved_at TEXT
                 );
 
+                -- The Controller's own map of each knowledge-base workspace (see kb_gardening.py): the
+                -- node it keeps pinned there and a local copy of its text, so a run can read the map
+                -- without a MemTrace round trip.
+                CREATE TABLE IF NOT EXISTS workspace_charters (
+                    workspace_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                -- One row per tidying pass over a workspace, and one per node it changed so that a
+                -- deletion can be undone even after MemTrace's own 30-day trash window.
+                CREATE TABLE IF NOT EXISTS kb_gardening_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    summary TEXT
+                );
+                CREATE TABLE IF NOT EXISTS kb_gardening_actions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    op TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    snapshot TEXT,
+                    undone INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS workspace_locks (
                     conversation_id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL,
@@ -1703,6 +1732,100 @@ class TraceStore:
                 ),
             )
         return request_id
+
+    def get_workspace_charter(self, workspace_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT workspace_id, node_id, body, updated_at FROM workspace_charters WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+        return (
+            {"workspace_id": row[0], "node_id": row[1], "body": row[2], "updated_at": row[3]} if row else None
+        )
+
+    def set_workspace_charter(self, workspace_id: str, node_id: str, body: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO workspace_charters (workspace_id, node_id, body, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id) DO UPDATE SET node_id = excluded.node_id, body = excluded.body, "
+                "updated_at = excluded.updated_at",
+                (workspace_id, node_id, body, utc_now_iso()),
+            )
+
+    def start_gardening_run(self, workspace_id: str, project: str) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO kb_gardening_runs (workspace_id, project, started_at) VALUES (?, ?, ?)",
+                (workspace_id, project, utc_now_iso()),
+            )
+            return int(cur.lastrowid)
+
+    def finish_gardening_run(self, run_id: int, status: str, summary: dict | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE kb_gardening_runs SET status = ?, summary = ? WHERE id = ?",
+                (status, json.dumps(summary, ensure_ascii=False) if summary else None, run_id),
+            )
+
+    def last_gardening_success(self, workspace_id: str) -> str | None:
+        """When this workspace was last tidied successfully (ISO), or None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ? AND status = 'ok'",
+                (workspace_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def last_gardening_attempt(self, workspace_id: str) -> str | None:
+        """When a pass over this workspace last started, whatever its outcome (ISO), or None."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(started_at) FROM kb_gardening_runs WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def get_gardening_run(self, run_id: int) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id, workspace_id, project, started_at, status, summary FROM kb_gardening_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "workspace_id": row[1], "project": row[2], "started_at": row[3],
+            "status": row[4], "summary": json.loads(row[5]) if row[5] else None,
+        }
+
+    def add_gardening_action(
+        self, run_id: int, *, op: str, node_id: str, snapshot: dict | None = None
+    ) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO kb_gardening_actions (run_id, op, node_id, snapshot) VALUES (?, ?, ?, ?)",
+                (run_id, op, node_id, json.dumps(snapshot, ensure_ascii=False) if snapshot else None),
+            )
+            return int(cur.lastrowid)
+
+    def list_gardening_actions(self, run_id: int, *, op: str | None = None) -> list[dict]:
+        query = "SELECT id, run_id, op, node_id, snapshot, undone FROM kb_gardening_actions WHERE run_id = ?"
+        params: list = [run_id]
+        if op is not None:
+            query += " AND op = ?"
+            params.append(op)
+        with self._connection() as conn:
+            rows = conn.execute(query + " ORDER BY id", params).fetchall()
+        return [
+            {
+                "id": r[0], "run_id": r[1], "op": r[2], "node_id": r[3],
+                "snapshot": json.loads(r[4]) if r[4] else None, "undone": bool(r[5]),
+            }
+            for r in rows
+        ]
+
+    def mark_gardening_action_undone(self, action_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE kb_gardening_actions SET undone = 1 WHERE id = ?", (action_id,))
 
     def create_completion_claim(
         self,
