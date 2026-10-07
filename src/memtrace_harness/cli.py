@@ -24,6 +24,7 @@ from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.topic_recall import TopicRecallService
+from memtrace_harness.trigger_review import make_review_caller
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.loop import AgentLoopRunner
@@ -598,6 +599,7 @@ def gateway_command(args: argparse.Namespace) -> int:
                 project=project, speaker="assistant", turn_type="chat", content=text
             ),
         )
+        gw.review_caller_factory = lambda project: make_review_caller(config, project)
         gateways.append(gw)
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
@@ -612,6 +614,7 @@ def gateway_command(args: argparse.Namespace) -> int:
         record_push=lambda project, text, _mgr=primary_session_mgr: _mgr.record_turn(
             project=project, speaker="assistant", turn_type="chat", content=text
         ),
+        review_caller_factory=lambda project: make_review_caller(config, project),
     )
 
     if args.serve:

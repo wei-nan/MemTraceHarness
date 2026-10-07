@@ -795,7 +795,8 @@ class TraceStore:
                     chosen_index INTEGER,
                     chosen_text TEXT,
                     followed INTEGER,
-                    reason TEXT
+                    reason TEXT,
+                    subject TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_decision_records_project
                     ON decision_records(project, id);
@@ -978,6 +979,7 @@ class TraceStore:
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
+            self._ensure_column(conn, "decision_records", "subject", "TEXT")
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
             self._ensure_column(conn, "model_responses", "stage", "TEXT")
             self._ensure_column(conn, "model_responses", "sequence", "INTEGER")
@@ -1700,14 +1702,15 @@ class TraceStore:
         chosen_text: str | None = None,
         followed: bool | None = None,
         reason: str | None = None,
+        subject: str | None = None,
     ) -> int:
         with self._connection() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO decision_records (
                     created_at, project, approval_id, conversation_id, kind, situation, options,
-                    recommended, outcome, chosen_index, chosen_text, followed, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    recommended, outcome, chosen_index, chosen_text, followed, reason, subject
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now_iso(),
@@ -1723,9 +1726,34 @@ class TraceStore:
                     chosen_text,
                     None if followed is None else int(followed),
                     reason,
+                    subject,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def count_decision_records(
+        self, project: str, *, kind: str, subject: str, outcome: str | None = None
+    ) -> int:
+        query = "SELECT COUNT(*) FROM decision_records WHERE project = ? AND kind = ? AND subject = ?"
+        params: list = [project, kind, subject]
+        if outcome is not None:
+            query += " AND outcome = ?"
+            params.append(outcome)
+        with self._connection() as conn:
+            return int(conn.execute(query, params).fetchone()[0])
+
+    def subjects_with_outcome(
+        self, project: str, *, kind: str, outcome: str, since_iso: str
+    ) -> set[str]:
+        """Subjects (a candidate id, a schedule id) that have a record of this kind and outcome
+        newer than `since_iso`."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT subject FROM decision_records WHERE project = ? AND kind = ? "
+                "AND outcome = ? AND created_at >= ? AND subject IS NOT NULL",
+                (project, kind, outcome, since_iso),
+            ).fetchall()
+        return {r[0] for r in rows}
 
     def list_decision_records(
         self, project: str, *, kind: str | None = None, limit: int = 50
@@ -1733,7 +1761,7 @@ class TraceStore:
         """Newest first. `followed` comes back as True/False/None."""
         query = (
             "SELECT id, created_at, project, approval_id, conversation_id, kind, situation, "
-            "options, recommended, outcome, chosen_index, chosen_text, followed, reason "
+            "options, recommended, outcome, chosen_index, chosen_text, followed, reason, subject "
             "FROM decision_records WHERE project = ?"
         )
         params: list = [project]
@@ -1766,6 +1794,7 @@ class TraceStore:
                     "chosen_text": row[11],
                     "followed": None if row[12] is None else bool(row[12]),
                     "reason": row[13],
+                    "subject": row[14],
                 }
             )
         return records
