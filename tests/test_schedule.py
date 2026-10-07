@@ -8,6 +8,7 @@ from memtrace_harness.schedule import (
     ScheduleSpec,
     compute_next_run,
     describe_schedule,
+    is_outside_interval_window,
     is_past_window_end,
     parse_schedule_spec,
 )
@@ -127,3 +128,42 @@ class DescribeScheduleTests(TestCase):
             ScheduleSpec(kind="weekdays", time_of_day="09:00", end_time_of_day="13:25")
         )
         self.assertIn("09:00~13:25", desc)
+
+
+class IntervalWindowTest(TestCase):
+    TZ = ZoneInfo("Asia/Taipei")
+
+    def _spec(self) -> ScheduleSpec:
+        return parse_schedule_spec("interval", "600@09:00-13:30@weekdays")
+
+    def _local(self, text: str) -> datetime:
+        return datetime.fromisoformat(text).replace(tzinfo=self.TZ).astimezone(timezone.utc)
+
+    def test_parses_window_and_weekdays(self) -> None:
+        spec = self._spec()
+        self.assertEqual((spec.interval_seconds, spec.time_of_day, spec.end_time_of_day, spec.weekdays_only),
+                         (600, "09:00", "13:30", True))
+        self.assertIn("09:00~13:30", describe_schedule(spec))
+
+    def test_rejects_a_bad_window(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_schedule_spec("interval", "600@13:30-09:00")
+        with self.assertRaises(ValueError):
+            parse_schedule_spec("interval", "600@whenever")
+
+    def test_inside_the_window_fires_on_the_interval(self) -> None:
+        nxt = compute_next_run(self._spec(), after=self._local("2026-10-07T10:00:00"), tz=self.TZ)
+        self.assertEqual(nxt, self._local("2026-10-07T10:10:00"))
+
+    def test_after_the_window_moves_to_next_trading_day_open(self) -> None:
+        nxt = compute_next_run(self._spec(), after=self._local("2026-10-07T13:25:00"), tz=self.TZ)
+        self.assertEqual(nxt, self._local("2026-10-08T09:00:00"))
+
+    def test_friday_after_close_skips_the_weekend(self) -> None:
+        nxt = compute_next_run(self._spec(), after=self._local("2026-10-09T13:28:00"), tz=self.TZ)
+        self.assertEqual(nxt, self._local("2026-10-12T09:00:00"))
+
+    def test_a_late_catch_up_outside_the_window_is_flagged(self) -> None:
+        self.assertTrue(is_outside_interval_window(self._spec(), at=self._local("2026-10-07T13:42:00"), tz=self.TZ))
+        self.assertFalse(is_outside_interval_window(self._spec(), at=self._local("2026-10-07T13:20:00"), tz=self.TZ))
+        self.assertFalse(is_outside_interval_window(parse_schedule_spec("interval", "600"), at=self._local("2026-10-07T23:00:00"), tz=self.TZ))
