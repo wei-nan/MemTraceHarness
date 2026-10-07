@@ -10,6 +10,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
+from memtrace_harness.decision_card import CARD_INSTRUCTION, card_from_artifact
 from memtrace_harness.fallback import (
     classify_execution_failure,
     error_signature,
@@ -1324,6 +1325,12 @@ class AgentLoopRunner:
                 # split, approving would re-run with the failure summary as the new
                 # goal instead of continuing the human's original request.
                 resume_goal=summary.task.goal,
+                # The stage that stopped the loop is the last one executed; its own
+                # distilled question (if it wrote a usable one) replaces the raw detail
+                # in what the human is shown.
+                decision_card=card_from_artifact(
+                    summary.stages[-1].artifact if summary.stages else None
+                ),
             )
         if writeback:
             if not self.memtrace_client:
@@ -1512,7 +1519,8 @@ def controller_task(
             f"this specific stage ({stage!r}). The ONLY actions valid at this stage are "
             f"{allowed!r} — picking any other enum member (even though the schema permits "
             "it) is a mistake, not a valid choice, regardless of what your reasoning says.\n"
-            f"Return only a valid JSON object with action in {allowed!r} and a string reason."
+            f"Return only a valid JSON object with action in {allowed!r} and a string reason.\n"
+            f"{CARD_INSTRUCTION}"
         ),
         context_items=[
             ContextItem(
@@ -1571,6 +1579,7 @@ def planner_task(task: TaskEnvelope) -> TaskEnvelope:
             "(string), acceptance_criteria (string array), open_questions (string array), "
             "and scope_exclusions (string array). "
             "Do not make product decisions when required input is missing.\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=task.context_items,
@@ -1586,6 +1595,7 @@ def planner_escalation_task(
         goal=(
             f"Revise the plan only because G1 identified a reasoning gap: {task.goal}\n"
             "Return the same JSON plan contract as the standard planner.\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=[
@@ -1604,6 +1614,7 @@ def planner_revision_task(
         goal=(
             f"Revise the Sonnet plan using the first G1 rejection: {task.goal}\n"
             "Return the same valid JSON plan contract. This is one bounded correction, not a retry.\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=[
@@ -1681,6 +1692,7 @@ def gate_task(
             f"{_G1_SCOPE if gate_name == 'G1' else _G2_SCOPE if gate_name == 'G2' else ''}"
             f"{_G1_RESCOPE if rescope else ''}"
             f"{verification_note}\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=items,
@@ -1711,6 +1723,7 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
             "'needs_human', or 'failed'), summary (string) containing the actual result "
             "you found or did, changed_files (string array, normally empty here), tests "
             "(string array, normally empty here), and gaps (string array).\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=task.context_items,
@@ -1726,6 +1739,7 @@ def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
             "Return only a valid JSON object after the work with status ('completed', "
             "'needs_human', or 'failed'), summary (string), changed_files (string array), "
             "tests (string array), and gaps (string array).\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=[
@@ -1748,6 +1762,7 @@ def developer_revision_task(
             f"Correct the implementation using the first G2 rejection: {task.goal}\n"
             "Return the same valid JSON development contract after running relevant tests. "
             "This is one bounded correction, not an unchanged retry.\n"
+            f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=[

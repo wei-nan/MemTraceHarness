@@ -107,6 +107,23 @@ A swipe-reply to a paused task's question goes to the chat model, which resumes 
 (the buttons, `/approve` and `/clarify` always work). The marker is honored only for the approval that
 message replied to, and only while it is still pending.
 
+**Decision card (2026-10-07).** A stage that stops for a human states its own question as a
+`decision_card` (`decision_card.py`): the blocker in a sentence, 2–3 concrete options each with its
+action and tradeoff, a recommended option with a reason, and what happens if nobody answers. Every
+role's output schema carries it (required, nullable), and each stage prompt appends the shared
+`CARD_INSTRUCTION`. When a loop stops `needs_human` for an info-needed reason, the card of the *last
+executed stage* is validated (`card_from_artifact`: it must be well-formed, and the stage's own
+status/verdict/action must itself hand over to a human) and stored on the approval request; the
+Telegram message then shows the card instead of the raw artifact dump, with one button per option
+(`pick:<id>:<n>`) that resumes the task exactly as `/clarify` with that option's text would. A missing
+or malformed card falls back to the previous unstructured message, so a model that fails to write one
+never blocks a stop. Cards are never used for `model_output_invalid`, `config_change_required`,
+`budget_exhausted` or approve/reject-style requests, and schedule-run notifications do not carry one yet.
+**Not implemented:** a single editor (Controller) that merges or suppresses cards across stages;
+recording which option was chosen versus recommended; citing past decisions/preferences in `basis`.
+**Unverified against live models:** that Codex/Claude/Antigravity accept the nullable-object schema and
+actually write useful cards — covered by unit tests with injected output only.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

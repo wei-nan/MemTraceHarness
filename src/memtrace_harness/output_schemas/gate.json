@@ -1,7 +1,14 @@
 {
   "type": "object",
   "properties": {
-    "verdict": {"type": "string", "enum": ["PASS", "REJECT", "NEEDS_HUMAN"]},
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "REJECT",
+        "NEEDS_HUMAN"
+      ]
+    },
     "reason_code": {
       "type": "string",
       "enum": [
@@ -22,23 +29,119 @@
       "items": {
         "type": "object",
         "properties": {
-          "severity": {"type": "string", "maxLength": 100},
-          "description": {"type": "string", "maxLength": 2000},
-          "evidence_ref": {"type": "string", "maxLength": 1000},
-          "requirement_ref": {"type": "string", "maxLength": 1000},
-          "required_action": {"type": "string", "maxLength": 2000}
+          "severity": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "evidence_ref": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "requirement_ref": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "required_action": {
+            "type": "string",
+            "maxLength": 2000
+          }
         },
-        "required": ["severity", "description", "evidence_ref", "requirement_ref", "required_action"],
+        "required": [
+          "severity",
+          "description",
+          "evidence_ref",
+          "requirement_ref",
+          "required_action"
+        ],
         "additionalProperties": false
       }
     },
     "unverified_items": {
       "type": "array",
       "maxItems": 50,
-      "items": {"type": "string", "maxLength": 1000}
+      "items": {
+        "type": "string",
+        "maxLength": 1000
+      }
     },
-    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "decision_card": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "How to ask the human to decide; null when not stopping for a human.",
+      "properties": {
+        "situation": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "action": {
+                "type": "string",
+                "maxLength": 400
+              },
+              "tradeoff": {
+                "type": "string",
+                "maxLength": 300
+              }
+            },
+            "required": [
+              "label",
+              "action",
+              "tradeoff"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "recommended": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "default_if_silent": {
+          "type": "string",
+          "maxLength": 200
+        }
+      },
+      "required": [
+        "situation",
+        "options",
+        "recommended",
+        "reason",
+        "default_if_silent"
+      ],
+      "additionalProperties": false
+    }
   },
-  "required": ["verdict", "reason_code", "findings", "unverified_items", "confidence"],
+  "required": [
+    "verdict",
+    "reason_code",
+    "findings",
+    "unverified_items",
+    "confidence",
+    "decision_card"
+  ],
   "additionalProperties": false
 }

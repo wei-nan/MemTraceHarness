@@ -954,6 +954,7 @@ class TraceStore:
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
+            self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
             self._ensure_column(conn, "runs", "conversation_id", "TEXT")
             self._ensure_column(conn, "model_responses", "stage", "TEXT")
             self._ensure_column(conn, "model_responses", "sequence", "INTEGER")
@@ -1634,6 +1635,7 @@ class TraceStore:
         proposed_action: str,
         stage_ref: str | None = None,
         resume_goal: str | None = None,
+        decision_card: dict | None = None,
     ) -> str:
         request_id = f"appr_{uuid4().hex[:12]}"
         now = utc_now_iso()
@@ -1642,8 +1644,8 @@ class TraceStore:
                 """
                 INSERT INTO approval_requests (
                     id, conversation_id, workspace, working_directory, stage_ref,
-                    reason, proposed_action, status, created_at, resume_goal
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    reason, proposed_action, status, created_at, resume_goal, decision_card
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -1655,9 +1657,26 @@ class TraceStore:
                     proposed_action,
                     now,
                     resume_goal,
+                    json.dumps(decision_card, ensure_ascii=False) if decision_card else None,
                 ),
             )
         return request_id
+
+    def get_approval_decision_card(self, request_id: str) -> dict | None:
+        """The decision card a stopped stage attached to this request (see decision_card.py),
+        or None. Kept out of the row mappers above: callers that do not render cards never
+        pay for it."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT decision_card FROM approval_requests WHERE id = ?", (request_id,)
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            card = json.loads(row[0])
+        except ValueError:
+            return None
+        return card if isinstance(card, dict) else None
 
     def count_approval_requests(self, conversation_id: str, reasons: set[str]) -> int:
         """How many approval requests this conversation has already raised for any of
