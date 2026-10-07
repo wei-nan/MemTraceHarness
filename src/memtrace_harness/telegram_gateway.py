@@ -485,19 +485,22 @@ class TelegramGateway:
             if self.topic_recall is not None:
                 self.topic_recall.start(scope, chat_id, text)
 
-            # A native swipe-reply to a pending approval's own message is
-            # unambiguous (the human deliberately picked that message to reply
-            # to) — resolve it as a clarify without involving the model at all.
-            # This is the only mechanical, non-model path left for touching a
-            # pending approval from plain text; anything else needs the
-            # /approve, /reject, /clarify commands or the inline buttons.
+            # A swipe-reply to a pending approval's own message may be the answer it is
+            # waiting for — or a question about it, or an unrelated remark. Resuming a task
+            # costs a whole loop (2026-10-05: a question typed as a swipe-reply started an
+            # Opus planner run), so the chat model decides: it sees the approval and only
+            # resumes the task by emitting HARNESS_APPROVAL_ANSWER::. When it isn't sure the
+            # task stays paused (the buttons and /clarify still work).
+            pending_approval = None
             reply_to = message.get("reply_to_message")
             if reply_to and reply_to.get("message_id") is not None:
-                pending = self.approval_manager.get_by_telegram_message(chat_id, reply_to["message_id"])
-                if pending and pending.status == "pending":
-                    return self._resolve_approval_action(pending.id, "clarify", chat_id, text)
+                candidate = self.approval_manager.get_by_telegram_message(chat_id, reply_to["message_id"])
+                if candidate and candidate.status == "pending":
+                    pending_approval = candidate
 
-            return self._chat_reply_and_maybe_start_task(scope, chat_id, text, quoted_text=quoted)
+            return self._chat_reply_and_maybe_start_task(
+                scope, chat_id, text, quoted_text=quoted, pending_approval=pending_approval
+            )
 
     # Stored with the user's turn so the transcript (and the nightly digest) still shows
     # what a short reply like "那檔怎麼了" was about. Kept after the user's own words so
@@ -556,8 +559,10 @@ class TelegramGateway:
     def expire_stale_approvals(self, ttl_hours: int, now: datetime | None = None) -> list[str]:
         """Close this gateway's pending approvals older than `ttl_hours`: mark them
         expired, strip their Telegram buttons, and tell the operator once. Workspace
-        locks are deliberately not touched — a lock belongs to whatever run holds it
-        now, not to an old unanswered question. Returns the expired request ids."""
+        locks are left alone — a lock belongs to whatever run holds it now — except
+        the one an unattended scan took while proposing the task: that lock exists only
+        to hold the question, so once it expires nothing owns it and it would block every
+        later scan. Returns the expired request ids."""
         if ttl_hours <= 0:
             return []
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=ttl_hours)
@@ -570,6 +575,10 @@ class TelegramGateway:
             if not self.approval_manager.trace_store.resolve_approval_request(data["id"], "expired"):
                 continue
             expired.append(data["id"])
+            if data.get("reason") == "unattended_write" and str(data["conversation_id"]).startswith("scan_"):
+                self.approval_manager.trace_store.release_workspace_lock(
+                    data["workspace"], data["conversation_id"]
+                )
             if data.get("telegram_chat_id") is not None and data.get("telegram_message_id") is not None:
                 self.clear_message_keyboard(data["telegram_chat_id"], data["telegram_message_id"])
         if expired:
@@ -848,10 +857,19 @@ class TelegramGateway:
         def _run() -> None:
             try:
                 summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id)
-                msg = (
-                    f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation}\n\n"
-                    f"🧩 {self._model_summary(summary)}"
-                )
+                if schedule_id and summary.status == "needs_human":
+                    # A notification, not a question: no approval is open, so a later reply
+                    # can't resume this monitoring run with some other goal.
+                    msg = (
+                        f"⏰ 排程 {schedule_id} 有事需要你留意：{summary.recommendation}\n\n"
+                        "這只是通知，沒有待核准的問題；要處理的話直接在聊天告訴我。\n\n"
+                        f"🧩 {self._model_summary(summary)}"
+                    )
+                else:
+                    msg = (
+                        f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation}\n\n"
+                        f"🧩 {self._model_summary(summary)}"
+                    )
                 self._report_run_outcome(
                     conv_id=conv_id, summary=summary, final_text=msg, chat_id=chat_id
                 )
@@ -1283,8 +1301,33 @@ class TelegramGateway:
             notice += "這些工具只能查詢，不能下單、改單或撤單；要交易請告訴使用者自己操作。\n"
         return notice + "\n"
 
+    _APPROVAL_ANSWER_MARKER = "HARNESS_APPROVAL_ANSWER::"
+
+    @classmethod
+    def _pending_approval_notice(cls, pending: ApprovalRequestData | None) -> str:
+        """Tell the chat model the message it answers is a paused task's question, and when
+        (only then) to resume it."""
+        if pending is None:
+            return ""
+        return (
+            f"使用者這則訊息是滑動回覆一則「待回答的問題」[{pending.id}]（一個暫停中的任務在等這個答案，"
+            f"原因：{pending.reason}，內容見上面被回覆的訊息）。請判斷使用者是在**回答**它，還是別的事：\n"
+            "- 如果使用者提供了它要的資訊、決定或指示（即使很簡短，例如「照這個做」「用方案 B」「改成 3%」），"
+            f"就在回覆的最後另起一行輸出「{cls._APPROVAL_ANSWER_MARKER}<使用者的答案，保留他的原意與關鍵細節>」，"
+            "任務就會帶著這個答案繼續執行。\n"
+            "- 如果使用者是在**問你問題**、要你解釋或查證、閒聊、或你不確定他是不是在回答，就**不要**輸出這一行，"
+            "只好好回答他；任務會繼續暫停，等他明確回答或按按鈕。不確定時寧可不輸出——多問一句的代價，"
+            "遠小於誤啟動一輪完整流程。\n"
+            "不要在同一則回覆同時輸出這一行和任務啟動標記。\n\n"
+        )
+
     def _chat_reply_and_maybe_start_task(
-        self, scope: ProjectScope, chat_id: int, text: str, quoted_text: str | None = None
+        self,
+        scope: ProjectScope,
+        chat_id: int,
+        text: str,
+        quoted_text: str | None = None,
+        pending_approval: ApprovalRequestData | None = None,
     ) -> str:
         """The entire chat front door goes through one model call now: no more
         separate CHAT/QUESTION/LOOKUP/TASK classification pass, and no more
@@ -1358,6 +1401,7 @@ class TelegramGateway:
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
             f"{self._quoted_reply_notice(quoted_text)}"
+            f"{self._pending_approval_notice(pending_approval)}"
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
@@ -1386,6 +1430,9 @@ class TelegramGateway:
                 reply_text, goal = self._extract_task_start(stdout)
                 reply_text, schedule_directive = self._extract_schedule_start(reply_text)
                 reply_text, schedule_controls = self._extract_schedule_controls(reply_text)
+                reply_text, approval_answer = self._extract_marker_line(
+                    reply_text, self._APPROVAL_ANSWER_MARKER
+                )
                 if confirmations:
                     reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
@@ -1394,6 +1441,12 @@ class TelegramGateway:
                     project=scope.name, speaker="assistant", turn_type="chat", content=reply_text or reply
                 )
                 self.send_message(chat_id, reply)
+                if approval_answer and pending_approval is not None and not goal:
+                    # Only honored for the approval this very message replied to, and only
+                    # while it is still pending (a double reply must not resume twice).
+                    current = self.approval_manager.get_request(pending_approval.id)
+                    if current is not None and current.status == "pending":
+                        self._resolve_approval_action(current.id, "clarify", chat_id, approval_answer)
                 if goal:
                     self.primary_session_mgr.record_turn(
                         project=scope.name, speaker="user", turn_type="decision", content=goal
@@ -1724,6 +1777,7 @@ class TelegramGateway:
             worktree_manager=self._worktree_manager() if worktree else None,
             repo_root=scope.working_directory if worktree else None,
             edit_lock=self._edit_lock_for(scope, conv_id, worktree, self.approval_manager.trace_store),
+            create_approvals=schedule_id is None,
         )
         summary = runner.run(task, writeback=True, conversation_id=conv_id)
         note = self._finalize_worktree(scope, conv_id, worktree, summary.status)
