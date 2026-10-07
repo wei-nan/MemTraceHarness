@@ -389,47 +389,6 @@ class TelegramGatewayTests(TestCase):
         gateway.notify_approval_request.assert_not_called()
         gateway.notify_all_allowlisted.assert_called_once_with("all done")
 
-    def test_swipe_reply_to_pending_approval_still_clarifies_and_resumes(self) -> None:
-        # A native swipe-reply to a pending approval's own message is the one
-        # mechanical, non-model path left for touching a pending approval from
-        # plain text — it must still resolve it as /clarify without needing any
-        # model call at all.
-        from unittest.mock import patch, MagicMock
-
-        gateway, approval_mgr, trace_store = self._gateway_for_report_outcome_tests()
-        req = approval_mgr.request_approval(
-            conversation_id="conv_clarify",
-            workspace="ws_test",
-            working_directory="/tmp",
-            reason="unattended_write",
-            proposed_action="「範例任務」（mem_x）已定案可開發，是否核准開始？",
-        )
-        gateway._resume_approved_conversation = MagicMock()
-        approval_mgr.record_telegram_message(req.id, chat_id=12345, message_id=901)
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"ok": true, "result": []}'
-        mock_response.__enter__.return_value = mock_response
-
-        with patch("urllib.request.urlopen", return_value=mock_response), patch(
-            "memtrace_harness.cli_process.CliProcessRunner.run"
-        ) as mock_run:
-            update = {
-                "update_id": 401,
-                "message": {
-                    "chat": {"id": 12345},
-                    "text": "順便把 CHANGELOG 也更新一下",
-                    "reply_to_message": {"message_id": 901},
-                },
-            }
-            result = gateway.process_update(update)
-
-        mock_run.assert_not_called()
-        self.assertIn("已更新為", result)
-        reloaded = approval_mgr.get_request(req.id)
-        self.assertEqual(reloaded.status, "approved")
-        gateway._resume_approved_conversation.assert_called_once()
-
     def test_unrelated_plain_text_does_not_touch_a_stale_pending_approval(self) -> None:
         # A plain message with no reply-to must never mechanically resolve some
         # unrelated pending approval sitting around — it's just chat, and the
@@ -563,6 +522,23 @@ class TelegramGatewayTests(TestCase):
         gateway.clear_message_keyboard.assert_called_once_with(12345, 7)
         gateway.notify_all_allowlisted.assert_called_once()
         self.assertEqual(gateway.expire_stale_approvals(0, now=later), [])  # ttl 0 disables
+
+    def test_expiring_a_scan_proposal_frees_its_workspace_lock(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock
+
+        gateway, mgr, store = self._gateway_for_report_outcome_tests()
+        gateway.notify_all_allowlisted = MagicMock()
+        gateway.clear_message_keyboard = MagicMock()
+        self.assertTrue(store.acquire_workspace_lock("ws_test", "scan_abc"))
+        mgr.request_approval(
+            conversation_id="scan_abc", workspace="ws_test", working_directory="/tmp",
+            reason="unattended_write", proposed_action="scan proposal",
+        )
+        later = datetime.now(timezone.utc) + timedelta(hours=13)
+        gateway.expire_stale_approvals(12, now=later)
+
+        self.assertIsNone(store.get_workspace_lock("ws_test"))
 
     def test_config_change_required_approval_only_offers_give_up(self) -> None:
         gateway, approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()

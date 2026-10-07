@@ -61,6 +61,7 @@ class AgentLoopRunner:
         worktree: TaskWorktree | None = None,
         worktree_manager: WorktreeManager | None = None,
         repo_root: Path | None = None,
+        create_approvals: bool = True,
         edit_lock: tuple[Callable[[], bool], Callable[[], None]] | None = None,
         edit_lock_wait_seconds: float = 3600.0,
         edit_lock_poll_seconds: float = 5.0,
@@ -71,6 +72,10 @@ class AgentLoopRunner:
         # other kind of task keeps running alongside. None when this task has the folder to
         # itself (its own worktree, or the project runs one task at a time).
         self.edit_lock = edit_lock
+        # False for an unattended schedule run: its needs_human stop is only a notification.
+        # An approval would let a later human reply resume the monitoring conversation with a
+        # different goal (2026-10-05, chat_2e6f12ab), so none is opened.
+        self.create_approvals = create_approvals
         self.edit_lock_wait_seconds = edit_lock_wait_seconds
         self.edit_lock_poll_seconds = edit_lock_poll_seconds
         self._sleep = sleep
@@ -1293,7 +1298,11 @@ class AgentLoopRunner:
 
     def _persist(self, summary: LoopSummary, *, writeback: bool) -> LoopSummary:
         self.trace_store.save_loop_summary(summary)
-        if summary.status in {"needs_human", "budget_exhausted"} and self.approval_manager:
+        if (
+            summary.status in {"needs_human", "budget_exhausted"}
+            and self.approval_manager
+            and self.create_approvals
+        ):
             if summary.status == "budget_exhausted":
                 reason = "budget_exhausted"
             elif _is_technical_output_failure(summary.recommendation):
@@ -1694,7 +1703,10 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
             "data, inspect files or state) to really do this, rather than describing "
             "what should happen. If it requires information you don't have and can't "
             "discover yourself, say so in `summary` and use status 'needs_human' "
-            "instead of guessing.\n"
+            "instead of guessing. Use 'needs_human' ONLY when you could not do the work; "
+            "if you did it and merely noticed something the human may want to act on "
+            "(a concern, an odd number, a suggestion), report status 'completed' and put the "
+            "observation in `summary`/`gaps`.\n"
             "Return only a valid JSON object after the work with status ('completed', "
             "'needs_human', or 'failed'), summary (string) containing the actual result "
             "you found or did, changed_files (string array, normally empty here), tests "

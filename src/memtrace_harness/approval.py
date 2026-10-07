@@ -57,11 +57,11 @@ class ApprovalRequestData:
     def format_telegram_message(self) -> str:
         # No /approve or /reject lines: those are now inline-keyboard buttons attached
         # to this message (see TelegramGateway's approval-send path) — typing an ID is
-        # no longer required for either. A native swipe-reply to THIS message is the
-        # mechanical, unambiguous way to answer from plain text (see
-        # TelegramGateway.process_update()'s reply_to_message check) — it always
-        # resumes the loop with that reply as the answer, no model judgment involved;
-        # anything else needs the /approve, /reject, /clarify commands or the buttons.
+        # no longer required for either. A native swipe-reply to THIS message is how to answer
+        # from plain text: the chat model reads it (see TelegramGateway.process_update()) and
+        # resumes the loop only if the reply is an answer — a question to the model, or a reply
+        # it is unsure about, leaves the task paused. The /approve, /reject, /clarify commands
+        # and the buttons always work.
         if self.reason in INFO_NEEDED_REASONS:
             # See INFO_NEEDED_REASONS: leads with "answer, don't tap a button" — a
             # bare approve here would just resume with this same unchanged goal.
@@ -70,7 +70,8 @@ class ApprovalRequestData:
                 f"工作區：{self.workspace}\n"
                 f"原因：{self.reason}\n"
                 f"內容：{self.proposed_action}\n\n"
-                f"👉 滑動回覆（swipe-reply）這則訊息、直接寫下你的答案，就會帶著答案繼續執行——"
+                f"👉 滑動回覆（swipe-reply）這則訊息、直接寫下你的答案——我會判斷你是在回答還是在問我問題，"
+                f"只有回答才會帶著答案繼續執行；你問問題的話我只回答你，任務會繼續暫停。"
                 f"不用按鈕，也不用特定格式。"
                 f"如果想直接放棄這個任務，按下面的「放棄」。"
             )
@@ -107,7 +108,7 @@ class ApprovalRequestData:
             f"原因：{self.reason}\n"
             f"內容：{self.proposed_action}\n\n"
             f"可以直接點下方按鈕核准/拒絕；也可以滑動回覆（swipe-reply）這則訊息並寫下補充說明，"
-            f"會直接帶著說明繼續執行，不用特定格式。"
+            f"如果是補充說明就會帶著它繼續執行；如果你是在問問題，我只回答、任務繼續暫停。"
         )
 
 

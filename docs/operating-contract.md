@@ -99,6 +99,14 @@ Agent Loop roles never get the tool; a per-order value limit (default 100000 TWD
 TaiwanTrade's own risk limits. A cancellation is proposed the same way (`request_order_cancel`) and sent
 only on the human's tap (the gateway makes the `DELETE`). **Not implemented:** amending orders, market orders.
 
+**Replies to a paused task (2026-10-05).** A schedule run that stops `needs_human` is only a
+notification: no approval is opened for it, so a later human reply cannot resume the monitoring run with
+a different goal (an operational run is told to use `needs_human` only when it could not do the work).
+A swipe-reply to a paused task's question goes to the chat model, which resumes the task only by emitting
+`HARNESS_APPROVAL_ANSWER::`; a question, a remark, a failed model call or any doubt leaves the task paused
+(the buttons, `/approve` and `/clarify` always work). The marker is honored only for the approval that
+message replied to, and only while it is still pending.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;
