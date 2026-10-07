@@ -124,6 +124,22 @@ recording which option was chosen versus recommended; citing past decisions/pref
 **Unverified against live models:** that Codex/Claude/Antigravity accept the nullable-object schema and
 actually write useful cards — covered by unit tests with injected output only.
 
+**Decision records and precedent (2026-10-07).** Each time the operator resolves a request the harness
+put to them, one `decision_records` row is written (`decision_records.py`): what was asked, what they
+chose, and whether that followed the recommendation (picked the recommended option, picked another,
+answered in free text, approved/rejected a cardless proposal). Technical stops (`model_output_invalid`,
+`config_change_required`, `budget_exhausted`) are not recorded. A button tap also becomes a `decision`
+turn from the operator in the conversation log, so the nightly digest sees it and can derive a preference
+from it through its existing cite-the-turn rule. The Controller — and only the Controller — is given an
+`operator_precedent` context item: up to 8 recent decisions (disagreements with a recommendation listed
+first) plus the operator's adopted preferences, framed as evidence, never an instruction; Planner, Red
+Team and Developer never receive it, which keeps the earlier rule that preferences describe how Harness
+talks to the human, not what the working roles build. A card's `basis` may cite only the `D<n>`/`P<n>`
+ids that item actually contained; others are dropped. **Not implemented:** retrieving precedent by
+decision kind, asking the operator why after a button tap that went against a recommendation (a reason is
+only captured from free-text answers), and promoting repeated disagreements to a preference outside the
+nightly digest.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

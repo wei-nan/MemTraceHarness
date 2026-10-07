@@ -86,6 +86,14 @@
         "default_if_silent": {
           "type": "string",
           "maxLength": 200
+        },
+        "basis": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "string",
+            "maxLength": 20
+          }
         }
       },
       "required": [
@@ -93,7 +101,8 @@
         "options",
         "recommended",
         "reason",
-        "default_if_silent"
+        "default_if_silent",
+        "basis"
       ],
       "additionalProperties": false
     }

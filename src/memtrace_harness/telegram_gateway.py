@@ -19,6 +19,7 @@ from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
+from memtrace_harness.decision_records import PRECEDENT_CONTENT_TYPE, precedent_block, record_resolution
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
@@ -547,7 +548,12 @@ class TelegramGateway:
         return text or None
 
     def _resolve_approval_action(
-        self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None
+        self,
+        request_id: str,
+        action: str,
+        chat_id: int,
+        reason_or_answer: str | None,
+        chosen_index: int | None = None,
     ) -> str:
         """Shared by the /approve|/reject|/clarify text commands, the inline-keyboard
         button callbacks, and a TASK-classified plain message (see
@@ -558,6 +564,7 @@ class TelegramGateway:
         )
         self.send_message(chat_id, f"核准狀態更新：{msg}")
         if success and req_data:
+            self._record_decision(req_data, action, reason_or_answer, chosen_index)
             if req_data.telegram_chat_id is not None and req_data.telegram_message_id is not None:
                 self.clear_message_keyboard(req_data.telegram_chat_id, req_data.telegram_message_id)
             if req_data.status == "approved":
@@ -567,6 +574,44 @@ class TelegramGateway:
                     req_data.workspace, req_data.conversation_id
                 )
         return msg
+
+    def _record_decision(
+        self,
+        req_data: ApprovalRequestData,
+        action: str,
+        answer: str | None,
+        chosen_index: int | None,
+    ) -> None:
+        """Keep what the operator just decided as precedent (decision_records.py). Best
+        effort: the resolution has already happened, so a failure here is logged, not raised."""
+        scope = next(
+            (
+                p
+                for p in self.projects
+                if p.workspace_id == req_data.workspace
+                or str(p.working_directory) == req_data.working_directory
+            ),
+            None,
+        )
+        if scope is None:
+            return
+        try:
+            recorded = record_resolution(
+                self.approval_manager.trace_store,
+                req_data,
+                project=scope.name,
+                action=action,
+                answer=answer,
+                chosen_index=chosen_index,
+            )
+            if recorded:
+                # A button tap leaves no message of the operator's own; log it as their turn
+                # so the chat model and the nightly digest see it like anything else they said.
+                self.primary_session_mgr.record_turn(
+                    project=scope.name, speaker="user", turn_type="decision", content=recorded[1]
+                )
+        except Exception:
+            logger.exception(f"recording the decision on {req_data.id} failed; continuing")
 
     def expire_stale_approvals(self, ttl_hours: int, now: datetime | None = None) -> list[str]:
         """Close this gateway's pending approvals older than `ttl_hours`: mark them
@@ -643,7 +688,9 @@ class TelegramGateway:
         answer = answer_for_choice(req.decision_card, index)
         if answer is None:
             return "無法辨識的選項"
-        return self._resolve_approval_action(request_id, "clarify", chat_id, answer)
+        return self._resolve_approval_action(
+            request_id, "clarify", chat_id, answer, chosen_index=index
+        )
 
     # ---- orders the model proposed (see taiwantrade_mcp.py): shown here, sent only on a tap
 
@@ -1198,6 +1245,20 @@ class TelegramGateway:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
             return ""
 
+    def _precedent_context(self, scope: ProjectScope) -> str:
+        """The Controller's view of how this operator has decided before (past decisions plus
+        adopted preferences). Best effort: without it the Controller simply decides as it did
+        before this existed."""
+        try:
+            return precedent_block(
+                self.primary_session_mgr.trace_store,
+                scope.name,
+                preferences=self._operator_profile_context(scope),
+            )
+        except Exception:
+            logger.exception("Failed to build operator precedent; continuing without it")
+            return ""
+
     def _project_context_items(self, scope: ProjectScope) -> list[ContextItem]:
         """What the Agent Loop actually needs to do its job, carried through the
         TaskEnvelope's structured context_items (respecting each role's
@@ -1236,6 +1297,17 @@ class TelegramGateway:
                     title="Recent daily digests",
                     body=f"{_DIGESTS_HEADER}\n\n{digests}",
                     content_type="context",
+                    source="harness",
+                )
+            )
+        precedent = self._precedent_context(scope)
+        if precedent:
+            items.append(
+                ContextItem(
+                    ref=f"harness:operator-precedent:{scope.name}",
+                    title="Operator precedent (past decisions and standing preferences)",
+                    body=precedent,
+                    content_type=PRECEDENT_CONTENT_TYPE,
                     source="harness",
                 )
             )

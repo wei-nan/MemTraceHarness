@@ -31,7 +31,9 @@ CARD_INSTRUCTION = (
     "`options` is exactly 2 or 3 concrete, mutually exclusive ways forward, each with a short "
     "`label`, the `action` that would be taken if chosen, and its `tradeoff` (cost or risk); "
     "`recommended` is the 0-based index of the option you would pick and `reason` says why in "
-    "one sentence; `default_if_silent` says what happens if the human does not answer. Do not "
+    "one sentence; `default_if_silent` says what happens if the human does not answer; `basis` lists the "
+    "ids (D<n> past decision, P<n> preference) of any operator precedent you actually relied on, "
+    "[] if none or if you were shown none. Do not "
     "pad: no option that is just \"ask me more\" or \"do nothing\" unless that is a real choice."
 )
 
@@ -57,8 +59,9 @@ CARD_SCHEMA: dict[str, Any] = {
         "recommended": {"type": "integer", "minimum": 0, "maximum": MAX_OPTIONS - 1},
         "reason": {"type": "string", "maxLength": 300},
         "default_if_silent": {"type": "string", "maxLength": 200},
+        "basis": {"type": "array", "maxItems": 3, "items": {"type": "string", "maxLength": 20}},
     },
-    "required": ["situation", "options", "recommended", "reason", "default_if_silent"],
+    "required": ["situation", "options", "recommended", "reason", "default_if_silent", "basis"],
     "additionalProperties": False,
 }
 
@@ -101,12 +104,19 @@ def normalize_card(value: Any) -> dict[str, Any] | None:
         return None
     if not 0 <= recommended < len(options):
         return None
+    raw_basis = value.get("basis")
+    basis = (
+        [b.strip() for b in raw_basis if isinstance(b, str) and b.strip()][:3]
+        if isinstance(raw_basis, list)
+        else []
+    )
     return {
         "situation": situation,
         "options": options,
         "recommended": recommended,
         "reason": reason,
         "default_if_silent": default,
+        "basis": basis,
     }
 
 
@@ -127,6 +137,14 @@ def card_from_artifact(artifact: dict[str, Any] | None) -> dict[str, Any] | None
     return normalize_card(artifact.get("decision_card"))
 
 
+def restrict_basis(card: dict[str, Any] | None, known_ids: set[str]) -> dict[str, Any] | None:
+    """The card with `basis` cut down to ids that were really offered to the model; a card
+    cannot claim a precedent it was never shown."""
+    if card is None:
+        return None
+    return {**card, "basis": [b for b in card.get("basis", []) if b in known_ids]}
+
+
 def option_letter(index: int) -> str:
     return _LETTERS[index]
 
@@ -141,6 +159,8 @@ def render_card(card: dict[str, Any]) -> str:
         lines.append(f"   代價：{option['tradeoff']}")
     lines.append("")
     lines.append(f"建議 {option_letter(card['recommended'])}：{card['reason']}")
+    if card.get("basis"):
+        lines.append(f"參考：{'、'.join(card['basis'])}")
     lines.append(f"不回應的話：{card['default_if_silent']}")
     return "\n".join(lines)
 
