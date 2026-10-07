@@ -950,6 +950,7 @@ class TraceStore:
             self._retag_legacy_schedule_turns(conn)
             self._ensure_column(conn, "schedules", "end_time_of_day", "TEXT")
             self._ensure_column(conn, "schedules", "paused_until", "TEXT")
+            self._ensure_column(conn, "schedules", "weekdays_only", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
             self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
             self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
@@ -2406,6 +2407,7 @@ class TraceStore:
         interval_seconds: int | None = None,
         time_of_day: str | None = None,
         end_time_of_day: str | None = None,
+        weekdays_only: bool = False,
         chat_id: int | None = None,
     ) -> str:
         schedule_id = f"sched_{uuid4().hex[:10]}"
@@ -2414,12 +2416,14 @@ class TraceStore:
                 """
                 INSERT INTO schedules (
                     id, project, workspace_id, goal, kind, interval_seconds,
-                    time_of_day, end_time_of_day, chat_id, active, created_at, next_run_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    time_of_day, end_time_of_day, chat_id, active, created_at, next_run_at,
+                    weekdays_only
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     schedule_id, project, workspace_id, goal, kind, interval_seconds,
                     time_of_day, end_time_of_day, chat_id, utc_now_iso(), next_run_at.isoformat(),
+                    1 if weekdays_only else 0,
                 ),
             )
         return schedule_id
@@ -2442,11 +2446,13 @@ class TraceStore:
             "last_run_at": row[12],
             "last_run_status": row[13],
             "paused_until": row[14],
+            "weekdays_only": bool(row[15]),
         }
 
     _SCHEDULE_COLUMNS = (
         "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, end_time_of_day, "
-        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status, paused_until"
+        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status, paused_until, "
+        "weekdays_only"
     )
 
     def get_schedule(self, schedule_id: str) -> dict | None:

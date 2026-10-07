@@ -43,7 +43,12 @@ from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
 from memtrace_harness.scanner import UnattendedScanner
-from memtrace_harness.schedule import ScheduleSpec, compute_next_run, is_past_window_end
+from memtrace_harness.schedule import (
+    compute_next_run,
+    is_outside_interval_window,
+    is_past_window_end,
+    spec_from_row,
+)
 from memtrace_harness.schemas import TaskEnvelope
 from memtrace_harness.scope import load_project_index
 from memtrace_harness.telegram_gateway import TelegramGateway
@@ -1160,15 +1165,12 @@ def _serve_gateway_loop(
                     # starts a background thread (non-blocking), and if the workspace
                     # turns out to be locked it just skips this occurrence — either
                     # way the schedule must not re-fire every tick until it succeeds.
-                    spec = ScheduleSpec(
-                        kind=row["kind"],
-                        interval_seconds=row["interval_seconds"],
-                        time_of_day=row["time_of_day"],
-                        end_time_of_day=row.get("end_time_of_day"),
-                    )
+                    spec = spec_from_row(row)
                     ran_at = datetime.now(timezone.utc)
                     next_run_at = compute_next_run(spec, after=ran_at, tz=schedule_tz)
-                    if is_past_window_end(spec, at=ran_at, tz=schedule_tz):
+                    if is_past_window_end(spec, at=ran_at, tz=schedule_tz) or is_outside_interval_window(
+                        spec, at=ran_at, tz=schedule_tz
+                    ):
                         trace_store.mark_schedule_ran(
                             row["id"], ran_at=ran_at, next_run_at=next_run_at, status="skipped_window"
                         )

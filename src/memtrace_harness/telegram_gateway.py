@@ -29,7 +29,13 @@ from memtrace_harness.memory_digest import (
 )
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
-from memtrace_harness.schedule import ScheduleSpec, compute_next_run, describe_schedule, parse_schedule_spec
+from memtrace_harness.schedule import (
+    ScheduleSpec,
+    compute_next_run,
+    describe_schedule,
+    parse_schedule_spec,
+    spec_from_row,
+)
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
@@ -1341,7 +1347,10 @@ class TelegramGateway:
             "重複執行某件事——才在回覆的最後另起一行，格式為「"
             f"{self._SCHEDULE_START_MARKER}<kind>::<spec>::<一句話描述要做的具體任務>」，"
             "其中 kind 是 interval、daily 或 weekdays 三選一：interval 的 spec 是週期秒數"
-            "（例如 3600 代表每小時一次，最少 60 秒）；daily 的 spec 是每天固定時間，"
+            "（例如 3600 代表每小時一次，最少 60 秒）；任務只在特定時段或只在工作日才需要"
+            "（例如台股盤中 09:00-13:30、只在交易日）時，一定要把限制寫進 spec，例如"
+            "「600@09:00-13:30@weekdays」，不要只寫在任務描述裡——spec 之外的限制系統不會執行，"
+            "排程會在收盤後、夜裡、週末照樣每個週期跑一次；daily 的 spec 是每天固定時間，"
             "24 小時制 HH:MM（例如 09:00）；weekdays 的 spec 跟 daily 一樣但只在週一到"
             "週五觸發。同一則回覆不要同時輸出這一行和上面的任務啟動標記。不確定使用者是否"
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
@@ -1492,12 +1501,7 @@ class TelegramGateway:
 
     @staticmethod
     def _row_spec(row: dict) -> ScheduleSpec:
-        return ScheduleSpec(
-            kind=row["kind"],
-            interval_seconds=row["interval_seconds"],
-            time_of_day=row["time_of_day"],
-            end_time_of_day=row.get("end_time_of_day"),
-        )
+        return spec_from_row(row)
 
     @classmethod
     def _paused_until_text(cls, paused_until: str, tz: ZoneInfo) -> str:
@@ -1608,6 +1612,7 @@ class TelegramGateway:
             interval_seconds=parsed.interval_seconds,
             time_of_day=parsed.time_of_day,
             end_time_of_day=parsed.end_time_of_day,
+            weekdays_only=parsed.weekdays_only,
             chat_id=chat_id,
             next_run_at=next_run_at,
         )
@@ -1669,12 +1674,7 @@ class TelegramGateway:
         tz = ZoneInfo(self.config.schedule_timezone)
         lines = [f"「{scope.name}」目前的排程："]
         for row in schedules:
-            spec = ScheduleSpec(
-                kind=row["kind"],
-                interval_seconds=row["interval_seconds"],
-                time_of_day=row["time_of_day"],
-                end_time_of_day=row.get("end_time_of_day"),
-            )
+            spec = spec_from_row(row)
             next_local = datetime.fromisoformat(row["next_run_at"]).astimezone(tz).strftime("%Y-%m-%d %H:%M")
             state = f"，下次 {next_local}"
             if row.get("paused_until"):
