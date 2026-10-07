@@ -32,6 +32,10 @@ stable cross-run aggregates and may create proposals; it cannot adopt its own pr
 - local SQLite stores run, execution, turn, provider-session and checkpoint references;
 - MemTrace writeback is explicit; conversation archives and nightly digests are written as
   draft-labelled notes (tags `harness`, `draft`);
+- a governed run's record stays in the local trace store and is **not** also written to the project's
+  MemTrace workspace as a "Harness loop draft" node (explicit operator decision, 2026-10-07: those drafts had
+  become 95% of one specification workspace); what a run teaches reaches the knowledge base through the
+  Controller's own `kb_updates`. The `--writeback` CLI flag still writes one on request;
 - operator preferences are adopted and retired by the Harness itself, with the safeguards below;
 - missing usage remains `unavailable`, never zero.
 

@@ -85,6 +85,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A run's record stays in the local trace store; it is not also written to the project's
+# MemTrace workspace as a "Harness loop draft" node. Until 2026-10-07 every run was, so a
+# schedule firing every ten minutes filled one project's specification workspace with 285
+# near-identical nodes (95% of it). What a run teaches belongs in the knowledge base through the
+# Controller's own kb_updates (completion_claims.py), not as one raw record per run.
+LOOP_DRAFT_WRITEBACK = False
+
 _DIGESTS_HEADER = (
     "Recent daily digests for this project — the Harness's nightly consolidation of "
     "the last few days (decisions, facts, items still open). Drafts grounded in the "
@@ -2178,7 +2185,7 @@ class TelegramGateway:
             edit_lock=self._edit_lock_for(scope, conv_id, worktree, self.approval_manager.trace_store),
             create_approvals=schedule_id is None,
         )
-        summary = runner.run(task, writeback=True, conversation_id=conv_id)
+        summary = runner.run(task, writeback=LOOP_DRAFT_WRITEBACK, conversation_id=conv_id)
         note = self._finalize_worktree(scope, conv_id, worktree, summary.status)
         if note and worktree and worktree.branch not in summary.recommendation:
             summary = replace(summary, recommendation=summary.recommendation + note)
@@ -2367,7 +2374,7 @@ class TelegramGateway:
                 )
                 summary = runner.run(
                     task,
-                    writeback=True,
+                    writeback=LOOP_DRAFT_WRITEBACK,
                     conversation_id=req_data.conversation_id,
                 )
                 if matching_scope is not None:
