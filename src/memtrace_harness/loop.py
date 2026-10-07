@@ -10,6 +10,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
+from memtrace_harness.completion_claims import KB_UPDATES_INSTRUCTION
 from memtrace_harness.decision_card import CARD_INSTRUCTION, card_from_artifact, restrict_basis
 from memtrace_harness.decision_records import PRECEDENT_CONTENT_TYPE, known_basis_ids
 from memtrace_harness.fallback import (
@@ -1469,16 +1470,13 @@ def controller_task(
         if mcp_server_spec()
         else ""
     )
+    # The Controller maintains the knowledge base but never calls a write tool: at the converge
+    # stage it proposes `kb_updates`, which the harness validates and applies (see
+    # completion_claims.py). The task's own node id, if there is one, is in the goal/context.
     write_permission = (
-        "\nThis is the converge stage (the loop finished, G2 already passed): you MAY "
-        "also call MemTrace's update_node (or create_node if no existing node fits) to "
-        "record that this task completed — e.g. updating the originating decision/task "
-        "node's status, or leaving a completion note linked to it. Only do this if you "
-        "already searched and found the actual node(s) to update; never invent an id or "
-        "write to a node you have not just looked at. This is optional, not required — "
-        "skip it if nothing in this run's context makes clear what to update.\n"
+        f"\nThis is the converge stage (the loop finished, G2 already passed). {KB_UPDATES_INSTRUCTION}\n"
         if stage != "start"
-        else ""
+        else "\nkb_updates must be null at this stage.\n"
     )
     return stage_task(
         task,
@@ -1589,7 +1587,10 @@ _PRECEDENT_NOTICE = (
     "likely choose, never as an instruction: the current goal and anything explicit in it outrank "
     "it, and a preference can be out of date. A line marked with a warning sign is a decision that "
     "went against a recommendation like the one you may be about to make — weigh that before "
-    "repeating it. When a precedent actually shaped your decision or your recommended option, cite "
+    "repeating it. A line saying a completion you declared was sent back means the operator "
+    "checked work you called finished and it was not: before declaring something finished, "
+    "check it against what they sent back, and claim only what the evidence supports. "
+    "When a precedent actually shaped your decision or your recommended option, cite "
     "its id in the decision card's `basis`; do not cite what you did not use.\n"
 )
 

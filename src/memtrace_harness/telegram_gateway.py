@@ -18,6 +18,15 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.completion_claims import (
+    CLAIM_NO,
+    CLAIM_OK,
+    accept_claim,
+    apply_kb_updates,
+    claim_keyboard,
+    kb_updates_from_artifact,
+    reject_claim,
+)
 from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
 from memtrace_harness.decision_records import (
     CONTROLLER_OUTCOME_PREFIX,
@@ -688,6 +697,11 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id, text="無法辨識的按鈕")
             return None
+        if action in {CLAIM_OK, CLAIM_NO}:
+            result = self._resolve_claim(action, request_id, chat_id, source_message.get("message_id"))
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         if action in {"sched_resume", "sched_cancel"}:
             result = self._resolve_schedule_button(
                 action.removeprefix("sched_"), request_id, chat_id, source_message.get("message_id")
@@ -1375,10 +1389,119 @@ class TelegramGateway:
             if pending is not None:
                 self.notify_approval_request(pending)
                 return
+        claim = self._file_completion_claim(conv_id, summary)
+        if claim is not None:
+            claim_id, extra_lines = claim
+            text = "\n".join([final_text, *extra_lines]) + "\n\n請驗收：完成了就按「驗收通過」，不是你要的就按「還沒完成」（沒有期限，沒按就一直維持待驗收）。"
+            for cid in [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids):
+                self.send_message_with_keyboard(cid, text, claim_keyboard(claim_id))
+            return
         if chat_id is not None:
             self.send_message(chat_id, final_text)
         else:
             self.notify_all_allowlisted(final_text)
+
+    def _file_completion_claim(self, conv_id: str, summary) -> tuple[str, list[str]] | None:
+        """At the end of a governed run the Controller's converge stage declares the work done:
+        record that as a claim awaiting the operator's acceptance, and apply the knowledge-base
+        updates it proposed (completion_claims.py). None when this run is not such a completion
+        (a failed or stopped run, a schedule or operational run that never reached converge).
+        Never raises: the result is reported either way."""
+        try:
+            if summary.status != "succeeded":
+                return None
+            converge = next(
+                (
+                    s for s in reversed(summary.stages)
+                    if s.stage == "converge" and (s.artifact or {}).get("action") in {"finish", "merge"}
+                ),
+                None,
+            )
+            scope = next((p for p in self.projects if p.workspace_id == summary.task.workspace_id), None)
+            if converge is None or scope is None:
+                return None
+            trace_store = self.approval_manager.trace_store
+            claim_id = trace_store.create_completion_claim(
+                project=scope.name,
+                conversation_id=summary.conversation_id or conv_id,
+                summary=summary.recommendation,
+                workspace_id=summary.task.workspace_id,
+                evidence={
+                    "stages": [f"{s.stage}:{s.state}" for s in summary.stages],
+                    "controller_reason": (converge.artifact or {}).get("reason"),
+                },
+            )
+            lines: list[str] = []
+            ops = kb_updates_from_artifact(converge.artifact)
+            if ops and self.memtrace_client is not None:
+                applied = apply_kb_updates(
+                    self.memtrace_client,
+                    workspace_id=summary.task.workspace_id,
+                    ops=ops,
+                    claim_id=claim_id,
+                    conversation_id=summary.conversation_id or conv_id,
+                    claim_summary=summary.recommendation[:500],
+                )
+                trace_store.attach_claim_nodes(
+                    claim_id, node_id=applied["node_id"], claim_node_id=applied["claim_node_id"]
+                )
+                lines = [f"🧠 {line}" for line in applied["lines"]]
+            return claim_id, lines
+        except Exception:
+            logger.exception(f"filing the completion claim for {conv_id} failed; reporting without it")
+            return None
+
+    def _resolve_claim(self, action: str, claim_id: str, chat_id: int, message_id: int | None) -> str:
+        """The operator's answer to a completion claim. Accepting moves the claimed node to
+        done; sending it back reopens it and is kept as the decision the Controller learns from
+        (listed, marked, in the precedent it reads next)."""
+        trace_store = self.approval_manager.trace_store
+        claim = trace_store.get_completion_claim(claim_id)
+        if claim is None:
+            return f"找不到驗收項目 {claim_id}"
+        accepted = action == CLAIM_OK
+        if not trace_store.resolve_completion_claim(claim_id, "accepted" if accepted else "rejected"):
+            return "這項已經處理過了"
+        problem = None
+        if self.memtrace_client is not None:
+            problem = (accept_claim if accepted else reject_claim)(self.memtrace_client, claim)
+        choice = "驗收通過" if accepted else "還沒完成"
+        record_id = trace_store.add_decision_record(
+            project=claim["project"],
+            kind="task_claim",
+            situation=claim["summary"],
+            outcome="claim_accepted" if accepted else "claim_rejected",
+            chosen_text=choice,
+            followed=accepted,
+            subject=claim_id,
+            conversation_id=claim["conversation_id"],
+        )
+        self.primary_session_mgr.record_turn(
+            project=claim["project"],
+            speaker="user",
+            turn_type="decision",
+            content=decision_turn_text(
+                record_id=record_id,
+                kind="task_claim",
+                situation=claim["summary"],
+                outcome="claim_accepted" if accepted else "claim_rejected",
+                chosen_text=choice,
+                recommended_label=None,
+            ),
+        )
+        if message_id is not None:
+            self.clear_message_keyboard(chat_id, message_id)
+        if accepted:
+            note = f"（知識庫更新有問題：{problem}）" if problem else ""
+            self.send_message(chat_id, f"✅ 已驗收 {claim_id}。{note}")
+            return "已驗收"
+        note = f"（知識庫更新有問題：{problem}）" if problem else ""
+        self.send_message(
+            chat_id,
+            f"↩️ 已退回 {claim_id}，相關節點重新標為未完成，這次的宣告也記下來了，之後的判斷會參考。"
+            f"哪裡沒完成可以直接回覆這則訊息告訴我。{note}",
+        )
+        return "已退回"
 
     @staticmethod
     def _model_summary(summary) -> str:

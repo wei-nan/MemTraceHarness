@@ -801,6 +801,23 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_decision_records_project
                     ON decision_records(project, id);
 
+                -- A completion the Controller declared at the end of a governed run, waiting for
+                -- (or carrying) the operator's acceptance (see completion_claims.py). Nothing
+                -- is accepted by silence: a claim stays 'claimed' until the operator answers.
+                CREATE TABLE IF NOT EXISTS completion_claims (
+                    id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    node_id TEXT,
+                    claim_node_id TEXT,
+                    workspace_id TEXT,
+                    summary TEXT NOT NULL,
+                    evidence TEXT,
+                    status TEXT NOT NULL DEFAULT 'claimed',
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS workspace_locks (
                     conversation_id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL,
@@ -1686,6 +1703,64 @@ class TraceStore:
                 ),
             )
         return request_id
+
+    def create_completion_claim(
+        self,
+        *,
+        project: str,
+        conversation_id: str,
+        summary: str,
+        evidence: dict | None = None,
+        node_id: str | None = None,
+        workspace_id: str | None = None,
+    ) -> str:
+        claim_id = f"clm_{uuid4().hex[:12]}"
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO completion_claims (id, project, conversation_id, node_id, workspace_id, "
+                "summary, evidence, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)",
+                (
+                    claim_id, project, conversation_id, node_id, workspace_id, summary,
+                    json.dumps(evidence, ensure_ascii=False) if evidence else None, utc_now_iso(),
+                ),
+            )
+        return claim_id
+
+    def get_completion_claim(self, claim_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id, project, conversation_id, node_id, workspace_id, summary, evidence, "
+                "status, created_at, resolved_at, claim_node_id FROM completion_claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            evidence = json.loads(row[6]) if row[6] else None
+        except ValueError:
+            evidence = None
+        return {
+            "id": row[0], "project": row[1], "conversation_id": row[2], "node_id": row[3],
+            "workspace_id": row[4], "summary": row[5], "evidence": evidence, "status": row[7],
+            "created_at": row[8], "resolved_at": row[9], "claim_node_id": row[10],
+        }
+
+    def attach_claim_nodes(self, claim_id: str, *, node_id: str | None, claim_node_id: str | None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE completion_claims SET node_id = ?, claim_node_id = ? WHERE id = ?",
+                (node_id, claim_node_id, claim_id),
+            )
+
+    def resolve_completion_claim(self, claim_id: str, status: str) -> bool:
+        """Only a claim still waiting can be accepted or rejected, once."""
+        with self._connection() as conn:
+            cur = conn.execute(
+                "UPDATE completion_claims SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'claimed'",
+                (status, utc_now_iso(), claim_id),
+            )
+            return cur.rowcount > 0
 
     def add_decision_record(
         self,

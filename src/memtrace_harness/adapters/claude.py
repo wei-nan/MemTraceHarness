@@ -43,11 +43,10 @@ class ClaudeCliAdapter(CliModelAdapter):
         # instruction to record completion) — no other role should get standing
         # permission to alter the KB.
         read_tools = "mcp__memtrace__search_nodes,mcp__memtrace__get_node,mcp__memtrace__list_nodes,mcp__memtrace__traverse"
-        write_tools = (
-            ",mcp__memtrace__create_node,mcp__memtrace__update_node"
-            if self.role_profile_id == "controller"
-            else ""
-        )
+        # No role calls a MemTrace write tool itself. The Controller maintains the knowledge
+        # base by proposing `kb_updates` that the harness validates and applies (see
+        # completion_claims.py), so every write is checked and tied to the run behind it.
+        write_tools = ""
         # Read-only TaiwanTrade proxy: an MCP server, which runs outside the sandbox.
         # Every role gets it, Controller included (operator's call, 2026-10-05).
         taiwantrade = mcp_server_spec()

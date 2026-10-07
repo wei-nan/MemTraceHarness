@@ -89,13 +89,95 @@
         "basis"
       ],
       "additionalProperties": false
+    },
+    "kb_updates": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "Updates to the knowledge base the harness should apply; null when none.",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "claim_done",
+              "note"
+            ]
+          },
+          "node_id": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "content_type": {
+            "type": "string",
+            "enum": [
+              "factual",
+              "procedural",
+              "context",
+              "inquiry",
+              "preference"
+            ]
+          },
+          "links": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "properties": {
+                "to_id": {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                "relation": {
+                  "type": "string",
+                  "enum": [
+                    "related_to",
+                    "extends",
+                    "extracted_from",
+                    "depends_on",
+                    "contradicts",
+                    "superseded_by",
+                    "answered_by"
+                  ]
+                }
+              },
+              "required": [
+                "to_id",
+                "relation"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "op",
+          "node_id",
+          "title",
+          "body",
+          "content_type",
+          "links"
+        ],
+        "additionalProperties": false
+      }
     }
   },
   "required": [
     "action",
     "reason",
     "searched_history",
-    "decision_card"
+    "decision_card",
+    "kb_updates"
   ],
   "additionalProperties": false
 }
