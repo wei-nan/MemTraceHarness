@@ -250,6 +250,17 @@ reviewer" and "consistent behavior" properties people actually rely on come from
 already being a fresh, separately-invoked CLI call — never a continued conversation — and from the
 permission/context boundaries above, not from forcing any role onto a specific vendor.
 
+**MemTrace lookups for Codex roles (2026-10-07).** Every role may query MemTrace read-only
+(`search_nodes`, `get_node`, `list_nodes`, `traverse`). Claude picks the tools up from the user's own CLI
+configuration; Codex cannot: the harness runs it under its own `CODEX_HOME` (`scripts/codex-will`, whose
+config lists no MCP server), and the Controller and Red Team calls add `--ignore-user-config`, which would
+drop one anyway. So `CodexCliAdapter` passes the server as `--config mcp_servers.memtrace.*` overrides
+(URL from `MEMTRACE_MCP_URL`, lookups only via `enabled_tools`, the token by `bearer_token_env_var` so it is
+never on the command line). Before this, 227 recorded Controller runs on Codex contained no tool event of any
+kind and Codex Red Team runs never touched MemTrace, while the Controller's prompt told it to look things up.
+Verified live: a Codex Controller call with these flags completed a `search_nodes` call. **Not verified:**
+whether Antigravity, the Controller's other fallback, has MemTrace tools at all.
+
 ## Conversation and checkpoint contract
 
 **ENFORCED**:

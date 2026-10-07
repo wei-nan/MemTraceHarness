@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
+
 import json
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 
 from memtrace_harness.adapters import (
     AntigravityCliAdapter,
@@ -190,6 +193,64 @@ class CliAdapterTests(TestCase):
         self.assertIn("mcp__memtrace__search_nodes", allowed)
         self.assertNotIn("mcp__memtrace__update_node", allowed)
         self.assertNotIn("mcp__memtrace__create_node", allowed)
+
+    def _codex_command(self, **kwargs) -> list[str]:
+        adapter = self._adapter(CodexCliAdapter, StaticProcessRunner(process_result("")), **kwargs)
+        return adapter.build_command("prompt")
+
+    def test_codex_gets_memtrace_lookups_even_for_the_roles_that_ignore_user_config(self) -> None:
+        # The Controller and Red Team calls pass --ignore-user-config, and the harness's Codex home
+        # lists no MCP server: without these overrides they have no MemTrace tool at all.
+        for policy in ("loop-snapshot", "gate-evidence-only", "task-and-targeted-evidence"):
+            with self.subTest(policy=policy), patch.dict("os.environ", {"MEMTRACE_API_TOKEN": "secret-token"}):
+                command = self._codex_command(
+                    memtrace_mcp_url="https://kb.example/mcp", context_policy=policy
+                )
+                overrides = [command[i + 1] for i, c in enumerate(command) if c == "--config"]
+                self.assertIn('mcp_servers.memtrace.url="https://kb.example/mcp"', overrides)
+                self.assertIn(
+                    'mcp_servers.memtrace.enabled_tools=["search_nodes", "get_node", "list_nodes", "traverse"]',
+                    overrides,
+                )
+                self.assertIn('mcp_servers.memtrace.default_tools_approval_mode="approve"', overrides)
+                self.assertIn('mcp_servers.memtrace.bearer_token_env_var="MEMTRACE_API_TOKEN"', overrides)
+                self.assertEqual("--ignore-user-config" in command, policy != "task-and-targeted-evidence")
+
+    def test_the_memtrace_token_is_never_put_on_the_command_line(self) -> None:
+        with patch.dict("os.environ", {"MEMTRACE_API_TOKEN": "secret-token"}):
+            command = self._codex_command(memtrace_mcp_url="https://kb.example/mcp")
+        self.assertNotIn("secret-token", " ".join(command))
+
+    def test_codex_memtrace_tools_are_lookups_only(self) -> None:
+        command = " ".join(self._codex_command(memtrace_mcp_url="https://kb.example/mcp"))
+        for write_tool in ("create_node", "update_node", "delete_node", "create_edge"):
+            self.assertNotIn(write_tool, command)
+
+    def test_without_a_memtrace_url_or_token_nothing_is_added(self) -> None:
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("MEMTRACE_API_TOKEN", None)
+            self.assertNotIn("mcp_servers.memtrace", " ".join(self._codex_command()))
+            with_url = " ".join(self._codex_command(memtrace_mcp_url="https://kb.example/mcp"))
+        self.assertIn("mcp_servers.memtrace.url", with_url)
+        self.assertNotIn("bearer_token_env_var", with_url)
+
+    def test_the_factory_hands_every_adapter_the_memtrace_url_from_config(self) -> None:
+        from memtrace_harness.adapter_factory import build_provider_adapter
+        from memtrace_harness.config import HarnessConfig
+
+        config = HarnessConfig(
+            memtrace_mcp_url="https://kb.example/mcp", memtrace_api_token=None,
+            trace_db_path=self.root / "t.sqlite3", trace_root=self.root, claude_command="claude",
+            codex_command="codex", antigravity_command="agy", antigravity_output_mode="auto",
+            cli_timeout_seconds=900, telegram_bot_token=None, telegram_allowed_chat_ids=set(),
+            project_index_path=None, chat_provider="claude", chat_model="haiku",
+            unattended_write_requires_approval=True,
+        )
+        adapter = build_provider_adapter(
+            provider="codex", config=config, working_directory=self.root, timeout_seconds=30
+        )
+        self.assertEqual(adapter.memtrace_mcp_url, "https://kb.example/mcp")
+        self.assertIn('mcp_servers.memtrace.url="https://kb.example/mcp"', " ".join(adapter.build_command("p")))
 
     def test_codex_usage_limit_error_is_surfaced_for_failure_classification(self) -> None:
         stdout = "\n".join(

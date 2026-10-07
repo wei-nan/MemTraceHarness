@@ -45,6 +45,7 @@ class CliModelAdapter(ModelAdapter):
         quota_bucket: str | None = None,
         fallback_index: int = 0,
         reply_language: str | None = None,
+        memtrace_mcp_url: str | None = None,
     ) -> None:
         self.adapter_id = adapter_id
         self.role = role
@@ -63,6 +64,9 @@ class CliModelAdapter(ModelAdapter):
         self.quota_bucket = quota_bucket or f"{self.provider}-account"
         self.fallback_index = fallback_index
         self.reply_language = reply_language
+        # Where the read-only MemTrace lookup tools are reachable, for providers that cannot
+        # pick them up from the user's own CLI configuration (see CodexCliAdapter).
+        self.memtrace_mcp_url = memtrace_mcp_url
 
     def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
         prompt = render_agent_prompt(task, self.role, reply_language=self.reply_language)
