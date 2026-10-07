@@ -54,7 +54,7 @@ CHARTER_MAX_CHARS = 5000
 CHARTER_TAGS = ["harness", "controller", "charter"]
 # Nodes the harness itself manages (digests and consolidation notes it syncs, task nodes it
 # scans, the map): a model's tidying must not delete, retitle or retag them.
-PROTECTED_TAGS = frozenset({"daily-digest", "primary-session", "charter", "task"})
+PROTECTED_TAGS = frozenset({"daily-digest", "primary-session", "charter", "directions-index", "task"})
 DELETE_REASONS = ("hallucination", "wrong_direction", "duplicate", "pii", "orphaned", "other")
 RESOLUTIONS = ("open", "resolved", "superseded")
 OPS = ("dedupe", "delete", "retag", "set_resolution", "supersede", "link", "retitle", "pin")
@@ -522,6 +522,33 @@ def describe_outcome(outcome: GardenOutcome) -> str:
     if outcome.notes:
         text += f"\n我學到：{outcome.notes}"
     return text
+
+
+def undo_created_nodes(client: MemTraceClient, trace_store: TraceStore, run_id: int) -> tuple[int, int]:
+    """Take back the nodes a promotion pass created (kb_promotion.py): soft-delete them, and forget
+    the records that point at them so a later pass may write them again. Returns (removed,
+    failed). Edits a pass made to a note it had written earlier are not reverted."""
+    run = trace_store.get_gardening_run(run_id)
+    if run is None:
+        return 0, 0
+    removed = failed = 0
+    for action in trace_store.list_gardening_actions(run_id, op="create"):
+        if action["undone"]:
+            continue
+        try:
+            client.delete_node(
+                workspace_id=run["workspace_id"], node_id=action["node_id"], reason_category="other",
+                reason_note="operator undid this pass", stage="kb_promotion_undo",
+            )
+        except Exception:
+            logger.exception(f"could not remove node {action['node_id']}")
+            failed += 1
+            continue
+        trace_store.delete_promotions_for_nodes(run["workspace_id"], [action["node_id"]])
+        trace_store.delete_workspace_index_for_node(run["workspace_id"], action["node_id"])
+        trace_store.mark_gardening_action_undone(action["id"])
+        removed += 1
+    return removed, failed
 
 
 def undo_gardening_run(
