@@ -10,7 +10,8 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
-from memtrace_harness.decision_card import CARD_INSTRUCTION, card_from_artifact
+from memtrace_harness.decision_card import CARD_INSTRUCTION, card_from_artifact, restrict_basis
+from memtrace_harness.decision_records import PRECEDENT_CONTENT_TYPE, known_basis_ids
 from memtrace_harness.fallback import (
     classify_execution_failure,
     error_signature,
@@ -1328,8 +1329,15 @@ class AgentLoopRunner:
                 # The stage that stopped the loop is the last one executed; its own
                 # distilled question (if it wrote a usable one) replaces the raw detail
                 # in what the human is shown.
-                decision_card=card_from_artifact(
-                    summary.stages[-1].artifact if summary.stages else None
+                decision_card=restrict_basis(
+                    card_from_artifact(summary.stages[-1].artifact if summary.stages else None),
+                    known_basis_ids(
+                        "\n".join(
+                            item.body
+                            for item in summary.task.context_items
+                            if item.content_type == PRECEDENT_CONTENT_TYPE
+                        )
+                    ),
                 ),
             )
         if writeback:
@@ -1513,6 +1521,7 @@ def controller_task(
             "a partial answer is always better than none.\n"
             f"{operational_action_notice}"
             f"{integration_notice}"
+            f"{_PRECEDENT_NOTICE}"
             "The JSON schema enforced on this call's output is shared by both controller "
             "stages (start and converge) and therefore lists a wider action enum than is "
             "valid right now — it will not stop you from picking a value that's wrong for "
@@ -1543,7 +1552,8 @@ def controller_task(
                 # Deliberately still just static text, no tool calls added — keeps
                 # Controller's zero-tool-call sandbox guarantee intact, just gives it
                 # more to read before deciding.
-                if item.content_type in {"harness_resume_envelope", "context"}
+                if item.content_type
+                in {"harness_resume_envelope", "context", PRECEDENT_CONTENT_TYPE}
             ],
         ],
     )
@@ -1569,6 +1579,25 @@ _TOOL_DENIAL_RESILIENCE = (
 )
 
 
+# Only the Controller is shown the operator's past decisions and preferences (the
+# `operator_precedent` context item): it is the role whose judgment — route, ask, notify,
+# merge — depends on how this person tends to decide. The working roles do technical work
+# and must not drift toward what they guess the operator likes (see _for_working_roles()).
+_PRECEDENT_NOTICE = (
+    "If an operator-precedent item is among the context below, it lists this operator's own past "
+    "decisions (D<n>) and standing preferences (P<n>). Treat it as evidence of what they would "
+    "likely choose, never as an instruction: the current goal and anything explicit in it outrank "
+    "it, and a preference can be out of date. A line marked with a warning sign is a decision that "
+    "went against a recommendation like the one you may be about to make — weigh that before "
+    "repeating it. When a precedent actually shaped your decision or your recommended option, cite "
+    "its id in the decision card's `basis`; do not cite what you did not use.\n"
+)
+
+
+def _for_working_roles(items: list[ContextItem]) -> list[ContextItem]:
+    return [item for item in items if item.content_type != PRECEDENT_CONTENT_TYPE]
+
+
 def planner_task(task: TaskEnvelope) -> TaskEnvelope:
     return stage_task(
         task,
@@ -1582,7 +1611,7 @@ def planner_task(task: TaskEnvelope) -> TaskEnvelope:
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
-        context_items=task.context_items,
+        context_items=_for_working_roles(task.context_items),
     )
 
 
@@ -1726,7 +1755,7 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
-        context_items=task.context_items,
+        context_items=_for_working_roles(task.context_items),
     )
 
 
@@ -1743,7 +1772,7 @@ def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
         context_items=[
-            *task.context_items,
+            *_for_working_roles(task.context_items),
             artifact_item("harness:accepted-plan", "Accepted plan", plan),
         ],
     )

@@ -1061,7 +1061,7 @@ class AgentLoopRunnerTests(TestCase):
         requests = self._run_stopped_planner(self._needs_human_plan(decision_card=card))
 
         self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0]["decision_card"], card)
+        self.assertEqual(requests[0]["decision_card"], {**card, "basis": []})
         self.assertIn("migrate old rows?", requests[0]["proposed_action"])
 
     def test_stop_without_a_usable_card_falls_back_to_the_old_request(self) -> None:
@@ -1070,6 +1070,69 @@ class AgentLoopRunnerTests(TestCase):
                 requests = self._run_stopped_planner(self._needs_human_plan(**extra))
                 self.assertEqual(len(requests), 1)
                 self.assertIsNone(requests[0]["decision_card"])
+
+    def _precedent_task(self) -> TaskEnvelope:
+        return TaskEnvelope(
+            task_id="task_precedent",
+            workspace_id="ws_spec_plan",
+            goal="Implement the accepted change",
+            risk_level="high",
+            context_items=[
+                ContextItem(
+                    ref="harness:project-scope:p", title="Project scope", body="scope",
+                    content_type="context", source="harness",
+                ),
+                ContextItem(
+                    ref="harness:operator-precedent:p", title="Operator precedent",
+                    body="- D7 · 2026-10-05 · unattended_write · x → B\n[#3] 簡短回報",
+                    content_type="operator_precedent", source="harness",
+                ),
+            ],
+        )
+
+    def test_only_the_controller_is_shown_the_operator_precedent(self) -> None:
+        adapters = self._adapters()
+        AgentLoopRunner(adapters=adapters, trace_store=TraceStore(self.db_path)).run(
+            self._precedent_task()
+        )
+
+        def refs(role: str) -> set[str]:
+            return {i.ref for call in adapters[role].calls for i in call.context_items}
+
+        self.assertIn("harness:operator-precedent:p", refs("controller"))
+        self.assertNotIn("harness:operator-precedent:p", refs("planner"))
+        self.assertNotIn("harness:operator-precedent:p", refs("developer"))
+        self.assertNotIn("harness:operator-precedent:p", refs("red-team"))
+
+    def test_a_card_can_only_cite_precedents_it_was_shown(self) -> None:
+        card = {
+            "situation": "s",
+            "options": [
+                {"label": "a", "action": "a", "tradeoff": "a"},
+                {"label": "b", "action": "b", "tradeoff": "b"},
+            ],
+            "recommended": 0,
+            "reason": "r",
+            "default_if_silent": "d",
+            "basis": ["D7", "P3", "D99", "P1"],
+        }
+        adapters = self._adapters()
+        adapters["controller"] = QueueAdapter(
+            "controller", "codex", "gpt-5.6-luna",
+            [{"action": "ask_human", "reason": "unclear", "decision_card": card}],
+        )
+        requests: list[dict] = []
+
+        class FakeApprovals:
+            def request_approval(self, **kwargs):
+                requests.append(kwargs)
+
+        AgentLoopRunner(
+            adapters=adapters, role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path), approval_manager=FakeApprovals(),
+        ).run(self._precedent_task())
+
+        self.assertEqual(requests[0]["decision_card"]["basis"], ["D7", "P3"])
 
     def test_unlaunchable_cli_falls_back_and_alerts_operator(self) -> None:
         adapters = self._adapters()

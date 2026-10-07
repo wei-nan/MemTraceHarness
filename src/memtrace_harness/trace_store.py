@@ -777,6 +777,29 @@ class TraceStore:
                     responded_by_chat_id INTEGER
                 );
 
+                -- One row per decision the operator made on a request the harness put to them
+                -- (see decision_records.py): what was asked, what they chose, and whether that
+                -- followed the recommendation. Precedent for the Controller and evidence for
+                -- the nightly preference digest.
+                CREATE TABLE IF NOT EXISTS decision_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    approval_id TEXT,
+                    conversation_id TEXT,
+                    kind TEXT NOT NULL,
+                    situation TEXT NOT NULL,
+                    options TEXT,
+                    recommended INTEGER,
+                    outcome TEXT NOT NULL,
+                    chosen_index INTEGER,
+                    chosen_text TEXT,
+                    followed INTEGER,
+                    reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_decision_records_project
+                    ON decision_records(project, id);
+
                 CREATE TABLE IF NOT EXISTS workspace_locks (
                     conversation_id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL,
@@ -1661,6 +1684,91 @@ class TraceStore:
                 ),
             )
         return request_id
+
+    def add_decision_record(
+        self,
+        *,
+        project: str,
+        kind: str,
+        situation: str,
+        outcome: str,
+        approval_id: str | None = None,
+        conversation_id: str | None = None,
+        options: list[dict] | None = None,
+        recommended: int | None = None,
+        chosen_index: int | None = None,
+        chosen_text: str | None = None,
+        followed: bool | None = None,
+        reason: str | None = None,
+    ) -> int:
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO decision_records (
+                    created_at, project, approval_id, conversation_id, kind, situation, options,
+                    recommended, outcome, chosen_index, chosen_text, followed, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    utc_now_iso(),
+                    project,
+                    approval_id,
+                    conversation_id,
+                    kind,
+                    situation,
+                    json.dumps(options, ensure_ascii=False) if options else None,
+                    recommended,
+                    outcome,
+                    chosen_index,
+                    chosen_text,
+                    None if followed is None else int(followed),
+                    reason,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_decision_records(
+        self, project: str, *, kind: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Newest first. `followed` comes back as True/False/None."""
+        query = (
+            "SELECT id, created_at, project, approval_id, conversation_id, kind, situation, "
+            "options, recommended, outcome, chosen_index, chosen_text, followed, reason "
+            "FROM decision_records WHERE project = ?"
+        )
+        params: list = [project]
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        records = []
+        for row in rows:
+            try:
+                options = json.loads(row[7]) if row[7] else None
+            except ValueError:
+                options = None
+            records.append(
+                {
+                    "id": row[0],
+                    "created_at": row[1],
+                    "project": row[2],
+                    "approval_id": row[3],
+                    "conversation_id": row[4],
+                    "kind": row[5],
+                    "situation": row[6],
+                    "options": options,
+                    "recommended": row[8],
+                    "outcome": row[9],
+                    "chosen_index": row[10],
+                    "chosen_text": row[11],
+                    "followed": None if row[12] is None else bool(row[12]),
+                    "reason": row[13],
+                }
+            )
+        return records
 
     def get_approval_decision_card(self, request_id: str) -> dict | None:
         """The decision card a stopped stage attached to this request (see decision_card.py),
