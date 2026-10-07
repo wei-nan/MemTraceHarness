@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,12 @@ from memtrace_harness.adapters.cli import CliModelAdapter
 from memtrace_harness.cli_process import ProcessResult
 from memtrace_harness.schemas import TaskEnvelope, TokenUsage
 from memtrace_harness.taiwantrade_mcp import mcp_server_spec
+
+
+# The MemTrace tools every role may use through Codex: lookups only. No role writes through a
+# tool (the Controller proposes `kb_updates`, see completion_claims.py).
+MEMTRACE_READ_TOOLS = ["search_nodes", "get_node", "list_nodes", "traverse"]
+MEMTRACE_TOKEN_ENV = "MEMTRACE_API_TOKEN"
 
 
 class CodexCliAdapter(CliModelAdapter):
@@ -55,6 +62,23 @@ class CodexCliAdapter(CliModelAdapter):
                     "--config", f'{prefix}.default_tools_approval_mode="approve"',
                 ]
             )
+        # MemTrace's read-only lookups. Until 2026-10-07 Codex had none: the harness runs it under
+        # its own CODEX_HOME (scripts/codex-will), whose config lists no MCP servers, and the
+        # Controller and Red Team calls below add --ignore-user-config, which would discard one
+        # anyway. So 227 Controller runs on Codex made no tool call at all while its prompt told
+        # it to look things up in MemTrace. Passed as --config overrides, like the TaiwanTrade
+        # proxy; the token goes by environment variable, never on the command line.
+        if self.memtrace_mcp_url:
+            prefix = "mcp_servers.memtrace"
+            command.extend(
+                [
+                    "--config", f"{prefix}.url={json.dumps(self.memtrace_mcp_url)}",
+                    "--config", f"{prefix}.enabled_tools={json.dumps(MEMTRACE_READ_TOOLS)}",
+                    "--config", f'{prefix}.default_tools_approval_mode="approve"',
+                ]
+            )
+            if os.getenv(MEMTRACE_TOKEN_ENV):
+                command.extend(["--config", f'{prefix}.bearer_token_env_var="{MEMTRACE_TOKEN_ENV}"'])
         if self.context_policy in {"loop-snapshot", "gate-evidence-only"}:
             command.append("--ignore-user-config")
         if self.context_policy == "loop-snapshot":

@@ -67,6 +67,7 @@ def build_provider_adapter(
         ),
         "fallback_index": fallback_index,
         "reply_language": config.reply_language,
+        "memtrace_mcp_url": config.memtrace_mcp_url,
     }
     if effective_provider == "claude":
         return ClaudeCliAdapter(**common)
