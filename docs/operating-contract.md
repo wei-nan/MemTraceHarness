@@ -140,6 +140,32 @@ decision kind, asking the operator why after a button tap that went against a re
 only captured from free-text answers), and promoting repeated disagreements to a preference outside the
 nightly digest.
 
+**Trigger review (2026-10-07).** What an unattended trigger produces is read by the Controller before it
+reaches the operator (`trigger_review.py`). It is one tool-less call through the project's Controller role
+profile (its provider/model, then its own fallbacks, in the Controller's neutral workspace), and it can
+only *reduce* what the operator is shown, on grounds the harness checks; a missing, failed or
+inadmissible verdict always degrades to the previous behaviour.
+
+- *Schedule results* (`TelegramGateway._schedule_delivery`): `push`, `digest_only` or `pause_and_notify`.
+  Holding a result back must cite which of the five earlier reports it repeats (and, for a `needs_human`
+  result, that report must have been pushed); `failed`/`budget_exhausted` runs are never reviewed or held
+  back; twelve held-back results in a row force a push; pausing needs at least three earlier reports and is
+  never applied to an alert. A held-back result is still written to the chat log, tagged `【未推送：…】`, so
+  the nightly digest sees it. A pause keeps the schedule (indefinitely) and tells the operator with
+  "繼續排程"/"取消排程" buttons; tapping one is recorded as a decision (resume = disagreement).
+- *Scanner candidates* (`UnattendedScanner._review_candidates`): per candidate `propose`, `defer` or
+  `drop`. The first proposed candidate goes to the operator with the Controller's reason appended; a
+  candidate can be deferred at most three times; a `drop` must cite `D<n>` operator decisions that were in
+  the precedent it was shown, is told to the operator, and keeps the item out of proposals for seven days.
+
+The review is only wired in by the serve command (`gateway`); without it, behaviour is unchanged.
+**Not implemented:** reviewing *before* a run to skip it (only the result is reviewed), rewriting the pushed
+text (it is pushed or held verbatim), and a review through the full Controller adapter — it uses the plain
+chat-command path like the digest and recall, so its raw output is not kept in the trace store and it has no
+quota-bucket/fallback bookkeeping. **Unverified against live models:** that the prompts produce admissible
+verdicts and that the thresholds (3 reports to pause, 12 silent results, 3 deferrals, 7 days) suit real
+schedules; covered by unit tests with injected output only.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

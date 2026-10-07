@@ -19,7 +19,21 @@ from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
-from memtrace_harness.decision_records import PRECEDENT_CONTENT_TYPE, precedent_block, record_resolution
+from memtrace_harness.decision_records import (
+    CONTROLLER_OUTCOME_PREFIX,
+    PRECEDENT_CONTENT_TYPE,
+    decision_turn_text,
+    precedent_block,
+    record_resolution,
+)
+from memtrace_harness.trigger_review import (
+    MAX_CONSECUTIVE_SILENT,
+    ScheduleDelivery,
+    build_schedule_prompt,
+    decide_schedule_delivery,
+    history_entry,
+    silent_tag,
+)
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
@@ -159,6 +173,13 @@ class TelegramGateway:
         # command; None here means chat simply runs without the slow path, which is also
         # what keeps unit tests from ever starting a real model call in a thread.
         self.topic_recall = None
+        # Builds the Controller's review call for a project (trigger_review.py); wired in by the
+        # serve command. None means a schedule's result is pushed without being read first —
+        # the behaviour before the review existed, and what keeps unit tests off real models.
+        self.review_caller_factory: Callable[[str], Callable[[str], str | None]] | None = None
+        # conversation_id -> the delivery chosen for a schedule run, handed from the run (which
+        # records the result) to the thread that reports it.
+        self._schedule_deliveries: dict[str, ScheduleDelivery] = {}
         # Each process invocation is a fresh instance (the gateway is a one-shot poll,
         # scheduled externally), so the update offset has to be persisted across runs —
         # otherwise every run would refetch and reprocess the same historical messages.
@@ -667,6 +688,13 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id, text="無法辨識的按鈕")
             return None
+        if action in {"sched_resume", "sched_cancel"}:
+            result = self._resolve_schedule_button(
+                action.removeprefix("sched_"), request_id, chat_id, source_message.get("message_id")
+            )
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         if action in {"order_confirm", "order_cancel"}:
             result = self._resolve_order_action(
                 action, request_id, chat_id, source_message.get("message_id")
@@ -933,6 +961,14 @@ class TelegramGateway:
         def _run() -> None:
             try:
                 summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id)
+                delivery = self._schedule_deliveries.pop(conv_id, None) if schedule_id else None
+                if delivery is not None and delivery.action == "digest_only":
+                    # Recorded in the chat log (tagged) for the nightly digest; not pushed.
+                    logger.info(f"schedule {schedule_id} result held back for the digest: {delivery.reason}")
+                    return
+                if delivery is not None and delivery.action == "pause_and_notify":
+                    self._pause_and_notify(scope, schedule_id, summary, delivery, chat_id)
+                    return
                 if schedule_id and summary.status == "needs_human":
                     # A notification, not a question: no approval is open, so a later reply
                     # can't resume this monitoring run with some other goal.
@@ -1682,6 +1718,145 @@ class TelegramGateway:
                 kept.append(line)
         return "\n".join(kept).rstrip(), controls
 
+    def _schedule_delivery(self, scope: ProjectScope, schedule_id: str, summary) -> ScheduleDelivery | None:
+        """Have the Controller read a schedule run's result before it is shown (see
+        trigger_review.py). None when no review is wired in or the schedule is gone — the
+        result is then reported exactly as before. Never raises."""
+        if self.review_caller_factory is None:
+            return None
+        try:
+            trace_store = self.approval_manager.trace_store
+            row = trace_store.get_schedule(schedule_id)
+            if row is None:
+                return None
+            tz = ZoneInfo(self.config.schedule_timezone)
+            now = datetime.now(timezone.utc)
+            turns = trace_store.get_primary_session_turns(
+                self.primary_session_mgr.primary_session_id_for_project(scope.name)
+            )
+            reports = [
+                history_entry(t["content"])
+                for t in turns
+                if t["turn_type"] == SCHEDULE_REPORT and t["schedule_id"] == schedule_id
+            ]
+            history = list(reversed(reports))[:MAX_CONSECUTIVE_SILENT]
+            last_user = next(
+                (t for t in reversed(turns) if t["speaker"] == "user" and t["turn_type"] != SCHEDULE_TRIGGER),
+                None,
+            )
+            last_operator = None
+            if last_user is not None:
+                minutes = int((now - datetime.fromisoformat(last_user["created_at"])).total_seconds() // 60)
+                last_operator = f"{minutes // 60} 小時 {minutes % 60} 分鐘前" if minutes >= 60 else f"{minutes} 分鐘前"
+            prompt = build_schedule_prompt(
+                schedule_id=schedule_id,
+                schedule_text=describe_schedule(self._row_spec(row)),
+                goal=row["goal"],
+                local_time=now.astimezone(tz).strftime("%Y-%m-%d %H:%M (%a)"),
+                status=summary.status,
+                result=summary.recommendation,
+                history=history[:5],
+                precedent=precedent_block(
+                    trace_store, scope.name, preferences=self._operator_profile_context(scope)
+                ),
+                last_operator_message=last_operator,
+            )
+            return decide_schedule_delivery(
+                caller=self.review_caller_factory(scope.name),
+                status=summary.status,
+                history=history,
+                prompt=prompt,
+            )
+        except Exception:
+            logger.exception(f"reviewing schedule {schedule_id}'s result failed; reporting it as before")
+            return None
+
+    def _pause_and_notify(
+        self, scope: ProjectScope, schedule_id: str, summary, delivery: ScheduleDelivery, chat_id: int | None
+    ) -> None:
+        """The Controller judged that a schedule no longer has a reason to run: pause it
+        (kept, not cancelled), say why, and give the operator a one-tap way to undo or finish
+        it. The decision is recorded so a later review can learn which way they went."""
+        trace_store = self.approval_manager.trace_store
+        row = trace_store.get_schedule(schedule_id)
+        if row is None or not row["active"]:
+            return
+        tz = ZoneInfo(self.config.schedule_timezone)
+        now = datetime.now(timezone.utc)
+        trace_store.pause_schedule(
+            schedule_id,
+            paused_until=self._PAUSE_INDEFINITELY,
+            next_run_at=compute_next_run(self._row_spec(row), after=now, tz=tz),
+        )
+        trace_store.add_decision_record(
+            project=scope.name,
+            kind="schedule_pause",
+            situation=delivery.reason,
+            outcome=f"{CONTROLLER_OUTCOME_PREFIX}paused",
+            subject=schedule_id,
+        )
+        text = (
+            f"⏸ 排程 {schedule_id} 我先暫停了：{delivery.reason}\n"
+            f"任務：{row['goal']}\n最近一輪結果：{summary.recommendation[:300]}\n\n"
+            "要繼續就按「繼續排程」；不按的話它會維持暫停。"
+        )
+        keyboard = [
+            [
+                {"text": "▶️ 繼續排程", "callback_data": f"sched_resume:{schedule_id}"},
+                {"text": "🗑 取消排程", "callback_data": f"sched_cancel:{schedule_id}"},
+            ]
+        ]
+        targets = [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids)
+        for cid in targets:
+            self.send_message_with_keyboard(cid, text, keyboard)
+        self.primary_session_mgr.record_turn(
+            project=scope.name, speaker="assistant", turn_type="chat", content=text
+        )
+
+    def _resolve_schedule_button(
+        self, action: str, schedule_id: str, chat_id: int, message_id: int | None
+    ) -> str:
+        """A tap on the buttons of _pause_and_notify(). Resuming is the operator disagreeing
+        with the Controller's judgment, cancelling is agreeing; either is kept as precedent."""
+        trace_store = self.approval_manager.trace_store
+        row = trace_store.get_schedule(schedule_id)
+        scope = next((p for p in self.projects if row and p.name == row["project"]), None)
+        if row is None or not row["active"] or scope is None:
+            return f"找不到可操作的排程 {schedule_id}"
+        paused = [
+            r
+            for r in trace_store.list_decision_records(scope.name, kind="schedule_pause", limit=20)
+            if r["subject"] == schedule_id and r["outcome"].startswith(CONTROLLER_OUTCOME_PREFIX)
+        ]
+        situation = paused[0]["situation"] if paused else f"排程 {schedule_id} 被暫停"
+        self._apply_schedule_control(scope, chat_id, "resume" if action == "resume" else "cancel", schedule_id)
+        outcome = "resumed" if action == "resume" else "cancelled"
+        record_id = trace_store.add_decision_record(
+            project=scope.name,
+            kind="schedule_pause",
+            situation=situation,
+            outcome=outcome,
+            chosen_text="繼續排程" if action == "resume" else "取消排程",
+            followed=action != "resume",
+            subject=schedule_id,
+        )
+        self.primary_session_mgr.record_turn(
+            project=scope.name,
+            speaker="user",
+            turn_type="decision",
+            content=decision_turn_text(
+                record_id=record_id,
+                kind="schedule_pause",
+                situation=situation,
+                outcome="picked_other" if action == "resume" else "picked_recommended",
+                chosen_text="繼續排程" if action == "resume" else "取消排程",
+                recommended_label="暫停" if action == "resume" else None,
+            ),
+        )
+        if message_id is not None:
+            self.clear_message_keyboard(chat_id, message_id)
+        return "已繼續排程" if action == "resume" else "已取消排程"
+
     def _apply_schedule_control(
         self, scope: ProjectScope, chat_id: int, action: str, payload: str
     ) -> None:
@@ -1885,14 +2060,22 @@ class TelegramGateway:
         if note and worktree and worktree.branch not in summary.recommendation:
             summary = replace(summary, recommendation=summary.recommendation + note)
         if schedule_id:
+            delivery = self._schedule_delivery(scope, schedule_id, summary)
+            if delivery is not None:
+                self._schedule_deliveries[conv_id] = delivery
+            content = (
+                f"排程 {schedule_id} 執行完成（loop {summary.conversation_id}，"
+                f"狀態 {summary.status}）：{summary.recommendation}"
+            )
+            if delivery is not None and delivery.action == "digest_only":
+                content = silent_tag(delivery.reason) + content
+            elif delivery is not None and delivery.action == "pause_and_notify":
+                content += f"（Controller 判斷這個排程已無需執行，已暫停：{delivery.reason}）"
             self.primary_session_mgr.record_turn(
                 project=scope.name,
                 speaker="work_session_report",
                 turn_type=SCHEDULE_REPORT,
-                content=(
-                    f"排程 {schedule_id} 執行完成（loop {summary.conversation_id}，"
-                    f"狀態 {summary.status}）：{summary.recommendation}"
-                ),
+                content=content,
                 source_work_conversation_id=summary.conversation_id,
                 schedule_id=schedule_id,
             )

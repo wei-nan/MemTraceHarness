@@ -3,9 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, TYPE_CHECKING
 from uuid import uuid4
+
+from memtrace_harness.decision_records import CONTROLLER_OUTCOME_PREFIX, precedent_block
+from memtrace_harness.memory_digest import preference_context_for
+from memtrace_harness.trigger_review import (
+    MAX_CANDIDATES_REVIEWED,
+    build_scanner_prompt,
+    decide_scanner_verdicts,
+)
 
 if TYPE_CHECKING:
     from memtrace_harness.approval import ApprovalManager
@@ -62,6 +70,7 @@ class UnattendedScanner:
         gateway: TelegramGateway | dict[str, TelegramGateway] | None = None,
         approval_mgr: ApprovalManager | None = None,
         record_push: Callable[[str, str], Any] | None = None,
+        review_caller_factory: Callable[[str], Callable[[str], str | None]] | None = None,
     ) -> None:
         self.config = config
         self.trace_store = trace_store
@@ -73,6 +82,9 @@ class UnattendedScanner:
         # Writes what the scanner pushed to the operator into the project's chat log,
         # so the nightly digest and the chat model see the whole day, not just replies.
         self._record_push = record_push
+        # Builds the Controller's review call for a project (trigger_review.py). None means
+        # candidates are proposed to the operator without being read first, as before.
+        self._review_caller_factory = review_caller_factory
 
     def _gateway_for(self, scope: ProjectScope) -> TelegramGateway | None:
         """Resolve the bot that owns this project. `gateway` may be a single shared
@@ -199,6 +211,74 @@ class UnattendedScanner:
         except Exception as exc:
             logger.error(f"Failed to record scanner push for {scope.name}: {exc}")
 
+    # A candidate the Controller dropped is not offered again for this long.
+    DROPPED_COOLDOWN = timedelta(days=7)
+
+    def _review_candidates(
+        self, scope: ProjectScope, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Have the Controller read the candidates before the operator is asked about one
+        (see trigger_review.py). Returns the candidates still to offer, the one to propose
+        first, and that candidate's reason ("" when there is none). Dropped and deferred
+        candidates are recorded, never silently forgotten; any failure of the review leaves
+        the list untouched."""
+        if self._review_caller_factory is None or not candidates:
+            return candidates, ""
+        try:
+            batch = [{**c, "id": str(c["id"])} for c in candidates[:MAX_CANDIDATES_REVIEWED]]
+            deferrals = {
+                c["id"]: self.trace_store.count_decision_records(
+                    scope.name, kind="scanner_candidate", subject=c["id"],
+                    outcome=f"{CONTROLLER_OUTCOME_PREFIX}deferred",
+                )
+                for c in batch
+            }
+            precedent = precedent_block(
+                self.trace_store, scope.name,
+                preferences=preference_context_for(self.trace_store, scope.name, with_ids=True),
+            )
+            verdicts = decide_scanner_verdicts(
+                caller=self._review_caller_factory(scope.name),
+                candidates=batch,
+                prompt=build_scanner_prompt(candidates=batch, precedent=precedent, deferrals=deferrals),
+                precedent=precedent,
+                deferrals=deferrals,
+            )
+        except Exception:
+            logger.exception(f"reviewing backlog candidates for {scope.name} failed; proposing as before")
+            return candidates, ""
+        gw = self._gateway_for(scope)
+        kept: list[dict[str, Any]] = []
+        reason = ""
+        for candidate in candidates:
+            verdict = verdicts.get(str(candidate["id"]))
+            title = candidate.get("title") or candidate["id"]
+            if verdict is not None and verdict.verdict == "defer":
+                self.trace_store.add_decision_record(
+                    project=scope.name, kind="scanner_candidate", situation=f"{title}：{verdict.reason}",
+                    outcome=f"{CONTROLLER_OUTCOME_PREFIX}deferred", subject=str(candidate["id"]),
+                )
+                continue
+            if verdict is not None and verdict.verdict == "drop":
+                self.trace_store.add_decision_record(
+                    project=scope.name, kind="scanner_candidate", situation=f"{title}：{verdict.reason}",
+                    outcome=f"{CONTROLLER_OUTCOME_PREFIX}dropped", subject=str(candidate["id"]),
+                    reason="、".join(verdict.evidence),
+                )
+                text = (
+                    f"🗑 我判斷 backlog 項目「{title}」（{candidate['id']}）不再適用：{verdict.reason}"
+                    f"（依據 {'、'.join(verdict.evidence)}）。{self.DROPPED_COOLDOWN.days} 天內不會再提案；"
+                    "如果我判斷錯了，直接告訴我。"
+                )
+                if gw:
+                    gw.notify_all_allowlisted(text)
+                self._log_push(scope, text)
+                continue
+            if not kept and verdict is not None and verdict.verdict == "propose":
+                reason = verdict.reason
+            kept.append(candidate)
+        return kept, reason
+
     def _notify_stalled(self, scope: ProjectScope, stalled: list[dict[str, Any]]) -> None:
         """Tell the operator once per item (per process) that an already-run item is
         still open and is being withheld, so the repeat is surfaced instead of
@@ -244,10 +324,15 @@ class UnattendedScanner:
                 ws_id, "unattended_write", within=timedelta(days=3)
             )
             stalled = [c for c in candidates if str(c.get("id")) in recently_run]
+            dropped = self.trace_store.subjects_with_outcome(
+                scope.name, kind="scanner_candidate", outcome=f"{CONTROLLER_OUTCOME_PREFIX}dropped",
+                since_iso=(datetime.now(timezone.utc) - self.DROPPED_COOLDOWN).isoformat(),
+            )
             candidates = [
-                c for c in candidates if str(c.get("id")) not in declined | recently_run
+                c for c in candidates if str(c.get("id")) not in declined | recently_run | dropped
             ]
             self._notify_stalled(scope, stalled)
+            candidates, review_reason = self._review_candidates(scope, candidates)
 
             if not candidates:
                 self.trace_store.release_workspace_lock(ws_id)
@@ -275,6 +360,8 @@ class UnattendedScanner:
             results[ws_id] = f"found_{len(candidates)}_items"
 
             proposed_action = f"「{next_title}」（{next_id}）已定案可開發，是否核准開始？"
+            if review_reason:
+                proposed_action += f"\n\nController 的看法：{review_reason}"
             if remaining:
                 queue_preview = "、".join(
                     f"「{str(c.get('title') or c['id'])}」" for c in remaining[:5]

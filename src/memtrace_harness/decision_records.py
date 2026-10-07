@@ -34,6 +34,10 @@ UNRECORDED_REASONS = frozenset({"model_output_invalid", "config_change_required"
 # given it (loop.py); the working roles never see the operator's decisions or preferences.
 PRECEDENT_CONTENT_TYPE = "operator_precedent"
 
+# Outcomes of actions the Controller took on its own, recorded so a later review can count them
+# but never shown to it as precedent.
+CONTROLLER_OUTCOME_PREFIX = "controller_"
+
 MAX_PRECEDENT_LINES = 8
 MAX_DEVIATIONS_FIRST = 4
 _SITUATION_CHARS = 160
@@ -159,6 +163,9 @@ def _line(record: dict[str, Any]) -> str:
 def select_precedents(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Records are newest first. Disagreements go in first (up to MAX_DEVIATIONS_FIRST), then
     the most recent of the rest fill the remaining lines; the result is shown newest first."""
+    # What the harness itself did (paused a schedule, deferred a candidate) is not a decision of
+    # the operator's; only their reaction to it is.
+    records = [r for r in records if not r["outcome"].startswith(CONTROLLER_OUTCOME_PREFIX)]
     deviations = [r for r in records if r["followed"] is False][:MAX_DEVIATIONS_FIRST]
     chosen = {r["id"] for r in deviations}
     rest = [r for r in records if r["id"] not in chosen][: MAX_PRECEDENT_LINES - len(deviations)]
