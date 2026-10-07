@@ -24,6 +24,12 @@ from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.topic_recall import TopicRecallService
+from memtrace_harness.kb_gardening import (
+    GARDEN_TIMEOUT_SECONDS,
+    garden_due,
+    run_gardening_pass,
+    workspaces_to_garden,
+)
 from memtrace_harness.trigger_review import make_review_caller
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
@@ -600,6 +606,13 @@ def gateway_command(args: argparse.Namespace) -> int:
             ),
         )
         gw.review_caller_factory = lambda project: make_review_caller(config, project)
+        gw.garden_now = lambda scope, chat_id, _gw=gw: threading.Thread(
+            target=run_knowledge_gardening,
+            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
+            kwargs={"only_project": scope.name, "force": True, "chat_id": chat_id},
+            name=f"kb-garden-{scope.name}",
+            daemon=True,
+        ).start()
         gateways.append(gw)
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
@@ -910,6 +923,52 @@ def _describe_open_item_triage(project: str, items: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def run_knowledge_gardening(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    projects: list,
+    gateway_for_project: dict[str, TelegramGateway],
+    *,
+    only_project: str | None = None,
+    force: bool = False,
+    chat_id: int | None = None,
+) -> int:
+    """Tidy and re-map the knowledge-base workspaces of the harness's projects (kb_gardening.py):
+    the ones that are due (not tidied for a week), or all of a project's when forced. One
+    workspace failing never stops the others. Returns how many passes ran."""
+    if memtrace_client is None:
+        return 0
+    ran = 0
+    scopes = [p for p in projects if only_project is None or p.name == only_project]
+    for workspace_id, project, label, purpose in workspaces_to_garden(config, scopes):
+        if not force and not garden_due(trace_store, workspace_id):
+            continue
+        try:
+            outcome = run_gardening_pass(
+                client=memtrace_client,
+                trace_store=trace_store,
+                workspace_id=workspace_id,
+                project=project,
+                role_label=label,
+                purpose=purpose,
+                caller=make_review_caller(config, project, timeout_seconds=GARDEN_TIMEOUT_SECONDS),
+            )
+        except Exception:
+            logger.exception(f"[{project}] tidying {workspace_id} failed; will retry next pass")
+            continue
+        if outcome is None:
+            continue
+        ran += 1
+        gw = gateway_for_project.get(project)
+        if gw is not None:
+            try:
+                gw.notify_garden_outcome(outcome, chat_id)
+            except Exception:
+                logger.exception(f"[{project}] reporting the tidying pass failed")
+    return ran
+
+
 def _run_nightly_digest_pass(
     config: HarnessConfig,
     trace_store: TraceStore,
@@ -1104,6 +1163,7 @@ def _serve_gateway_loop(
     last_consolidation = 0.0
     last_digest_check = 0.0
     digest_thread: threading.Thread | None = None
+    garden_thread: threading.Thread | None = None
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
@@ -1226,6 +1286,18 @@ def _serve_gateway_loop(
                     daemon=True,
                 )
                 digest_thread.start()
+            # Same night window as the digest; each workspace is only actually tidied if a week
+            # has passed since its last successful pass (kb_gardening.garden_due).
+            if (garden_thread is None or not garden_thread.is_alive()) and in_digest_window(
+                datetime.now(schedule_tz)
+            ):
+                garden_thread = threading.Thread(
+                    target=run_knowledge_gardening,
+                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
+                    name="kb-garden",
+                    daemon=True,
+                )
+                garden_thread.start()
             last_digest_check = now
 
     # One shutdown budget for both: let each bot finish the message it is handling (an

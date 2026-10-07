@@ -71,7 +71,9 @@ class ScannerVerdict:
     evidence: tuple[str, ...] = ()
 
 
-def make_review_caller(config: HarnessConfig, project_name: str) -> ReviewCaller:
+def make_review_caller(
+    config: HarnessConfig, project_name: str, *, timeout_seconds: int = REVIEW_TIMEOUT_SECONDS
+) -> ReviewCaller:
     """One call through the project's Controller role: its own model first, then its own
     fallbacks, in the Controller's neutral workspace. Returns the model's stdout or None."""
     from memtrace_harness.cli_process import CliProcessRunner
@@ -83,7 +85,7 @@ def make_review_caller(config: HarnessConfig, project_name: str) -> ReviewCaller
         sandbox.mkdir(parents=True, exist_ok=True)
         for candidate in [profile, *profile.fallbacks]:
             cmd = config.chat_command(candidate.provider, candidate.model, prompt)
-            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=REVIEW_TIMEOUT_SECONDS)
+            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=timeout_seconds)
             if result.return_code == 0 and result.stdout.strip():
                 return result.stdout
         return None

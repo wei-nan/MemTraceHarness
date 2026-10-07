@@ -189,6 +189,26 @@ and Controller-maintained knowledge for tasks that have no node. **Unverified ag
 a Controller fills `kb_updates` sensibly, and that MemTrace accepts the `tags`/`resolution_status` update
 the harness sends (the read side — `get_node` returning `tags` — was confirmed on a live node).
 
+**Knowledge-base maps and tidying (explicit operator decision, 2026-10-07).** Each workspace a project
+uses (its specification workspace and its cold-memory workspace) gets a *map* the Controller writes and
+keeps current as one pinned node (`知識庫地圖：…`, tags `harness`, `controller`, `charter`), and is tidied by
+the Controller (`kb_gardening.py`). A pass runs per workspace at most weekly in the nightly window, or on
+`/garden`; a failed pass is not retried for six hours. The model is shown a harness-computed survey and a
+compact node listing (identical titles collapsed into one `G<n>` line) and answers with the map text and
+ops: `dedupe`, `delete`, `retag`, `set_resolution`, `supersede`, `link`, `retitle`, `pin`. **ENFORCED:** the
+harness applies the ops, never the model; an op may only name nodes the model was shown; at most 100 nodes
+removed and 40 other ops per pass; pinned nodes, nodes a person confirmed, nodes ever explicitly asked for,
+nodes tagged `daily-digest`/`primary-session`/`task`, and the map itself are never removed or rewritten.
+Wrong nodes may be deleted (operator decision): a delete is MemTrace's soft delete (30-day trash), the
+node's content is also kept in the local trace store, and the operator is told after every pass that
+removed anything, with a button that restores the whole pass (from the trash, else recreated from the local
+copy). The map's text is kept locally and given as a context item to the Controller and the working
+roles (it is navigation, not operator preference). Only the workspaces of the harness's own projects are
+touched. **Not implemented:** gardening driven by retrieval statistics (`ask_count`/`traversal_count` are
+shown to the model but not acted on by the harness), undoing non-delete ops (retag, retitle, resolution,
+links, pin), and moving content between workspaces. **Unverified against live models:** that the Controller
+model produces a useful map and sound ops from this prompt; nothing has been run against a live workspace.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

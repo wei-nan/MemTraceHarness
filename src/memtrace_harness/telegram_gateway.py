@@ -27,6 +27,7 @@ from memtrace_harness.completion_claims import (
     kb_updates_from_artifact,
     reject_claim,
 )
+from memtrace_harness.kb_gardening import GardenOutcome, describe_outcome, undo_gardening_run
 from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
 from memtrace_harness.decision_records import (
     CONTROLLER_OUTCOME_PREFIX,
@@ -196,6 +197,9 @@ class TelegramGateway:
         # conversation_id -> the delivery chosen for a schedule run, handed from the run (which
         # records the result) to the thread that reports it.
         self._schedule_deliveries: dict[str, ScheduleDelivery] = {}
+        # Starts a tidying pass over a project's knowledge-base workspaces now (the /garden
+        # command); wired in by the serve command, None means the feature is not running here.
+        self.garden_now: Callable[[ProjectScope, int], None] | None = None
         # Each process invocation is a fresh instance (the gateway is a one-shot poll,
         # scheduled externally), so the update offset has to be persisted across runs —
         # otherwise every run would refetch and reprocess the same historical messages.
@@ -294,6 +298,7 @@ class TelegramGateway:
             {"command": "reject", "description": "拒絕待處理的請求（可加請求 ID）"},
             {"command": "clarify", "description": "補充說明並繼續執行（可加請求 ID 與說明）"},
             {"command": "schedules", "description": "查看這個專案目前的排程"},
+            {"command": "garden", "description": "現在就整理這個專案的知識庫（可加專案名）"},
             {"command": "schedule_cancel", "description": "取消一組排程（需加排程 ID）"},
         ]
         try:
@@ -478,6 +483,18 @@ class TelegramGateway:
             rejection = result.rejection_message or "已拒絕（超出範圍）。"
             self.send_message(chat_id, f"❌ {rejection}")
             return rejection
+
+        if result.kind == "garden":
+            scope = result.project_scope
+            if scope is None:
+                msg = "請指定要整理哪個專案的知識庫，例如 /garden Beri。"
+            elif self.garden_now is None:
+                msg = "知識庫整理在這個 gateway 沒有啟用。"
+            else:
+                self.garden_now(scope, chat_id)
+                msg = f"🌱 開始整理「{scope.name}」的知識庫，完成後會回報（可能要幾分鐘）。"
+            self.send_message(chat_id, msg)
+            return msg
 
         if result.kind == "status":
             info = (
@@ -704,6 +721,11 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id, text="無法辨識的按鈕")
             return None
+        if action == "kb_undo":
+            result = self._resolve_garden_undo(request_id, chat_id, source_message.get("message_id"))
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         if action in {CLAIM_OK, CLAIM_NO}:
             result = self._resolve_claim(action, request_id, chat_id, source_message.get("message_id"))
             if callback_id:
@@ -1302,6 +1324,13 @@ class TelegramGateway:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
             return ""
 
+    def _charter_workspaces(self, scope: ProjectScope) -> list[tuple[str, str]]:
+        memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
+        pairs = [(scope.workspace_id, "spec")]
+        if memory_ws != scope.workspace_id:
+            pairs.append((memory_ws, "cold-memory"))
+        return pairs
+
     def _precedent_context(self, scope: ProjectScope) -> str:
         """The Controller's view of how this operator has decided before (past decisions plus
         adopted preferences). Best effort: without it the Controller simply decides as it did
@@ -1346,6 +1375,21 @@ class TelegramGateway:
                 source="harness",
             ),
         ]
+        for workspace_id, label in self._charter_workspaces(scope):
+            charter = self.approval_manager.trace_store.get_workspace_charter(workspace_id)
+            if charter:
+                items.append(
+                    ContextItem(
+                        ref=f"harness:kb-map:{workspace_id}",
+                        title=f"Knowledge-base map: {label} workspace {workspace_id}",
+                        body=(
+                            f"The Controller's own map of workspace `{workspace_id}` ({label}) — read "
+                            f"it before searching that workspace:\n\n{charter['body']}"
+                        ),
+                        content_type="context",
+                        source="harness",
+                    )
+                )
         digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
         if digests:
             items.append(
@@ -1407,6 +1451,40 @@ class TelegramGateway:
             self.send_message(chat_id, final_text)
         else:
             self.notify_all_allowlisted(final_text)
+
+    def notify_garden_outcome(self, outcome: GardenOutcome, chat_id: int | None = None) -> None:
+        """Tell the operator what a tidying pass did, with a one-tap undo when it deleted
+        anything (the nodes are in MemTrace's trash and copied locally)."""
+        text = describe_outcome(outcome)
+        keyboard = (
+            [[{"text": "↩️ 還原這批刪除", "callback_data": f"kb_undo:{outcome.run_id}"}]]
+            if outcome.deleted
+            else None
+        )
+        for cid in [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids):
+            if keyboard:
+                self.send_message_with_keyboard(cid, text, keyboard)
+            else:
+                self.send_message(cid, text)
+        self.primary_session_mgr.record_turn(
+            project=outcome.project, speaker="assistant", turn_type="chat", content=text
+        )
+
+    def _resolve_garden_undo(self, run_id_text: str, chat_id: int, message_id: int | None) -> str:
+        if self.memtrace_client is None or not run_id_text.isdigit():
+            return "無法還原"
+        restored, recreated, failed = undo_gardening_run(
+            self.memtrace_client, self.approval_manager.trace_store, int(run_id_text)
+        )
+        if message_id is not None:
+            self.clear_message_keyboard(chat_id, message_id)
+        text = f"↩️ 已還原 {restored + recreated} 個節點"
+        if recreated:
+            text += f"（其中 {recreated} 個已不在垃圾桶，用本機留的內容重建）"
+        if failed:
+            text += f"；{failed} 個還原失敗，請看日誌"
+        self.send_message(chat_id, text + "。")
+        return "已還原" if not failed else "部分還原"
 
     def _file_completion_claim(self, conv_id: str, summary) -> tuple[str, list[str]] | None:
         """At the end of a governed run the Controller's converge stage declares the work done:
