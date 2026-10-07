@@ -194,3 +194,22 @@ class GatewayWiringTests(TestCase):
             gateway, _, _ = _gateway(tmp)
             items = gateway._project_context_items(gateway.projects[0])
             self.assertFalse([i for i in items if i.content_type == "operator_precedent"])
+
+
+class RunRecordsStayLocalTests(TestCase):
+    def test_a_runs_record_is_not_also_written_to_the_projects_workspace(self) -> None:
+        # Every run used to leave a "Harness loop draft" node behind: a ten-minute schedule filled
+        # one specification workspace with 285 near-identical nodes.
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            gateway, _, _ = _gateway(tmp)
+            summary = MagicMock(conversation_id="chat_x", status="succeeded", recommendation="ok", stages=[])
+            with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
+                "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
+            ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+                runner.return_value.run.return_value = summary
+                gateway._run_new_task(gateway.projects[0], "chat_x", "追蹤持股", schedule_id="sched_a")
+                gateway._run_new_task(gateway.projects[0], "chat_y", "請開發功能")
+            writebacks = [c.kwargs["writeback"] for c in runner.return_value.run.call_args_list]
+            self.assertEqual(writebacks, [False, False])
