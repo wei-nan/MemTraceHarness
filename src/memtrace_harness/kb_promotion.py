@@ -358,6 +358,22 @@ def render_index(
     return "\n".join(lines)
 
 
+def _changed_after(node: dict[str, Any], cutoff: datetime) -> bool:
+    for key in ("created_at", "updated_at"):
+        raw = node.get(key)
+        if not raw:
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp > cutoff:
+            return True
+    return False
+
+
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -372,16 +388,34 @@ def run_promotion_pass(
     purpose: str,
     caller: Callable[[str], str | None],
     dry_run: bool = False,
+    only_if_new: bool = False,
 ) -> PromotionOutcome | None:
     """One promotion pass for a project. None when there is nothing to promote from or the model
     gave nothing usable. With dry_run nothing is written: the validated proposal is returned in
-    `preview` so it can be read first."""
+    `preview` so it can be read first. With only_if_new (the scheduled pass) a project whose
+    digests have not changed since the last successful pass is skipped without a model call.
+    Every real pass leaves a record, so a failure or a skip is not retried on the next tick."""
+    run_id = None if dry_run else trace_store.start_gardening_run(spec_workspace_id, project, kind="promote")
+
+    def finish(status: str, summary: dict | None = None) -> None:
+        if run_id is not None:
+            trace_store.finish_gardening_run(run_id, status, summary)
+
     if memory_workspace_id == spec_workspace_id:
+        finish("ok", {"skipped": "no separate memory workspace"})
         return None
     memory_nodes = fetch_nodes(client, memory_workspace_id)
     digests = source_digests(memory_nodes)
     if not digests:
+        finish("ok", {"skipped": "no digests"})
         return None
+    if only_if_new:
+        since = trace_store.last_gardening_success(spec_workspace_id, "promote")
+        if since is not None:
+            cutoff = datetime.fromisoformat(since)
+            if not any(_changed_after(d, cutoff) for d in digests):
+                finish("ok", {"skipped": "no new digests"})
+                return None
     sources = {d["id"]: d for d in digests}
     spec_nodes = fetch_nodes(client, spec_workspace_id)
     spec = spec_knowledge(spec_nodes)
@@ -401,6 +435,7 @@ def run_promotion_pass(
         logger.exception(f"[{project}] the promotion model call failed")
         reply = None
     if not isinstance(reply, dict):
+        finish("failed")
         return None
 
     notes, dropped = validate_notes(reply.get("notes"), sources, spec_ids)
@@ -416,7 +451,6 @@ def run_promotion_pass(
     if dry_run:
         return outcome
 
-    run_id = trace_store.start_gardening_run(spec_workspace_id, project, kind="promote")
     outcome.run_id = run_id
     titles_to_ids = {e["key"]: e["node_id"] for e in existing}
     for note in notes:

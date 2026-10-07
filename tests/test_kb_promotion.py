@@ -10,7 +10,7 @@ from memtrace_harness import cli
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
-from memtrace_harness.kb_gardening import undo_created_nodes
+from memtrace_harness.kb_gardening import garden_due, undo_created_nodes
 from memtrace_harness.kb_promotion import (
     MAX_NOTES,
     PromotionOutcome,
@@ -362,6 +362,89 @@ class GatewayTests(TestCase):
             gw.promote_now = None
             gw.process_update({"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/promote"}})
             self.assertIn("沒有啟用", gw.send_message.call_args.args[1])
+
+
+class ScheduledPassTests(TestCase):
+    def _ts_with_success(self, tmp, when):
+        ts = store(tmp)
+        run_id = ts.start_gardening_run("ws_spec", "P", kind="promote")
+        ts.finish_gardening_run(run_id, "ok")
+        with ts._connection() as conn:
+            conn.execute("UPDATE kb_gardening_runs SET started_at = ? WHERE id = ?", (when, run_id))
+        return ts
+
+    def test_a_scheduled_pass_skips_the_model_when_no_digest_changed_since_the_last_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._ts_with_success(tmp, "2026-10-01T00:00:00+00:00")   # digests (Sep 27/29) are older
+            caller = MagicMock()
+            out = run_promotion_pass(client=kb(), trace_store=ts, project="P", spec_workspace_id="ws_spec",
+                                     memory_workspace_id="ws_mem", purpose="", caller=caller, only_if_new=True)
+            self.assertIsNone(out)
+            caller.assert_not_called()
+
+    def test_a_scheduled_pass_runs_when_a_digest_is_newer_and_a_manual_one_always_does(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._ts_with_success(tmp, "2026-09-27T12:00:00+00:00")   # the second digest (Sep 28) is newer
+            out = run(kb(), ts, reply(), only_if_new=True)
+            self.assertEqual(out.created, ["當日沖多因子回測為負期望"])
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._ts_with_success(tmp, "2026-10-01T00:00:00+00:00")
+            self.assertIsNotNone(run(kb(), ts, reply(), only_if_new=False))
+
+    def test_failures_and_skips_are_recorded_so_they_are_not_retried_every_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = store(tmp)
+            self.assertTrue(garden_due(ts, "ws_spec", kind="promote"))
+            self.assertIsNone(run(kb(), ts, "not json"))                     # the model gave nothing usable
+            self.assertFalse(garden_due(ts, "ws_spec", kind="promote"))      # backed off
+            self.assertIsNone(ts.last_gardening_success("ws_spec", "promote"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = store(tmp)
+            run_promotion_pass(client=FakeKb([], [spec_node(1)]), trace_store=ts, project="P",
+                               spec_workspace_id="ws_spec", memory_workspace_id="ws_mem", purpose="",
+                               caller=MagicMock())
+            self.assertFalse(garden_due(ts, "ws_spec", kind="promote"))      # "nothing to promote from" is remembered too
+            self.assertIsNotNone(ts.last_gardening_success("ws_spec", "promote"))
+
+    def test_a_dry_run_leaves_no_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = store(tmp)
+            run(kb(), ts, reply(), dry_run=True)
+            self.assertIsNone(ts.last_gardening_attempt("ws_spec", "promote"))
+
+    def test_promotion_and_tidying_keep_separate_schedules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = store(tmp)
+            run(kb(), ts, reply())
+            self.assertTrue(garden_due(ts, "ws_spec"))                       # tidying has not run
+            self.assertFalse(garden_due(ts, "ws_spec", kind="promote"))
+
+
+class CliScheduleTests(TestCase):
+    def _env(self, tmp):
+        k = kb()
+        gw, ts, scope = _gateway(tmp, k)
+        scope.raw_markdown = "測試專案"
+        gw.notify_promotion_outcome = MagicMock()
+        return k, gw, ts, scope
+
+    def test_the_nightly_pass_is_weekly_and_quiet_when_nothing_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            k, gw, ts, scope = self._env(tmp)
+            with patch.object(gw.config.__class__, "memory_workspace_id_for", lambda self, name, ws: "ws_mem"), patch.object(
+                cli, "make_review_caller", return_value=lambda prompt: reply()
+            ):
+                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}), 1)
+                gw.notify_promotion_outcome.assert_called_once()              # it wrote something: tell the operator
+                gw.notify_promotion_outcome.reset_mock()
+                # Next night: not due for a week, so nothing runs and nothing is said.
+                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}), 0)
+                gw.notify_promotion_outcome.assert_not_called()
+                # /promote ignores the schedule and always reports, even when nothing changed.
+                self.assertEqual(
+                    cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}, chat_id=12345, force=True), 1
+                )
+                gw.notify_promotion_outcome.assert_called_once()
 
 
 class CliTests(TestCase):
