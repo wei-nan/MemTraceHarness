@@ -61,6 +61,7 @@ from memtrace_harness.memory_digest import (
     apply_chat_preference_correction,
     preference_context_for,
 )
+from memtrace_harness.ops_mcp import ops_server_spec
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import (
@@ -772,6 +773,13 @@ class TelegramGateway:
             if callback_id:
                 self.answer_callback_query(callback_id, text=result[:200])
             return result
+        if action in {"job_confirm", "job_cancel"}:
+            result = self._resolve_job_action(
+                action, request_id, chat_id, source_message.get("message_id")
+            )
+            if callback_id:
+                self.answer_callback_query(callback_id, text=result[:200])
+            return result
         if action in {"order_confirm", "order_cancel"}:
             result = self._resolve_order_action(
                 action, request_id, chat_id, source_message.get("message_id")
@@ -888,6 +896,94 @@ class TelegramGateway:
                 f"{'撤單' if order['kind'] == 'cancel' else '委託'}已過期、沒有"
                 f"{'撤單' if order['kind'] == 'cancel' else '下單'}：{self._order_summary(order)}",
             )
+
+    # ---- jobs the model asked to re-run (see ops_mcp.py): shown here, run only on a tap
+    JOB_TIMEOUT_SECONDS = 900
+    JOB_OUTPUT_CHARS = 1500
+
+    def process_job_requests(self) -> None:
+        """Gateway tick: put newly requested jobs in front of the human; close the unanswered."""
+        trace_store = self.approval_manager.trace_store
+        for job in trace_store.claim_pending_job_requests([p.name for p in self.projects]):
+            text = (
+                f"▶️ 待確認重跑工作（{job['project']}）\n"
+                f"{job['job_name']}：{job['command']}\n"
+                f"有效至：{job['expires_at']}\n\n"
+                "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
+            )
+            keyboard = [[
+                {"text": "✅ 確認執行", "callback_data": f"job_confirm:{job['request_id']}"},
+                {"text": "❌ 取消", "callback_data": f"job_cancel:{job['request_id']}"},
+            ]]
+            shown = False
+            for cid in self.allowed_chat_ids:
+                message_id = self.send_message_with_keyboard(cid, text, keyboard)
+                if message_id is not None:
+                    trace_store.set_job_request_message(job["request_id"], chat_id=cid, message_id=message_id)
+                    shown = True
+            if not shown:
+                trace_store.transition_job_request(job["request_id"], ("awaiting",), "pending")
+        for job in trace_store.expire_job_requests(datetime.now(timezone.utc).isoformat()):
+            if job["telegram_message_id"] is not None and job["telegram_chat_id"] is not None:
+                self.clear_message_keyboard(job["telegram_chat_id"], job["telegram_message_id"])
+            msg = f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}"
+            if job["telegram_chat_id"] is not None:
+                self.send_message(job["telegram_chat_id"], msg)
+            self._record_order_turn(job["project"], msg)
+
+    def _resolve_job_action(
+        self, action: str, request_id: str, chat_id: int, message_id: int | None
+    ) -> str:
+        trace_store = self.approval_manager.trace_store
+        job = trace_store.get_job_request(request_id)
+        scope = next((p for p in self.projects if job and p.name == job["project"]), None)
+        if job is None or scope is None:
+            return "找不到這個要求。"
+        if message_id is not None:
+            self.clear_message_keyboard(chat_id, message_id)
+        if action == "job_cancel":
+            if not trace_store.transition_job_request(request_id, ("awaiting",), "cancelled"):
+                return f"這個要求已經是「{job['status']}」，沒有變動。"
+            trace_store.finish_job_request(request_id, "cancelled")
+            result = f"❌ 已取消，沒有執行：{job['job_name']}"
+            self.send_message(chat_id, result)
+            self._record_order_turn(job["project"], result)
+            return result
+        # Compare-and-set: a double tap cannot start it twice. The command is the one declared
+        # in the scope file now, not whatever text the request carried.
+        if not trace_store.transition_job_request(request_id, ("awaiting",), "running"):
+            return f"這個要求已經是「{job['status']}」，沒有再執行。"
+        command = (scope.jobs or {}).get(job["job_name"])
+        if command is None:
+            trace_store.finish_job_request(request_id, "failed", {"error": "job no longer declared"})
+            return f"工作 {job['job_name']} 已不在專案設定裡，沒有執行。"
+        threading.Thread(
+            target=self._run_job, args=(scope, job, command, chat_id), daemon=True,
+            name=f"job-{request_id}",
+        ).start()
+        started = f"▶️ 開始執行 {job['job_name']}，完成後會回報。"
+        self.send_message(chat_id, started)
+        return started
+
+    def _run_job(self, scope: ProjectScope, job: dict, command: str, chat_id: int) -> None:
+        trace_store = self.approval_manager.trace_store
+        try:
+            done = subprocess.run(
+                command, shell=True, cwd=scope.working_directory, capture_output=True, text=True,
+                timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+            )
+            output = ((done.stdout or "") + (done.stderr or "")).strip()
+            status, code = ("done" if done.returncode == 0 else "failed"), done.returncode
+        except subprocess.TimeoutExpired:
+            output, status, code = f"超過 {self.JOB_TIMEOUT_SECONDS} 秒，已中止。", "failed", None
+        except Exception as exc:  # noqa: BLE001 — report any launch failure to the human
+            output, status, code = f"無法啟動：{exc}", "failed", None
+        tail = output[-self.JOB_OUTPUT_CHARS:]
+        trace_store.finish_job_request(job["request_id"], status, {"exit_code": code, "output_tail": tail})
+        head = "✅ 完成" if status == "done" else f"❌ 失敗（結束碼 {code}）"
+        result = f"{head}：{job['job_name']}\n{tail}"
+        self.send_message(chat_id, result)
+        self._record_order_turn(job["project"], result)
 
     def _resolve_order_action(
         self, action: str, intent_id: str, chat_id: int, message_id: int | None
@@ -1746,6 +1842,28 @@ class TelegramGateway:
     )
 
     @staticmethod
+    def _ops_notice(scope: ProjectScope) -> str:
+        """The chat sandbox has no network, so a failure seen from it says nothing about the
+        outside. Say so, and point at the operations tools (ops_mcp.py) that look from outside."""
+        notice = (
+            "你的沙盒沒有網路：在這裡連不上、DNS 解析失敗，都不能當作外部服務（例如證交所 TWSE）真的壞了"
+            "或本機被擋的證據，絕對不要拿來回答使用者。\n"
+        )
+        if not ops_server_spec(scope, None):
+            return notice + (
+                "這個專案沒有設定診斷工具，查不到真相時就如實說「我在這裡驗證不了」，並說明要怎麼驗證。\n\n"
+            )
+        return notice + (
+            "使用者問某個排程、腳本或外部服務為什麼失敗、現在連不連得上時，先用 MCP 工具 `ops` 自己查，"
+            "再回答，不要要使用者等或叫他去查：`http_probe`（從外面實際發請求，回報狀態碼、耗時、大小、"
+            "錯誤；attempts 可重複測幾次看耗時是否穩定）、`read_log`（看失敗的 log，名稱用 list_logs）、"
+            "`list_jobs`／`run_job`（要把失敗的工作重跑時，run_job 只是提出要求，使用者要在 Telegram 按"
+            "「確認執行」才會跑；你要說「已請你確認」，不要說已經跑了）。回答要寫出量測到的事實，並判斷"
+            "是服務端的問題，還是專案自己的程式（逾時太短、舊的端點、被限流）。確定原因在專案程式、需要"
+            "改程式時，才用上面的任務啟動標記交給開發流程；只是診斷或重跑，不要開任務。\n\n"
+        )
+
+    @staticmethod
     def _taiwantrade_notice(project: str | None = None) -> str:
         """Tell the chat model it has the read-only TaiwanTrade tools. Without this it
         tries `curl 127.0.0.1:8000` from its network-less sandbox, fails, and reports a
@@ -1878,13 +1996,7 @@ class TelegramGateway:
             "哪裡卡住或失敗、要怎麼改進（不是要你檢討交易損益，也不是要你開發某個功能）——才在回覆"
             f"最後另起一行，格式為「{self._REVIEW_START_MARKER}<一句話說明想看什麼>」。系統會自動產生"
             "有數據的復盤報告，你不需要自己整理數字。同一則回覆不要同時輸出任務啟動標記。\n\n"
-            "你的沙盒沒有網路：在這裡連不上、DNS 解析失敗，都不能當作外部服務（例如證交所 TWSE）"
-            "真的壞了或本機被擋的證據，也不要拿來回答使用者。當使用者要你調查某個排程、腳本或"
-            "外部服務為什麼失敗（或問「現在連得上嗎」），你自己查不到真相——不要下結論、也不要"
-            "叫使用者再等；使用者想查清楚或修好時，用上面的任務啟動標記，交給有網路的流程實測。"
-            "任務描述要寫明：看失敗的 log、實際發請求量測（連得上嗎、多慢、回傳多大）、判斷是服務"
-            "端問題還是專案自己的程式（逾時太短、舊的端點、被限流）；若原因在專案程式就修好，"
-            "並把失敗的那次工作補跑，最後回報量測到的事實。\n\n"
+            f"{self._ops_notice(scope)}"
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
             f"{self._quoted_reply_notice(quoted_text)}"
@@ -1902,6 +2014,7 @@ class TelegramGateway:
                 claude_allowed_tools=self._CHAT_MEMTRACE_READ_TOOLS,
                 taiwantrade=True,
                 order_project=scope.name,
+                ops_server=ops_server_spec(scope, self.config.trace_db_path),
             )
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 from pathlib import Path
 from unittest import TestCase
 
@@ -486,7 +487,51 @@ class TelegramGatewayTests(TestCase):
         self.assertIn("不需要先徵求任何核准", cmd[-1])
         # A failure seen from the network-less chat sandbox is not evidence about the outside.
         self.assertIn("你的沙盒沒有網路", cmd[-1])
-        self.assertIn("實際發請求量測", cmd[-1])
+        self.assertIn("沒有設定診斷工具", cmd[-1])  # this scope declares no ops tools
+
+    def test_a_requested_job_runs_only_after_the_human_taps_confirm(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.jobs = {"hello": "echo ran-it"}
+        gateway.send_message = MagicMock()
+        gateway.send_message_with_keyboard = MagicMock(return_value=77)
+        gateway.clear_message_keyboard = MagicMock()
+        store.create_job_request(
+            request_id="job_1", project=scope.name, job_name="hello", command="echo ran-it",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
+        self.assertEqual(store.get_job_request("job_1")["status"], "awaiting")  # shown, not run
+
+        gateway._resolve_job_action("job_confirm", "job_1", 12345, 77)
+        for thread in [t for t in threading.enumerate() if t.name == "job-job_1"]:
+            thread.join(10)
+        self.assertEqual(store.get_job_request("job_1")["status"], "done")
+        self.assertIn("ran-it", store.get_job_request("job_1")["result"]["output_tail"])
+        # A second tap cannot run it again.
+        self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "job_1", 12345, 77))
+
+    def test_cancelled_or_undeclared_jobs_do_not_run(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.jobs = {}
+        gateway.send_message = MagicMock()
+        gateway.clear_message_keyboard = MagicMock()
+        for rid in ("job_a", "job_b"):
+            store.create_job_request(
+                request_id=rid, project=scope.name, job_name=rid, command="touch /tmp/should-not-exist",
+                expires_at="2999-01-01T00:00:00+00:00",
+            )
+            store.transition_job_request(rid, ("pending",), "awaiting")
+        gateway._resolve_job_action("job_cancel", "job_a", 12345, None)
+        self.assertEqual(store.get_job_request("job_a")["status"], "cancelled")
+        gateway._resolve_job_action("job_confirm", "job_b", 12345, None)  # no longer declared
+        self.assertEqual(store.get_job_request("job_b")["status"], "failed")
 
     def test_expire_stale_approvals_closes_old_pending_only(self) -> None:
         from datetime import datetime, timedelta, timezone

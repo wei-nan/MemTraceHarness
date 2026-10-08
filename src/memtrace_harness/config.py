@@ -64,6 +64,7 @@ class HarnessConfig:
         claude_allowed_tools: str | None = None,
         taiwantrade: bool = False,
         order_project: str | None = None,
+        ops_server: dict | None = None,
     ) -> list[str]:
         """argv for one plain, non-interactive "answer this prompt" call — the quick
         chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
@@ -96,6 +97,16 @@ class HarnessConfig:
                     # tool of this proxy is a read-only GET, so approve them up front.
                     "--config", 'mcp_servers.taiwantrade.default_tools_approval_mode="approve"',
                 ]
+            if ops_server:
+                env_toml = ",".join(f"{k}={json.dumps(v)}" for k, v in ops_server["env"].items())
+                command += [
+                    "--config", f"mcp_servers.ops.command={json.dumps(ops_server['command'])}",
+                    "--config", f"mcp_servers.ops.args={json.dumps(ops_server['args'])}",
+                    "--config", f"mcp_servers.ops.env={{{env_toml}}}",
+                    # Safe to approve up front: run_job only records a request the human must
+                    # confirm in Telegram; the other tools read.
+                    "--config", 'mcp_servers.ops.default_tools_approval_mode="approve"',
+                ]
             if model:
                 command += ["--model", model]
             return command + [prompt]
@@ -104,6 +115,10 @@ class HarnessConfig:
             claude_allowed_tools = ",".join(
                 filter(None, [claude_allowed_tools, "mcp__taiwantrade"])
             )
+        if provider == "claude" and ops_server:
+            # --mcp-config may be given more than once; the taiwantrade one above is separate.
+            command += ["--mcp-config", json.dumps({"mcpServers": {"ops": ops_server}})]
+            claude_allowed_tools = ",".join(filter(None, [claude_allowed_tools, "mcp__ops"]))
         if provider == "claude" and claude_allowed_tools:
             command += ["--allowedTools", claude_allowed_tools]
         if model:
