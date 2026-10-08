@@ -17,6 +17,7 @@ from memtrace_harness.loop import (
     _plan_structure_ok,
     controller_task,
     gate_task,
+    operational_task,
     summarize_invalid_artifact,
     summarize_plan_needs_human,
     valid_plan,
@@ -267,6 +268,19 @@ class ControllerTaskContextTests(TestCase):
         self.assertIn("claim_done", converge_goal)
         self.assertIn("You do not call any write tool", converge_goal)
         self.assertNotIn("claim_done", start_goal)
+
+    def test_operational_runs_are_told_to_use_the_taiwantrade_tools_instead_of_curl(self) -> None:
+        from unittest.mock import patch
+
+        task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check positions")
+        spec = {"command": "python", "args": ["-m", "x"], "env": {}}
+        with patch("memtrace_harness.loop.mcp_server_spec", return_value=spec):
+            goal = operational_task(task).goal
+        self.assertIn("get_positions", goal)
+        self.assertIn("instead of requesting http://127.0.0.1:8000", goal)
+        self.assertIn("answered 401", goal)
+        with patch("memtrace_harness.loop.mcp_server_spec", return_value=None):
+            self.assertNotIn("get_positions", operational_task(task).goal)
 
     def test_start_stage_explains_run_operational_action_choice(self) -> None:
         task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")

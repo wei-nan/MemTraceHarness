@@ -1729,6 +1729,22 @@ def gate_task(
     )
 
 
+# Told to the Developer on an operational run. Its CLI has the read-only TaiwanTrade tools, which
+# attach the API key themselves; without a hint it follows the project's notes and calls the local
+# API with curl, which carries no key and is answered 401 (a monitoring schedule failed this way
+# for days: three of three recent cases, 2026-10-07).
+def _taiwantrade_note() -> str:
+    if not mcp_server_spec():
+        return ""
+    return (
+        "You have read-only MCP tools for live TaiwanTrade data (get_quotes, get_positions, get_balance, "
+        "list_orders, get_settlements, get_stock_intraday, get_watchlist, ...). For anything they cover, call "
+        "them instead of requesting http://127.0.0.1:8000 yourself with curl or a script: they add the API key, "
+        "which you do not have and must not look for, so a direct request is answered 401. If a tool itself "
+        "returns an authentication error, report that error as it is.\n"
+    )
+
+
 def operational_task(task: TaskEnvelope) -> TaskEnvelope:
     """Controller chose run_operational_action: run this directly via Developer with
     no plan and no review afterward (see AgentLoopRunner._run_operational_action()).
@@ -1749,6 +1765,7 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
             "if you did it and merely noticed something the human may want to act on "
             "(a concern, an odd number, a suggestion), report status 'completed' and put the "
             "observation in `summary`/`gaps`.\n"
+            f"{_taiwantrade_note()}"
             "Return only a valid JSON object after the work with status ('completed', "
             "'needs_human', or 'failed'), summary (string) containing the actual result "
             "you found or did, changed_files (string array, normally empty here), tests "
