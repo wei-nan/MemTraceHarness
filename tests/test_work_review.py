@@ -281,7 +281,7 @@ class ReviewRunTests(TestCase):
 
 class FakeKb:
     def __init__(self):
-        self.created, self.updated = [], []
+        self.created, self.updated, self.edges = [], [], []
 
     def create_node(self, **kw):
         self.created.append(kw)
@@ -289,6 +289,10 @@ class FakeKb:
 
     def update_node(self, **kw):
         self.updated.append(kw)
+
+    def create_edge(self, **kw):
+        self.edges.append((kw["from_id"], kw["to_id"], kw["relation"]))
+        return True
 
 
 class LessonTests(TestCase):
@@ -409,7 +413,7 @@ class CliTests(TestCase):
                 ran = cli.run_work_reviews(gw.config, ts, kb, [scope, scope], {"P": gw}, chat_id=12345, force=True)
             self.assertEqual(ran, 1)                                           # the same workspace twice: one review
             gw.notify_review_outcome.assert_called_once()
-            self.assertEqual(len(kb.created), 1)
+            self.assertEqual([n["title"] for n in kb.created], ["監控類請求常停在授權", "工作復盤紀錄：P"])
 
     def test_the_weekly_pass_skips_a_workspace_that_has_never_been_reviewed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,3 +421,101 @@ class CliTests(TestCase):
             seed(ts, runs=[("succeeded", "a")] * 8)
             with patch.object(cli, "make_review_caller", return_value=lambda prompt: reply_json()):
                 self.assertEqual(cli.run_work_reviews(gw.config, ts, None, [scope], {"P": gw}), 0)
+
+
+class ReviewRecordTests(TestCase):
+    def _reviewed(self, ts, kb, when=NOW, runs=None, reply=None):
+        seed(ts, runs=runs or [("succeeded", "a")] * 6 + [("needs_human", "b")] * 3 + [("failed", "c")], start=when - timedelta(days=1))
+        out = run_work_review(trace_store=ts, workspace_id="ws_a", project="P", project_names=["P"],
+                              caller=lambda p: reply or reply_json(), now=when)
+        write_lessons(kb, ts, out, "ws_mem")
+        return out
+
+    def test_the_record_node_holds_the_latest_findings_and_the_lessons_and_is_pinned_and_linked(self) -> None:
+        from memtrace_harness.work_review import write_review_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ts, kb = store(tmp), FakeKb()
+            out = self._reviewed(ts, kb)
+            self.assertEqual(write_review_index(kb, ts, out, "ws_mem"), "created")
+            record = kb.created[-1]
+            self.assertEqual(record["title"], "工作復盤紀錄：P")
+            self.assertEqual(record["tags"], ["harness", "controller", "work-review-index"])
+            self.assertNotIn("draft", record["tags"])
+            for needle in ("引用前先確認它現在是否還存在", "⚠️ 需要人偏多", "10 次裡有 3 次需要人",
+                           "**監控類請求常停在授權**", "需要人 3 次多半是授權問題"):
+                self.assertIn(needle, record["body"])
+            self.assertTrue(any(u.get("pinned") for u in kb.updated))
+            self.assertIn(("mem_l2", "mem_l1", "related_to"), kb.edges)              # record -> the lesson node
+            self.assertEqual(ts.get_workspace_index("ws_mem", "work-review")["node_id"], "mem_l2")
+
+    def test_the_next_review_updates_the_same_node_and_keeps_earlier_lessons_and_a_history(self) -> None:
+        from memtrace_harness.work_review import write_review_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ts, kb = store(tmp), FakeKb()
+            first = self._reviewed(ts, kb)
+            write_review_index(kb, ts, first, "ws_mem")
+            second_reply = json.dumps({
+                "findings": [{"title": "授權錯誤已消失", "kind": "working", "statement": "近期沒有授權錯誤。",
+                              "evidence": [{"quote": "執行結果：成功 1、需要人 0（0%）、失敗 0（0%）"}]}],
+                "lessons": [], "proposals": [], "summary": "好轉",
+            }, ensure_ascii=False)
+            second = self._reviewed(ts, kb, when=NOW + timedelta(days=8), runs=[("succeeded", "x")], reply=second_reply)
+            self.assertEqual(write_review_index(kb, ts, second, "ws_mem"), "updated")
+            body = kb.updated[-1]["body"]
+            self.assertIn("✅ 授權錯誤已消失", body)
+            self.assertIn("**監控類請求常停在授權**", body)                          # the earlier lesson is kept
+            self.assertIn("## 之前的復盤", body)
+            self.assertIn("復盤 #1", body)
+            self.assertEqual(len([n for n in kb.created if n["title"].startswith("工作復盤紀錄")]), 1)
+            self.assertIsNone(write_review_index(kb, ts, second, "ws_mem"))         # nothing changed: nothing written
+
+    def test_a_dry_run_or_a_failing_knowledge_base_writes_nothing_and_never_raises(self) -> None:
+        from memtrace_harness.work_review import write_review_index
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ts, kb = store(tmp), FakeKb()
+            out = self._reviewed(ts, kb)
+            out.dry_run = True
+            self.assertIsNone(write_review_index(kb, ts, out, "ws_mem"))
+            out.dry_run = False
+            broken = FakeKb()
+            broken.create_node = MagicMock(side_effect=RuntimeError("down"))
+            self.assertIsNone(write_review_index(broken, ts, out, "ws_mem"))
+
+    def test_the_gardener_never_touches_the_record(self) -> None:
+        from memtrace_harness.kb_gardening import is_protected
+
+        self.assertTrue(is_protected({"id": "mem_x", "tags": ["harness", "controller", "work-review-index"]}))
+
+
+class ConversationInfluenceTests(TestCase):
+    def test_the_record_reaches_chat_and_the_task_context_from_the_memory_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, ts, scope = _gateway(tmp)
+            ts.set_workspace_index("ws_mem", "work-review", "mem_rec", "# 工作復盤紀錄：P\n⚠️ 近期監控反覆被授權問題卡住")
+            ts.set_workspace_index("ws_a", "directions", "mem_dir", "# 研究與策略總覽：P\n| 方向 | 狀態 |")
+            with patch.object(gw.config.__class__, "memory_workspace_id_for", lambda self, name, ws: "ws_mem"):
+                chat = gw._identity_context(scope)
+                items = {i.ref: i for i in gw._project_context_items(scope)}
+            self.assertIn("### 工作復盤紀錄", chat)
+            self.assertIn("近期監控反覆被授權問題卡住", chat)
+            self.assertIn("### 研究與策略總覽", chat)
+            self.assertIn("check whether it still does", chat)                       # told to verify before repeating it
+            self.assertIn("近期監控反覆被授權問題卡住", items["harness:kb-index:ws_mem:work-review"].body)
+            self.assertEqual(items["harness:kb-index:ws_mem:work-review"].content_type, "context")
+            self.assertIn("harness:kb-index:ws_a:directions", items)
+
+    def test_without_any_overview_nothing_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, ts, scope = _gateway(tmp)
+            self.assertNotIn("Overviews the Controller keeps", gw._identity_context(scope))
+            self.assertFalse([i for i in gw._project_context_items(scope) if i.ref.startswith("harness:kb-index:")])
+
+    def test_an_overlong_record_is_cut_in_the_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw, ts, scope = _gateway(tmp)
+            ts.set_workspace_index("ws_a", "work-review", "mem_rec", "字" * 20000)
+            [item] = [i for i in gw._project_context_items(scope) if i.ref.startswith("harness:kb-index:")]
+            self.assertEqual(len(item.body), 4500)
