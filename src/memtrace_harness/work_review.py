@@ -427,6 +427,102 @@ def write_lessons(
     return written
 
 
+# ---- the review record node ------------------------------------------------------------------
+
+REVIEW_INDEX_KIND = "work-review"
+REVIEW_INDEX_TAGS = ["harness", "controller", "work-review-index"]
+MAX_LESSONS_IN_INDEX = 8
+MAX_HISTORY_LINES = 6
+
+
+def render_review_index(project: str, reviews: list[dict[str, Any]]) -> str:
+    """The record of the harness's own reviews, newest first: the latest findings in full, the lessons
+    kept so far, and a line per earlier review. Rendered by the harness from what the reviews already
+    passed the checks for. It describes the past: it says so, and a later review replaces it."""
+    latest = reviews[0]
+    result = latest.get("result") or {}
+    start = (latest.get("period_start") or "最早的紀錄")[:10]
+    lines = [
+        f"# 工作復盤紀錄：{project}",
+        "由 Controller 依 Harness 自己的執行紀錄整理，每則都經過對照報告的核對。這描述的是過去：問題可能已經"
+        "修好或改變，引用前先確認它現在是否還存在；下一次復盤會取代這份內容。",
+        "",
+        f"## 最近一次復盤（復盤 #{latest['id']}，{start} 到 {latest['period_end'][:10]}，共 {result.get('runs', '?')} 次執行）",
+        str(result.get("summary") or ""),
+    ]
+    marks = {"problem": "⚠️", "working": "✅", "unclear": "❔"}
+    for finding in result.get("findings") or []:
+        lines.append(f"- {marks.get(finding.get('kind'), '❔')} {finding['title']}：{finding['statement']}")
+    lessons: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for review in reviews:
+        res = review.get("result") or {}
+        full = res.get("lessons_full") or [{"title": t, "body": ""} for t in res.get("lessons") or []]
+        for lesson in full:
+            key = " ".join(lesson["title"].lower().split())
+            if key not in seen and len(lessons) < MAX_LESSONS_IN_INDEX:
+                seen.add(key)
+                lessons.append((lesson["title"], lesson.get("body") or ""))
+    if lessons:
+        lines += ["", "## 目前記下的教訓"]
+        lines += [f"- **{t}**" + (f"：{' '.join(b.split())[:300]}" if b else "") for t, b in lessons]
+    older = reviews[1:MAX_HISTORY_LINES]
+    if older:
+        lines += ["", "## 之前的復盤"]
+        lines += [
+            f"- 復盤 #{r['id']}（到 {r['period_end'][:10]}）：{str((r.get('result') or {}).get('summary') or '')[:160]}"
+            for r in older
+        ]
+    return "\n".join(lines)
+
+
+def write_review_index(
+    client: Any, trace_store: TraceStore, outcome: ReviewOutcome, memory_workspace_id: str
+) -> str | None:
+    """Create or update the pinned record node in the memory workspace and link it to the lesson
+    nodes it lists. Returns "created", "updated" or None (nothing to write, or it failed — never
+    raises: the review has already been delivered)."""
+    if outcome.dry_run:
+        return None
+    reviews = trace_store.list_work_reviews(outcome.workspace_id, MAX_HISTORY_LINES)
+    if not reviews:
+        return None
+    body = render_review_index(outcome.project, reviews)
+    previous = trace_store.get_workspace_index(memory_workspace_id, REVIEW_INDEX_KIND)
+    try:
+        if previous and previous["body"].strip() == body.strip():
+            return None
+        if previous:
+            client.update_node(
+                workspace_id=memory_workspace_id, node_id=previous["node_id"], body=body, stage="work_review"
+            )
+            node_id, result = previous["node_id"], "updated"
+        else:
+            node_id = client.create_node(
+                workspace_id=memory_workspace_id, title=f"工作復盤紀錄：{outcome.project}", body=body,
+                content_type="context", tags=list(REVIEW_INDEX_TAGS), force_create=True, stage="work_review",
+            )
+            client.update_node(workspace_id=memory_workspace_id, node_id=node_id, pinned=True, stage="work_review")
+            result = "created"
+        trace_store.set_workspace_index(memory_workspace_id, REVIEW_INDEX_KIND, node_id, body)
+        # Connect it to the lesson nodes, so the record is reachable from them and they from it.
+        for review in reviews:
+            for title in (review.get("result") or {}).get("lessons") or []:
+                record = trace_store.get_promotion(memory_workspace_id, "lesson:" + " ".join(title.lower().split()))
+                if record:
+                    try:
+                        client.create_edge(
+                            workspace_id=memory_workspace_id, from_id=node_id, to_id=record["node_id"],
+                            relation="related_to", stage="work_review",
+                        )
+                    except Exception:
+                        logger.exception("linking the review record to a lesson failed")
+        return result
+    except Exception:
+        logger.exception(f"[{outcome.project}] writing the work-review record failed")
+        return None
+
+
 # ---- one review -----------------------------------------------------------------------------
 
 
@@ -505,7 +601,9 @@ def run_work_review(
         trace_store.finish_work_review(
             review_id, "ok", report=report.text,
             result={"findings": outcome.findings, "proposals": [p["title"] for p in outcome.proposals],
-                    "lessons": [l["title"] for l in outcome.lessons], "dropped": dropped[:20],
+                    "lessons": [l["title"] for l in outcome.lessons],
+                    "lessons_full": [{"title": l["title"], "body": l["body"]} for l in outcome.lessons],
+                    "runs": report.runs, "dropped": dropped[:20],
                     "summary": outcome.summary},
         )
     return outcome

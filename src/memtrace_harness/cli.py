@@ -38,6 +38,7 @@ from memtrace_harness.work_review import (
     review_due,
     run_work_review,
     write_lessons,
+    write_review_index,
 )
 from memtrace_harness.trigger_review import make_review_caller
 from memtrace_harness.approval import ApprovalManager
@@ -1097,9 +1098,9 @@ def run_work_reviews(
                 gw.send_message(chat_id, f"🔍 [{scope.name}] 這段期間沒有足夠的紀錄可以復盤，或模型沒有給出可用的答案。")
             continue
         if memtrace_client is not None:
-            write_lessons(
-                memtrace_client, trace_store, outcome, config.memory_workspace_id_for(scope.name, workspace_id)
-            )
+            memory_ws = config.memory_workspace_id_for(scope.name, workspace_id)
+            write_lessons(memtrace_client, trace_store, outcome, memory_ws)
+            write_review_index(memtrace_client, trace_store, outcome, memory_ws)
         ran += 1
         if gw is not None:
             try:

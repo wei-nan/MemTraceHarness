@@ -251,7 +251,15 @@ describes changes.** Proposed changes to how the harness works reach the operato
 (reason `review_proposal`); their answer is kept as precedent, resumes no task, and the harness changes nothing
 by itself — a proposal that should be done is a separate, explicit request. Lessons about how work goes are
 written to the project's memory workspace without draft labels (tags `harness`, `controller`, `work-lesson`),
-keyed by title and with their quotes, undoable with one button. **Not implemented:** judging whether an
+keyed by title and with their quotes, undoable with one button. Each workspace also gets one pinned
+*record* node (`工作復盤紀錄：<project>`, tag `work-review-index`, protected from tidying) in the project's memory
+workspace, rendered by the harness from the reviews that passed the checks: the latest findings, the lessons
+kept so far (up to 8, newer replacing older of the same title) and a line per earlier review, linked
+`related_to` to the lesson nodes; each review updates it in place. The record, and the research-directions
+overview, reach the next conversations: they are given to the chat model (as "overviews the Controller
+keeps", with an instruction to check that a problem still exists before telling the human it does) and to
+the Controller and the working roles as context items, cut at 4500 characters each in a prompt. They
+describe the past and say so; the next review replaces the record. **Not implemented:** judging whether an
 individual held-back schedule result was right, comparing more than one previous period, and acting on a
 chosen proposal. **Verified on live data (dry run, nothing written):** on TWTradingStrategy the Controller
 produced findings that correctly separated recent from old problems and flagged repeated TaiwanTrade 401

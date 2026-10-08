@@ -110,6 +110,9 @@ _DIGESTS_HEADER = (
 # Telegram's sendMessage rejects any text over 4096 UTF-16 code units; stay comfortably
 # under that in plain characters so multi-byte text (e.g. Chinese) never trips it.
 TELEGRAM_MAX_MESSAGE_LENGTH = 3500
+# The most of one Controller-kept overview (research directions, work-review record) that goes into a
+# prompt; longer ones are cut, the full text stays in the knowledge base.
+MAX_OVERVIEW_CHARS = 4500
 
 
 def _split_telegram_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
@@ -1286,6 +1289,15 @@ class TelegramGateway:
             "(繁體中文，台灣用語與正體字), never Simplified Chinese and never simplified "
             "phrasing/vocabulary, regardless of what language the human's own message used.",
         ]
+        overviews = self._kb_indexes(scope)
+        if overviews:
+            parts.append(
+                "Overviews the Controller keeps in the knowledge base — research directions and the "
+                "record of its reviews of the harness's own work. They describe the past and a later "
+                "one replaces them; when one says a problem existed, check whether it still does "
+                "before telling the human it does:\n\n"
+                + "\n\n".join(f"### {label}\n{body}" for label, body in overviews)[:MAX_OVERVIEW_CHARS]
+            )
         digests = self.primary_session_mgr.get_recent_digests_context(scope.name)
         if digests:
             parts.append(f"{_DIGESTS_HEADER}\n\n{digests}")
@@ -1355,6 +1367,20 @@ class TelegramGateway:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
             return ""
 
+    def _kb_index_rows(self, scope: ProjectScope) -> list[tuple[str, str, str]]:
+        """The overviews the Controller keeps for this project: (workspace, kind, text), from the
+        specification workspace (research directions) and the memory workspace (record of its work
+        reviews). Read from the local copy kept when they were written."""
+        rows: list[tuple[str, str, str]] = []
+        for workspace_id, _ in self._charter_workspaces(scope):
+            for index in self.approval_manager.trace_store.list_workspace_indexes(workspace_id):
+                rows.append((workspace_id, index["kind"], index["body"]))
+        return rows
+
+    def _kb_indexes(self, scope: ProjectScope) -> list[tuple[str, str]]:
+        labels = {"directions": "研究與策略總覽", "work-review": "工作復盤紀錄"}
+        return [(labels.get(kind, kind), body) for _, kind, body in self._kb_index_rows(scope)]
+
     def _charter_workspaces(self, scope: ProjectScope) -> list[tuple[str, str]]:
         memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
         pairs = [(scope.workspace_id, "spec")]
@@ -1421,12 +1447,12 @@ class TelegramGateway:
                         source="harness",
                     )
                 )
-        for index in self.approval_manager.trace_store.list_workspace_indexes(scope.workspace_id):
+        for workspace_id, kind, body in self._kb_index_rows(scope):
             items.append(
                 ContextItem(
-                    ref=f"harness:kb-index:{scope.workspace_id}:{index['kind']}",
-                    title=f"Overview kept by the Controller ({index['kind']}) in workspace {scope.workspace_id}",
-                    body=index["body"],
+                    ref=f"harness:kb-index:{workspace_id}:{kind}",
+                    title=f"Overview kept by the Controller ({kind}) in workspace {workspace_id}",
+                    body=body[:MAX_OVERVIEW_CHARS],
                     content_type="context",
                     source="harness",
                 )

@@ -1941,6 +1941,20 @@ class TraceStore:
                 ),
             }
 
+    def list_work_reviews(self, workspace_id: str, limit: int = 6) -> list[dict]:
+        """The most recent successful reviews of this workspace, newest first, with their results."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, project, period_start, period_end, result FROM work_reviews "
+                "WHERE workspace_id = ? AND status = 'ok' ORDER BY id DESC LIMIT ?",
+                (workspace_id, limit),
+            ).fetchall()
+        return [
+            {"id": r[0], "project": r[1], "period_start": r[2], "period_end": r[3],
+             "result": json.loads(r[4]) if r[4] else {}}
+            for r in rows
+        ]
+
     def start_gardening_run(self, workspace_id: str, project: str, kind: str = "garden") -> int:
         with self._connection() as conn:
             cur = conn.execute(
