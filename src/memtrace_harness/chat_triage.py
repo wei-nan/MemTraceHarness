@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 @dataclass
 class TriageResult:
     kind: str  # "approval_response", "chat", "status", "out_of_scope", "unrecognized",
-    # "schedule_list", "schedule_cancel", "garden", "promote"
+    # "schedule_list", "schedule_cancel", "garden", "promote", "review"
     project_scope: ProjectScope | None
     approval_id: str | None = None
     approval_action: str | None = None  # "approve", "reject", "clarify"
@@ -66,6 +66,12 @@ class ChatTriage:
             return TriageResult(
                 kind="schedule_cancel", project_scope=None, schedule_id=parts[1].strip()
             )
+
+        if cleaned.startswith("/review"):
+            matched = self._match_project_from_text(cleaned) or self._find_project(default_project)
+            if not matched and len(self.projects) == 1:
+                matched = self.projects[0]
+            return TriageResult(kind="review", project_scope=matched)
 
         if cleaned.startswith("/promote"):
             matched = self._match_project_from_text(cleaned) or self._find_project(default_project)

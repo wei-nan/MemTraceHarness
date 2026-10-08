@@ -235,6 +235,28 @@ reverting an edit to a note a pass wrote earlier, and checking that a note's
 TWTradingStrategy the Controller model produced 7 notes and 6 directions with every quote verified and all 62
 numbers present in the cited digests.
 
+**Review of the harness's own work (explicit operator decision, 2026-10-08).** `/review [project]`, a request
+in chat (the chat model emits `HARNESS_REVIEW_START::`), or — once a first review exists — the nightly window
+once a week (when the period holds at least 5 runs) reviews how the harness's work went (`work_review.py`), per
+workspace, over the period since the last successful review (the first covers all history; a failed attempt
+leaves its period for the next one). **ENFORCED:** the *report* is computed by the harness from its own records
+with no model involved (outcomes, stage states, model calls and quota exhaustion, fallbacks, gate verdicts,
+repeated questions with the date of the last one, operator decisions and claims, held-back schedule results,
+the latest stopped or failed cases); the Controller's *interpretation* is checked against it — every finding,
+proposal and lesson needs verbatim quotes that occur in the report, and every number of two digits or more in
+it must occur in the report. The prompt carries a short hand-written list of facts about the harness the
+report cannot show (`HARNESS_FACTS`: what `quota_cooldown` means, that held-back schedule results are
+deliberate, that decision records began on 2026-10-07 …); **it must be updated whenever the behaviour it
+describes changes.** Proposed changes to how the harness works reach the operator as decision cards
+(reason `review_proposal`); their answer is kept as precedent, resumes no task, and the harness changes nothing
+by itself — a proposal that should be done is a separate, explicit request. Lessons about how work goes are
+written to the project's memory workspace without draft labels (tags `harness`, `controller`, `work-lesson`),
+keyed by title and with their quotes, undoable with one button. **Not implemented:** judging whether an
+individual held-back schedule result was right, comparing more than one previous period, and acting on a
+chosen proposal. **Verified on live data (dry run, nothing written):** on TWTradingStrategy the Controller
+produced findings that correctly separated recent from old problems and flagged repeated TaiwanTrade 401
+errors as the current blocker.
+
 **POLICY_ONLY**:
 
 - project-spec and Agent Loop references should be written once at their authoritative location;

@@ -30,7 +30,15 @@ from memtrace_harness.kb_gardening import (
     run_gardening_pass,
     workspaces_to_garden,
 )
+from memtrace_harness.decision_records import precedent_block
 from memtrace_harness.kb_promotion import PROMOTION_TIMEOUT_SECONDS, run_promotion_pass
+from memtrace_harness.work_review import (
+    MIN_RUNS_FOR_AUTO_REVIEW,
+    REVIEW_TIMEOUT_SECONDS as WORK_REVIEW_TIMEOUT_SECONDS,
+    review_due,
+    run_work_review,
+    write_lessons,
+)
 from memtrace_harness.trigger_review import make_review_caller
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
@@ -42,6 +50,7 @@ from memtrace_harness.memory_digest import (
     PreferenceChanges,
     due_digest_dates,
     in_digest_window,
+    preference_context_for,
     run_digest_for_date,
     sync_digests_to_memtrace,
     sync_operator_profile,
@@ -621,6 +630,13 @@ def gateway_command(args: argparse.Namespace) -> int:
             name=f"kb-promote-{scope.name}",
             daemon=True,
         ).start()
+        gw.work_review_now = lambda scope, chat_id, _gw=gw: threading.Thread(
+            target=run_work_reviews,
+            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
+            kwargs={"only_project": scope.name, "chat_id": chat_id, "force": True},
+            name=f"work-review-{scope.name}",
+            daemon=True,
+        ).start()
         gateways.append(gw)
         for scope in group_projects:
             gateway_for_project[scope.name] = gw
@@ -1033,6 +1049,66 @@ def run_knowledge_promotion(
     return ran
 
 
+def run_work_reviews(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    projects: list,
+    gateway_for_project: dict[str, TelegramGateway],
+    *,
+    only_project: str | None = None,
+    chat_id: int | None = None,
+    force: bool = False,
+) -> int:
+    """Review how the harness's own work went since the last review (work_review.py), one review
+    per workspace (projects sharing a workspace are reviewed together). On demand (/review or a
+    request in chat; force=True) or weekly from the nightly window, after a first review exists and
+    when the period holds enough runs. Returns the reviews made."""
+    ran = 0
+    seen: set[str] = set()
+    for scope in projects:
+        if only_project is not None and scope.name != only_project:
+            continue
+        workspace_id = scope.workspace_id
+        if workspace_id in seen:
+            continue
+        seen.add(workspace_id)
+        if not force and not review_due(trace_store, workspace_id):
+            continue
+        gw = gateway_for_project.get(scope.name)
+        try:
+            outcome = run_work_review(
+                trace_store=trace_store,
+                workspace_id=workspace_id,
+                project=scope.name,
+                project_names=[p.name for p in projects if p.workspace_id == workspace_id],
+                caller=make_review_caller(config, scope.name, timeout_seconds=WORK_REVIEW_TIMEOUT_SECONDS),
+                precedent=precedent_block(
+                    trace_store, scope.name,
+                    preferences=preference_context_for(trace_store, scope.name, with_ids=True),
+                ),
+                min_runs=0 if force else MIN_RUNS_FOR_AUTO_REVIEW,
+            )
+        except Exception:
+            logger.exception(f"[{scope.name}] the work review failed")
+            outcome = None
+        if outcome is None:
+            if gw is not None and chat_id is not None:
+                gw.send_message(chat_id, f"🔍 [{scope.name}] 這段期間沒有足夠的紀錄可以復盤，或模型沒有給出可用的答案。")
+            continue
+        if memtrace_client is not None:
+            write_lessons(
+                memtrace_client, trace_store, outcome, config.memory_workspace_id_for(scope.name, workspace_id)
+            )
+        ran += 1
+        if gw is not None:
+            try:
+                gw.notify_review_outcome(outcome, scope, chat_id)
+            except Exception:
+                logger.exception(f"[{scope.name}] reporting the work review failed")
+    return ran
+
+
 def _run_nightly_digest_pass(
     config: HarnessConfig,
     trace_store: TraceStore,
@@ -1229,6 +1305,7 @@ def _serve_gateway_loop(
     digest_thread: threading.Thread | None = None
     garden_thread: threading.Thread | None = None
     promote_thread: threading.Thread | None = None
+    review_thread: threading.Thread | None = None
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
     schedule_tz = ZoneInfo(config.schedule_timezone)
@@ -1378,6 +1455,17 @@ def _serve_gateway_loop(
                     daemon=True,
                 )
                 promote_thread.start()
+            # The weekly review of the harness's own work (only after a first one was asked for).
+            if (review_thread is None or not review_thread.is_alive()) and in_digest_window(
+                datetime.now(schedule_tz)
+            ):
+                review_thread = threading.Thread(
+                    target=run_work_reviews,
+                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
+                    name="work-review",
+                    daemon=True,
+                )
+                review_thread.start()
             last_digest_check = now
 
     # One shutdown budget for both: let each bot finish the message it is handling (an

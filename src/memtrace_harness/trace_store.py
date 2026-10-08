@@ -868,6 +868,21 @@ class TraceStore:
                     undone INTEGER NOT NULL DEFAULT 0
                 );
 
+                -- A review of how the harness's own work went over a period (see work_review.py):
+                -- the evidence report the harness computed and what the Controller concluded from it.
+                -- The period of the next review starts where the last successful one ended.
+                CREATE TABLE IF NOT EXISTS work_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    period_start TEXT,
+                    period_end TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    report TEXT,
+                    result TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS workspace_locks (
                     conversation_id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL,
@@ -1836,6 +1851,95 @@ class TraceStore:
                 conn.execute(
                     "DELETE FROM kb_promotions WHERE workspace_id = ? AND node_id = ?", (workspace_id, node_id)
                 )
+
+    def start_work_review(self, workspace_id: str, project: str, period_start: str | None, period_end: str) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO work_reviews (workspace_id, project, started_at, period_start, period_end) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (workspace_id, project, utc_now_iso(), period_start, period_end),
+            )
+            return int(cur.lastrowid)
+
+    def finish_work_review(self, review_id: int, status: str, *, report: str | None = None, result: dict | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE work_reviews SET status = ?, report = ?, result = ? WHERE id = ?",
+                (status, report, json.dumps(result, ensure_ascii=False) if result else None, review_id),
+            )
+
+    def last_work_review(self, workspace_id: str, *, ok_only: bool = True) -> dict | None:
+        query = (
+            "SELECT id, project, started_at, period_start, period_end, status, result FROM work_reviews "
+            "WHERE workspace_id = ?" + (" AND status = 'ok'" if ok_only else "") + " ORDER BY id DESC LIMIT 1"
+        )
+        with self._connection() as conn:
+            row = conn.execute(query, (workspace_id,)).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0], "project": row[1], "started_at": row[2], "period_start": row[3],
+            "period_end": row[4], "status": row[5], "result": json.loads(row[6]) if row[6] else None,
+        }
+
+    def work_review_data(
+        self, workspace_id: str, project_names: list[str], since: str | None, until: str
+    ) -> dict:
+        """The raw rows a work review is computed from, for runs created in (since, until] on
+        this workspace: loop outcomes, stage states, model calls, gate verdicts, approvals, the
+        operator's decisions, claims and scheduled-result delivery. Only counts and short fields
+        are read; nothing here depends on the size of an artifact."""
+        lo = since or ""
+        marks = ",".join("?" for _ in project_names) or "''"
+        names = list(project_names)
+        in_run = "r.workspace_id = ? AND r.created_at > ? AND r.created_at <= ?"
+        run_args = (workspace_id, lo, until)
+        with self._connection() as conn:
+            def rows(sql: str, args: tuple) -> list[tuple]:
+                return conn.execute(sql, args).fetchall()
+
+            return {
+                "runs": rows(
+                    "SELECT r.id, r.conversation_id, r.goal, r.summary_json, r.created_at FROM runs r "
+                    f"WHERE {in_run} ORDER BY r.created_at", run_args,
+                ),
+                "stages": rows(
+                    "SELECT l.profile_id, l.state, COUNT(*) FROM loop_stages l JOIN runs r ON r.id = l.run_id "
+                    f"WHERE {in_run} GROUP BY 1, 2", run_args,
+                ),
+                "cli": rows(
+                    "SELECT e.profile_id, e.provider, e.status, COALESCE(e.failure_category, 'none'), "
+                    "e.fallback_index, e.duration_ms FROM cli_executions e JOIN runs r ON r.id = e.run_id "
+                    f"WHERE {in_run}", run_args,
+                ),
+                "controller_actions": rows(
+                    "SELECT json_extract(l.artifact_json, '$.action'), COUNT(*) FROM loop_stages l "
+                    "JOIN runs r ON r.id = l.run_id WHERE l.profile_id = 'controller' AND l.stage = 'control-start' "
+                    f"AND l.state = 'succeeded' AND {in_run} GROUP BY 1", run_args,
+                ),
+                "gates": rows(
+                    "SELECT json_extract(l.artifact_json, '$.verdict'), json_extract(l.artifact_json, '$.reason_code'), "
+                    "COUNT(*) FROM loop_stages l JOIN runs r ON r.id = l.run_id WHERE l.profile_id = 'red-team' "
+                    f"AND l.artifact_json IS NOT NULL AND {in_run} GROUP BY 1, 2", run_args,
+                ),
+                "approvals": rows(
+                    "SELECT conversation_id, reason, status, created_at FROM approval_requests "
+                    "WHERE workspace = ? AND created_at > ? AND created_at <= ?", run_args,
+                ),
+                "decisions": rows(
+                    f"SELECT kind, outcome, followed FROM decision_records WHERE project IN ({marks}) "
+                    "AND created_at > ? AND created_at <= ?", (*names, lo, until),
+                ),
+                "claims": rows(
+                    f"SELECT status, COUNT(*) FROM completion_claims WHERE project IN ({marks}) "
+                    "AND created_at > ? AND created_at <= ? GROUP BY 1", (*names, lo, until),
+                ),
+                "schedule_reports": rows(
+                    "SELECT SUM(content LIKE '【未推送%'), COUNT(*) FROM primary_sessions_hot_log "
+                    f"WHERE project IN ({marks}) AND turn_type = 'schedule_report' "
+                    "AND created_at > ? AND created_at <= ?", (*names, lo, until),
+                ),
+            }
 
     def start_gardening_run(self, workspace_id: str, project: str, kind: str = "garden") -> int:
         with self._connection() as conn:
