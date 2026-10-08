@@ -91,13 +91,20 @@ run is unchanged: this isolates *tasks* from each other, it is not provider fan-
 **Not implemented:** automatically resolving merge conflicts, pruning worktrees of abandoned or
 failed-with-changes runs, and the unattended scanner still wants the whole project idle.
 
-**Diagnosing outside failures (operator request, 2026-10-08; prompt policy, not code-enforced).** The chat
-model's sandbox has no network, so a connection or DNS failure seen there says nothing about an outside
-service (a Telegram answer once blamed "TWSE unreachable from here" when the project's own script was merely
-timing out on a slow legacy endpoint). The chat prompt tells it not to conclude from that, and — when the
-operator wants a schedule/script/service failure looked into — to start a governed task whose goal asks for
-real measurements, a service-side vs project-side verdict, a fix when the cause is the project's own code,
-and a re-run of the failed job. Whether that task's Developer provider has network is a role-profile choice.
+**Diagnosing and re-running without the Agent Loop (operator decision, 2026-10-08).** The chat model's sandbox
+has no network, so a connection or DNS failure seen there says nothing about an outside service (a Telegram answer
+once blamed "TWSE unreachable from here" when the project's own script was merely timing out on a slow legacy
+endpoint). Diagnosis and re-running a job are the harness's own job; only changing code goes through the Agent Loop.
+`ops_mcp.py` is an MCP server (spawned outside the CLI sandbox, like the TaiwanTrade proxy) given to the chat reply
+for a project whose scope file declares something: `probe_hosts` (hostnames `http_probe` may GET; redirects are
+reported, never followed), `log_files` (what `read_log` may tail) and `job: name = command` lines. **Enforced:**
+those allowlists; `run_job` never runs anything — it records a `job_requests` row, the gateway shows a Telegram
+confirm button, and the command (re-read from the scope file at tap time) runs in a daemon thread only after the
+tap, once per request, with a 15-minute limit; its result is sent and written to the chat log. Unanswered
+requests expire after 10 minutes. **Prompt policy, not enforced:** that the model probes before answering and only
+starts a development task when the cause is in the project's code. Wired for Codex and Claude chat models only
+(Antigravity chat gets the notice but no tools). **Unverified against live models:** that a chat model calls these
+tools sensibly. A project that declares nothing is told to say it cannot verify from the chat sandbox.
 
 **Orders proposed by the chat model (explicit operator decision, 2026-10-05).** For a project
 listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a limit order

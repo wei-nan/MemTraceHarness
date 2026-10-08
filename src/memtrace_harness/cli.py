@@ -1347,6 +1347,11 @@ def _serve_gateway_loop(
                 gw.process_order_intents()
             except Exception:
                 logger.exception("processing proposed orders failed; continuing")
+            # Same for jobs the model asked to re-run: buttons now, the run only after a tap.
+            try:
+                gw.process_job_requests()
+            except Exception:
+                logger.exception("processing job requests failed; continuing")
 
         if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
             for gw in gateways:

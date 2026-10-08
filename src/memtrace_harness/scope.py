@@ -29,6 +29,13 @@ class ProjectScope:
     # Optional shell command run inside a fresh worktree to make it usable (link
     # node_modules, copy an .env — whatever git does not carry over).
     worktree_setup_command: str | None = None
+    # What the chat model's operations tools (ops_mcp.py) may touch, all declared by the
+    # operator in the scope file: hostnames http_probe may request, log files read_log may
+    # read (paths relative to working_directory), and named shell commands run_job may run
+    # after the human taps confirm in Telegram ("- job: name = command", one per line).
+    probe_hosts: list[str] | None = None
+    log_files: list[str] | None = None
+    jobs: dict[str, str] | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:
@@ -88,6 +95,15 @@ class ProjectScope:
         )
         worktree_setup_command = _extract_field(content, "worktree_setup_command")
 
+        probe_hosts = _split_list(_extract_field(content, "probe_hosts"))
+        log_files = _split_list(_extract_field(content, "log_files"))
+        jobs = {
+            match.group(1): match.group(2).strip()
+            for match in re.finditer(
+                r"(?:^|\n)[-*\s]*`?job`?\s*[:=]\s*([A-Za-z0-9_-]{1,40})\s*=\s*([^\n\r]+)", content
+            )
+        }
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -103,7 +119,14 @@ class ProjectScope:
             agent_loop_enabled=agent_loop_enabled,
             max_workers=max_workers,
             worktree_setup_command=worktree_setup_command,
+            probe_hosts=[h.lower() for h in probe_hosts],
+            log_files=log_files,
+            jobs=jobs,
         )
+
+
+def _split_list(value: str | None) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()] if value else []
 
 
 def _extract_field(content: str, *keys: str) -> str | None:

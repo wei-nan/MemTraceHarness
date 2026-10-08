@@ -941,6 +941,20 @@ class TraceStore:
 
                 CREATE INDEX IF NOT EXISTS idx_order_intents_status
                     ON order_intents(status, project);
+
+                CREATE TABLE IF NOT EXISTS job_requests (
+                    request_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    job_name TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    telegram_chat_id INTEGER,
+                    telegram_message_id INTEGER,
+                    result_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_workspace_locks_ws
                     ON workspace_locks(workspace_id);
                 CREATE INDEX IF NOT EXISTS idx_task_queue_ws
@@ -2841,6 +2855,103 @@ class TraceStore:
         for row in rows:
             self.finish_order_intent(row["intent_id"], "expired")
         return rows
+
+    # ---- jobs the chat model asked to re-run (ops_mcp.py): shown to the human, run only on a tap
+    _JOB_COLUMNS = (
+        "request_id, project, job_name, command, status, expires_at, "
+        "telegram_chat_id, telegram_message_id, result_json"
+    )
+
+    @staticmethod
+    def _job_row_to_dict(row: tuple) -> dict:
+        keys = (
+            "request_id", "project", "job_name", "command", "status", "expires_at",
+            "telegram_chat_id", "telegram_message_id",
+        )
+        out = dict(zip(keys, row[:8]))
+        out["result"] = json.loads(row[8]) if row[8] else None
+        return out
+
+    def create_job_request(
+        self, *, request_id: str, project: str, job_name: str, command: str, expires_at: str
+    ) -> bool:
+        """False when the same job is already waiting for the human (a repeated request)."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? "
+                "AND (status IN ('pending', 'awaiting') OR (status = 'running' AND updated_at > ?))",
+                (project, job_name, (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (request_id, project, job_name, command, expires_at, now, now),
+            ).rowcount > 0
+
+    def get_job_request(self, request_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM job_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        return self._job_row_to_dict(row) if row else None
+
+    def transition_job_request(
+        self, request_id: str, from_statuses: tuple[str, ...], to_status: str
+    ) -> bool:
+        marks = ",".join("?" for _ in from_statuses)
+        with self._connection() as conn:
+            return conn.execute(
+                f"UPDATE job_requests SET status = ?, updated_at = ? "
+                f"WHERE request_id = ? AND status IN ({marks})",
+                (to_status, utc_now_iso(), request_id, *from_statuses),
+            ).rowcount > 0
+
+    def claim_pending_job_requests(self, projects: list[str]) -> list[dict]:
+        if not projects:
+            return []
+        marks = ",".join("?" for _ in projects)
+        with self._connection() as conn:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT request_id FROM job_requests WHERE status = 'pending' "
+                    f"AND project IN ({marks}) ORDER BY created_at",
+                    projects,
+                )
+            ]
+        claimed = [i for i in ids if self.transition_job_request(i, ("pending",), "awaiting")]
+        return [d for d in (self.get_job_request(i) for i in claimed) if d]
+
+    def set_job_request_message(self, request_id: str, *, chat_id: int, message_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE job_requests SET telegram_chat_id = ?, telegram_message_id = ? "
+                "WHERE request_id = ?",
+                (chat_id, message_id, request_id),
+            )
+
+    def finish_job_request(self, request_id: str, status: str, result: dict | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE job_requests SET status = ?, result_json = ?, updated_at = ? WHERE request_id = ?",
+                (status, json.dumps(result, ensure_ascii=False) if result else None,
+                 utc_now_iso(), request_id),
+            )
+
+    def expire_job_requests(self, now_iso: str) -> list[dict]:
+        with self._connection() as conn:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT request_id FROM job_requests WHERE status IN ('pending', 'awaiting') "
+                    "AND expires_at <= ?",
+                    (now_iso,),
+                )
+            ]
+        expired = [i for i in ids if self.transition_job_request(i, ("pending", "awaiting"), "expired")]
+        return [d for d in (self.get_job_request(i) for i in expired) if d]
 
     def get_latest_turn(self, conversation_id: str) -> dict | None:
         """Most recently completed Agent Loop stage for a conversation — written by
