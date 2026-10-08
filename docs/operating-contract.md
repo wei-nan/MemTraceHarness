@@ -125,7 +125,7 @@ listed, e.g. chart images). They are told to use a listed tool instead of callin
 file, and, when no listed tool covers the need, to stop with `needs_human` and a decision card rather than
 build their own client. **Enforced:** the catalog content always matches the served tools. **Prompt policy,
 not enforced:** that a role checks it and stops; nothing scans code for direct API calls or key-file reads,
-and the key file stays readable. Antigravity's MCP registration (`agy mcp add`) is still manual and unchecked.
+and the key file stays readable. Antigravity's MCP registration (`agy mcp add`) is still manual, but the gateway now checks it at startup (`agy_mcp_check.py`): a missing, disabled or mis-pointed `taiwantrade`/`memtrace` server is printed, logged and sent to the allowlisted Telegram chats with the `agy mcp add` command to fix it. It only reports; it never registers anything and never blocks startup.
 
 **Replies to a paused task (2026-10-05).** A schedule run that stops `needs_human` is only a
 notification: no approval is opened for it, so a later human reply cannot resume the monitoring run with
