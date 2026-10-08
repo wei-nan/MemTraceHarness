@@ -118,6 +118,15 @@ Agent Loop roles never get the tool; a per-order value limit (default 100000 TWD
 TaiwanTrade's own risk limits. A cancellation is proposed the same way (`request_order_cancel`) and sent
 only on the human's tap (the gateway makes the `DELETE`). **Not implemented:** amending orders, market orders.
 
+**Tool-first rule for working roles (2026-10-09, operator decision).** Planner (and its revision/escalation),
+Developer (and its revision) and operational runs are shown a tool catalog built from the TaiwanTrade tool
+definitions (`tool_catalog()`), including what Agent Loop roles do NOT have (the order tools; endpoints not
+listed, e.g. chart images). They are told to use a listed tool instead of calling the API or reading a key
+file, and, when no listed tool covers the need, to stop with `needs_human` and a decision card rather than
+build their own client. **Enforced:** the catalog content always matches the served tools. **Prompt policy,
+not enforced:** that a role checks it and stops; nothing scans code for direct API calls or key-file reads,
+and the key file stays readable. Antigravity's MCP registration (`agy mcp add`) is still manual and unchecked.
+
 **Replies to a paused task (2026-10-05).** A schedule run that stops `needs_human` is only a
 notification: no approval is opened for it, so a later human reply cannot resume the monitoring run with
 a different goal (an operational run is told to use `needs_human` only when it could not do the work).
