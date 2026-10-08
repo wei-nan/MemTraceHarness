@@ -19,6 +19,7 @@ VALID_REASONS = {
     "unattended_write",
     "model_output_invalid",
     "config_change_required",
+    "review_proposal",
 }
 
 # These reasons mean "the loop stopped because it needs information only a human
@@ -32,7 +33,7 @@ VALID_REASONS = {
 # "needs_human" stop: it's a technical glitch (the model's own output didn't parse),
 # not a question — there is nothing to answer, only retry (approve) or give up
 # (reject), so it keeps the ordinary approve/reject framing instead.
-INFO_NEEDED_REASONS = {"ambiguous_requirement", "reasoning_gap", "gate_reject_twice"}
+INFO_NEEDED_REASONS = {"ambiguous_requirement", "reasoning_gap", "gate_reject_twice", "review_proposal"}
 
 # From this many earlier info-needed requests on the same conversation, the next one is
 # prefixed with a "you've been asked this before" warning (see request_approval()).

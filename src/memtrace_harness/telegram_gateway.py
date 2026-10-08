@@ -34,6 +34,7 @@ from memtrace_harness.kb_gardening import (
     undo_gardening_run,
 )
 from memtrace_harness.kb_promotion import PromotionOutcome
+from memtrace_harness.work_review import PROPOSAL_REASON, ReviewOutcome, describe_review
 from memtrace_harness.kb_promotion import describe_outcome as describe_promotion
 from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
 from memtrace_harness.decision_records import (
@@ -209,6 +210,8 @@ class TelegramGateway:
         self.garden_now: Callable[[ProjectScope, int], None] | None = None
         # Same for promoting cold-memory findings into the spec workspace (the /promote command).
         self.promote_now: Callable[[ProjectScope, int], None] | None = None
+        # Same for the review of the harness's own work (/review, or asking for it in chat).
+        self.work_review_now: Callable[[ProjectScope, int], None] | None = None
         # Each process invocation is a fresh instance (the gateway is a one-shot poll,
         # scheduled externally), so the update offset has to be persisted across runs —
         # otherwise every run would refetch and reprocess the same historical messages.
@@ -309,6 +312,7 @@ class TelegramGateway:
             {"command": "schedules", "description": "查看這個專案目前的排程"},
             {"command": "garden", "description": "現在就整理這個專案的知識庫（可加專案名）"},
             {"command": "promote", "description": "把冷記憶的研究結論整理進規格工作區（可加專案名）"},
+            {"command": "review", "description": "復盤 harness 自己的工作：哪裡卡住、怎麼改進（可加專案名）"},
             {"command": "schedule_cancel", "description": "取消一組排程（需加排程 ID）"},
         ]
         try:
@@ -493,6 +497,11 @@ class TelegramGateway:
             rejection = result.rejection_message or "已拒絕（超出範圍）。"
             self.send_message(chat_id, f"❌ {rejection}")
             return rejection
+
+        if result.kind == "review":
+            msg = self._start_work_review(result.project_scope, chat_id)
+            self.send_message(chat_id, msg)
+            return msg
 
         if result.kind == "promote":
             scope = result.project_scope
@@ -1502,6 +1511,45 @@ class TelegramGateway:
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
 
+    def _start_work_review(self, scope: ProjectScope | None, chat_id: int) -> str:
+        """Start a review of the harness's own work for a project, in the background. Shared by
+        the /review command and the chat model's request. Returns what to tell the operator."""
+        if scope is None:
+            return "請指定專案，例如 /review TWTradingStrategy。"
+        if self.work_review_now is None:
+            return "工作復盤在這個 gateway 沒有啟用。"
+        self.work_review_now(scope, chat_id)
+        return f"🔍 開始復盤「{scope.name}」自上次復盤以來的工作，完成後會回報（可能要一兩分鐘）。"
+
+    def notify_review_outcome(self, outcome: ReviewOutcome, scope: ProjectScope, chat_id: int | None = None) -> None:
+        """Report a work review: the findings, then each proposed change as a decision card the
+        operator answers (the answer is kept as precedent; the harness changes nothing by itself)."""
+        text = describe_review(outcome)
+        keyboard = (
+            [[{"text": "↩️ 撤銷這次寫入的教訓", "callback_data": f"kb_undo:{outcome.lesson_run_id}"}]]
+            if outcome.lesson_run_id is not None and outcome.lessons
+            else None
+        )
+        targets = [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids)
+        for cid in targets:
+            if keyboard:
+                self.send_message_with_keyboard(cid, text, keyboard)
+            else:
+                self.send_message(cid, text)
+        self.primary_session_mgr.record_turn(
+            project=outcome.project, speaker="assistant", turn_type="chat", content=text
+        )
+        for index, proposal in enumerate(outcome.proposals, start=1):
+            req = self.approval_manager.request_approval(
+                conversation_id=f"review_{outcome.review_id}_{index}",
+                workspace=outcome.workspace_id,
+                working_directory=str(scope.working_directory),
+                reason=PROPOSAL_REASON,
+                proposed_action=f"{proposal['title']}\n{proposal['card']['situation']}",
+                decision_card=proposal["card"],
+            )
+            self.notify_approval_request(req)
+
     def notify_promotion_outcome(self, outcome: PromotionOutcome, chat_id: int | None = None) -> None:
         """Tell the operator what a promotion pass wrote, with an undo for what it created."""
         text = describe_promotion(outcome)
@@ -1659,6 +1707,7 @@ class TelegramGateway:
         return "、".join(parts) if parts else "無"
 
     _TASK_START_MARKER = "HARNESS_TASK_START::"
+    _REVIEW_START_MARKER = "HARNESS_REVIEW_START::"
     _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
     _SCHEDULE_PAUSE_MARKER = "HARNESS_SCHEDULE_PAUSE::"
     _SCHEDULE_RESUME_MARKER = "HARNESS_SCHEDULE_RESUME::"
@@ -1799,6 +1848,10 @@ class TelegramGateway:
             "週五觸發。同一則回覆不要同時輸出這一行和上面的任務啟動標記。不確定使用者是否"
             "真的要排程、或排程細節（週期、時間）還沒問清楚時，絕對不要輸出這一行，先在對話"
             "裡把細節問清楚。\n\n"
+            "如果，而且只有在，使用者要你復盤 harness 自己的工作——回顧最近的任務與排程做得如何、"
+            "哪裡卡住或失敗、要怎麼改進（不是要你檢討交易損益，也不是要你開發某個功能）——才在回覆"
+            f"最後另起一行，格式為「{self._REVIEW_START_MARKER}<一句話說明想看什麼>」。系統會自動產生"
+            "有數據的復盤報告，你不需要自己整理數字。同一則回覆不要同時輸出任務啟動標記。\n\n"
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
             f"{self._quoted_reply_notice(quoted_text)}"
@@ -1834,6 +1887,7 @@ class TelegramGateway:
                 reply_text, approval_answer = self._extract_marker_line(
                     reply_text, self._APPROVAL_ANSWER_MARKER
                 )
+                reply_text, review_request = self._extract_marker_line(reply_text, self._REVIEW_START_MARKER)
                 if confirmations:
                     reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
@@ -1853,6 +1907,8 @@ class TelegramGateway:
                         project=scope.name, speaker="user", turn_type="decision", content=goal
                     )
                     self._start_or_queue_task(scope, goal, chat_id)
+                if review_request and not goal:
+                    self.send_message(chat_id, self._start_work_review(scope, chat_id))
                 if schedule_directive:
                     self._create_schedule(scope, chat_id, schedule_directive)
                 for action, payload in schedule_controls:
@@ -2356,6 +2412,14 @@ class TelegramGateway:
     def _resume_approved_conversation(
         self, req_data: ApprovalRequestData, answer: str | None = None
     ) -> None:
+        if req_data.reason == PROPOSAL_REASON:
+            # A proposal from a work review resumes no task: the answer is the whole outcome. It
+            # has been kept as precedent; implementing a change is a separate, explicit request.
+            self.send_message(
+                req_data.telegram_chat_id if req_data.telegram_chat_id is not None else sorted(self.allowed_chat_ids)[0],
+                "📝 已記下你的選擇，之後的判斷會參考；harness 不會自己改動。想照這個做的話，直接告訴我，我會開成開發任務。",
+            )
+            return
         working_dir = Path(req_data.working_directory).resolve()
         if not working_dir.is_dir():
             logger.error(f"Cannot resume conversation {req_data.conversation_id}: working dir {working_dir} invalid")
