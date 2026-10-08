@@ -91,6 +91,14 @@ run is unchanged: this isolates *tasks* from each other, it is not provider fan-
 **Not implemented:** automatically resolving merge conflicts, pruning worktrees of abandoned or
 failed-with-changes runs, and the unattended scanner still wants the whole project idle.
 
+**Diagnosing outside failures (operator request, 2026-10-08; prompt policy, not code-enforced).** The chat
+model's sandbox has no network, so a connection or DNS failure seen there says nothing about an outside
+service (a Telegram answer once blamed "TWSE unreachable from here" when the project's own script was merely
+timing out on a slow legacy endpoint). The chat prompt tells it not to conclude from that, and — when the
+operator wants a schedule/script/service failure looked into — to start a governed task whose goal asks for
+real measurements, a service-side vs project-side verdict, a fix when the cause is the project's own code,
+and a re-run of the failed job. Whether that task's Developer provider has network is a role-profile choice.
+
 **Orders proposed by the chat model (explicit operator decision, 2026-10-05).** For a project
 listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a limit order
 (`create_order_intent`); a human must confirm it. ENFORCED in code: the tool only creates a

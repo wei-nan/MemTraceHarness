@@ -484,6 +484,9 @@ class TelegramGatewayTests(TestCase):
         # --allowedTools is variadic: it must come before the flag that precedes the prompt.
         self.assertLess(cmd.index("--allowedTools"), cmd.index("--print"))
         self.assertIn("不需要先徵求任何核准", cmd[-1])
+        # A failure seen from the network-less chat sandbox is not evidence about the outside.
+        self.assertIn("你的沙盒沒有網路", cmd[-1])
+        self.assertIn("實際發請求量測", cmd[-1])
 
     def test_expire_stale_approvals_closes_old_pending_only(self) -> None:
         from datetime import datetime, timedelta, timezone
