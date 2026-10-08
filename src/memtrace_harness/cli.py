@@ -1300,6 +1300,23 @@ def _serve_gateway_loop(
         except Exception:
             logger.exception(f"[{label}] startup notification failed; continuing")
 
+    from memtrace_harness.agy_mcp_check import check_antigravity_mcp
+
+    try:
+        mcp_problems = check_antigravity_mcp(config.memtrace_mcp_url)
+    except Exception:
+        logger.exception("Antigravity MCP check failed; continuing")
+        mcp_problems = []
+    for problem in mcp_problems:
+        print(f"WARNING: {problem}")
+        logger.warning(problem)
+    if mcp_problems:
+        for gw in gateways:
+            try:
+                gw.notify_all_allowlisted("⚠️ Antigravity 的 MCP 設定與 Harness 預期不符：\n" + "\n".join(mcp_problems))
+            except Exception:
+                logger.exception("Antigravity MCP warning notification failed; continuing")
+
     last_scan = 0.0
     last_consolidation = 0.0
     last_digest_check = 0.0
