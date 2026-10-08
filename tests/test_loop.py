@@ -16,8 +16,13 @@ from memtrace_harness.loop import (
     _is_technical_output_failure,
     _plan_structure_ok,
     controller_task,
+    developer_revision_task,
+    developer_task,
     gate_task,
     operational_task,
+    planner_escalation_task,
+    planner_revision_task,
+    planner_task,
     summarize_invalid_artifact,
     summarize_plan_needs_human,
     valid_plan,
@@ -281,6 +286,26 @@ class ControllerTaskContextTests(TestCase):
         self.assertIn("answered 401", goal)
         with patch("memtrace_harness.loop.mcp_server_spec", return_value=None):
             self.assertNotIn("get_positions", operational_task(task).goal)
+
+    def test_planner_and_developer_check_the_tool_catalog_and_stop_when_it_has_a_gap(self) -> None:
+        from unittest.mock import patch
+
+        task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="add a TAIEX chart fetch")
+        env = {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/k"}
+        with patch.dict("os.environ", env):
+            for goal in (
+                planner_task(task).goal,
+                planner_revision_task(task, {}, {}).goal,
+                planner_escalation_task(task, {}, {}).goal,
+                developer_task(task, {}).goal,
+                developer_revision_task(task, {}, {}, {}).goal,
+            ):
+                self.assertIn("get_positions", goal)
+                self.assertIn("not available to Agent Loop roles".lower(), goal.lower())
+                self.assertIn("needs_human", goal)
+                self.assertIn("do not build your own client", goal)
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertNotIn("get_positions", planner_task(task).goal)
 
     def test_start_stage_explains_run_operational_action_choice(self) -> None:
         task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")

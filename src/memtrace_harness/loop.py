@@ -21,7 +21,7 @@ from memtrace_harness.fallback import (
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.output_contracts import output_schema_path
 from memtrace_harness.role_profiles import RoleProfile
-from memtrace_harness.taiwantrade_mcp import mcp_server_spec
+from memtrace_harness.taiwantrade_mcp import mcp_server_spec, tool_catalog
 from memtrace_harness.schemas import (
     ContextItem,
     LoopStageResult,
@@ -1609,6 +1609,7 @@ def planner_task(task: TaskEnvelope) -> TaskEnvelope:
             "(string), acceptance_criteria (string array), open_questions (string array), "
             "and scope_exclusions (string array). "
             "Do not make product decisions when required input is missing.\n"
+            f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
@@ -1625,6 +1626,7 @@ def planner_escalation_task(
         goal=(
             f"Revise the plan only because G1 identified a reasoning gap: {task.goal}\n"
             "Return the same JSON plan contract as the standard planner.\n"
+            f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
@@ -1644,6 +1646,7 @@ def planner_revision_task(
         goal=(
             f"Revise the Sonnet plan using the first G1 rejection: {task.goal}\n"
             "Return the same valid JSON plan contract. This is one bounded correction, not a retry.\n"
+            f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
@@ -1745,6 +1748,25 @@ def _taiwantrade_note() -> str:
     )
 
 
+# Told to every working role before it builds anything: check the tool catalog first, and stop for
+# the operator when it does not cover the need (operator decision 2026-10-09: ask, do not build
+# around the Harness's own tools). Prompt policy, not enforced.
+_TOOL_FIRST_RULE = (
+    "Before writing code or a script that fetches TaiwanTrade data or touches the account, check "
+    "the tool list above. If a listed tool covers it, use that tool (or have the code's caller use "
+    "it) instead of calling http://127.0.0.1:8000 yourself or reading any API-key file — you are "
+    "not given the key. If NO listed tool covers what is needed, do not build your own client or "
+    "script around it: stop with status 'needs_human' and a decision card that names the missing "
+    "capability, what you searched the list for, and the options (e.g. add a Harness tool, or "
+    "approve a project-side script).\n"
+)
+
+
+def _tool_first_note() -> str:
+    catalog = tool_catalog()
+    return f"{catalog}{_TOOL_FIRST_RULE}" if catalog else ""
+
+
 def operational_task(task: TaskEnvelope) -> TaskEnvelope:
     """Controller chose run_operational_action: run this directly via Developer with
     no plan and no review afterward (see AgentLoopRunner._run_operational_action()).
@@ -1786,6 +1808,7 @@ def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
             "Return only a valid JSON object after the work with status ('completed', "
             "'needs_human', or 'failed'), summary (string), changed_files (string array), "
             "tests (string array), and gaps (string array).\n"
+            f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
@@ -1809,6 +1832,7 @@ def developer_revision_task(
             f"Correct the implementation using the first G2 rejection: {task.goal}\n"
             "Return the same valid JSON development contract after running relevant tests. "
             "This is one bounded correction, not an unchanged retry.\n"
+            f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),

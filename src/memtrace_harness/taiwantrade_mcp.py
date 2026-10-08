@@ -625,6 +625,22 @@ def serve(stdin=None, stdout=None) -> None:
             stdout.flush()
 
 
+def tool_catalog(env: dict[str, str] | None = None) -> str:
+    """The TaiwanTrade tools every Agent Loop role has, and what they do NOT cover, built from
+    the tool definitions themselves so it cannot drift from what is actually served. Empty when
+    the operator has not opted in (no API key file), because then no role has the tools."""
+    if not mcp_server_spec(env):
+        return ""
+    lines = [f"- {tool.name}: {tool.description}" for tool in TOOLS]
+    return (
+        "TaiwanTrade tools available to you (read-only MCP, they add the API key themselves):\n"
+        + "\n".join(lines)
+        + f"\nNOT available to Agent Loop roles: `{ORDER_TOOL_NAME}` and `{CANCEL_TOOL_NAME}` "
+        "(only the Telegram chat model proposes orders, and a human taps to confirm), and any "
+        "TaiwanTrade endpoint not listed above (for example chart images).\n"
+    )
+
+
 def order_projects(env: dict[str, str] | None = None) -> set[str]:
     """Projects the operator allowed to propose orders (HARNESS_TAIWANTRADE_ORDER_PROJECTS,
     comma-separated project names). Empty by default: nobody can trade."""
