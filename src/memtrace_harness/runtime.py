@@ -13,6 +13,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -187,6 +188,19 @@ def serve(
 
     signal.signal(signal.SIGINT, _handle_stop)
     signal.signal(signal.SIGTERM, _handle_stop)
+
+    if isinstance(config.workspace_root, Path):
+        # The first status request looks up what each provider CLI offers (slow, then cached): do it now,
+        # so the status page is not what waits for it.
+        def warm_model_catalog() -> None:
+            from memtrace_harness.model_catalog import provider_models
+
+            try:
+                provider_models(config)
+            except Exception:
+                logger.exception("warming the model catalog failed")
+
+        threading.Thread(target=warm_model_catalog, name="model-catalog-warmup", daemon=True).start()
 
     service.notify_operator(f"✅ Harness 已啟動（{scope.name}）。")
     _startup_checks(parts)
