@@ -828,6 +828,7 @@ def make_recall_model_caller(config: HarnessConfig, project_name: str):
                 model,
                 prompt,
                 claude_allowed_tools=TelegramGateway._CHAT_MEMTRACE_READ_TOOLS,
+                memtrace_read=True,
             )
             result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=RECALL_TIMEOUT_SECONDS)
             if result.return_code == 0 and result.stdout.strip():
@@ -1316,6 +1317,23 @@ def _serve_gateway_loop(
                 gw.notify_all_allowlisted("⚠️ Antigravity 的 MCP 設定與 Harness 預期不符：\n" + "\n".join(mcp_problems))
             except Exception:
                 logger.exception("Antigravity MCP warning notification failed; continuing")
+
+    from memtrace_harness.chat_tools_check import check_chat_tools
+
+    for gw in gateways:
+        try:
+            chat_problems = check_chat_tools(config, [p.name for p in gw.projects])
+        except Exception:
+            logger.exception("chat tool check failed; continuing")
+            continue
+        for problem in chat_problems:
+            print(f"WARNING: {problem}")
+            logger.warning(problem)
+        if chat_problems:
+            try:
+                gw.notify_all_allowlisted("⚠️ 聊天模型的 MemTrace 工具與預期不符：\n" + "\n".join(chat_problems))
+            except Exception:
+                logger.exception("chat tool warning notification failed; continuing")
 
     last_scan = 0.0
     last_consolidation = 0.0

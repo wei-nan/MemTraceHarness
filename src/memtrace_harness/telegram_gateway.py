@@ -19,10 +19,13 @@ from pathlib import Path
 
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.completion_claims import (
+    CHAT_NOTE_MARKER,
+    CHAT_NOTE_TAGS,
     CLAIM_NO,
     CLAIM_OK,
     accept_claim,
     apply_kb_updates,
+    chat_notes_to_ops,
     claim_keyboard,
     kb_updates_from_artifact,
     reject_claim,
@@ -1842,6 +1845,18 @@ class TelegramGateway:
     )
 
     @staticmethod
+    def _memtrace_notice() -> str:
+        return (
+            "你代表 Harness，對這個專案的 MemTrace 知識庫有讀與寫的能力：讀用 MCP 工具 `memtrace`"
+            "（search_nodes、get_node、list_nodes、traverse）；寫則是你在回覆中另起一行輸出"
+            f"「{CHAT_NOTE_MARKER}<factual|procedural|context|inquiry|preference>::<標題>::<一行內容>」，"
+            "Harness 會驗證並替你寫入（每則回覆最多 3 行，內容寫成單行）。使用者要你記錄、或對話得出值得"
+            "保存的決定／事實時就這樣寫，寫入結果 Harness 會附在回覆後面，你不要自己宣稱已存入。另外，"
+            "每則對話本來就會由 Harness 定期整理成草稿存進知識庫，不是「沒有存」。如果你發現 MemTrace 讀取工具"
+            "實際上不能用，要明說是工具故障，並用任務啟動標記開一個診斷任務，不要只叫使用者去找人。\n\n"
+        )
+
+    @staticmethod
     def _ops_notice(scope: ProjectScope) -> str:
         """The chat sandbox has no network, so a failure seen from it says nothing about the
         outside. Say so, and point at the operations tools (ops_mcp.py) that look from outside."""
@@ -1996,6 +2011,7 @@ class TelegramGateway:
             "哪裡卡住或失敗、要怎麼改進（不是要你檢討交易損益，也不是要你開發某個功能）——才在回覆"
             f"最後另起一行，格式為「{self._REVIEW_START_MARKER}<一句話說明想看什麼>」。系統會自動產生"
             "有數據的復盤報告，你不需要自己整理數字。同一則回覆不要同時輸出任務啟動標記。\n\n"
+            f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
@@ -2015,6 +2031,7 @@ class TelegramGateway:
                 taiwantrade=True,
                 order_project=scope.name,
                 ops_server=ops_server_spec(scope, self.config.trace_db_path),
+                memtrace_read=True,
             )
             result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
             if result.return_code == 0 and result.stdout.strip():
@@ -2026,7 +2043,9 @@ class TelegramGateway:
                 # Preference corrections first, and only their own lines are removed, so a
                 # task or schedule marker on another line still reaches the extractors.
                 stdout, corrections = self._extract_preference_corrections(result.stdout.strip())
+                stdout, note_payloads = self._extract_chat_notes(stdout)
                 confirmations = self._apply_preference_corrections(scope, corrections, text)
+                confirmations += self._apply_chat_notes(scope, note_payloads)
                 reply_text, goal = self._extract_task_start(stdout)
                 reply_text, schedule_directive = self._extract_schedule_start(reply_text)
                 reply_text, schedule_controls = self._extract_schedule_controls(reply_text)
@@ -2084,6 +2103,41 @@ class TelegramGateway:
                 reply_text = "\n".join(lines[:i]).rstrip()
                 return reply_text, (payload or None)
         return raw, None
+
+    @staticmethod
+    def _extract_chat_notes(raw: str) -> tuple[str, list[str]]:
+        """Pull every HARNESS_KB_NOTE:: line out of a chat reply, wherever it sits."""
+        kept, payloads = [], []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(CHAT_NOTE_MARKER):
+                payloads.append(stripped[len(CHAT_NOTE_MARKER):].strip())
+            else:
+                kept.append(line)
+        return "\n".join(kept).rstrip(), payloads
+
+    def _apply_chat_notes(self, scope: ProjectScope, payloads: list[str]) -> list[str]:
+        """Write what the chat model asked to remember into this project's memory workspace.
+        Failures are reported to the operator, never swallowed: the model must not be left
+        believing something was saved."""
+        ops = chat_notes_to_ops(payloads)
+        if not payloads:
+            return []
+        if not ops:
+            return ["🧠 知識庫沒有寫入：記錄格式不正確。"]
+        if self.memtrace_client is None:
+            return ["🧠 知識庫沒有寫入：這個 Harness 沒有連上 MemTrace。"]
+        applied = apply_kb_updates(
+            self.memtrace_client,
+            workspace_id=self.config.memory_workspace_id_for(scope.name, scope.workspace_id),
+            ops=ops,
+            claim_id="chat",
+            conversation_id=f"chat_{scope.name}",
+            claim_summary="",
+            origin="聊天",
+            note_tags=CHAT_NOTE_TAGS,
+        )
+        return [f"🧠 {line}" for line in applied["lines"]]
 
     @staticmethod
     def _extract_preference_corrections(raw: str) -> tuple[str, list[str]]:
