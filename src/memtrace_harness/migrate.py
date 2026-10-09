@@ -92,6 +92,7 @@ def plan_workspaces(
     *,
     first_port: int = DEFAULT_API_PORT,
     primaries: tuple[str, ...] = (),
+    reserved_ports: set[int] | frozenset[int] = frozenset(),
 ) -> list[WorkspacePlan]:
     groups: dict[str, list[ProjectScope]] = {}
     for scope in scopes:
@@ -101,7 +102,7 @@ def plan_workspaces(
         primary = next((m for m in members if m.name in primaries), members[0])
         ordered.append((primary, [m for m in members if m is not primary]))
     plans: list[WorkspacePlan] = []
-    taken: set[int] = set()
+    taken: set[int] = set(reserved_ports)
     for scope, others in ordered:
         suffix = slug(scope.name)
         env: dict[str, str] = {k: legacy[k] for k in GLOBAL_KEYS if legacy.get(k)}
@@ -371,8 +372,16 @@ def migrate_command(args: argparse.Namespace) -> int:
         raise ValueError(f"{index} lists no projects")
     services = (args.services_dir or DEFAULT_SERVICES_DIR).expanduser()
     repo_python = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"
+    web_path = services / "web.toml"
+    # Ports an earlier migration already handed out (their Harnesses may not be running yet, so nothing listens).
+    reserved = (
+        {int(h["url"].rsplit(":", 1)[1]) for h in tomllib.loads(web_path.read_text(encoding="utf-8")).get("harness", [])}
+        if web_path.is_file()
+        else set()
+    )
     plans = plan_workspaces(
-        legacy, scopes, first_port=args.first_port, primaries=tuple(getattr(args, "primary", None) or ())
+        legacy, scopes, first_port=args.first_port, primaries=tuple(getattr(args, "primary", None) or ()),
+        reserved_ports=reserved,
     )
 
     old_db = Path(legacy.get("HARNESS_TRACE_DB", "data/harness.sqlite3"))
