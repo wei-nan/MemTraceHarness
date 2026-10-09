@@ -17,8 +17,8 @@ Boundaries enforced here (not left to the prompt):
 Orders (opt-in per project, ``HARNESS_TAIWANTRADE_ORDER_PROJECTS``): the only write-ish tool
 is ``create_order_intent`` (and ``request_order_cancel`` for an existing order). They create a
 TaiwanTrade *intent* / a cancel *request* — nothing reaches the broker — and hand the one-time
-confirmation token to the harness database, never to the model. Only the gateway can turn either
-into a real order or cancellation, and only when the human taps the Telegram confirm button
+confirmation token to the harness database, never to the model. Only the Harness can turn either
+into a real order or cancellation, and only when the human taps the confirm button in the chat
 (``submit_order`` / ``cancel_order``). So a trade always needs the human, however the model behaves.
 
 Run: ``python -m memtrace_harness.taiwantrade_mcp`` (speaks JSON-RPC over stdin/stdout).
@@ -153,7 +153,7 @@ ORDER_TOOL_NAME = "create_order_intent"
 ORDER_TOOL = Tool(
     ORDER_TOOL_NAME,
     "Propose a stock order for the user to confirm. This does NOT place the order: it creates a "
-    "pending order and the user gets a confirm/cancel button in Telegram; only their tap sends it "
+    "pending order and the user gets a confirm/cancel button in the chat; only their tap sends it "
     "to the broker, and the result is reported to them automatically. Limit orders only. For an "
     "intraday odd-lot order set is_odd_lot=true and quantity is in shares (1-999); otherwise "
     "quantity is in lots (張, 1000 shares each).",
@@ -173,7 +173,7 @@ CANCEL_TOOL_NAME = "request_order_cancel"
 CANCEL_TOOL = Tool(
     CANCEL_TOOL_NAME,
     "Propose cancelling an existing order for the user to confirm. This does NOT cancel it: the user "
-    "gets a confirm/cancel button in Telegram and only their tap sends the cancellation to the broker; "
+    "gets a confirm/cancel button in the chat and only their tap sends the cancellation to the broker; "
     "the result is reported to them automatically. Find the order_id with list_orders first. The local "
     "order status can lag the broker (a filled order may still read PendingSubmit); get_positions shows "
     "what is actually held.",
@@ -289,8 +289,8 @@ def create_order_intent(
         )
         message = (
             "Order proposal created and NOT yet placed. The user has been sent a confirm/cancel "
-            "button in Telegram; the order is only sent if they tap confirm, and the result is "
-            "reported to them automatically. Tell the user to check Telegram."
+            "button in the chat; the order is only sent if they tap confirm, and the result is "
+            "reported to them automatically. Tell the user to check the chat."
         )
     else:
         # Same proposal as one already issued (a retry, or the user asking again). If it is
@@ -298,7 +298,7 @@ def create_order_intent(
         reshown = context.store.reshow_order_intent(intent_id)
         message = (
             "This exact proposal already exists and is still waiting for the user; its confirm/cancel "
-            "buttons were sent to their Telegram again. Tell the user to check the latest Telegram "
+            "buttons were sent to their chat again. Tell the user to check the latest "
             "message. Do not create it again."
             if reshown
             else f"An identical proposal was already created in the last few minutes (status {status}); "
@@ -359,7 +359,7 @@ def create_cancel_request(
         request_id = existing["intent_id"]
         note = (
             "A cancel proposal for this order is already waiting for the user; its buttons were "
-            "sent to their Telegram again. Tell the user to check the latest Telegram message. "
+            "sent to their chat again. Tell the user to check the latest message. "
             "Do not create it again."
         )
     else:
@@ -378,8 +378,8 @@ def create_cancel_request(
         )
         note = (
             "Cancel proposal created and NOT yet sent. The user has been sent a confirm/cancel "
-            "button in Telegram; the cancellation is only sent if they tap confirm, and the result "
-            "is reported to them automatically. Tell the user to check Telegram."
+            "button in the chat; the cancellation is only sent if they tap confirm, and the result "
+            "is reported to them automatically. Tell the user to check the chat."
         )
     return json.dumps(
         {
@@ -403,7 +403,7 @@ def cancel_order(
     api_key: str,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> dict[str, Any]:
-    """Send a confirmed cancellation. Called by the gateway after the human's tap — never
+    """Send a confirmed cancellation. Called by the Harness after the human's tap — never
     reachable from a tool."""
     if not re.fullmatch(r"[0-9A-Za-z_-]{1,64}", order_id):
         raise ProxyError("invalid order id")
@@ -423,7 +423,7 @@ def submit_order(
     api_key: str,
     opener: Callable[..., Any] = urllib.request.urlopen,
 ) -> dict[str, Any]:
-    """Turn a confirmed intent into a real order. Called by the gateway after the human's tap
+    """Turn a confirmed intent into a real order. Called by the Harness after the human's tap
     — never reachable from a tool, so a model cannot call it."""
     request = urllib.request.Request(
         base_url.rstrip("/") + "/trade/orders",
@@ -636,7 +636,7 @@ def tool_catalog(env: dict[str, str] | None = None) -> str:
         "TaiwanTrade tools available to you (read-only MCP, they add the API key themselves):\n"
         + "\n".join(lines)
         + f"\nNOT available to Agent Loop roles: `{ORDER_TOOL_NAME}` and `{CANCEL_TOOL_NAME}` "
-        "(only the Telegram chat model proposes orders, and a human taps to confirm), and any "
+        "(only the chat model proposes orders, and a human taps to confirm), and any "
         "TaiwanTrade endpoint not listed above (for example chart images).\n"
     )
 

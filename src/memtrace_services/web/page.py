@@ -1,59 +1,12 @@
-from __future__ import annotations
+"""The status page's HTML (one self-contained document; the server fills in `__INITIAL_DATA__`).
 
-import json
-import logging
-import threading
-import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+Frontend-only interactivity runs against data already pushed over SSE: expand/collapse per-project
+cards, filter by project name, search recent-conversation content. The write actions it offers
+(models, approve/reject, preferences) are POSTed to this service, which forwards each to the
+Harness that owns the project (see server.py) — the page never talks to a Harness itself.
+"""
 
-from memtrace_harness.config import HarnessConfig
-
-logger = logging.getLogger(__name__)
-
-# Fallback refresh even with no activity, so the page never looks stalled if a browser
-# tab sat open past the last real event (e.g. nothing happened for an hour).
-HEARTBEAT_SECONDS = 15.0
-
-
-class StatusEventBus:
-    """Version counter + condition variable, not a per-client queue: every SSE
-    connection just waits for the version to change, then recomputes the latest status
-    data itself. Cheap to publish from (a single notify_all()), and a burst of
-    publishes right after each other (e.g. poll + scan + consolidation all in one
-    cycle) still only costs each client one recomputation, not one per publish."""
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._version = 0
-
-    def publish(self) -> None:
-        with self._condition:
-            self._version += 1
-            self._condition.notify_all()
-
-    def wait_for_update(self, last_seen: int, timeout: float) -> int:
-        with self._condition:
-            self._condition.wait_for(lambda: self._version != last_seen, timeout=timeout)
-            return self._version
-
-
-# Frontend-only interactivity — everything below runs against data already pushed over
-# SSE, no new endpoints: expand/collapse per-project cards, filter by project name, and
-# search recent-conversation content. Approve/reject/trigger-a-scan style actions still
-# stay deferred until there's an auth story matching Telegram's allowed_chat_ids gate
-# (see the status-web-dashboard memory note) — those are IRREVERSIBLE remote actions.
-# The one exception (2026-09-17, explicit user request): editing a role's provider/
-# model is a local config change, not a remote action, so it's exposed via POST
-# /api/role-profile (see _StatusRequestHandler.do_POST()) even without that auth
-# story — its only real gate is the dashboard's own bind address (127.0.0.1 unless
-# the operator widens it).
-# Preferences (2026-10-01/02, explicit user request): the Harness adopts and retires
-# the operator's standing preferences ITSELF (nightly digest, or a correction made in
-# chat); this page is the after-the-fact view and override. POST /api/preference adopts a
-# rule that was left waiting (over the per-day auto-adopt cap), dismisses it, retires an
-# adopted one, or restores a retired one. Same local-only gate as the other writes.
-_PAGE_TEMPLATE = """<!doctype html>
+PAGE_TEMPLATE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
@@ -253,12 +206,15 @@ function esc(s) {
   });
 }
 
-function renderDaemon(d) {
+function renderHarnesses(list) {
   var el = document.getElementById("daemon");
-  var pids = d.pids && d.pids.length ? d.pids.map(esc).join("<br>") : "沒有正在跑的 gateway --serve 行程";
-  var warn = d.multiple_warning ? '<div class="warn">⚠️ 找到不只一個 --serve 行程，同一個 bot 會搶 getUpdates 連線（409 Conflict）</div>' : "";
-  var launchd = d.launchd ? esc(d.launchd) : "沒有註冊 com.memtraceharness.gateway";
-  el.innerHTML = pids + warn + "<div>launchd：" + launchd + "</div>";
+  el.innerHTML = (list || []).map(function (h) {
+    if (!h.up) {
+      return '<div class="warn">⚠️ ' + esc(h.name) + "：連不上 Harness（" + esc(h.error || "沒有回應") + "）</div>";
+    }
+    var backlog = h.outbox_backlog ? ' · <span class="warn">' + h.outbox_backlog + " 則訊息等著送出（聊天服務沒在取？）</span>" : "";
+    return "<div>" + esc(h.name) + "：pid " + esc(h.pid) + " · " + esc(h.workspace_dir || "") + backlog + "</div>";
+  }).join("") || "（沒有設定任何 Harness）";
 }
 
 function matchesQuery(project, q) {
@@ -553,7 +509,7 @@ document.addEventListener("click", function (e) {
       btn.disabled = false;
       if (res.ok) {
         statusEl.className = "rp-status ok";
-        statusEl.textContent = "已建立 " + res.body.path + "，重啟 gateway 後才會生效並可在此編輯";
+        statusEl.textContent = "已建立 " + res.body.path + "，下次執行任務就會用它，現在可以在此編輯";
       } else {
         statusEl.className = "rp-status err";
         statusEl.textContent = res.body.error || "建立失敗";
@@ -663,7 +619,7 @@ function stageLabel(stage) {
   return STAGE_LABELS[stage] || stage;
 }
 
-function renderPipeline(pipeline) {
+function renderPipeline(pipeline, projectName) {
   if (!pipeline || !pipeline.length) {
     return '<div class="empty">尚未有階段完成（可能剛啟動）</div>';
   }
@@ -671,7 +627,7 @@ function renderPipeline(pipeline) {
     var stateClass = t.state === "succeeded" ? "ok" : (t.state === "invalid_output" || t.state === "failed" || t.state === "unavailable" ? "bad" : "mid");
     var icon = STATE_ICON[t.state] || "•";
     var retryTag = t.attempt_index > 0 ? '<span class="chip">重試 #' + t.attempt_index + '</span>' : "";
-    return '<div class="step ' + stateClass + '" onclick="openStageDetail(' + t.turn_id + ')" title="' + esc(t.provider + "/" + (t.model || "?")) + '">' +
+    return '<div class="step ' + stateClass + '" onclick="openStageDetail(' + t.turn_id + ',' + JSON.stringify(projectName).replace(/"/g, '&quot;') + ')" title="' + esc(t.provider + "/" + (t.model || "?")) + '">' +
       '<div class="step-icon">' + icon + '</div>' +
       '<div class="step-label">' + esc(stageLabel(t.stage)) + '</div>' +
       '<div class="step-meta">' + esc(t.provider + "/" + (t.model || "?")) + " " + retryTag + '</div>' +
@@ -695,12 +651,12 @@ function renderLock(project) {
   return html;
 }
 
-function openStageDetail(turnId) {
+function openStageDetail(turnId, project) {
   var panel = document.getElementById("stage-detail");
   var body = document.getElementById("stage-detail-body");
   panel.classList.add("open");
   body.innerHTML = '<div class="empty">載入中…</div>';
-  fetch("/api/turn?turn_id=" + turnId)
+  fetch("/api/turn?turn_id=" + turnId + "&project=" + encodeURIComponent(project || ""))
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (d) {
       if (!d) { body.innerHTML = '<div class="empty">找不到這個階段的紀錄</div>'; return; }
@@ -735,7 +691,7 @@ function detailsOpen(key) {
 }
 
 function renderEvidence(rule) {
-  var key = "evidence:" + rule.id;
+  var key = "evidence:" + rule.uid;
   var items = (rule.evidence || []).map(function (e) {
     var at = e.turn_seq === null || e.turn_seq === undefined ? "" : " #" + e.turn_seq;
     return '<div class="evidence-item">' + esc(e.date) + esc(at) + "：" + esc(e.quote) + "</div>";
@@ -745,23 +701,23 @@ function renderEvidence(rule) {
 }
 
 function renderPendingPreference(rule) {
-  var draft = state.prefDrafts[rule.id] || {};
+  var draft = state.prefDrafts[rule.uid] || {};
   var text = draft.text !== undefined ? draft.text : rule.text;
   var scope = draft.scope || rule.scope;
-  return '<div class="pref" data-id="' + rule.id + '">' +
+  return '<div class="pref" data-id="' + rule.uid + '">' +
     '<div class="meta"><span class="chip">' + esc(categoryLabel(rule.category)) + "</span>" +
     (rule.explicit
       ? '<span class="tag-explicit">● 你明確說過的規則</span>'
       : '<span class="tag-inferred">● 模型推測，請仔細確認</span>') +
     "<span>來源：" + esc(rule.project) + " · " + esc(rule.source_digest_date || "") + "</span></div>" +
-    '<textarea class="pref-text" data-id="' + rule.id + '">' + esc(text) + "</textarea>" +
+    '<textarea class="pref-text" data-id="' + rule.uid + '">' + esc(text) + "</textarea>" +
     '<div class="pref-actions">' +
-    '<select class="pref-scope" data-id="' + rule.id + '">' +
+    '<select class="pref-scope" data-id="' + rule.uid + '">' +
     '<option value="global"' + (scope === "global" ? " selected" : "") + ">全域（所有專案）</option>" +
     '<option value="project"' + (scope === "project" ? " selected" : "") + ">僅 " + esc(rule.project) + "</option>" +
     "</select>" +
-    '<button class="pref-btn adopt" data-id="' + rule.id + '" data-action="adopt">✅ 採用</button>' +
-    '<button class="pref-btn dismiss" data-id="' + rule.id + '" data-action="dismiss">略過</button>' +
+    '<button class="pref-btn adopt" data-id="' + rule.uid + '" data-action="adopt">✅ 採用</button>' +
+    '<button class="pref-btn dismiss" data-id="' + rule.uid + '" data-action="dismiss">略過</button>' +
     '<span class="pref-status"></span></div>' +
     renderEvidence(rule) + "</div>";
 }
@@ -773,23 +729,23 @@ var ADOPTED_BY_LABELS = {
 };
 
 function renderAdoptedPreference(rule) {
-  return '<div class="pref" data-id="' + rule.id + '">' +
+  return '<div class="pref" data-id="' + rule.uid + '">' +
     '<div class="meta"><span class="chip">#' + rule.id + " " + esc(categoryLabel(rule.category)) + "</span>" +
     '<span class="tag-auto">' + esc(ADOPTED_BY_LABELS[rule.adopted_by] || "已採用") + "</span>" +
     "<span>" + (rule.scope === "global" ? "全域" : "僅 " + esc(rule.project)) + " · " + esc((rule.resolved_at || "").slice(0, 10)) + "</span></div>" +
     '<div class="content">' + esc(rule.text) + "</div>" +
-    '<div class="pref-actions"><button class="pref-btn retire" data-id="' + rule.id + '" data-action="retire">撤銷</button>' +
+    '<div class="pref-actions"><button class="pref-btn retire" data-id="' + rule.uid + '" data-action="retire">撤銷</button>' +
     '<span class="pref-status"></span></div>' +
     renderEvidence(rule) + "</div>";
 }
 
 function renderRetiredPreference(rule) {
-  return '<div class="pref" data-id="' + rule.id + '">' +
+  return '<div class="pref" data-id="' + rule.uid + '">' +
     '<div class="meta"><span class="chip">#' + rule.id + " " + esc(categoryLabel(rule.category)) + "</span>" +
     "<span>" + esc((rule.resolved_at || "").slice(0, 10)) + " 撤回</span></div>" +
     '<div class="content">' + esc(rule.text) + "</div>" +
     '<div class="meta">' + esc(rule.retire_reason || "") + "</div>" +
-    '<div class="pref-actions"><button class="pref-btn restore" data-id="' + rule.id + '" data-action="restore">恢復</button>' +
+    '<div class="pref-actions"><button class="pref-btn restore" data-id="' + rule.uid + '" data-action="restore">恢復</button>' +
     '<span class="pref-status"></span></div></div>';
 }
 
@@ -878,17 +834,16 @@ function renderProject(project, q) {
     var pipelineHint = project.lock
       ? ""
       : '<div class="lock-progress">（等待核准中，非鎖定狀態 — conversation_id=' + esc(project.pipeline_conversation_id) + '）</div>';
-    pipelineSection = '<div class="section-label">Agent Loop 進度</div>' + pipelineHint + renderPipeline(project.pipeline);
+    pipelineSection = '<div class="section-label">Agent Loop 進度</div>' + pipelineHint + renderPipeline(project.pipeline, project.name);
   }
   return '<div class="card' + collapsed + visible + '" data-name="' + esc(project.name) + '">' +
     '<h2 onclick="toggleCard(\\'' + esc(project.name) + '\\')"><span class="caret">▾</span>' + esc(project.name) + runningBadge + "</h2>" +
     '<div class="body">' +
     '<div class="path">' + esc(project.working_directory) + "</div>" +
     '<div class="chips">' +
-    '<span class="chip' + (d.bot ? " on" : "") + '">bot: ' + (d.bot ? "專屬" : "共用") + "</span>" +
-    '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "專屬" : "共用") + "</span>" +
-    '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "共用") + "</span>" +
-    '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "專屬" : "預設") + "</span>" +
+    '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "已設定" : "預設") + "</span>" +
+    '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "同專案") + "</span>" +
+    '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "自己的檔案" : "預設") + "</span>" +
     '<span class="chip' + ((project.schedules || []).length ? " on" : "") + '">排程: ' + (project.schedules || []).length + "</span>" +
     "</div>" +
     renderModelSettings(project) +
@@ -912,7 +867,7 @@ function render() {
   // someone mid-edit — render once they leave it.
   if (isEditingPreference()) { state.renderDeferred = true; return; }
   state.renderDeferred = false;
-  renderDaemon(state.data.daemon);
+  renderHarnesses(state.data.harnesses);
   renderMemory();
   document.getElementById("projects").innerHTML = state.data.projects.length
     ? state.data.projects.map(function (p) { return renderProject(p, state.query); }).join("")
@@ -954,7 +909,8 @@ document.addEventListener("click", function (e) {
   var action = btn.getAttribute("data-action");
   var box = btn.closest(".pref");
   var statusEl = box.querySelector(".pref-status");
-  var body = { id: Number(id), action: action };
+  var uidParts = String(id).split(":");
+  var body = { id: Number(uidParts.pop()), project: uidParts.join(":"), action: action };
   if (action === "adopt") {
     body.text = box.querySelector(".pref-text").value;
     body.scope = box.querySelector(".pref-scope").value;
@@ -1005,418 +961,3 @@ es.onmessage = function (evt) { state.data = JSON.parse(evt.data); render(); };
 </script>
 </body>
 </html>"""
-
-
-class _StatusRequestHandler(BaseHTTPRequestHandler):
-    config: HarnessConfig
-    bus: StatusEventBus
-    gateway_for_project: dict[str, Any]
-
-    def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path in ("/", ""):
-            self._serve_page()
-        elif parsed.path == "/events":
-            self._serve_events()
-        elif parsed.path == "/api/turn":
-            self._serve_turn_detail(urllib.parse.parse_qs(parsed.query))
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self) -> None:  # noqa: N802 (stdlib method name)
-        # The write actions this dashboard offers (2026-09-17, explicit user
-        # request) — everything else stays read-only by design (see the module
-        # docstring above). Still only reachable at all when the dashboard itself is:
-        # bound to config.status_server_host (127.0.0.1 by default, never exposed off
-        # the machine unless the operator explicitly widens it, e.g. via Tailscale —
-        # there is no separate auth on any of these endpoints, so widening exposure
-        # widens who can change a project's models or approve/reject its pending work
-        # too). approve/reject in particular can trigger a real governed Agent Loop
-        # run — same consequence as an approval from Telegram, just a different door.
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/api/role-profile":
-            self._handle_update_role_profile()
-        elif parsed.path == "/api/role-profile/independent":
-            self._handle_make_role_profiles_independent()
-        elif parsed.path == "/api/chat-model":
-            self._handle_update_chat_model()
-        elif parsed.path == "/api/recall-model":
-            self._handle_update_stage_model("recall-model")
-        elif parsed.path == "/api/recall-fallbacks":
-            self._handle_update_stage_model("recall-fallbacks")
-        elif parsed.path == "/api/digest-fallbacks":
-            self._handle_update_digest_fallbacks()
-        elif parsed.path == "/api/digest-model":
-            self._handle_update_digest_model()
-        elif parsed.path == "/api/approval":
-            self._handle_approval_action()
-        elif parsed.path == "/api/preference":
-            self._handle_preference_action()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def _read_json_body(self) -> dict | None:
-        length = int(self.headers.get("Content-Length") or "0")
-        raw = self.rfile.read(length) if length else b""
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-            return payload if isinstance(payload, dict) else None
-        except Exception:
-            return None
-
-    def _handle_update_role_profile(self) -> None:
-        from memtrace_harness.cli import update_role_profile_for_project
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            profile_id = str(payload["profile_id"])
-            provider = str(payload["provider"])
-            model = str(payload["model"])
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            update_role_profile_for_project(self.config, project, profile_id, provider, model)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to update a role profile")
-            self._send_json(500, {"error": "internal error updating the role profile"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True})
-
-    def _handle_make_role_profiles_independent(self) -> None:
-        from memtrace_harness.cli import create_dedicated_role_profiles_file
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            dest = create_dedicated_role_profiles_file(self.config, project)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to create a dedicated role-profiles file")
-            self._send_json(500, {"error": "internal error creating the dedicated file"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True, "path": str(dest)})
-
-    def _handle_update_chat_model(self) -> None:
-        from memtrace_harness.cli import update_chat_model_for_project
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            provider = str(payload["provider"])
-            model = str(payload["model"])
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            update_chat_model_for_project(self.config, project, provider, model)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to update a chat model")
-            self._send_json(500, {"error": "internal error updating the chat model"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True})
-
-    def _handle_update_digest_model(self) -> None:
-        from memtrace_harness.cli import update_digest_model_for_project
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            provider = str(payload["provider"])
-            model = str(payload["model"])
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            update_digest_model_for_project(self.config, project, provider, model)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to update a digest model")
-            self._send_json(500, {"error": "internal error updating the digest model"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True})
-
-    def _handle_update_stage_model(self, kind: str) -> None:
-        """Recall model / fallbacks: same body shapes as the digest endpoints."""
-        from memtrace_harness.cli import (
-            update_recall_fallbacks_for_project,
-            update_recall_model_for_project,
-        )
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            if kind == "recall-model":
-                args = (str(payload["provider"]), str(payload["model"]))
-                update = update_recall_model_for_project
-            else:
-                args = (str(payload["fallbacks"]),)
-                update = update_recall_fallbacks_for_project
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            update(self.config, project, *args)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to update the recall model settings")
-            self._send_json(500, {"error": "internal error updating the recall model"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True})
-
-    def _handle_update_digest_fallbacks(self) -> None:
-        from memtrace_harness.cli import update_digest_fallbacks_for_project
-
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            fallbacks = str(payload["fallbacks"])
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        try:
-            update_digest_fallbacks_for_project(self.config, project, fallbacks)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to update digest fallbacks")
-            self._send_json(500, {"error": "internal error updating the digest fallbacks"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True})
-
-    def _handle_approval_action(self) -> None:
-        payload = self._read_json_body()
-        try:
-            project = str(payload["project"])
-            request_id = str(payload["request_id"])
-            action = str(payload["action"]).lower()
-        except (TypeError, KeyError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        if action not in ("approve", "reject"):
-            self._send_json(
-                400, {"error": f"unsupported action {action!r} (expected approve or reject)"}
-            )
-            return
-        gateway = self.gateway_for_project.get(project)
-        if gateway is None:
-            self._send_json(400, {"error": f"no gateway registered for project {project!r}"})
-            return
-        req = gateway.approval_manager.get_request(request_id)
-        if req is None:
-            self._send_json(400, {"error": f"approval request {request_id!r} not found"})
-            return
-        if req.telegram_chat_id is None:
-            self._send_json(
-                400, {"error": "this request was never posted to a chat, cannot resolve it here"}
-            )
-            return
-        try:
-            # Same code path a Telegram text command, inline button, or swipe-reply
-            # would go through — one place resolves an approval, this is just
-            # another door to it. Runs any resulting Agent Loop resumption in a
-            # background thread (see _resume_approved_conversation()), so this call
-            # returns immediately rather than blocking the request on a full run.
-            msg = gateway._resolve_approval_action(request_id, action, req.telegram_chat_id, None)
-        except Exception:
-            logger.exception("status dashboard failed to resolve an approval")
-            self._send_json(500, {"error": "internal error resolving the approval"})
-            return
-        self.bus.publish()
-        self._send_json(200, {"ok": True, "message": msg})
-
-    def _handle_preference_action(self) -> None:
-        from memtrace_harness.memory_digest import resolve_preference, sync_operator_profile
-        from memtrace_harness.memtrace_client import MemTraceClient
-        from memtrace_harness.trace_store import TraceStore
-
-        payload = self._read_json_body()
-        try:
-            rule_id = int(payload["id"])
-            action = str(payload["action"]).lower()
-        except (TypeError, KeyError, ValueError):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        text = payload.get("text")
-        scope = payload.get("scope")
-        if (text is not None and not isinstance(text, str)) or (scope is not None and not isinstance(scope, str)):
-            self._send_json(400, {"error": "malformed request body"})
-            return
-        trace_store = TraceStore(self.config.trace_db_path)
-        try:
-            rule = resolve_preference(trace_store, rule_id, action, text=text, scope=scope)
-        except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
-            return
-        except Exception:
-            logger.exception("status dashboard failed to resolve a preference")
-            self._send_json(500, {"error": "internal error resolving the preference"})
-            return
-        # Local SQLite is what chat reads, so the change is already in effect here.
-        # Rewriting the MemTrace profile node is a best-effort mirror.
-        synced: bool | None = None
-        if action in ("adopt", "retire", "restore") and self.config.memtrace_mcp_url and self.config.operator_preference_workspace_id:
-            try:
-                client = MemTraceClient(self.config.memtrace_mcp_url, self.config.memtrace_api_token)
-                sync_operator_profile(trace_store, client, self.config.operator_preference_workspace_id)
-                synced = True
-            except Exception:
-                logger.exception("mirroring the operator profile to MemTrace failed")
-                synced = False
-        self.bus.publish()
-        self._send_json(200, {"ok": True, "rule": rule, "memtrace_synced": synced})
-
-    def _send_json(self, status: int, data: dict) -> None:
-        payload = json.dumps(data).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _collect_data(self) -> dict:
-        from memtrace_harness.cli import _collect_status_data
-
-        try:
-            return _collect_status_data(self.config)
-        except Exception as exc:  # keep the dashboard itself from crashing on a bad read
-            logger.exception("status dashboard failed to collect status")
-            return {
-                "daemon": {"pids": [], "multiple_warning": False, "pgrep_error": str(exc), "launchd": None, "launchd_error": None},
-                "project_index_path": None,
-                "projects": [],
-                "known_models": {},
-            }
-
-    def _serve_page(self) -> None:
-        data_json = json.dumps(self._collect_data())
-        page = _PAGE_TEMPLATE.replace("__INITIAL_DATA__", data_json)
-        payload = page.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _serve_events(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-
-        last_seen = 0
-        try:
-            while True:
-                self._write_event(self._collect_data())
-                last_seen = self.bus.wait_for_update(last_seen, timeout=HEARTBEAT_SECONDS)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client navigated away or closed the tab — not an error
-
-    def _serve_turn_detail(self, query: dict[str, list[str]]) -> None:
-        # On-demand only — deliberately not part of _collect_data()/the SSE push,
-        # since artifact/final_text bodies can be long and most pipeline stages a
-        # viewer sees are never clicked. Read-only: turn_id must parse as int and the
-        # lookup itself never touches process/file state, just SQLite reads.
-        raw_id = (query.get("turn_id") or [""])[0]
-        try:
-            turn_id = int(raw_id)
-        except ValueError:
-            self.send_response(400)
-            self.end_headers()
-            return
-        from memtrace_harness.cli import _collect_turn_detail
-
-        try:
-            detail = _collect_turn_detail(self.config, turn_id)
-        except Exception:
-            logger.exception(f"status dashboard failed to collect turn detail for turn_id={turn_id}")
-            detail = None
-        payload = json.dumps(detail).encode("utf-8")
-        self.send_response(200 if detail is not None else 404)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _write_event(self, data: dict) -> None:
-        frame = f"data: {json.dumps(data)}\n\n".encode("utf-8")
-        self.wfile.write(frame)
-        self.wfile.flush()
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        logger.debug("status server: " + format, *args)
-
-
-def start_status_server(
-    config: HarnessConfig,
-    gateway_for_project: dict[str, Any] | None = None,
-) -> tuple[ThreadingHTTPServer, StatusEventBus] | tuple[None, None]:
-    """Start the web status dashboard in a background thread, bound to
-    config.status_server_host (default 127.0.0.1 — not exposed off the machine unless
-    the operator explicitly widens it, e.g. via Tailscale). Returns (None, None) if
-    disabled or if the port can't be bound (e.g. already running from a previous
-    process), so this never blocks the gateway's actual job. The returned bus's
-    publish() should be called by the caller whenever something worth showing changed
-    (a Telegram update was processed, a scan/consolidation pass did something) so
-    connected browsers update immediately instead of waiting for the heartbeat.
-
-    gateway_for_project (project name -> TelegramGateway, same mapping
-    _serve_gateway_loop already builds) is what lets the dashboard's approve/reject
-    buttons resolve an approval through the exact same TelegramGateway._resolve_
-    approval_action() every other entry point (text command, inline button, swipe-
-    reply) already goes through — one place, no drift. None (the CLI `gateway`
-    one-shot path, or tests) just means approve/reject aren't available; every
-    read-only view still works."""
-    if not config.status_server_enabled:
-        return None, None
-
-    bus = StatusEventBus()
-    handler_cls = type(
-        "StatusRequestHandler",
-        (_StatusRequestHandler,),
-        {"config": config, "bus": bus, "gateway_for_project": gateway_for_project or {}},
-    )
-    try:
-        server = ThreadingHTTPServer(
-            (config.status_server_host, config.status_server_port), handler_cls
-        )
-    except OSError:
-        logger.exception(
-            f"could not bind status server on {config.status_server_host}:"
-            f"{config.status_server_port}; is another gateway process already running?"
-        )
-        return None, None
-
-    # Long-lived SSE connections must not keep the process alive after shutdown().
-    server.daemon_threads = True
-    thread = threading.Thread(target=server.serve_forever, name="status-server", daemon=True)
-    thread.start()
-    logger.info(f"status dashboard listening on http://{config.status_server_host}:{config.status_server_port}")
-    return server, bus

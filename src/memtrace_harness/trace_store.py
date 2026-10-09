@@ -554,7 +554,7 @@ class TraceStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        # timeout=30: background Agent Loop runs (Telegram gateway, unattended scanner)
+        # timeout=30: background Agent Loop runs (the Harness, unattended scanner)
         # and the status dashboard's read queries can now all be writing/reading
         # concurrently from separate threads — each opens its own short-lived
         # connection here, but a stage-result write racing a scan-pass write can still
@@ -902,7 +902,7 @@ class TraceStore:
                     kind TEXT NOT NULL,
                     conversation_id TEXT,
                     schedule_id TEXT,
-                    chat_id INTEGER,
+                    audience TEXT,
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
@@ -932,8 +932,6 @@ class TraceStore:
                     confirmation_token TEXT,
                     status TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
-                    telegram_chat_id INTEGER,
-                    telegram_message_id INTEGER,
                     result_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -949,8 +947,6 @@ class TraceStore:
                     command TEXT NOT NULL,
                     status TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
-                    telegram_chat_id INTEGER,
-                    telegram_message_id INTEGER,
                     result_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -960,10 +956,21 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_task_queue_ws
                     ON task_queue(workspace_id, id);
 
-                CREATE TABLE IF NOT EXISTS telegram_gateway_state (
-                    bot_token_hash TEXT PRIMARY KEY,
-                    last_offset INTEGER NOT NULL
+                CREATE TABLE IF NOT EXISTS outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    audience TEXT,
+                    text TEXT,
+                    actions_json TEXT,
+                    bind_json TEXT,
+                    ref TEXT,
+                    created_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    leased_until TEXT,
+                    delivered_at TEXT,
+                    delivery_json TEXT
                 );
+                CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(delivered_at, id);
 
                 CREATE TABLE IF NOT EXISTS schedules (
                     id TEXT PRIMARY KEY,
@@ -974,7 +981,7 @@ class TraceStore:
                     interval_seconds INTEGER,
                     time_of_day TEXT,
                     end_time_of_day TEXT,
-                    chat_id INTEGER,
+                    audience TEXT,
                     active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     next_run_at TEXT NOT NULL,
@@ -1072,8 +1079,12 @@ class TraceStore:
             self._ensure_column(conn, "schedules", "paused_until", "TEXT")
             self._ensure_column(conn, "schedules", "weekdays_only", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "approval_requests", "resume_goal", "TEXT")
-            self._ensure_column(conn, "approval_requests", "telegram_chat_id", "INTEGER")
-            self._ensure_column(conn, "approval_requests", "telegram_message_id", "INTEGER")
+            self._ensure_column(conn, "schedules", "audience", "TEXT")
+            self._ensure_column(conn, "task_queue", "audience", "TEXT")
+            self._ensure_column(conn, "approval_requests", "message_ref", "TEXT")
+            self._ensure_column(conn, "order_intents", "message_ref", "TEXT")
+            self._ensure_column(conn, "job_requests", "message_ref", "TEXT")
+            self._backfill_message_refs(conn)
             self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
             self._ensure_column(conn, "decision_records", "subject", "TEXT")
             self._ensure_column(conn, "kb_gardening_runs", "kind", "TEXT NOT NULL DEFAULT 'garden'")
@@ -2262,19 +2273,13 @@ class TraceStore:
             ).fetchall()
         return [d for d in (self.get_approval_request(r[0]) for r in rows) if d]
 
-    def get_approval_request(self, request_id: str) -> dict | None:
-        with self._connection() as conn:
-            row = conn.execute(
-                """
-                SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
-                       resume_goal, telegram_chat_id, telegram_message_id
-                FROM approval_requests WHERE id = ?
-                """,
-                (request_id,),
-            ).fetchone()
-        if not row:
-            return None
+    _APPROVAL_COLUMNS = (
+        "id, conversation_id, workspace, working_directory, stage_ref, reason, proposed_action, "
+        "status, created_at, responded_at, responded_by_chat_id, resume_goal, message_ref"
+    )
+
+    @staticmethod
+    def _approval_dict(row) -> dict:
         return {
             "id": row[0],
             "conversation_id": row[1],
@@ -2286,74 +2291,38 @@ class TraceStore:
             "status": row[7],
             "created_at": row[8],
             "responded_at": row[9],
-            "responded_by_chat_id": row[10],
+            # The audience that answered (an opaque address a service hands the Harness).
+            "responded_by": row[10],
             "resume_goal": row[11],
-            "telegram_chat_id": row[12],
-            "telegram_message_id": row[13],
+            # Opaque reference to the message a service delivered this request in (outbox ack).
+            "message_ref": row[12],
         }
+
+    def get_approval_request(self, request_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._APPROVAL_COLUMNS} FROM approval_requests WHERE id = ?",
+                (request_id,),
+            ).fetchone()
+        return self._approval_dict(row) if row else None
 
     def get_pending_approval_request(self, conversation_id: str) -> dict | None:
         with self._connection() as conn:
             row = conn.execute(
-                """
-                SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
-                       resume_goal, telegram_chat_id, telegram_message_id
-                FROM approval_requests WHERE conversation_id = ? AND status = 'pending'
-                ORDER BY created_at DESC LIMIT 1
-                """,
+                f"SELECT {self._APPROVAL_COLUMNS} FROM approval_requests "
+                "WHERE conversation_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
                 (conversation_id,),
             ).fetchone()
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "conversation_id": row[1],
-            "workspace": row[2],
-            "working_directory": row[3],
-            "stage_ref": row[4],
-            "reason": row[5],
-            "proposed_action": row[6],
-            "status": row[7],
-            "created_at": row[8],
-            "responded_at": row[9],
-            "responded_by_chat_id": row[10],
-            "resume_goal": row[11],
-            "telegram_chat_id": row[12],
-            "telegram_message_id": row[13],
-        }
+        return self._approval_dict(row) if row else None
 
     def list_pending_approvals_for_workspace(self, workspace_id: str) -> list[dict]:
         with self._connection() as conn:
             rows = conn.execute(
-                """
-                SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
-                       resume_goal, telegram_chat_id, telegram_message_id
-                FROM approval_requests WHERE workspace = ? AND status = 'pending'
-                ORDER BY created_at ASC
-                """,
+                f"SELECT {self._APPROVAL_COLUMNS} FROM approval_requests "
+                "WHERE workspace = ? AND status = 'pending' ORDER BY created_at ASC",
                 (workspace_id,),
             ).fetchall()
-        return [
-            {
-                "id": row[0],
-                "conversation_id": row[1],
-                "workspace": row[2],
-                "working_directory": row[3],
-                "stage_ref": row[4],
-                "reason": row[5],
-                "proposed_action": row[6],
-                "status": row[7],
-                "created_at": row[8],
-                "responded_at": row[9],
-                "responded_by_chat_id": row[10],
-                "resume_goal": row[11],
-                "telegram_chat_id": row[12],
-                "telegram_message_id": row[13],
-            }
-            for row in rows
-        ]
+        return [self._approval_dict(row) for row in rows]
 
     def list_recently_declined_stage_refs(self, workspace_id: str, reason: str) -> set[str]:
         """stage_ref values of rejected approval_requests for this workspace+reason —
@@ -2388,50 +2357,25 @@ class TraceStore:
             ).fetchall()
         return {row[0] for row in rows}
 
-    def set_approval_telegram_message(
-        self, request_id: str, *, chat_id: int, message_id: int
-    ) -> None:
-        """Records which sent Telegram message carries this approval request, so a
-        native swipe-reply to it can be resolved back to the exact approval without
-        the human typing an ID — see get_approval_request_by_message_id()."""
+    def set_approval_message_ref(self, request_id: str, message_ref: str) -> None:
+        """Records which delivered message carries this approval request, so a reply to it can
+        be resolved back to the exact approval without the human typing an ID — see
+        get_approval_request_by_message_ref()."""
         with self._connection() as conn:
             conn.execute(
-                "UPDATE approval_requests SET telegram_chat_id = ?, telegram_message_id = ? WHERE id = ?",
-                (chat_id, message_id, request_id),
+                "UPDATE approval_requests SET message_ref = ? WHERE id = ?", (message_ref, request_id)
             )
 
-    def get_approval_request_by_message_id(self, chat_id: int, message_id: int) -> dict | None:
+    def get_approval_request_by_message_ref(self, message_ref: str) -> dict | None:
         with self._connection() as conn:
             row = conn.execute(
-                """
-                SELECT id, conversation_id, workspace, working_directory, stage_ref,
-                       reason, proposed_action, status, created_at, responded_at, responded_by_chat_id,
-                       resume_goal, telegram_chat_id, telegram_message_id
-                FROM approval_requests WHERE telegram_chat_id = ? AND telegram_message_id = ?
-                """,
-                (chat_id, message_id),
+                f"SELECT {self._APPROVAL_COLUMNS} FROM approval_requests WHERE message_ref = ?",
+                (message_ref,),
             ).fetchone()
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "conversation_id": row[1],
-            "workspace": row[2],
-            "working_directory": row[3],
-            "stage_ref": row[4],
-            "reason": row[5],
-            "proposed_action": row[6],
-            "status": row[7],
-            "created_at": row[8],
-            "responded_at": row[9],
-            "responded_by_chat_id": row[10],
-            "resume_goal": row[11],
-            "telegram_chat_id": row[12],
-            "telegram_message_id": row[13],
-        }
+        return self._approval_dict(row) if row else None
 
     def resolve_approval_request(
-        self, request_id: str, status: str, responded_by_chat_id: int | None = None
+        self, request_id: str, status: str, responded_by: str | None = None
     ) -> bool:
         if status not in {"approved", "rejected", "expired"}:
             raise ValueError(f"Invalid approval status: {status}")
@@ -2443,7 +2387,7 @@ class TraceStore:
                 SET status = ?, responded_at = ?, responded_by_chat_id = ?
                 WHERE id = ? AND status = 'pending'
                 """,
-                (status, now, responded_by_chat_id, request_id),
+                (status, now, responded_by, request_id),
             )
             return cursor.rowcount > 0
 
@@ -2590,14 +2534,14 @@ class TraceStore:
         payload: dict,
         conversation_id: str | None = None,
         schedule_id: str | None = None,
-        chat_id: int | None = None,
+        audience: str | None = None,
     ) -> int:
         with self._connection() as conn:
             cursor = conn.execute(
                 "INSERT INTO task_queue (workspace_id, kind, conversation_id, schedule_id, "
-                "chat_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "audience, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    workspace_id, kind, conversation_id, schedule_id, chat_id,
+                    workspace_id, kind, conversation_id, schedule_id, audience,
                     json.dumps(payload, ensure_ascii=False), utc_now_iso(),
                 ),
             )
@@ -2611,13 +2555,13 @@ class TraceStore:
             "kind": row[2],
             "conversation_id": row[3],
             "schedule_id": row[4],
-            "chat_id": row[5],
+            "audience": row[5],
             "payload": json.loads(row[6]),
             "created_at": row[7],
         }
 
     _QUEUE_COLUMNS = (
-        "id, workspace_id, kind, conversation_id, schedule_id, chat_id, payload_json, created_at"
+        "id, workspace_id, kind, conversation_id, schedule_id, audience, payload_json, created_at"
     )
 
     def peek_next_queued_task(self, workspace_id: str) -> dict | None:
@@ -2686,14 +2630,14 @@ class TraceStore:
             )
 
     # ---- order intents: a trade the model proposed, waiting for the human's button.
-    # Status flow: pending -> awaiting (shown in Telegram) -> confirming -> submitted|failed,
+    # Status flow: pending -> awaiting (delivered to the operator) -> confirming -> submitted|failed,
     # or awaiting -> cancelled|expired. Every move is a compare-and-set so a double tap or a
-    # second gateway can never send the same order twice.
+    # second Harness can never send the same order twice.
 
     _ORDER_COLUMNS = (
         "intent_id, project, symbol, action, price, quantity, is_odd_lot, price_type, "
         "order_type, estimated_value, risk_json, confirmation_token, status, expires_at, "
-        "telegram_chat_id, telegram_message_id, result_json, created_at, kind, target_order_id"
+        "message_ref, result_json, created_at, kind, target_order_id"
     )
 
     @staticmethod
@@ -2703,10 +2647,9 @@ class TraceStore:
             "price": row[4], "quantity": row[5], "is_odd_lot": bool(row[6]),
             "price_type": row[7], "order_type": row[8], "estimated_value": row[9],
             "risk": json.loads(row[10] or "{}"), "confirmation_token": row[11],
-            "status": row[12], "expires_at": row[13], "telegram_chat_id": row[14],
-            "telegram_message_id": row[15],
-            "result": json.loads(row[16]) if row[16] else None, "created_at": row[17],
-            "kind": row[18], "target_order_id": row[19],
+            "status": row[12], "expires_at": row[13], "message_ref": row[14],
+            "result": json.loads(row[15]) if row[15] else None, "created_at": row[16],
+            "kind": row[17], "target_order_id": row[18],
         }
 
     def create_order_intent(
@@ -2756,7 +2699,7 @@ class TraceStore:
     ) -> None:
         """A proposal to cancel an existing order. Same life cycle as a new-order proposal
         (shown with buttons, sent only on the human's tap), but there is no token: the
-        cancel is a DELETE the gateway makes itself."""
+        cancel is a DELETE the Harness makes itself."""
         now = utc_now_iso()
         estimated = round(price * quantity * (1 if is_odd_lot else 1000), 2)
         with self._connection() as conn:
@@ -2799,7 +2742,7 @@ class TraceStore:
             ).rowcount > 0
 
     def claim_pending_order_intents(self, projects: list[str]) -> list[dict]:
-        """Take the proposals no gateway has shown yet for these projects."""
+        """Take the proposals no Harness has shown yet for these projects."""
         if not projects:
             return []
         marks = ",".join("?" for _ in projects)
@@ -2816,16 +2759,14 @@ class TraceStore:
         return [d for d in (self.get_order_intent(i) for i in claimed) if d]
 
     def reshow_order_intent(self, intent_id: str) -> bool:
-        """The model proposed the same still-pending order again: have the gateway send the
+        """The model proposed the same still-pending order again: have the Harness send the
         confirm buttons once more (at the bottom of the chat, where the human is looking)."""
         return self.transition_order_intent(intent_id, ("awaiting",), "pending")
 
-    def set_order_intent_message(self, intent_id: str, *, chat_id: int, message_id: int) -> None:
+    def set_order_intent_message(self, intent_id: str, message_ref: str) -> None:
         with self._connection() as conn:
             conn.execute(
-                "UPDATE order_intents SET telegram_chat_id = ?, telegram_message_id = ? "
-                "WHERE intent_id = ?",
-                (chat_id, message_id, intent_id),
+                "UPDATE order_intents SET message_ref = ? WHERE intent_id = ?", (message_ref, intent_id)
             )
 
     def finish_order_intent(self, intent_id: str, status: str, result: dict | None = None) -> None:
@@ -2840,7 +2781,7 @@ class TraceStore:
             )
 
     def expire_order_intents(self, now_iso: str) -> list[dict]:
-        """Proposals nobody confirmed in time. Returned so the gateway can tell the human."""
+        """Proposals nobody confirmed in time. Returned so the Harness can tell the human."""
         with self._connection() as conn:
             ids = [
                 r[0]
@@ -2859,17 +2800,16 @@ class TraceStore:
     # ---- jobs the chat model asked to re-run (ops_mcp.py): shown to the human, run only on a tap
     _JOB_COLUMNS = (
         "request_id, project, job_name, command, status, expires_at, "
-        "telegram_chat_id, telegram_message_id, result_json"
+        "message_ref, result_json"
     )
 
     @staticmethod
     def _job_row_to_dict(row: tuple) -> dict:
         keys = (
-            "request_id", "project", "job_name", "command", "status", "expires_at",
-            "telegram_chat_id", "telegram_message_id",
+            "request_id", "project", "job_name", "command", "status", "expires_at", "message_ref",
         )
-        out = dict(zip(keys, row[:8]))
-        out["result"] = json.loads(row[8]) if row[8] else None
+        out = dict(zip(keys, row[:7]))
+        out["result"] = json.loads(row[7]) if row[7] else None
         return out
 
     def create_job_request(
@@ -2924,12 +2864,10 @@ class TraceStore:
         claimed = [i for i in ids if self.transition_job_request(i, ("pending",), "awaiting")]
         return [d for d in (self.get_job_request(i) for i in claimed) if d]
 
-    def set_job_request_message(self, request_id: str, *, chat_id: int, message_id: int) -> None:
+    def set_job_request_message(self, request_id: str, message_ref: str) -> None:
         with self._connection() as conn:
             conn.execute(
-                "UPDATE job_requests SET telegram_chat_id = ?, telegram_message_id = ? "
-                "WHERE request_id = ?",
-                (chat_id, message_id, request_id),
+                "UPDATE job_requests SET message_ref = ? WHERE request_id = ?", (message_ref, request_id)
             )
 
     def finish_job_request(self, request_id: str, status: str, result: dict | None = None) -> None:
@@ -3080,7 +3018,7 @@ class TraceStore:
         time_of_day: str | None = None,
         end_time_of_day: str | None = None,
         weekdays_only: bool = False,
-        chat_id: int | None = None,
+        audience: str | None = None,
     ) -> str:
         schedule_id = f"sched_{uuid4().hex[:10]}"
         with self._connection() as conn:
@@ -3088,13 +3026,13 @@ class TraceStore:
                 """
                 INSERT INTO schedules (
                     id, project, workspace_id, goal, kind, interval_seconds,
-                    time_of_day, end_time_of_day, chat_id, active, created_at, next_run_at,
+                    time_of_day, end_time_of_day, audience, active, created_at, next_run_at,
                     weekdays_only
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     schedule_id, project, workspace_id, goal, kind, interval_seconds,
-                    time_of_day, end_time_of_day, chat_id, utc_now_iso(), next_run_at.isoformat(),
+                    time_of_day, end_time_of_day, audience, utc_now_iso(), next_run_at.isoformat(),
                     1 if weekdays_only else 0,
                 ),
             )
@@ -3111,7 +3049,7 @@ class TraceStore:
             "interval_seconds": row[5],
             "time_of_day": row[6],
             "end_time_of_day": row[7],
-            "chat_id": row[8],
+            "audience": row[8],
             "active": bool(row[9]),
             "created_at": row[10],
             "next_run_at": row[11],
@@ -3123,7 +3061,7 @@ class TraceStore:
 
     _SCHEDULE_COLUMNS = (
         "id, project, workspace_id, goal, kind, interval_seconds, time_of_day, end_time_of_day, "
-        "chat_id, active, created_at, next_run_at, last_run_at, last_run_status, paused_until, "
+        "audience, active, created_at, next_run_at, last_run_at, last_run_status, paused_until, "
         "weekdays_only"
     )
 
@@ -3188,24 +3126,126 @@ class TraceStore:
                 (ran_at.isoformat(), status, next_run_at.isoformat(), schedule_id),
             )
 
-    def get_telegram_offset(self, bot_token_hash: str) -> int:
+    # ---- outbox: what the Harness wants said to the operator. Services (Telegram, ...) fetch it
+    # over the API, deliver it their own way and acknowledge it; the Harness never talks to a chat.
+
+    OUTBOX_MAX_ATTEMPTS = 5
+    OUTBOX_LEASE_SECONDS = 60
+
+    def enqueue_outbox(
+        self,
+        kind: str,
+        *,
+        audience: str | None = None,
+        text: str | None = None,
+        actions: list[list[dict[str, str]]] | None = None,
+        bind: dict | None = None,
+        ref: str | None = None,
+    ) -> int:
+        """kind: 'message' (text, optional button rows [{label, id}], bind = what to remember the
+        delivered message for), 'clear' (remove the buttons of the message `ref`), 'typing'."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO outbox (kind, audience, text, actions_json, bind_json, ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    kind, audience, text,
+                    json.dumps(actions, ensure_ascii=False) if actions else None,
+                    json.dumps(bind) if bind else None, ref, utc_now_iso(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    @staticmethod
+    def _outbox_row_to_dict(row: tuple) -> dict:
+        return {
+            "id": row[0], "kind": row[1], "audience": row[2], "text": row[3],
+            "actions": json.loads(row[4]) if row[4] else None,
+            "bind": json.loads(row[5]) if row[5] else None, "ref": row[6],
+            "created_at": row[7], "attempts": row[8],
+        }
+
+    _OUTBOX_COLUMNS = "id, kind, audience, text, actions_json, bind_json, ref, created_at, attempts"
+
+    def claim_outbox(self, *, limit: int = 20) -> list[dict]:
+        """Events nobody has delivered, oldest first, leased to the caller for a minute so two
+        fetches do not hand out the same event; an unacknowledged lease simply lapses and the
+        event is offered again."""
+        now = datetime.now(timezone.utc)
+        lease_until = (now + timedelta(seconds=self.OUTBOX_LEASE_SECONDS)).isoformat()
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._OUTBOX_COLUMNS} FROM outbox WHERE delivered_at IS NULL "
+                "AND (leased_until IS NULL OR leased_until <= ?) ORDER BY id LIMIT ?",
+                (now.isoformat(), limit),
+            ).fetchall()
+            for row in rows:
+                conn.execute("UPDATE outbox SET leased_until = ? WHERE id = ?", (lease_until, row[0]))
+        return [self._outbox_row_to_dict(r) for r in rows]
+
+    def get_outbox_event(self, event_id: int) -> dict | None:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT last_offset FROM telegram_gateway_state WHERE bot_token_hash = ?",
-                (bot_token_hash,),
+                f"SELECT {self._OUTBOX_COLUMNS} FROM outbox WHERE id = ?", (event_id,)
             ).fetchone()
-        return row[0] if row else 0
+        return self._outbox_row_to_dict(row) if row else None
 
-    def set_telegram_offset(self, bot_token_hash: str, offset: int) -> None:
+    def ack_outbox(self, event_id: int, *, ok: bool, message_refs: list[str] | None = None) -> str:
+        """The service's receipt. Returns 'delivered', 'retry' (will be offered again), 'failed'
+        (gave up after OUTBOX_MAX_ATTEMPTS) or 'unknown'."""
         with self._connection() as conn:
+            row = conn.execute("SELECT attempts, delivered_at FROM outbox WHERE id = ?", (event_id,)).fetchone()
+            if row is None:
+                return "unknown"
+            if row[1] is not None:
+                return "delivered"
+            if ok:
+                conn.execute(
+                    "UPDATE outbox SET delivered_at = ?, delivery_json = ?, leased_until = NULL WHERE id = ?",
+                    (utc_now_iso(), json.dumps({"message_refs": message_refs or []}), event_id),
+                )
+                return "delivered"
+            attempts = row[0] + 1
+            if attempts >= self.OUTBOX_MAX_ATTEMPTS:
+                conn.execute(
+                    "UPDATE outbox SET attempts = ?, delivered_at = ?, delivery_json = ?, leased_until = NULL "
+                    "WHERE id = ?",
+                    (attempts, utc_now_iso(), json.dumps({"failed": True}), event_id),
+                )
+                return "failed"
             conn.execute(
-                """
-                INSERT INTO telegram_gateway_state (bot_token_hash, last_offset)
-                VALUES (?, ?)
-                ON CONFLICT(bot_token_hash) DO UPDATE SET last_offset = excluded.last_offset
-                """,
-                (bot_token_hash, offset),
+                "UPDATE outbox SET attempts = ?, leased_until = NULL WHERE id = ?", (attempts, event_id)
             )
+            return "retry"
+
+    def outbox_backlog(self) -> int:
+        with self._connection() as conn:
+            return conn.execute("SELECT COUNT(*) FROM outbox WHERE delivered_at IS NULL").fetchone()[0]
+
+    def prune_outbox(self, older_than_iso: str) -> int:
+        with self._connection() as conn:
+            return conn.execute(
+                "DELETE FROM outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?", (older_than_iso,)
+            ).rowcount
+
+    def _backfill_message_refs(self, conn) -> None:
+        """Rows written before the outbox kept a Telegram (chat, message) pair; carry it over as
+        the opaque reference the Telegram service now uses ('tg:<chat>:<message>')."""
+        for table in ("schedules", "task_queue"):
+            columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if "chat_id" in columns:
+                conn.execute(
+                    f"UPDATE {table} SET audience = 'tg:' || chat_id "
+                    "WHERE audience IS NULL AND chat_id IS NOT NULL"
+                )
+        for table in ("approval_requests", "order_intents", "job_requests"):
+            columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if {"telegram_chat_id", "telegram_message_id"} <= columns:
+                conn.execute(
+                    f"UPDATE {table} SET message_ref = 'tg:' || telegram_chat_id || ':' || telegram_message_id "
+                    "WHERE message_ref IS NULL AND telegram_chat_id IS NOT NULL "
+                    "AND telegram_message_id IS NOT NULL"
+                )
 
     @staticmethod
     def _ensure_column(

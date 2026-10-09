@@ -7,7 +7,7 @@ from memtrace_harness.loop import (
     summarize_invalid_artifact,
     summarize_plan_needs_human,
 )
-from memtrace_harness.telegram_gateway import _split_telegram_text
+from memtrace_services.telegram.botapi import _split_telegram_text
 
 
 class TelegramSplitTests(TestCase):

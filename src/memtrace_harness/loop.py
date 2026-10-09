@@ -8,6 +8,7 @@ import subprocess
 import time
 from typing import Any, Callable, TYPE_CHECKING
 
+from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
 from memtrace_harness.completion_claims import KB_UPDATES_INSTRUCTION
@@ -91,7 +92,7 @@ class AgentLoopRunner:
         self.worktree_manager = worktree_manager
         self.repo_root = repo_root
         self.integration: IntegrationReport | None = None
-        # Operator-facing out-of-band alert (the gateway wires this to Telegram) for
+        # Operator-facing out-of-band alert (the Harness wires this to the operator's chat) for
         # infrastructure faults the operator must fix — currently only a provider CLI
         # that cannot be launched at all, see _alert_cli_unavailable().
         self.alert_callback = alert_callback
@@ -1049,6 +1050,7 @@ class AgentLoopRunner:
                 capture_output=True,
                 text=True,
                 timeout=self.verify_timeout_seconds,
+                env=child_env(),
             )
             exit_code: int | None = completed.returncode
             stdout, stderr = completed.stdout, completed.stderr
@@ -1547,7 +1549,7 @@ def controller_task(
                 # harness_resume_envelope: an actual same-conversation resume
                 # checkpoint. "context": project scope + knowledge-base locations +
                 # recent prior-discussion
-                # (see TelegramGateway._project_context_items()) — added 2026-09-05
+                # (see HarnessService._project_context_items()) — added 2026-09-05
                 # after Controller kept saying "I don't have context" for goals like
                 # "接續 chat_3077a492 的任務" that only make sense with recent
                 # discussion in view (chat_3077a492/chat_621c8bb9, generation 17).
@@ -2116,7 +2118,7 @@ def _is_technical_output_failure(recommendation: str) -> bool:
     (see summarize_invalid_artifact() and the raw-text fallback above) — a technical
     glitch a retry can fix, never a genuine question with an answer a human could type.
     Routed to reason="model_output_invalid" instead of "ambiguous_requirement" so the
-    Telegram message doesn't tell a human to "just answer" something that isn't a
+    chat message doesn't tell a human to "just answer" something that isn't a
     question — see the 2026-09-05 appr_4367790a7b70/appr_8daa7ac3707e confusion, where
     a Controller schema-validation failure was shown with "直接用文字回覆你的答案"
     and the human correctly couldn't make sense of it."""
@@ -2145,7 +2147,7 @@ def summarize_gate_artifact(label: str, artifact: dict[str, Any] | None) -> str:
     requires human review" tells them nothing they can act on without going and
     reading the raw JSON themselves (or asking someone else to). This renders the
     verdict, reason_code, top findings, and open questions directly into the text that
-    ends up as the Telegram approval message's proposed_action."""
+    ends up as the approval message's proposed_action."""
     if not artifact:
         return f"{label}: gate requires human review (no structured verdict available)."
     verdict = str(artifact.get("verdict") or "NEEDS_HUMAN")

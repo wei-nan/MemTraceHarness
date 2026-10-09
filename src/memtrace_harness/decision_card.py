@@ -18,7 +18,7 @@ MAX_OPTIONS = 3
 MIN_OPTIONS = 2
 _LETTERS = "ABC"
 
-# Telegram callback_data is capped at 64 bytes; "pick:appr_<12 hex>:<n>" is 24.
+# A button id is capped at 64 bytes by the strictest transport (Telegram's 64 bytes); "pick:appr_<12 hex>:<n>" is 24.
 PICK_CALLBACK_PREFIX = "pick"
 
 # The instruction every stage that can stop for a human appends to its prompt. One shared
@@ -150,7 +150,7 @@ def option_letter(index: int) -> str:
 
 
 def render_card(card: dict[str, Any]) -> str:
-    """The human-facing body of the card, as plain text for Telegram."""
+    """The human-facing body of the card, as plain text for a chat."""
     lines = [card["situation"], ""]
     for index, option in enumerate(card["options"]):
         star = " ⭐建議" if index == card["recommended"] else ""
@@ -181,15 +181,15 @@ def pick_keyboard_rows(request_id: str, card: dict[str, Any]) -> list[list[dict[
         rows.append(
             [
                 {
-                    "text": f"{star}{option_letter(index)}. {option['label']}"[:60],
-                    "callback_data": f"{PICK_CALLBACK_PREFIX}:{request_id}:{index}",
+                    "label": f"{star}{option_letter(index)}. {option['label']}"[:60],
+                    "id": f"{PICK_CALLBACK_PREFIX}:{request_id}:{index}",
                 }
             ]
         )
     return rows
 
 
-def parse_pick_callback(data: str) -> tuple[str, int] | None:
+def parse_pick_action(data: str) -> tuple[str, int] | None:
     parts = data.split(":")
     if len(parts) != 3 or parts[0] != PICK_CALLBACK_PREFIX:
         return None

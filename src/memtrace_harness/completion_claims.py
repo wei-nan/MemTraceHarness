@@ -301,7 +301,7 @@ def _transition(
 def claim_keyboard(claim_id: str) -> list[list[dict[str, str]]]:
     return [
         [
-            {"text": "✅ 驗收通過", "callback_data": f"{CLAIM_OK}:{claim_id}"},
-            {"text": "❌ 還沒完成", "callback_data": f"{CLAIM_NO}:{claim_id}"},
+            {"label": "✅ 驗收通過", "id": f"{CLAIM_OK}:{claim_id}"},
+            {"label": "❌ 還沒完成", "id": f"{CLAIM_NO}:{claim_id}"},
         ]
     ]

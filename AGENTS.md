@@ -16,12 +16,17 @@ Hard project boundaries:
   contract — but a single run still has one editing provider.)
 - Never claim missing token usage is zero. Preserve `complete`, `partial`, or `unavailable`.
 - Unit tests must inject subprocess output and must not consume model quota.
+- The Harness and its services are separate: `memtrace_harness` never imports `memtrace_services` and
+  vice versa; a service reaches a Harness only through its local HTTP API; the Harness holds no chat
+  transport, bot token or chat id (see "Harness and services" in the operating contract). Each Harness
+  runs against one workspace folder and keeps its settings in that folder's `.harness.env` — never read
+  or print it, and never put a secret in a command line or a log.
 - Harness output remains draft evidence; it cannot approve its own Agent Loop gate or Improvement
   Loop proposal.
 - Role identity is the job in the pipeline (route, plan, escalate, verify, implement), not a vendor
   pin: every role's provider/model — Controller, Planner, Planner-escalation, Red Team, and
   Developer alike — is project-configurable via a custom role-profiles file
-  (`HARNESS_ROLE_PROFILES_FILE_<PROJECT>`). What must stay enforced regardless of vendor choice:
+  (`HARNESS_ROLE_PROFILES_FILE` in the workspace's `.harness.env`). What must stay enforced regardless of vendor choice:
   only the `developer` profile may hold `workspace-write` (every other role stays `read-only`);
   each role's `context_policy` shape (Controller only gets a loop snapshot, Red Team only
   gate-scoped evidence, etc.); and Red Team / Planner-escalation both fail closed with no fallback

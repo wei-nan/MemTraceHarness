@@ -15,7 +15,7 @@ The model never calls a write tool. The harness shows it a survey it computed (s
 four hundred bodies), checks every op against the nodes it was actually shown, protects what it
 manages or a person confirmed, caps how much one pass may do, and records what it changed. Nothing
 is destroyed: a delete is MemTrace's soft delete (restorable for 30 days) and its content is also
-kept locally, so one tap in Telegram undoes a whole pass's deletions.
+kept locally, so one tap undoes a whole pass's deletions.
 """
 
 from __future__ import annotations

@@ -1,0 +1,204 @@
+import argparse
+import sqlite3
+import stat
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+
+from memtrace_harness.migrate import migrate_command, plan_workspaces, slug
+from memtrace_harness.scope import load_project_index
+from memtrace_harness.trace_store import TraceStore
+from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file
+
+LEGACY = """\
+MEMTRACE_MCP_URL=https://kb.example/mcp
+MEMTRACE_API_TOKEN=mt-secret
+HARNESS_CLAUDE_COMMAND=/opt/claude
+HARNESS_TELEGRAM_BOT_TOKEN=shared-bot
+HARNESS_TELEGRAM_ALLOWED_CHAT_IDS=111,222
+HARNESS_TELEGRAM_BOT_TOKEN_ALPHA=alpha-bot
+HARNESS_CHAT_PROVIDER=claude
+HARNESS_CHAT_MODEL=haiku
+HARNESS_CHAT_FALLBACKS=antigravity/gemini
+HARNESS_CHAT_MODEL_ALPHA=sonnet
+HARNESS_DIGEST_PROVIDER=claude
+HARNESS_DIGEST_MODEL=claude-sonnet-5-5
+HARNESS_MEMORY_WORKSPACE_ID=ws_shared_mem
+HARNESS_MEMORY_WORKSPACE_ID_BETA_PROJECT=ws_beta_mem
+HARNESS_ROLE_PROFILES_FILE_ALPHA={roles}
+HARNESS_PROJECT_INDEX={index}
+HARNESS_TRACE_DB={db}
+HARNESS_TRACE_ROOT={traces}
+HARNESS_STATUS_SERVER_PORT=8787
+"""
+
+
+class MigrationFixture(TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name).resolve()
+        self.alpha, self.beta = self.tmp / "alpha", self.tmp / "beta-project"
+        for d, ws in ((self.alpha, "ws_alpha"), (self.beta, "ws_beta")):
+            d.mkdir()
+            (d / "harness-scope.md").write_text(f"# scope\n\n- workspace_id: {ws}\n", encoding="utf-8")
+        self.index = self.tmp / "projects.index.txt"
+        self.index.write_text(f"{self.alpha / 'harness-scope.md'}\n{self.beta / 'harness-scope.md'}\n", encoding="utf-8")
+        self.roles = self.tmp / "alpha-roles.toml"
+        self.roles.write_text("[profiles.controller]\n", encoding="utf-8")
+        self.db = self.tmp / "legacy.sqlite3"
+        self.traces = self.tmp / "traces"
+        self.env = self.tmp / ".env"
+        self.env.write_text(
+            LEGACY.format(roles=self.roles, index=self.index, db=self.db, traces=self.traces), encoding="utf-8"
+        )
+        self._seed()
+
+    def _seed(self) -> None:
+        store = TraceStore(self.db)
+        for project, scope, text in (
+            ("alpha", "global", "全域"), ("alpha", "project", "只有 alpha"), ("beta-project", "project", "只有 beta"),
+        ):
+            store.add_preference_candidate(
+                project=project, scope=scope, category="x", text=text, evidence=[], explicit=True,
+                source_digest_date=None, status="adopted", adopted_by="operator",
+            )
+        with sqlite3.connect(self.db) as conn:
+            for project, ws in (("alpha", "ws_alpha"), ("beta-project", "ws_beta")):
+                run = f"run_{project[:3]}"
+                conn.execute("INSERT INTO runs (id, workspace_id, goal, task_json, created_at) VALUES (?, ?, 'g', '{}', 't')", (run, ws))
+                conn.execute(
+                    "INSERT INTO conversations (id, task_id, workspace_id, state, created_at, updated_at, last_activity_at) "
+                    "VALUES (?, 't', ?, 'succeeded', 't', 't', 't')", (f"chat_{project[:3]}", ws),
+                )
+                conn.execute(
+                    "INSERT INTO turns (conversation_id, run_id, sequence, stage, profile_id, provider, state, usage_json, "
+                    "raw_trace_ref, created_at) VALUES (?, ?, 1, 'plan', 'p', 'claude', 'succeeded', '{}', ?, 't')",
+                    (f"chat_{project[:3]}", run, f"{self.traces}/{run}/out.log"),
+                )
+                conn.execute(
+                    "INSERT INTO primary_sessions_hot_log (primary_session_id, project, turn_seq, created_at, speaker, turn_type, content) "
+                    "VALUES (?, ?, 1, 't', 'user', 'chat', ?)", (f"psess_{project}", project, f"hello {project}"),
+                )
+                (self.traces / run).mkdir(parents=True)
+                (self.traces / run / "out.log").write_text(f"trace of {project}", encoding="utf-8")
+            conn.execute("CREATE TABLE telegram_gateway_state (bot_token_hash TEXT PRIMARY KEY, last_offset INTEGER NOT NULL)")
+            conn.execute("INSERT INTO telegram_gateway_state VALUES ('h', 5)")
+            # the old shape: an approval remembered as a (chat, message) pair, a schedule by chat id
+            conn.execute("ALTER TABLE approval_requests ADD COLUMN telegram_chat_id INTEGER")
+            conn.execute("ALTER TABLE approval_requests ADD COLUMN telegram_message_id INTEGER")
+            conn.execute(
+                "INSERT INTO approval_requests (id, conversation_id, workspace, working_directory, reason, proposed_action, "
+                "status, created_at, telegram_chat_id, telegram_message_id) "
+                "VALUES ('appr_old', 'chat_alp', 'ws_alpha', '/x', 'git_push', 'x', 'pending', 't', 111, 42)"
+            )
+            conn.execute("ALTER TABLE schedules ADD COLUMN chat_id INTEGER") if False else None
+            conn.commit()
+
+    def apply(self) -> int:
+        return migrate_command(
+            argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", apply=True)
+        )
+
+
+class PlanTests(MigrationFixture):
+    def test_suffixed_settings_become_plain_ones_and_each_project_gets_its_own_token_and_port(self) -> None:
+        plans = plan_workspaces(parse_env_file(self.env), load_project_index(self.index))
+        alpha, beta = plans
+        self.assertEqual(alpha.env["HARNESS_CHAT_MODEL"], "sonnet")        # its own override
+        self.assertEqual(beta.env["HARNESS_CHAT_MODEL"], "haiku")          # the global one
+        self.assertEqual(alpha.env["HARNESS_MEMORY_WORKSPACE_ID"], "ws_shared_mem")
+        self.assertEqual(beta.env["HARNESS_MEMORY_WORKSPACE_ID"], "ws_beta_mem")
+        self.assertEqual(alpha.env["MEMTRACE_API_TOKEN"], "mt-secret")
+        self.assertNotEqual(alpha.api_port, beta.api_port)
+        self.assertNotEqual(alpha.api_token, beta.api_token)
+        for plan in plans:
+            self.assertFalse([k for k in plan.env if "TELEGRAM" in k or k.endswith(("_ALPHA", "_BETA_PROJECT"))])
+        self.assertEqual(alpha.roles_source, self.roles)
+
+    def test_a_bot_of_its_own_moves_to_a_service_env_and_a_shared_bot_is_flagged(self) -> None:
+        alpha, beta = plan_workspaces(parse_env_file(self.env), load_project_index(self.index))
+        self.assertEqual(alpha.telegram["TELEGRAM_BOT_TOKEN"], "alpha-bot")
+        self.assertEqual(alpha.telegram["TELEGRAM_ALLOWED_CHAT_IDS"], "111,222")
+        self.assertEqual(alpha.telegram["HARNESS_API_TOKEN"], alpha.api_token)
+        self.assertEqual(alpha.telegram["HARNESS_URL"], f"http://127.0.0.1:{alpha.api_port}")
+        self.assertIsNone(beta.telegram)
+        self.assertTrue(any("shared the global bot" in n for n in beta.notes))
+
+    def test_slug_matches_the_old_suffix_rule(self) -> None:
+        self.assertEqual(slug("beri-android"), "BERI_ANDROID")
+        self.assertEqual(slug("project-c"), "PROJECT_C")
+
+
+class ApplyTests(MigrationFixture):
+    def test_a_dry_run_writes_nothing(self) -> None:
+        self.assertEqual(
+            migrate_command(argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", apply=False)), 0
+        )
+        self.assertFalse((self.alpha / ENV_FILE_NAME).exists())
+        self.assertFalse((self.tmp / "services").exists())
+
+    def test_apply_builds_the_workspaces_the_services_env_and_leaves_the_legacy_files_alone(self) -> None:
+        before = self.env.read_text(encoding="utf-8")
+        self.assertEqual(self.apply(), 0)
+        self.assertEqual(self.env.read_text(encoding="utf-8"), before)
+        for root in (self.alpha, self.beta):
+            self.assertEqual(stat.S_IMODE((root / ENV_FILE_NAME).stat().st_mode), 0o600)
+            self.assertTrue((root / ".harness" / "harness.sqlite3").is_file())
+        alpha_env = parse_env_file(self.alpha / ENV_FILE_NAME)
+        self.assertEqual(alpha_env["HARNESS_ROLE_PROFILES_FILE"], str(self.alpha / ".harness" / "roles.toml"))
+        self.assertEqual((self.alpha / ".harness" / "roles.toml").read_text(encoding="utf-8"), "[profiles.controller]\n")
+        telegram = parse_env_file(self.tmp / "services" / "alpha" / "telegram.env")
+        self.assertEqual(telegram["TELEGRAM_BOT_TOKEN"], "alpha-bot")
+        self.assertEqual(telegram["HARNESS_API_TOKEN"], alpha_env["HARNESS_API_TOKEN"])
+        web = (self.tmp / "services" / "web.toml").read_text(encoding="utf-8")
+        self.assertIn(f'token = "{alpha_env["HARNESS_API_TOKEN"]}"', web)
+        self.assertEqual(web.count("[[harness]]"), 2)
+        self.assertEqual(
+            sorted(p.name for p in (self.tmp / "services" / "launchd").iterdir()),
+            ["com.memtraceharness.alpha.plist", "com.memtraceharness.alpha.telegram.plist",
+             "com.memtraceharness.beta-project.plist", "com.memtraceharness.web.plist"],
+        )
+
+    def test_each_store_holds_only_its_own_project(self) -> None:
+        self.apply()
+        for root, mine, other_text, my_text in (
+            (self.alpha, "alpha", "只有 beta", "只有 alpha"), (self.beta, "beta-project", "只有 alpha", "只有 beta"),
+        ):
+            store = TraceStore(root / ".harness" / "harness.sqlite3")
+            with store._connection() as conn:
+                runs = [r[0] for r in conn.execute("SELECT id FROM runs")]
+                turns = [r[0] for r in conn.execute("SELECT run_id FROM turns")]
+                logged = [r[0] for r in conn.execute("SELECT content FROM primary_sessions_hot_log")]
+                prefs = {r[0] for r in conn.execute("SELECT text FROM preference_rules")}
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(runs, [f"run_{mine[:3]}"])
+            self.assertEqual(turns, [f"run_{mine[:3]}"])
+            self.assertEqual(logged, [f"hello {mine}"])
+            self.assertIn("全域", prefs)  # the operator's global preference is everyone's
+            self.assertIn(my_text, prefs)
+            self.assertNotIn(other_text, prefs)
+            self.assertNotIn("telegram_gateway_state", tables)  # the offset lives in the Telegram service now
+
+    def test_raw_traces_follow_their_store_and_the_rows_point_at_the_new_place(self) -> None:
+        self.apply()
+        store = TraceStore(self.alpha / ".harness" / "harness.sqlite3")
+        with store._connection() as conn:
+            [ref] = [r[0] for r in conn.execute("SELECT raw_trace_ref FROM turns")]
+        self.assertEqual(ref, f"{self.alpha / '.harness' / 'traces'}/run_alp/out.log")
+        self.assertEqual(Path(ref).read_text(encoding="utf-8"), "trace of alpha")
+        self.assertFalse((self.alpha / ".harness" / "traces" / "run_bet").exists())
+
+    def test_it_refuses_to_overwrite_a_workspace_that_already_has_settings(self) -> None:
+        (self.alpha / ENV_FILE_NAME).write_text("HARNESS_CHAT_MODEL=mine\n", encoding="utf-8")
+        with self.assertRaises(RuntimeError):
+            self.apply()
+        self.assertEqual((self.alpha / ENV_FILE_NAME).read_text(encoding="utf-8"), "HARNESS_CHAT_MODEL=mine\n")
+
+
+class LegacyStoreTests(MigrationFixture):
+    def test_old_chat_and_message_ids_become_the_opaque_references_services_use(self) -> None:
+        self.apply()
+        store = TraceStore(self.alpha / ".harness" / "harness.sqlite3")
+        self.assertEqual(store.get_approval_request("appr_old")["message_ref"], "tg:111:42")
+        self.assertEqual(store.get_approval_request_by_message_ref("tg:111:42")["id"], "appr_old")

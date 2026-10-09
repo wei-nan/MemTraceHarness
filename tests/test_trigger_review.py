@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.support import tap
 
 import json
 import tempfile
@@ -14,7 +15,7 @@ from memtrace_harness.config import HarnessConfig
 from memtrace_harness.primary_session import SCHEDULE_REPORT, PrimarySessionManager
 from memtrace_harness.scanner import UnattendedScanner
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 from memtrace_harness.trigger_review import (
     MAX_CONSECUTIVE_SILENT,
@@ -151,7 +152,6 @@ def _config(tmp: Path) -> HarnessConfig:
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=tmp / "t.sqlite3",
         trace_root=tmp, claude_command="claude", codex_command="codex",
         antigravity_command="agy", antigravity_output_mode="auto", cli_timeout_seconds=900,
-        telegram_bot_token="fake", telegram_allowed_chat_ids={12345}, project_index_path=None,
         chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
 
@@ -179,8 +179,8 @@ class ScannerReviewTests(TestCase):
         gateway = MagicMock()
         self.gateway = gateway
         scanner = UnattendedScanner(
-            _config(tmp), self.store, [scope], memtrace, gateway=gateway,
-            approval_mgr=ApprovalManager(self.store, {12345}),
+            _config(tmp), self.store, [scope], memtrace, service=gateway,
+            approval_mgr=ApprovalManager(self.store),
             review_caller_factory=lambda project: (lambda prompt: review_reply),
         )
         return scanner, scanner.run_scan_pass()
@@ -214,7 +214,7 @@ class ScannerReviewTests(TestCase):
                 project="proj", kind="unattended_write", situation="舊的", outcome="rejected", followed=False
             ),
         )
-        self.gateway.notify_all_allowlisted.assert_any_call(
+        self.gateway.notify_operator.assert_any_call(
             "🗑 我判斷 backlog 項目「舊的」（mem_a）不再適用：已決定不做（依據 D1）。"
             "7 天內不會再提案；如果我判斷錯了，直接告訴我。"
         )
@@ -233,7 +233,7 @@ class ScannerReviewTests(TestCase):
             reply(verdicts=[{"id": "mem_a", "verdict": "drop", "reason": "已決定不做", "evidence": ["D1"]}])
         )
         self.assertIn("舊的", self._proposal().split("佇列")[0])
-        self.gateway.notify_all_allowlisted.assert_not_called()
+        self.gateway.notify_operator.assert_not_called()
 
     def test_a_review_that_fails_leaves_the_proposal_as_it_was(self) -> None:
         self._scan("garbage")
@@ -253,8 +253,8 @@ class ScheduleReviewWiringTests(TestCase):
             scope_file_path=tmp / "harness-scope.md",
         )
         self.mgr = PrimarySessionManager(self.store)
-        gateway = TelegramGateway(
-            config, ApprovalManager(self.store, {12345}), ChatTriage([scope]), self.mgr, [scope]
+        gateway = HarnessService(
+            config, ApprovalManager(self.store), ChatTriage([scope]), self.mgr, [scope]
         )
         gateway.send_message = MagicMock()
         gateway.send_message_with_keyboard = MagicMock(return_value=1)
@@ -265,7 +265,7 @@ class ScheduleReviewWiringTests(TestCase):
         self.scope = scope
         self.schedule_id = self.store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="追蹤持股", kind="interval",
-            interval_seconds=600, chat_id=12345,
+            interval_seconds=600, audience=12345,
             next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
         return gateway
@@ -279,9 +279,9 @@ class ScheduleReviewWiringTests(TestCase):
 
     def _run(self, gateway, *, status="succeeded", text="持股無變化"):
         summary = MagicMock(conversation_id="chat_x", status=status, recommendation=text, stages=[])
-        with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
-            "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
-        ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+        with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+            "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+        ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
             runner.return_value.run.return_value = summary
             gateway._start_or_queue_task(self.scope, "追蹤持股", 12345, schedule_id=self.schedule_id)
             for t in threading.enumerate():
@@ -326,12 +326,12 @@ class ScheduleReviewWiringTests(TestCase):
         text, keyboard = gateway.send_message_with_keyboard.call_args.args[1:3]
         self.assertIn("部位已賣出", text)
         self.assertEqual(
-            [b["callback_data"] for b in keyboard[0]],
+            [b["id"] for b in keyboard[0]],
             [f"sched_resume:{self.schedule_id}", f"sched_cancel:{self.schedule_id}"],
         )
         self.assertFalse(any("任務已完成" in c.args[1] for c in gateway.send_message.call_args_list))
 
-        gateway._handle_callback_query(
+        tap(gateway, 
             {"id": "cb", "data": f"sched_resume:{self.schedule_id}",
              "message": {"chat": {"id": 12345}, "message_id": 7}}
         )

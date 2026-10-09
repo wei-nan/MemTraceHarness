@@ -9,9 +9,10 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from memtrace_harness import taiwantrade_mcp as tw
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
-from tests.test_telegram_gateway import _build_schedule_gateway
+from tests.support import outbox
+from tests.test_service import _build_schedule_gateway
 
 TOKEN = "SECRET-ONE-TIME-TOKEN"
 
@@ -96,7 +97,7 @@ class OrderProxyTests(TestCase):
         self._create()
         self.store.claim_pending_order_intents(["TWTradingStrategy"])    # shown once: awaiting
         text, _ = self._create(opener=intent_opener([], token=None))
-        self.assertIn("buttons were sent to their Telegram again", text)
+        self.assertIn("buttons were sent to their chat again", text)
         self.assertEqual(self.store.get_order_intent("intent-1")["confirmation_token"], TOKEN)
         self.assertEqual(self.store.get_order_intent("intent-1")["status"], "pending")
 
@@ -203,11 +204,15 @@ class OrderConfirmationFlowTests(TestCase):
         self._tmp = TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.gateway, self.store, self.scope = _build_schedule_gateway(Path(self._tmp.name))
-        self.gateway.send_message = MagicMock(return_value=True)
-        self.gateway.send_message_with_keyboard = MagicMock(return_value=777)
-        self.gateway.clear_message_keyboard = MagicMock()
-        self.gateway.answer_callback_query = MagicMock()
         self.project = self.scope.name
+
+    def _keyboards(self) -> list[dict]:
+        """The shown proposals (outbox events that carry buttons), oldest first."""
+        return [e for e in outbox(self.gateway) if e["kind"] == "message" and e["actions"]]
+
+    def _delivered(self, event: dict, ref: str = "tg:12345:777") -> None:
+        """What the Telegram service does after it delivered the event."""
+        self.gateway.ack_event(event["id"], ok=True, message_refs=[ref])
 
     def _propose(self, intent_id="intent-1", expires=None) -> None:
         self.store.create_order_intent(
@@ -217,10 +222,9 @@ class OrderConfirmationFlowTests(TestCase):
             expires_at=expires or (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
         )
 
-    def _tap(self, action: str, intent_id="intent-1", chat_id=12345):
-        return self.gateway._handle_callback_query(
-            {"id": "cb", "data": f"{action}:{intent_id}",
-             "message": {"chat": {"id": chat_id}, "message_id": 777}}
+    def _tap(self, action: str, intent_id="intent-1", audience=12345):
+        return self.gateway.handle_action(
+            f"{action}:{intent_id}", audience=audience, message_ref="tg:12345:777"
         )
 
     def _turns(self):
@@ -228,32 +232,36 @@ class OrderConfirmationFlowTests(TestCase):
 
     def test_a_proposal_is_shown_with_confirm_and_cancel_buttons_and_nothing_is_sent(self) -> None:
         self._propose()
-        with patch("memtrace_harness.telegram_gateway.submit_order") as submit:
+        with patch("memtrace_harness.service.submit_order") as submit:
             self.gateway.process_order_intents()
         submit.assert_not_called()
-        _, text, keyboard = self.gateway.send_message_with_keyboard.call_args.args
+        shown = self._keyboards()[-1]
+        text, keyboard = shown["text"], shown["actions"]
         self.assertIn("買進 2327", text)
         self.assertIn("還沒有送到券商", text)
         self.assertEqual(
-            [b["callback_data"] for b in keyboard[0]], ["order_confirm:intent-1", "order_cancel:intent-1"]
+            [b["id"] for b in keyboard[0]], ["order_confirm:intent-1", "order_cancel:intent-1"]
         )
         self.assertEqual(self.store.get_order_intent("intent-1")["status"], "awaiting")
         self.assertNotIn(TOKEN, text)
         # A second tick does not show it again.
         self.gateway.process_order_intents()
-        self.assertEqual(self.gateway.send_message_with_keyboard.call_count, 1)
+        self.assertEqual(len(self._keyboards()), 1)
 
     def test_a_reshown_proposal_clears_the_old_buttons_and_sends_new_ones(self) -> None:
         self._propose()
-        self.gateway.process_order_intents()                       # first notification, id 777
-        self.gateway.send_message_with_keyboard.return_value = 888
+        self.gateway.process_order_intents()                       # first notification
+        self._delivered(self._keyboards()[0], "tg:12345:777")
+        self.assertEqual(self.store.get_order_intent("intent-1")["message_ref"], "tg:12345:777")
         self.store.reshow_order_intent("intent-1")                 # the model proposed it again
         self.gateway.process_order_intents()
-        self.gateway.clear_message_keyboard.assert_called_with(12345, 777)
-        self.assertEqual(self.gateway.send_message_with_keyboard.call_count, 2)
-        self.assertEqual(self.store.get_order_intent("intent-1")["telegram_message_id"], 888)
-        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
-            "memtrace_harness.telegram_gateway.submit_order", return_value={"order_id": "A1", "status": "S"}
+        clears = [e for e in outbox(self.gateway) if e["kind"] == "clear"]
+        self.assertEqual([e["ref"] for e in clears], ["tg:12345:777"])
+        self.assertEqual(len(self._keyboards()), 2)
+        self._delivered(self._keyboards()[1], "tg:12345:888")
+        self.assertEqual(self.store.get_order_intent("intent-1")["message_ref"], "tg:12345:888")
+        with patch("memtrace_harness.service.load_api_key", return_value="k"), patch(
+            "memtrace_harness.service.submit_order", return_value={"order_id": "A1", "status": "S"}
         ) as submit:
             self._tap("order_confirm")
         submit.assert_called_once()
@@ -261,8 +269,8 @@ class OrderConfirmationFlowTests(TestCase):
     def test_confirm_sends_the_order_once_reports_it_and_tells_the_chat_model(self) -> None:
         self._propose()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
-            "memtrace_harness.telegram_gateway.submit_order",
+        with patch("memtrace_harness.service.load_api_key", return_value="k"), patch(
+            "memtrace_harness.service.submit_order",
             return_value={"order_id": "A1", "status": "PreSubmitted", "filled_qty": 0},
         ) as submit:
             first = self._tap("order_confirm")
@@ -275,13 +283,13 @@ class OrderConfirmationFlowTests(TestCase):
         row = self.store.get_order_intent("intent-1")
         self.assertEqual(row["status"], "submitted")
         self.assertIsNone(row["confirmation_token"])      # useless afterwards, so dropped
-        self.gateway.clear_message_keyboard.assert_called()
+        self.assertTrue(any(e["kind"] == "clear" for e in outbox(self.gateway)))
         self.assertTrue(any("已送出委託" in t for t in self._turns()))
 
     def test_cancel_never_sends_anything(self) -> None:
         self._propose()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.submit_order") as submit:
+        with patch("memtrace_harness.service.submit_order") as submit:
             result = self._tap("order_cancel")
             late = self._tap("order_confirm")
         submit.assert_not_called()
@@ -292,8 +300,8 @@ class OrderConfirmationFlowTests(TestCase):
     def test_a_failed_submission_is_reported_with_the_reason(self) -> None:
         self._propose()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
-            "memtrace_harness.telegram_gateway.submit_order",
+        with patch("memtrace_harness.service.load_api_key", return_value="k"), patch(
+            "memtrace_harness.service.submit_order",
             side_effect=tw.ProxyError("TaiwanTrade returned HTTP 502: Broker submission state is unknown"),
         ):
             result = self._tap("order_confirm")
@@ -305,7 +313,7 @@ class OrderConfirmationFlowTests(TestCase):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         self._propose(expires=past)
         self.store.transition_order_intent("intent-1", ("pending",), "awaiting")
-        with patch("memtrace_harness.telegram_gateway.submit_order") as submit:
+        with patch("memtrace_harness.service.submit_order") as submit:
             result = self._tap("order_confirm")
         submit.assert_not_called()
         self.assertIn("過期", result)
@@ -314,19 +322,11 @@ class OrderConfirmationFlowTests(TestCase):
         past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
         self._propose(expires=past)
         self.store.transition_order_intent("intent-1", ("pending",), "awaiting")
-        self.store.set_order_intent_message("intent-1", chat_id=12345, message_id=777)
+        self.store.set_order_intent_message("intent-1", "tg:12345:777")
         self.gateway.process_order_intents()
         self.assertEqual(self.store.get_order_intent("intent-1")["status"], "expired")
-        self.assertIn("已過期", self.gateway.send_message.call_args.args[1])
+        self.assertIn("已過期", outbox(self.gateway)[-1]["text"])
         self.assertTrue(any("已過期" in t for t in self._turns()))
-
-    def test_a_tap_from_a_chat_that_is_not_allowlisted_does_nothing(self) -> None:
-        self._propose()
-        self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.submit_order") as submit:
-            self.assertIsNone(self._tap("order_confirm", chat_id=999))
-        submit.assert_not_called()
-        self.assertEqual(self.store.get_order_intent("intent-1")["status"], "awaiting")
 
     def test_an_unknown_intent_or_another_projects_intent_is_ignored(self) -> None:
         self.store.create_order_intent(
@@ -335,7 +335,7 @@ class OrderConfirmationFlowTests(TestCase):
             risk={}, confirmation_token=TOKEN, expires_at="2999-01-01T00:00:00+00:00",
         )
         self.store.transition_order_intent("other", ("pending",), "awaiting")
-        with patch("memtrace_harness.telegram_gateway.submit_order") as submit:
+        with patch("memtrace_harness.service.submit_order") as submit:
             self.assertIn("找不到", self._tap("order_confirm", "other"))
             self.assertIn("找不到", self._tap("order_confirm", "missing"))
         submit.assert_not_called()
@@ -348,8 +348,8 @@ class ChatNoticeTests(TestCase):
             "HARNESS_TAIWANTRADE_ORDER_PROJECTS": "TWTradingStrategy",
         }
         with patch.dict("os.environ", env, clear=True):
-            enabled = TelegramGateway._taiwantrade_notice("TWTradingStrategy")
-            other = TelegramGateway._taiwantrade_notice("Beri")
+            enabled = HarnessService._taiwantrade_notice("TWTradingStrategy")
+            other = HarnessService._taiwantrade_notice("Beri")
         self.assertIn("create_order_intent", enabled)
         self.assertIn("不要說已經下單", enabled)
         self.assertNotIn("create_order_intent", other)
@@ -443,19 +443,20 @@ class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
 
     def test_the_cancel_proposal_is_shown_with_its_own_buttons_and_nothing_is_sent(self) -> None:
         self._propose_cancel()
-        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+        with patch("memtrace_harness.service.cancel_order") as cancel:
             self.gateway.process_order_intents()
         cancel.assert_not_called()
-        _, text, keyboard = self.gateway.send_message_with_keyboard.call_args.args
+        shown = self._keyboards()[-1]
+        text, keyboard = shown["text"], shown["actions"]
         self.assertIn("待確認撤單", text)
         self.assertIn("89dd094d", text)
-        self.assertEqual([b["text"] for b in keyboard[0]], ["✅ 確認撤單", "❌ 不撤單"])
+        self.assertEqual([b["label"] for b in keyboard[0]], ["✅ 確認撤單", "❌ 不撤單"])
 
     def test_confirm_sends_one_delete_and_reports_it(self) -> None:
         self._propose_cancel()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
-            "memtrace_harness.telegram_gateway.cancel_order", return_value={"detail": "Cancel request sent"}
+        with patch("memtrace_harness.service.load_api_key", return_value="k"), patch(
+            "memtrace_harness.service.cancel_order", return_value={"detail": "Cancel request sent"}
         ) as cancel:
             first = self._tap("order_confirm", "cancel-1")
             second = self._tap("order_confirm", "cancel-1")
@@ -468,7 +469,7 @@ class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
     def test_declining_sends_nothing(self) -> None:
         self._propose_cancel()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+        with patch("memtrace_harness.service.cancel_order") as cancel:
             result = self._tap("order_cancel", "cancel-1")
         cancel.assert_not_called()
         self.assertIn("沒有撤單", result)
@@ -476,8 +477,8 @@ class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
     def test_a_cancel_the_broker_refuses_is_reported_with_the_reason(self) -> None:
         self._propose_cancel()
         self.gateway.process_order_intents()
-        with patch("memtrace_harness.telegram_gateway.load_api_key", return_value="k"), patch(
-            "memtrace_harness.telegram_gateway.cancel_order",
+        with patch("memtrace_harness.service.load_api_key", return_value="k"), patch(
+            "memtrace_harness.service.cancel_order",
             side_effect=tw.ProxyError("TaiwanTrade returned HTTP 400: order already filled"),
         ):
             result = self._tap("order_confirm", "cancel-1")
@@ -492,7 +493,7 @@ class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
             expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
         )
         self.store.transition_order_intent("cancel-old", ("pending",), "awaiting")
-        with patch("memtrace_harness.telegram_gateway.cancel_order") as cancel:
+        with patch("memtrace_harness.service.cancel_order") as cancel:
             result = self._tap("order_confirm", "cancel-old")
         cancel.assert_not_called()
         self.assertIn("過期", result)
@@ -500,6 +501,6 @@ class CancelConfirmationFlowTests(OrderConfirmationFlowTests):
     def test_the_chat_model_is_told_about_the_cancel_tool(self) -> None:
         env = {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/k", "HARNESS_TAIWANTRADE_ORDER_PROJECTS": "P"}
         with patch.dict("os.environ", env, clear=True):
-            notice = TelegramGateway._taiwantrade_notice("P")
+            notice = HarnessService._taiwantrade_notice("P")
         self.assertIn("request_order_cancel", notice)
         self.assertIn("get_positions 為準", notice)

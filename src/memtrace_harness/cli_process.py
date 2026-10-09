@@ -15,6 +15,47 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# What a child process (a provider CLI, a job, a verify command) may inherit. The Harness's own
+# environment holds its secrets — the MemTrace token, its API token — and a model that runs shell
+# commands (the Developer does) would otherwise be handed all of them. Everything not named here is
+# dropped; HARNESS_PASSTHROUGH_ENV adds names (comma-separated) for the odd tool that needs one.
+_CHILD_ENV_EXACT = frozenset(
+    {
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", "LANG", "LANGUAGE",
+        "COLORTERM", "NO_COLOR", "FORCE_COLOR", "PWD", "SSH_AUTH_SOCK", "DISPLAY", "EDITOR",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy",
+        "no_proxy", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS", "VIRTUAL_ENV", "PYTHONPATH", "PYTHONUNBUFFERED",
+        "CODEX_HOME", "GH_TOKEN", "GITHUB_TOKEN",
+    }
+)
+_CHILD_ENV_PREFIXES = ("LC_", "XDG_", "CLAUDE_", "ANTHROPIC_", "GEMINI_", "GOOGLE_", "AGY_", "CODEX_", "OPENAI_")
+# Only a child that was given the MemTrace MCP server on its command line gets the token it needs.
+MEMTRACE_TOKEN_ENV = "MEMTRACE_API_TOKEN"
+
+
+def child_env(
+    command: list[str] | None = None, environ: dict[str, str] | None = None
+) -> dict[str, str]:
+    """The environment a child process gets: the allowlist above, plus MEMTRACE_API_TOKEN only when
+    the command wires the MemTrace MCP server to read it (Codex's bearer_token_env_var)."""
+    source = os.environ if environ is None else environ
+    extra = {n.strip() for n in source.get("HARNESS_PASSTHROUGH_ENV", "").split(",") if n.strip()}
+    env = {
+        key: value
+        for key, value in source.items()
+        if key in _CHILD_ENV_EXACT or key in extra or key.startswith(_CHILD_ENV_PREFIXES)
+    }
+    if (
+        command
+        and MEMTRACE_TOKEN_ENV in source
+        and any(arg.startswith("mcp_servers.memtrace.") for arg in command)
+        and any(MEMTRACE_TOKEN_ENV in arg for arg in command)
+    ):
+        env[MEMTRACE_TOKEN_ENV] = source[MEMTRACE_TOKEN_ENV]
+    return env
+
+
 @dataclass(frozen=True)
 class ProcessResult:
     command: list[str]
@@ -34,7 +75,7 @@ class ProcessResult:
 # background thread (see inflight.py) runs its stages one at a time, synchronously,
 # in that same OS thread — so "the process this thread is currently blocked on" is
 # always well-defined and unique. This lets kill_process_for_thread() reach into a
-# running CLI call from a completely different thread (the gateway's shutdown-drain
+# running CLI call from a completely different thread (the Harness's shutdown-drain
 # sequence) without threading a cancellation token through every layer of
 # AgentLoopRunner/adapters/CliModelAdapter — the registry is the only extra plumbing.
 _active_processes_lock = threading.Lock()
@@ -124,7 +165,7 @@ class CliProcessRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=os.environ.copy(),
+                env=child_env(command),
                 # Own process group (POSIX): lets kill_process_for_thread() terminate
                 # the whole tree, not just this direct child, and keeps SIGINT/SIGTERM
                 # sent to the harness's own process group from also hitting the CLI

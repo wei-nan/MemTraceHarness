@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from tests.support import relay
 from unittest import TestCase
 from unittest.mock import MagicMock
 
@@ -11,60 +12,29 @@ from memtrace_harness.config import HarnessConfig
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scanner import UnattendedScanner
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 
 class RedTeamAcceptanceTests(TestCase):
     def test_red_team_acceptance_allowlist_security(self) -> None:
-        """Red Team Verification 1: Allowlist Security Boundary"""
+        """Red Team Verification 1: Allowlist Security Boundary. The allowlist is enforced by the
+        Telegram service, at the transport layer, before anything reaches the Harness; the Harness's
+        own door (its API) refuses anyone without its token."""
+        from pathlib import Path as _Path
+        from tests.test_telegram_service import FakeBot, FakeClient, make_service, text_update
+
         with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            db_path = tmp_path / "rt_sec.sqlite3"
-            trace_store = TraceStore(db_path)
-            config = HarnessConfig(
-                memtrace_mcp_url=None,
-                memtrace_api_token=None,
-                trace_db_path=db_path,
-                trace_root=tmp_path,
-                claude_command="claude",
-                codex_command="codex",
-                antigravity_command="agy",
-                antigravity_output_mode="auto",
-                cli_timeout_seconds=900,
-                telegram_bot_token="test_bot_token",
-                telegram_allowed_chat_ids={88888},
-                project_index_path=None,
-                chat_provider="claude",
-                chat_model="haiku",
-                unattended_write_requires_approval=True,
-            )
-            scope = ProjectScope(
-                name="rt_proj",
-                workspace_id="ws_rt",
-                working_directory=tmp_path,
-                scope_file_path=tmp_path / "harness-scope.md",
-            )
-            triage = ChatTriage([scope])
-            appr_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
-            psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, appr_mgr, triage, psess_mgr, [scope])
-
+            service, bot, client = make_service(tmp_dir)
             # Attacker attempting to send commands from unallowed chat ID 66666
-            attacker_update = {
-                "update_id": 1,
-                "message": {"chat": {"id": 66666}, "text": "/approve appr_fake123"},
-            }
-            res = gateway.process_update(attacker_update)
-            self.assertIsNone(res, "Attacker message was not dropped at transport layer!")
-
+            self.assertTrue(service.process_update(text_update(chat_id=66666, text="/approve appr_fake123")))
             # Attacker attempting to trigger arbitrary task execution from unallowed chat ID
-            attacker_task_update = {
-                "update_id": 2,
-                "message": {"chat": {"id": 66666}, "text": "Execute malicious code in project rt_proj"},
-            }
-            res_task = gateway.process_update(attacker_task_update)
-            self.assertIsNone(res_task, "Attacker task execution attempt was not dropped!")
+            self.assertTrue(
+                service.process_update(text_update(chat_id=66666, text="Execute malicious code in project rt_proj"))
+            )
+            self.assertEqual(client.messages, [], "Attacker message was not dropped at transport layer!")
+            self.assertEqual(client.actions, [])
+            self.assertEqual(bot.sent, [])
 
     def test_red_team_acceptance_scope_and_boundary_rejection(self) -> None:
         """Red Team Verification 2: Scope & Boundary Rules Rejection"""
@@ -118,14 +88,11 @@ class RedTeamAcceptanceTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="fake_bot_token",
-                telegram_allowed_chat_ids={12345},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,
             )
-            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+            approval_mgr = ApprovalManager(trace_store)
             scope = ProjectScope(
                 name="secure_project",
                 workspace_id="ws_secure",
@@ -135,7 +102,7 @@ class RedTeamAcceptanceTests(TestCase):
             )
             triage = ChatTriage([scope])
             psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+            gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
 
             from unittest.mock import patch
             from memtrace_harness.cli_process import ProcessResult
@@ -163,7 +130,7 @@ class RedTeamAcceptanceTests(TestCase):
                     "update_id": 1,
                     "message": {"chat": {"id": 12345}, "text": "我在 .env 內放了一把 X-API-KEY 的 token"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             # Never blocked at the triage layer before reaching the model.
             self.assertIsNotNone(result)
@@ -182,7 +149,7 @@ class RedTeamAcceptanceTests(TestCase):
             tmp_path = Path(tmp_dir)
             db_path = tmp_path / "rt_appr.sqlite3"
             trace_store = TraceStore(db_path)
-            appr_mgr = ApprovalManager(trace_store, {10001})
+            appr_mgr = ApprovalManager(trace_store)
 
             req = appr_mgr.request_approval(
                 conversation_id="conv_rt",
@@ -198,11 +165,11 @@ class RedTeamAcceptanceTests(TestCase):
             self.assertEqual(data["status"], "pending")
 
             # Guarantee B: Single terminal response rule (no replay or double-spend)
-            ok1, msg1, req_data = appr_mgr.respond(req.id, "approve", chat_id=10001)
+            ok1, msg1, req_data = appr_mgr.respond(req.id, "approve", audience=10001)
             self.assertTrue(ok1)
             self.assertIn("approved", msg1)
 
-            ok2, msg2, _ = appr_mgr.respond(req.id, "reject", chat_id=10001)
+            ok2, msg2, _ = appr_mgr.respond(req.id, "reject", audience=10001)
             self.assertFalse(ok2)
             self.assertIn("已經是", msg2)
 
@@ -224,9 +191,6 @@ class RedTeamAcceptanceTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="test_bot_token",
-                telegram_allowed_chat_ids={88888},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,

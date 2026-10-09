@@ -7,6 +7,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from tests.support import relay
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +15,7 @@ from memtrace_harness.loop import AgentLoopRunner, operational_task
 from memtrace_harness.schemas import TaskEnvelope
 from memtrace_harness.trace_store import TraceStore
 from tests.test_loop import QueueAdapter
-from tests.test_telegram_gateway import _build_schedule_gateway
+from tests.test_service import _build_schedule_gateway
 
 
 def _adapters(controller):
@@ -94,10 +95,10 @@ class ScheduleReportGatewayTests(TestCase):
     def test_only_schedule_runs_are_told_not_to_open_approvals(self) -> None:
         for schedule_id, expected in (("sched_x", False), (None, True)):
             with self.subTest(schedule_id=schedule_id), patch(
-                "memtrace_harness.telegram_gateway.load_role_profiles", return_value={}
+                "memtrace_harness.service.load_role_profiles", return_value={}
             ), patch(
-                "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
-            ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+                "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+            ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
                 runner.return_value.run.return_value = MagicMock(
                     conversation_id="c", status="succeeded", recommendation="ok"
                 )
@@ -126,7 +127,7 @@ class SwipeReplyIsOnlyAnAnswerWhenTheModelSaysSoTests(TestCase):
             proposed_action="要持久化已觸發但尚未送單的事件嗎？",
             resume_goal="改用新公式",
         )
-        self.approvals.record_telegram_message(self.req.id, chat_id=12345, message_id=901)
+        self.approvals.record_message_ref(self.req.id, f"tg:{12345}:{901}")
         self.prompts: list[str] = []
 
     def _swipe(self, text: str, model_stdout: str | None, *, reply_to: int | None = 901):
@@ -147,7 +148,7 @@ class SwipeReplyIsOnlyAnAnswerWhenTheModelSaysSoTests(TestCase):
         with patch("urllib.request.urlopen"), patch(
             "memtrace_harness.cli_process.CliProcessRunner.run", fake_run
         ):
-            return self.gateway.process_update({"update_id": 1, "message": message})
+            return relay(self.gateway, {"update_id": 1, "message": message})
 
     def _status(self) -> str:
         return self.approvals.get_request(self.req.id).status
@@ -192,6 +193,6 @@ class SwipeReplyIsOnlyAnAnswerWhenTheModelSaysSoTests(TestCase):
         self.gateway._resume_approved_conversation.assert_not_called()
 
     def test_the_question_message_no_longer_promises_that_any_reply_resumes(self) -> None:
-        text = self.req.format_telegram_message()
+        text = self.req.format_message()
         self.assertIn("只有回答才會帶著答案繼續執行", text)
         self.assertNotIn("就會帶著答案繼續執行——", text)

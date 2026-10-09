@@ -39,8 +39,8 @@ DIGEST_TITLE_PREFIX = "Daily digest"
 
 # The nightly pass only runs inside this local hour (02:00-02:59 in
 # HARNESS_SCHEDULE_TIMEZONE, Asia/Taipei by default), never "any time after it": a
-# gateway restart in the afternoon must not start digesting on the spot. A night the
-# gateway was down is caught up the next night (AUTO_CATCH_UP_DAYS).
+# Harness restart in the afternoon must not start digesting on the spot. A night the
+# Harness was down is caught up the next night (AUTO_CATCH_UP_DAYS).
 DIGEST_HOUR = 2
 # How far back the automatic nightly pass catches up on missed days. Older history is
 # only digested by an explicit `memory-digest --backfill`, since each day costs a

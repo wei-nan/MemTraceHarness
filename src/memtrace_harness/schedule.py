@@ -1,6 +1,6 @@
 """Pure scheduling logic for the chat-triggered recurring-task feature: parsing a
 schedule directive out of a model reply, and computing when it should next fire.
-No I/O here — persistence lives in TraceStore, triggering lives in TelegramGateway."""
+No I/O here — persistence lives in TraceStore, triggering lives in HarnessService."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def _next_in_interval_window(spec: ScheduleSpec, candidate: datetime, tz: ZoneIn
 
 def is_outside_interval_window(spec: ScheduleSpec, *, at: datetime, tz: ZoneInfo) -> bool:
     """True when an interval schedule with a window and/or weekday restriction is due
-    at a moment outside it (e.g. a gateway that was down and caught up late)."""
+    at a moment outside it (e.g. a Harness that was down and caught up late)."""
     if spec.kind != "interval" or (spec.time_of_day is None and not spec.weekdays_only):
         return False
     return _next_in_interval_window(spec, at, tz) != at.astimezone(timezone.utc)

@@ -11,12 +11,12 @@ from memtrace_harness.decision_card import (
     answer_for_choice,
     card_from_artifact,
     normalize_card,
-    parse_pick_callback,
+    parse_pick_action,
     pick_keyboard_rows,
     render_card,
 )
 from memtrace_harness.output_contracts import PROFILE_SCHEMAS, output_schema_path
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 
@@ -91,21 +91,21 @@ class RenderTests(TestCase):
         card = normalize_card(good_card())
         rows = pick_keyboard_rows("appr_abc123abc123", card)
         self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[0][0]["text"].startswith("⭐ A."))
-        data = rows[1][0]["callback_data"]
+        self.assertTrue(rows[0][0]["label"].startswith("⭐ A."))
+        data = rows[1][0]["id"]
         self.assertLessEqual(len(data.encode()), 64)
-        self.assertEqual(parse_pick_callback(data), ("appr_abc123abc123", 1))
+        self.assertEqual(parse_pick_action(data), ("appr_abc123abc123", 1))
         answer = answer_for_choice(card, 1)
         self.assertIn("方案 B", answer)
         self.assertIn("寫遷移腳本處理舊資料", answer)
         self.assertIsNone(answer_for_choice(card, 2))
-        self.assertIsNone(parse_pick_callback("approve:appr_x"))
-        self.assertIsNone(parse_pick_callback("pick:appr_x:not-a-number"))
+        self.assertIsNone(parse_pick_action("approve:appr_x"))
+        self.assertIsNone(parse_pick_action("pick:appr_x:not-a-number"))
 
 
 class ApprovalWiringTests(TestCase):
     def _manager(self, tmp: str) -> ApprovalManager:
-        return ApprovalManager(TraceStore(Path(tmp) / "t.sqlite3"), {1})
+        return ApprovalManager(TraceStore(Path(tmp) / "t.sqlite3"))
 
     def _request(self, mgr: ApprovalManager, tmp: str, card, reason="ambiguous_requirement"):
         return mgr.request_approval(
@@ -123,7 +123,7 @@ class ApprovalWiringTests(TestCase):
             req = self._request(mgr, tmp, normalize_card(good_card()))
             reloaded = mgr.get_request(req.id)
             self.assertEqual(reloaded.decision_card, normalize_card(good_card()))
-            message = reloaded.format_telegram_message()
+            message = reloaded.format_message()
             self.assertIn("需要你決定", message)
             self.assertIn("A. 只改新資料", message)
             self.assertNotIn("RAW DUMP", message)
@@ -133,7 +133,7 @@ class ApprovalWiringTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._manager(tmp)
             req = self._request(mgr, tmp, None)
-            message = mgr.get_request(req.id).format_telegram_message()
+            message = mgr.get_request(req.id).format_message()
             self.assertIn("需要你回答問題", message)
             self.assertIn("RAW DUMP", message)
 
@@ -141,12 +141,12 @@ class ApprovalWiringTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             mgr = self._manager(tmp)
             req = self._request(mgr, tmp, normalize_card(good_card()), reason="model_output_invalid")
-            self.assertIn("系統技術性錯誤", mgr.get_request(req.id).format_telegram_message())
+            self.assertIn("系統技術性錯誤", mgr.get_request(req.id).format_message())
 
     def test_keyboard_has_one_button_per_option_plus_give_up(self) -> None:
         card = normalize_card(good_card())
-        keyboard = TelegramGateway._approval_keyboard("appr_1", "ambiguous_requirement", card)
-        self.assertEqual([row[0]["callback_data"] for row in keyboard],
+        keyboard = HarnessService._approval_keyboard("appr_1", "ambiguous_requirement", card)
+        self.assertEqual([row[0]["id"] for row in keyboard],
                          ["pick:appr_1:0", "pick:appr_1:1", "reject:appr_1"])
-        plain = TelegramGateway._approval_keyboard("appr_1", "ambiguous_requirement", None)
-        self.assertEqual([row[0]["callback_data"] for row in plain], ["reject:appr_1"])
+        plain = HarnessService._approval_keyboard("appr_1", "ambiguous_requirement", None)
+        self.assertEqual([row[0]["id"] for row in plain], ["reject:appr_1"])

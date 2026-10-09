@@ -265,9 +265,8 @@ class RecallConfigTests(TestCase):
         return HarnessConfig(
             memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=Path("t"), trace_root=Path("."),
             claude_command="claude", codex_command="codex", antigravity_command="agy",
-            antigravity_output_mode="auto", cli_timeout_seconds=900, telegram_bot_token=None,
-            telegram_allowed_chat_ids=set(), project_index_path=None, chat_provider="claude",
-            chat_model="haiku", unattended_write_requires_approval=True, **kw,
+            antigravity_output_mode="auto", cli_timeout_seconds=900,
+            chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True, **kw,
         )
 
     def test_recall_falls_back_to_the_digest_chain_then_chat(self) -> None:

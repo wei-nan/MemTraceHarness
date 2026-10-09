@@ -10,7 +10,7 @@ Boundaries enforced here, from what the operator declared in the project's scope
   and only the status, timing, size and the start of the body are returned.
 - ``read_log``: only files in ``log_files`` (paths resolved under the working directory), tail only.
 - ``run_job``: only jobs declared as ``job: name = command``. It does not run anything: it records a
-  request and the human gets a confirm button in Telegram; the gateway runs the command only after
+  request and the human gets a confirm button in the chat; the Harness runs the command only after
   that tap. ``list_jobs`` shows what exists.
 
 Run: ``python -m memtrace_harness.ops_mcp`` (JSON-RPC over stdin/stdout).
@@ -93,7 +93,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "run_job",
         "description": (
             "Ask to run one of the project's named jobs again. This does NOT run it: the user gets a "
-            "confirm/cancel button in Telegram, the job runs only after they tap confirm, and its result "
+            "confirm/cancel button in the chat, the job runs only after they tap confirm, and its result "
             "is reported to them automatically. Say that a confirmation is waiting; do not say it ran."
         ),
         "inputSchema": {
@@ -211,7 +211,7 @@ def request_job(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     ):
         raise OpsError("could not record the request")
     return (
-        f"Requested job {name}. The user now has a confirm button in Telegram (valid 10 minutes); "
+        f"Requested job {name}. The user now has a confirm button in the chat (valid 10 minutes); "
         "it runs only after they tap it, and the result is reported to them automatically."
     )
 

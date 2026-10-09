@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
@@ -17,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from pathlib import Path
 
+from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.completion_claims import (
     CHAT_NOTE_MARKER,
@@ -39,7 +37,7 @@ from memtrace_harness.kb_gardening import (
 from memtrace_harness.kb_promotion import PromotionOutcome
 from memtrace_harness.work_review import PROPOSAL_REASON, ReviewOutcome, describe_review
 from memtrace_harness.kb_promotion import describe_outcome as describe_promotion
-from memtrace_harness.decision_card import answer_for_choice, parse_pick_callback, pick_keyboard_rows
+from memtrace_harness.decision_card import answer_for_choice, parse_pick_action, pick_keyboard_rows
 from memtrace_harness.decision_records import (
     CONTROLLER_OUTCOME_PREFIX,
     PRECEDENT_CONTENT_TYPE,
@@ -111,41 +109,9 @@ _DIGESTS_HEADER = (
     "transcript, not accepted spec; the recent transcript below is newer than these"
 )
 
-# Telegram's sendMessage rejects any text over 4096 UTF-16 code units; stay comfortably
-# under that in plain characters so multi-byte text (e.g. Chinese) never trips it.
-TELEGRAM_MAX_MESSAGE_LENGTH = 3500
 # The most of one Controller-kept overview (research directions, work-review record) that goes into a
 # prompt; longer ones are cut, the full text stays in the knowledge base.
 MAX_OVERVIEW_CHARS = 4500
-
-
-def _split_telegram_text(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split text into <=limit-char chunks so a long report arrives as several readable
-    messages instead of being truncated or rejected by Telegram. Breaks at the last
-    paragraph/line boundary that fits, else the last sentence end, else the last space;
-    only text with none of those (one unbroken run longer than `limit`) is cut hard."""
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        split_at = max(window.rfind("\n\n"), window.rfind("\n"))
-        if split_at < limit // 4:
-            split_at = max(
-                (window.rfind(mark) + len(mark) for mark in ("。", "！", "？", ". ", "! ", "? ")
-                 if window.rfind(mark) != -1),
-                default=-1,
-            )
-        if split_at < limit // 4:
-            split_at = window.rfind(" ")
-        if split_at < limit // 4:
-            split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip("\n ")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
 
 
 def _hydrate_github_issue_context(stage_ref: str, *, working_directory: Path) -> ContextItem | None:
@@ -182,7 +148,18 @@ def _hydrate_github_issue_context(stage_ref: str, *, working_directory: Path) ->
     )
 
 
-class TelegramGateway:
+class HarnessService:
+    """One Harness: the model-based work of a single workspace, with no transport of its own.
+
+    Everything the Harness wants to say goes into the outbox (trace_store.outbox) as neutral
+    events — text, optional button rows `[{label, id}]`, a `bind` saying what to remember the
+    delivered message for. A service (Telegram, ...) fetches them over the local API, delivers
+    them its own way and acknowledges. What people say comes the other way through
+    `handle_message()` and `handle_action()`. The `audience` argument that runs through this file is
+    an opaque address a service handed in with an incoming message ("tg:<chat>"); the Harness only
+    ever passes it back, and `None` means "whoever the operator is".
+    """
+
     def __init__(
         self,
         config: HarnessConfig,
@@ -191,11 +168,8 @@ class TelegramGateway:
         primary_session_mgr: PrimarySessionManager,
         projects: list[ProjectScope],
         memtrace_client: MemTraceClient | None = None,
-        bot_token: str | None = None,
     ) -> None:
         self.config = config
-        self.bot_token = bot_token or config.telegram_bot_token
-        self.allowed_chat_ids = config.telegram_allowed_chat_ids
         self.approval_manager = approval_manager
         self.triage = triage
         self.primary_session_mgr = primary_session_mgr
@@ -214,167 +188,110 @@ class TelegramGateway:
         self._schedule_deliveries: dict[str, ScheduleDelivery] = {}
         # Starts a tidying pass over a project's knowledge-base workspaces now (the /garden
         # command); wired in by the serve command, None means the feature is not running here.
-        self.garden_now: Callable[[ProjectScope, int], None] | None = None
+        self.garden_now: Callable[[ProjectScope, str | None], None] | None = None
         # Same for promoting cold-memory findings into the spec workspace (the /promote command).
-        self.promote_now: Callable[[ProjectScope, int], None] | None = None
+        self.promote_now: Callable[[ProjectScope, str | None], None] | None = None
         # Same for the review of the harness's own work (/review, or asking for it in chat).
-        self.work_review_now: Callable[[ProjectScope, int], None] | None = None
-        # Each process invocation is a fresh instance (the gateway is a one-shot poll,
-        # scheduled externally), so the update offset has to be persisted across runs —
-        # otherwise every run would refetch and reprocess the same historical messages.
-        self._offset_key = hashlib.sha256(self.bot_token.encode("utf-8")).hexdigest() if self.bot_token else None
-        self.offset = (
-            self.approval_manager.trace_store.get_telegram_offset(self._offset_key)
-            if self._offset_key
-            else 0
-        )
+        self.work_review_now: Callable[[ProjectScope, str | None], None] | None = None
+        # Wakes a long-polling API call when something new goes into the outbox.
+        self._outbox_signal = threading.Condition()
 
-    def is_enabled(self) -> bool:
-        return bool(self.bot_token)
+    # ---- outbound: everything said to the operator goes through the outbox
 
-    def send_message(self, chat_id: int, text: str) -> bool:
-        if not self.is_enabled():
+    def _enqueue(self, kind: str, **fields: Any) -> int:
+        event_id = self.approval_manager.trace_store.enqueue_outbox(kind, **fields)
+        with self._outbox_signal:
+            self._outbox_signal.notify_all()
+        return event_id
+
+    def send_message(self, audience: str | None, text: str, *, bind: dict | None = None) -> bool:
+        if not text:
             return False
-        if chat_id not in self.allowed_chat_ids:
-            # Enforce allowlist: never send to non-allowlisted chat IDs
-            return False
-
-        ok = True
-        for chunk in _split_telegram_text(text):
-            ok = self._send_single_message(chat_id, chunk) and ok
-        return ok
-
-    def _send_single_message(self, chat_id: int, text: str) -> bool:
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        # Plain text, deliberately no parse_mode: most fields interpolated into these
-        # messages (goal text, reasons, recommendations) are arbitrary/user-provided and
-        # can contain unescaped Markdown special characters (e.g. "unattended_write" has
-        # an underscore) — Telegram's legacy Markdown mode then fails the whole send with
-        # "can't parse entities" and the message never arrives. Reliability beats styling.
-        payload = {"chat_id": chat_id, "text": text}
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return bool(data.get("ok"))
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram sendMessage failed: {exc}")
-            return False
+        self._enqueue("message", audience=audience, text=text, bind=bind)
+        return True
 
     def send_message_with_keyboard(
-        self, chat_id: int, text: str, keyboard: list[list[dict[str, str]]]
-    ) -> int | None:
-        """Same as send_message() but attaches a Telegram inline keyboard and returns
-        the sent message's id (or None on failure) so the caller can remember which
-        message a button/reply is about — see record_telegram_message()."""
-        if not self.is_enabled() or chat_id not in self.allowed_chat_ids:
-            return None
-        chunks = _split_telegram_text(text)
-        # Send any overflow as plain leading messages, so the keyboard ends up
-        # attached to the final chunk where the operator will actually tap it.
-        for chunk in chunks[:-1]:
-            self._send_single_message(chat_id, chunk)
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": chunks[-1],
-            "reply_markup": {"inline_keyboard": keyboard},
-        }
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result = data.get("result")
-                if data.get("ok") and isinstance(result, dict):
-                    return result.get("message_id")
-                return None
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram sendMessage (with keyboard) failed: {exc}")
-            return None
+        self,
+        audience: str | None,
+        text: str,
+        keyboard: list[list[dict[str, str]]],
+        *,
+        bind: dict | None = None,
+    ) -> int:
+        """Same as send_message() with button rows `[{label, id}]`; a tap comes back through
+        handle_action(id). Returns the outbox event id."""
+        return self._enqueue("message", audience=audience, text=text, actions=keyboard, bind=bind)
 
-    def register_bot_commands(self) -> bool:
-        """Tell Telegram what commands this bot supports (setMyCommands) so they show
-        up in the client's own "/" command menu. There is no dedicated command to
-        start a governed task any more — that now comes out of ordinary
-        conversation with the model (see _chat_reply_and_maybe_start_task()).
-        Idempotent and cheap; safe to call every gateway startup, not just once ever."""
-        if not self.is_enabled():
-            return False
-        url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
-        commands = [
+    def clear_actions(self, message_ref: str | None) -> None:
+        """Best-effort: remove the buttons of an already delivered message once what they asked
+        has been settled, so a stale button can't be tapped again."""
+        if message_ref:
+            self._enqueue("clear", ref=message_ref)
+
+    def send_typing(self, audience: str | None) -> None:
+        """A one-shot "something is happening" hint, not a guarantee."""
+        self._enqueue("typing", audience=audience)
+
+    def notify_operator(self, text: str) -> None:
+        self.send_message(None, text)
+
+    def fetch_events(self, *, limit: int = 20, wait_seconds: float = 0.0) -> list[dict]:
+        """The undelivered outbox events (oldest first), waiting up to `wait_seconds` for one."""
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        store = self.approval_manager.trace_store
+        while True:
+            events = store.claim_outbox(limit=limit)
+            if events or time.monotonic() >= deadline:
+                return events
+            with self._outbox_signal:
+                self._outbox_signal.wait(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
+
+    def ack_event(self, event_id: int, *, ok: bool, message_refs: list[str] | None = None) -> str:
+        """A service's receipt for one event; remembers what the event asked to be remembered."""
+        store = self.approval_manager.trace_store
+        result = store.ack_outbox(event_id, ok=ok, message_refs=message_refs)
+        if result in {"delivered", "failed"}:
+            event = store.get_outbox_event(event_id)
+            if event and event.get("bind"):
+                try:
+                    self._on_delivery(event["bind"], delivered=result == "delivered", refs=message_refs or [])
+                except Exception:
+                    logger.exception(f"recording the delivery of outbox event {event_id} failed")
+        return result
+
+    def _on_delivery(self, bind: dict, *, delivered: bool, refs: list[str]) -> None:
+        """What a delivered (or given-up) message was waiting for. Only the last reference is
+        kept: with more than one chat on a service the common case is still a single operator."""
+        kind, ident = bind.get("type"), bind.get("id")
+        store = self.approval_manager.trace_store
+        ref = refs[-1] if refs else None
+        if kind == "approval" and delivered and ref:
+            self.approval_manager.record_message_ref(ident, ref)
+        elif kind == "order":
+            if delivered and ref:
+                store.set_order_intent_message(ident, ref)
+            elif not delivered:
+                # Never reached the operator: put it back so the next tick shows it again.
+                store.transition_order_intent(ident, ("awaiting",), "pending")
+        elif kind == "job":
+            if delivered and ref:
+                store.set_job_request_message(ident, ref)
+            elif not delivered:
+                store.transition_job_request(ident, ("awaiting",), "pending")
+
+    def commands(self) -> list[dict[str, str]]:
+        """The slash commands this Harness understands, for a service to list in its own UI."""
+        return [
             {"command": "status", "description": "查看目前狀態與可用指令"},
             {"command": "approve", "description": "核准待處理的請求（可加請求 ID）"},
             {"command": "reject", "description": "拒絕待處理的請求（可加請求 ID）"},
             {"command": "clarify", "description": "補充說明並繼續執行（可加請求 ID 與說明）"},
             {"command": "schedules", "description": "查看這個專案目前的排程"},
-            {"command": "garden", "description": "現在就整理這個專案的知識庫（可加專案名）"},
-            {"command": "promote", "description": "把冷記憶的研究結論整理進規格工作區（可加專案名）"},
-            {"command": "review", "description": "復盤 harness 自己的工作：哪裡卡住、怎麼改進（可加專案名）"},
+            {"command": "garden", "description": "現在就整理這個專案的知識庫"},
+            {"command": "promote", "description": "把冷記憶的研究結論整理進規格工作區"},
+            {"command": "review", "description": "復盤 harness 自己的工作：哪裡卡住、怎麼改進"},
             {"command": "schedule_cancel", "description": "取消一組排程（需加排程 ID）"},
         ]
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps({"commands": commands}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                return bool(data.get("ok"))
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram setMyCommands failed: {exc}")
-            return False
-
-    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
-        """Required after handling a button tap — until this is called, Telegram keeps
-        showing a loading spinner on the button the user just pressed."""
-        if not self.is_enabled():
-            return
-        url = f"https://api.telegram.org/bot{self.bot_token}/answerCallbackQuery"
-        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
-        if text:
-            payload["text"] = text
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram answerCallbackQuery failed: {exc}")
-
-    def clear_message_keyboard(self, chat_id: int, message_id: int) -> None:
-        """Best-effort: remove the approve/reject buttons once a request is resolved,
-        so a stale button can't be tapped again after the request is no longer pending."""
-        if not self.is_enabled():
-            return
-        url = f"https://api.telegram.org/bot{self.bot_token}/editMessageReplyMarkup"
-        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}}
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram editMessageReplyMarkup failed: {exc}")
 
     @staticmethod
     def _approval_keyboard(
@@ -385,109 +302,57 @@ class TelegramGateway:
             # the same way out as the question-only keyboard below.
             return [
                 *pick_keyboard_rows(request_id, decision_card),
-                [{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}],
+                [{"label": "🛑 放棄這個任務", "id": f"reject:{request_id}"}],
             ]
         if reason in INFO_NEEDED_REASONS:
             # No "approve" button here — see INFO_NEEDED_REASONS: a bare approve
             # would just resume with the same unchanged goal that produced this
             # question in the first place. Answering is a text reply, not a tap.
-            return [[{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}]]
+            return [[{"label": "🛑 放棄這個任務", "id": f"reject:{request_id}"}]]
         if reason == "config_change_required":
-            # Only a way to close the request — see format_telegram_message(): neither
+            # Only a way to close the request — see ApprovalRequestData.format_message(): neither
             # approving nor answering can lift a project-setting limit.
-            return [[{"text": "🛑 放棄這個任務", "callback_data": f"reject:{request_id}"}]]
+            return [[{"label": "🛑 放棄這個任務", "id": f"reject:{request_id}"}]]
         if reason == "model_output_invalid":
             # Same approve/reject callback_data as the default case (resolve logic
             # is unchanged) — only the labels differ, since "approve" here means
             # "retry the same goal" rather than "go ahead with this write action".
             return [
                 [
-                    {"text": "🔁 重試", "callback_data": f"approve:{request_id}"},
-                    {"text": "❌ 放棄", "callback_data": f"reject:{request_id}"},
+                    {"label": "🔁 重試", "id": f"approve:{request_id}"},
+                    {"label": "❌ 放棄", "id": f"reject:{request_id}"},
                 ]
             ]
         return [
             [
-                {"text": "✅ 核准", "callback_data": f"approve:{request_id}"},
-                {"text": "❌ 拒絕", "callback_data": f"reject:{request_id}"},
+                {"label": "✅ 核准", "id": f"approve:{request_id}"},
+                {"label": "❌ 拒絕", "id": f"reject:{request_id}"},
             ]
         ]
 
     def notify_approval_request(self, req: ApprovalRequestData) -> None:
-        """Send an approval request with tappable buttons to every allowlisted chat,
-        and remember the (chat_id, message_id) so a swipe-reply to it later resolves
-        unambiguously back to this request. Note: with more than one allowlisted chat,
-        only the last chat's message_id is kept for reply-matching — the common case
-        here is a single operator/single chat, so this isn't built out further."""
-        for cid in self.allowed_chat_ids:
-            message_id = self.send_message_with_keyboard(
-                cid,
-                req.format_telegram_message(),
-                self._approval_keyboard(req.id, req.reason, req.decision_card),
-            )
-            if message_id is not None:
-                self.approval_manager.record_telegram_message(
-                    req.id, chat_id=cid, message_id=message_id
-                )
+        """Put an approval request, with its buttons, in front of the operator, and remember
+        which delivered message carries it (the outbox ack) so a reply to that message resolves
+        unambiguously back to this request."""
+        self.send_message_with_keyboard(
+            None,
+            req.format_message(),
+            self._approval_keyboard(req.id, req.reason, req.decision_card),
+            bind={"type": "approval", "id": req.id},
+        )
 
-    def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
-        """Best-effort "typing..." indicator. Telegram only shows it for ~5s per call
-        and there's no long-running work happening on this thread to refresh it from,
-        so this is a one-shot hint, not a guarantee it stays up for the whole wait —
-        the point is to signal "something is happening" immediately, not to be exact."""
-        if not self.is_enabled() or chat_id not in self.allowed_chat_ids:
-            return
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendChatAction"
-        payload = {"chat_id": chat_id, "action": action}
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram sendChatAction failed: {exc}")
-
-    def notify_all_allowlisted(self, text: str) -> None:
-        for cid in self.allowed_chat_ids:
-            self.send_message(cid, text)
-
-    def get_updates(self, timeout: int = 10) -> list[dict[str, Any]]:
-        if not self.is_enabled():
-            return []
-
-        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates?offset={self.offset}&timeout={timeout}"
-        try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("ok"):
-                    return data.get("result", [])
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            logger.error(f"Telegram getUpdates failed: {exc}")
-        return []
-
-    def process_update(self, update: dict[str, Any]) -> str | None:
-        update_id = update.get("update_id", 0)
-        self.offset = max(self.offset, update_id + 1)
-
-        callback_query = update.get("callback_query")
-        if callback_query:
-            return self._handle_callback_query(callback_query)
-
-        message = update.get("message")
-        if not message:
-            return None
-
-        chat_id = message.get("chat", {}).get("id")
-        if chat_id is None or chat_id not in self.allowed_chat_ids:
-            # HARD REQUIREMENT: Any chat ID not on the allowlist is ignored at transport layer
-            return None
-
-        text = message.get("text", "")
+    def handle_message(
+        self,
+        text: str,
+        *,
+        audience: str | None,
+        reply_to_ref: str | None = None,
+        reply_to_text: str | None = None,
+    ) -> str | None:
+        """What a person said, as a service relays it. Everything the Harness answers goes to the
+        outbox; the returned string is only the gist, for tests and the API's synchronous echo.
+        `reply_to_ref`/`reply_to_text` carry the message being replied to, if any."""
+        text = (text or "").strip()
         if not text:
             return None
 
@@ -497,17 +362,17 @@ class TelegramGateway:
             assert result.approval_id is not None
             assert result.approval_action is not None
             return self._resolve_approval_action(
-                result.approval_id, result.approval_action, chat_id, result.approval_reason
+                result.approval_id, result.approval_action, audience, result.approval_reason
             )
 
         if result.kind == "out_of_scope" or result.kind == "unrecognized":
             rejection = result.rejection_message or "已拒絕（超出範圍）。"
-            self.send_message(chat_id, f"❌ {rejection}")
+            self.send_message(audience, f"❌ {rejection}")
             return rejection
 
         if result.kind == "review":
-            msg = self._start_work_review(result.project_scope, chat_id)
-            self.send_message(chat_id, msg)
+            msg = self._start_work_review(result.project_scope, audience)
+            self.send_message(audience, msg)
             return msg
 
         if result.kind == "promote":
@@ -515,11 +380,11 @@ class TelegramGateway:
             if scope is None:
                 msg = "請指定專案，例如 /promote TWTradingStrategy。"
             elif self.promote_now is None:
-                msg = "研究結論整理在這個 gateway 沒有啟用。"
+                msg = "研究結論整理在這個 Harness 沒有啟用。"
             else:
-                self.promote_now(scope, chat_id)
+                self.promote_now(scope, audience)
                 msg = f"📚 開始把「{scope.name}」冷記憶裡的研究結論整理進規格工作區，完成後會回報（可能要幾分鐘）。"
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             return msg
 
         if result.kind == "garden":
@@ -527,16 +392,16 @@ class TelegramGateway:
             if scope is None:
                 msg = "請指定要整理哪個專案的知識庫，例如 /garden Beri。"
             elif self.garden_now is None:
-                msg = "知識庫整理在這個 gateway 沒有啟用。"
+                msg = "知識庫整理在這個 Harness 沒有啟用。"
             else:
-                self.garden_now(scope, chat_id)
+                self.garden_now(scope, audience)
                 msg = f"🌱 開始整理「{scope.name}」的知識庫，完成後會回報（可能要幾分鐘）。"
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             return msg
 
         if result.kind == "status":
             info = (
-                f"Harness Gateway 已上線。\n已註冊專案數：{len(self.projects)}\n\n"
+                f"Harness 已上線：{self.projects[0].name if self.projects else '（無專案）'}。\n\n"
                 "指令：\n"
                 "/status — 看這則訊息\n"
                 "一般打字：直接跟模型聊天即可，不用特定格式或前綴。如果對話讓模型確信你"
@@ -547,23 +412,23 @@ class TelegramGateway:
                 "/schedules — 查看這個專案目前的排程\n"
                 "/schedule_cancel <id> — 取消一組排程"
             )
-            self.send_message(chat_id, info)
+            self.send_message(audience, info)
             return info
 
         if result.kind == "schedule_list":
             scope = result.project_scope
             if scope is None:
                 msg = "無法對應到任何已註冊的專案，請在訊息裡提到專案名稱。"
-                self.send_message(chat_id, msg)
+                self.send_message(audience, msg)
                 return msg
             msg = self.list_schedules_message(scope)
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             return msg
 
         if result.kind == "schedule_cancel":
             assert result.schedule_id is not None
             msg = self.cancel_schedule_message(result.schedule_id)
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             return msg
 
         if result.kind == "chat":
@@ -575,37 +440,37 @@ class TelegramGateway:
             # whether real development work should start).
             scope = result.project_scope
             assert scope is not None
-            # Telegram attaches the full text of a swipe-replied-to message, whoever
-            # sent it — including this bot's own scheduled pushes and notifications
-            # from external scripts that use the same bot, neither of which the
-            # Harness would otherwise ever see (a bot never receives its own messages).
-            quoted = self._replied_to_text(message)
+            # A service attaches the full text of a replied-to message, whoever sent it —
+            # including this Harness's own scheduled pushes and notifications from external
+            # scripts that use the same bot, neither of which the Harness would otherwise ever
+            # see (a bot never receives its own messages).
+            quoted = (reply_to_text or "").strip() or None
             self.primary_session_mgr.record_turn(
                 project=scope.name,
                 speaker="user",
                 turn_type="chat",
                 content=text if not quoted else f"{text}\n{self._quote_marker(quoted)}",
             )
-            self.send_chat_action(chat_id, "typing")
+            self.send_typing(audience)
             if self.topic_recall is not None:
-                self.topic_recall.start(scope, chat_id, text)
+                self.topic_recall.start(scope, audience, text)
 
-            # A swipe-reply to a pending approval's own message may be the answer it is
-            # waiting for — or a question about it, or an unrelated remark. Resuming a task
-            # costs a whole loop (2026-10-05: a question typed as a swipe-reply started an
-            # Opus planner run), so the chat model decides: it sees the approval and only
-            # resumes the task by emitting HARNESS_APPROVAL_ANSWER::. When it isn't sure the
-            # task stays paused (the buttons and /clarify still work).
+            # A reply to a pending approval's own message may be the answer it is waiting for —
+            # or a question about it, or an unrelated remark. Resuming a task costs a whole loop
+            # (2026-10-05: a question typed as a swipe-reply started an Opus planner run), so the
+            # chat model decides: it sees the approval and only resumes the task by emitting
+            # HARNESS_APPROVAL_ANSWER::. When it isn't sure the task stays paused (the buttons and
+            # /clarify still work).
             pending_approval = None
-            reply_to = message.get("reply_to_message")
-            if reply_to and reply_to.get("message_id") is not None:
-                candidate = self.approval_manager.get_by_telegram_message(chat_id, reply_to["message_id"])
+            if reply_to_ref:
+                candidate = self.approval_manager.get_by_message_ref(reply_to_ref)
                 if candidate and candidate.status == "pending":
                     pending_approval = candidate
 
             return self._chat_reply_and_maybe_start_task(
-                scope, chat_id, text, quoted_text=quoted, pending_approval=pending_approval
+                scope, audience, text, quoted_text=quoted, pending_approval=pending_approval
             )
+        return None
 
     # Stored with the user's turn so the transcript (and the nightly digest) still shows
     # what a short reply like "那檔怎麼了" was about. Kept after the user's own words so
@@ -630,20 +495,11 @@ class TelegramGateway:
             f"被回覆的訊息：\n「{shown}」\n\n"
         )
 
-    @staticmethod
-    def _replied_to_text(message: dict[str, Any]) -> str | None:
-        reply_to = message.get("reply_to_message")
-        if not isinstance(reply_to, dict):
-            return None
-        text = reply_to.get("text") or reply_to.get("caption")
-        text = text.strip() if isinstance(text, str) else ""
-        return text or None
-
     def _resolve_approval_action(
         self,
         request_id: str,
         action: str,
-        chat_id: int,
+        audience: str | None,
         reason_or_answer: str | None,
         chosen_index: int | None = None,
     ) -> str:
@@ -652,13 +508,12 @@ class TelegramGateway:
         _classify_message_intent()) — one place that resolves an approval and
         reacts to the outcome, so those entry points can't drift out of sync."""
         success, msg, req_data = self.approval_manager.respond(
-            request_id=request_id, action=action, chat_id=chat_id, reason_or_answer=reason_or_answer
+            request_id=request_id, action=action, audience=audience, reason_or_answer=reason_or_answer
         )
-        self.send_message(chat_id, f"核准狀態更新：{msg}")
+        self.send_message(audience, f"核准狀態更新：{msg}")
         if success and req_data:
             self._record_decision(req_data, action, reason_or_answer, chosen_index)
-            if req_data.telegram_chat_id is not None and req_data.telegram_message_id is not None:
-                self.clear_message_keyboard(req_data.telegram_chat_id, req_data.telegram_message_id)
+            self.clear_actions(req_data.message_ref)
             if req_data.status == "approved":
                 self._resume_approved_conversation(req_data, reason_or_answer)
             elif req_data.status in {"rejected", "expired"}:
@@ -706,8 +561,8 @@ class TelegramGateway:
             logger.exception(f"recording the decision on {req_data.id} failed; continuing")
 
     def expire_stale_approvals(self, ttl_hours: int, now: datetime | None = None) -> list[str]:
-        """Close this gateway's pending approvals older than `ttl_hours`: mark them
-        expired, strip their Telegram buttons, and tell the operator once. Workspace
+        """Close this Harness's pending approvals older than `ttl_hours`: mark them
+        expired, strip their buttons, and tell the operator once. Workspace
         locks are left alone — a lock belongs to whatever run holds it now — except
         the one an unattended scan took while proposing the task: that lock exists only
         to hold the question, so once it expires nothing owns it and it would block every
@@ -728,74 +583,40 @@ class TelegramGateway:
                 self.approval_manager.trace_store.release_workspace_lock(
                     data["workspace"], data["conversation_id"]
                 )
-            if data.get("telegram_chat_id") is not None and data.get("telegram_message_id") is not None:
-                self.clear_message_keyboard(data["telegram_chat_id"], data["telegram_message_id"])
+            self.clear_actions(data.get("message_ref"))
         if expired:
-            self.notify_all_allowlisted(
+            self.notify_operator(
                 f"⌛ {len(expired)} 筆超過 {ttl_hours} 小時沒回應的請求已自動失效"
                 f"（{', '.join(expired)}）。它們的按鈕已移除；如果任務還需要，請重新下指令。"
             )
         return expired
 
-    def _handle_callback_query(self, callback_query: dict[str, Any]) -> str | None:
-        """A tap on an approve/reject inline-keyboard button. Telegram delivers this as
-        its own update type (not a "message"), separate from ordinary text updates."""
-        callback_id = callback_query.get("id")
-        data = callback_query.get("data") or ""
-        source_message = callback_query.get("message") or {}
-        chat_id = source_message.get("chat", {}).get("id")
-        if chat_id is None or chat_id not in self.allowed_chat_ids:
-            if callback_id:
-                self.answer_callback_query(callback_id)
-            return None
-        pick = parse_pick_callback(data)
+    def handle_action(
+        self, action_id: str, *, audience: str | None, message_ref: str | None = None
+    ) -> str | None:
+        """A tap on a button the Harness sent (`id` from the button row). Returns a short line a
+        service may show as a toast; the full outcome goes to the outbox like everything else."""
+        pick = parse_pick_action(action_id)
         if pick is not None:
-            result = self._resolve_card_pick(pick[0], pick[1], chat_id)
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
-        action, _, request_id = data.partition(":")
+            return self._resolve_card_pick(pick[0], pick[1], audience)[:200]
+        action, _, request_id = action_id.partition(":")
         if not action or not request_id:
-            if callback_id:
-                self.answer_callback_query(callback_id, text="無法辨識的按鈕")
-            return None
+            return "無法辨識的按鈕"
         if action == "kb_undo":
-            result = self._resolve_garden_undo(request_id, chat_id, source_message.get("message_id"))
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
+            return self._resolve_garden_undo(request_id, audience, message_ref)[:200]
         if action in {CLAIM_OK, CLAIM_NO}:
-            result = self._resolve_claim(action, request_id, chat_id, source_message.get("message_id"))
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
+            return self._resolve_claim(action, request_id, audience, message_ref)[:200]
         if action in {"sched_resume", "sched_cancel"}:
-            result = self._resolve_schedule_button(
-                action.removeprefix("sched_"), request_id, chat_id, source_message.get("message_id")
-            )
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
+            return self._resolve_schedule_button(
+                action.removeprefix("sched_"), request_id, audience, message_ref
+            )[:200]
         if action in {"job_confirm", "job_cancel"}:
-            result = self._resolve_job_action(
-                action, request_id, chat_id, source_message.get("message_id")
-            )
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
+            return self._resolve_job_action(action, request_id, audience, message_ref)[:200]
         if action in {"order_confirm", "order_cancel"}:
-            result = self._resolve_order_action(
-                action, request_id, chat_id, source_message.get("message_id")
-            )
-            if callback_id:
-                self.answer_callback_query(callback_id, text=result[:200])
-            return result
-        result = self._resolve_approval_action(request_id, action, chat_id, None)
-        if callback_id:
-            self.answer_callback_query(callback_id, text=result[:200])
-        return result
+            return self._resolve_order_action(action, request_id, audience, message_ref)[:200]
+        return self._resolve_approval_action(request_id, action, audience, None)[:200]
 
-    def _resolve_card_pick(self, request_id: str, index: int, chat_id: int) -> str:
+    def _resolve_card_pick(self, request_id: str, index: int, audience: str | None) -> str:
         """A tap on one option of a decision card: resume the stopped task with that option
         as the operator's answer, exactly as if they had typed it to /clarify."""
         req = self.approval_manager.get_request(request_id)
@@ -805,7 +626,7 @@ class TelegramGateway:
         if answer is None:
             return "無法辨識的選項"
         return self._resolve_approval_action(
-            request_id, "clarify", chat_id, answer, chosen_index=index
+            request_id, "clarify", audience, answer, chosen_index=index
         )
 
     # ---- orders the model proposed (see taiwantrade_mcp.py): shown here, sent only on a tap
@@ -827,8 +648,8 @@ class TelegramGateway:
         confirm, abort = ("✅ 確認撤單", "❌ 不撤單") if kind == "cancel" else ("✅ 確認下單", "❌ 取消")
         return [
             [
-                {"text": confirm, "callback_data": f"order_confirm:{intent_id}"},
-                {"text": abort, "callback_data": f"order_cancel:{intent_id}"},
+                {"label": confirm, "id": f"order_confirm:{intent_id}"},
+                {"label": abort, "id": f"order_cancel:{intent_id}"},
             ]
         ]
 
@@ -850,7 +671,7 @@ class TelegramGateway:
         )
 
     def process_order_intents(self) -> None:
-        """Gateway tick: put newly proposed orders in front of the human, and close the
+        """Harness tick: put newly proposed orders in front of the human, and close the
         ones nobody confirmed in time."""
         trace_store = self.approval_manager.trace_store
         for order in trace_store.claim_pending_order_intents([p.name for p in self.projects]):
@@ -870,29 +691,19 @@ class TelegramGateway:
                     "這是模型提出的委託，還沒有送到券商。按「確認下單」才會送出；不按、按取消、"
                     "或時間到都不會下單。"
                 )
-            shown = False
-            if order["telegram_message_id"] is not None and order["telegram_chat_id"] is not None:
-                # Re-shown: the earlier buttons are stale clutter higher up the chat.
-                self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
-            for cid in self.allowed_chat_ids:
-                message_id = self.send_message_with_keyboard(
-                    cid, text, self._order_keyboard(order["intent_id"], order["kind"])
-                )
-                if message_id is not None:
-                    trace_store.set_order_intent_message(
-                        order["intent_id"], chat_id=cid, message_id=message_id
-                    )
-                    shown = True
-            if not shown:
-                # Telegram unreachable: put it back so the next tick tries again.
-                trace_store.transition_order_intent(order["intent_id"], ("awaiting",), "pending")
+            # Re-shown: the earlier buttons are stale clutter higher up the chat. If the delivery
+            # never succeeds the outbox gives up and _on_delivery() puts the order back to pending.
+            self.clear_actions(order["message_ref"])
+            self.send_message_with_keyboard(
+                None, text, self._order_keyboard(order["intent_id"], order["kind"]),
+                bind={"type": "order", "id": order["intent_id"]},
+            )
         for order in trace_store.expire_order_intents(datetime.now(timezone.utc).isoformat()):
-            if order["telegram_message_id"] is not None and order["telegram_chat_id"] is not None:
-                self.clear_message_keyboard(order["telegram_chat_id"], order["telegram_message_id"])
-                self.send_message(
-                    order["telegram_chat_id"],
+            if order["message_ref"]:
+                self.clear_actions(order["message_ref"])
+                self.notify_operator(
                     f"⌛ {'撤單' if order['kind'] == 'cancel' else '委託'}已過期，沒有"
-                    f"{'撤單' if order['kind'] == 'cancel' else '下單'}：{self._order_summary(order)}",
+                    f"{'撤單' if order['kind'] == 'cancel' else '下單'}：{self._order_summary(order)}"
                 )
             self._record_order_turn(
                 order["project"],
@@ -905,7 +716,7 @@ class TelegramGateway:
     JOB_OUTPUT_CHARS = 1500
 
     def process_job_requests(self) -> None:
-        """Gateway tick: put newly requested jobs in front of the human; close the unanswered."""
+        """Harness tick: put newly requested jobs in front of the human; close the unanswered."""
         trace_store = self.approval_manager.trace_store
         for job in trace_store.claim_pending_job_requests([p.name for p in self.projects]):
             text = (
@@ -915,41 +726,34 @@ class TelegramGateway:
                 "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
             )
             keyboard = [[
-                {"text": "✅ 確認執行", "callback_data": f"job_confirm:{job['request_id']}"},
-                {"text": "❌ 取消", "callback_data": f"job_cancel:{job['request_id']}"},
+                {"label": "✅ 確認執行", "id": f"job_confirm:{job['request_id']}"},
+                {"label": "❌ 取消", "id": f"job_cancel:{job['request_id']}"},
             ]]
-            shown = False
-            for cid in self.allowed_chat_ids:
-                message_id = self.send_message_with_keyboard(cid, text, keyboard)
-                if message_id is not None:
-                    trace_store.set_job_request_message(job["request_id"], chat_id=cid, message_id=message_id)
-                    shown = True
-            if not shown:
-                trace_store.transition_job_request(job["request_id"], ("awaiting",), "pending")
+            self.send_message_with_keyboard(
+                None, text, keyboard, bind={"type": "job", "id": job["request_id"]}
+            )
         for job in trace_store.expire_job_requests(datetime.now(timezone.utc).isoformat()):
-            if job["telegram_message_id"] is not None and job["telegram_chat_id"] is not None:
-                self.clear_message_keyboard(job["telegram_chat_id"], job["telegram_message_id"])
+            self.clear_actions(job["message_ref"])
             msg = f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}"
-            if job["telegram_chat_id"] is not None:
-                self.send_message(job["telegram_chat_id"], msg)
+            if job["message_ref"]:
+                self.notify_operator(msg)
             self._record_order_turn(job["project"], msg)
 
     def _resolve_job_action(
-        self, action: str, request_id: str, chat_id: int, message_id: int | None
+        self, action: str, request_id: str, audience: str | None, message_ref: str | None
     ) -> str:
         trace_store = self.approval_manager.trace_store
         job = trace_store.get_job_request(request_id)
         scope = next((p for p in self.projects if job and p.name == job["project"]), None)
         if job is None or scope is None:
             return "找不到這個要求。"
-        if message_id is not None:
-            self.clear_message_keyboard(chat_id, message_id)
+        self.clear_actions(message_ref)
         if action == "job_cancel":
             if not trace_store.transition_job_request(request_id, ("awaiting",), "cancelled"):
                 return f"這個要求已經是「{job['status']}」，沒有變動。"
             trace_store.finish_job_request(request_id, "cancelled")
             result = f"❌ 已取消，沒有執行：{job['job_name']}"
-            self.send_message(chat_id, result)
+            self.send_message(audience, result)
             self._record_order_turn(job["project"], result)
             return result
         # Compare-and-set: a double tap cannot start it twice. The command is the one declared
@@ -961,19 +765,19 @@ class TelegramGateway:
             trace_store.finish_job_request(request_id, "failed", {"error": "job no longer declared"})
             return f"工作 {job['job_name']} 已不在專案設定裡，沒有執行。"
         threading.Thread(
-            target=self._run_job, args=(scope, job, command, chat_id), daemon=True,
+            target=self._run_job, args=(scope, job, command, audience), daemon=True,
             name=f"job-{request_id}",
         ).start()
         started = f"▶️ 開始執行 {job['job_name']}，完成後會回報。"
-        self.send_message(chat_id, started)
+        self.send_message(audience, started)
         return started
 
-    def _run_job(self, scope: ProjectScope, job: dict, command: str, chat_id: int) -> None:
+    def _run_job(self, scope: ProjectScope, job: dict, command: str, audience: str | None) -> None:
         trace_store = self.approval_manager.trace_store
         try:
             done = subprocess.run(
                 command, shell=True, cwd=scope.working_directory, capture_output=True, text=True,
-                timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
+                timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=child_env(),
             )
             output = ((done.stdout or "") + (done.stderr or "")).strip()
             status, code = ("done" if done.returncode == 0 else "failed"), done.returncode
@@ -985,11 +789,11 @@ class TelegramGateway:
         trace_store.finish_job_request(job["request_id"], status, {"exit_code": code, "output_tail": tail})
         head = "✅ 完成" if status == "done" else f"❌ 失敗（結束碼 {code}）"
         result = f"{head}：{job['job_name']}\n{tail}"
-        self.send_message(chat_id, result)
+        self.send_message(audience, result)
         self._record_order_turn(job["project"], result)
 
     def _resolve_order_action(
-        self, action: str, intent_id: str, chat_id: int, message_id: int | None
+        self, action: str, intent_id: str, audience: str | None, message_ref: str | None
     ) -> str:
         trace_store = self.approval_manager.trace_store
         order = trace_store.get_order_intent(intent_id)
@@ -1007,9 +811,8 @@ class TelegramGateway:
             )
         else:
             result = self._confirm_order(order, summary)
-        if message_id is not None:
-            self.clear_message_keyboard(chat_id, message_id)
-        self.send_message(chat_id, result)
+        self.clear_actions(message_ref)
+        self.send_message(audience, result)
         self._record_order_turn(order["project"], result)
         return result
 
@@ -1075,7 +878,7 @@ class TelegramGateway:
         )
 
     def _start_or_queue_task(
-        self, scope: ProjectScope, goal: str, chat_id: int, schedule_id: str | None = None
+        self, scope: ProjectScope, goal: str, audience: str | None, schedule_id: str | None = None
     ) -> str:
         """Start a governed task now if the project has a free worker slot, otherwise
         queue it. A schedule whose previous run is still running (or still queued) is
@@ -1097,14 +900,14 @@ class TelegramGateway:
                 payload={"goal": goal},
                 conversation_id=None,
                 schedule_id=schedule_id,
-                chat_id=chat_id,
+                audience=audience,
             )
             position = sum(1 for q in trace_store.list_queued_tasks(ws_id) if q["id"] <= queue_id)
             msg = (
                 f"「{scope.name}」的 {slot_limit} 個任務位都在忙，這個任務已排入佇列"
                 f"（第 {position} 位），有空位時會自動開始。"
             )
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             return msg
 
         # No separate approval step before starting: the decision to do real
@@ -1113,8 +916,8 @@ class TelegramGateway:
         # decision has already been made together with the human in the chat.
         # Say WHICH task started: with several schedules (and chat tasks) running, a bare
         # "a task started" can't be told apart.
-        self.send_message(chat_id, self._task_started_text(scope, goal, schedule_id))
-        self._launch_task(scope, conv_id, goal, chat_id, schedule_id)
+        self.send_message(audience, self._task_started_text(scope, goal, schedule_id))
+        self._launch_task(scope, conv_id, goal, audience, schedule_id)
         return f"任務已在背景開始執行：{goal}"
 
     @staticmethod
@@ -1124,7 +927,7 @@ class TelegramGateway:
         return f"🔧 開始執行「{scope.name}」：{goal}"
 
     def _launch_task(
-        self, scope: ProjectScope, conv_id: str, goal: str, chat_id: int, schedule_id: str | None
+        self, scope: ProjectScope, conv_id: str, goal: str, audience: str | None, schedule_id: str | None
     ) -> None:
         """Run an already-slotted task in a background thread so this bot's poll loop —
         and therefore ordinary chat on it — isn't blocked for the minutes a governed loop
@@ -1143,7 +946,7 @@ class TelegramGateway:
                     logger.info(f"schedule {schedule_id} result held back for the digest: {delivery.reason}")
                     return
                 if delivery is not None and delivery.action == "pause_and_notify":
-                    self._pause_and_notify(scope, schedule_id, summary, delivery, chat_id)
+                    self._pause_and_notify(scope, schedule_id, summary, delivery, audience)
                     return
                 if schedule_id and summary.status == "needs_human":
                     # A notification, not a question: no approval is open, so a later reply
@@ -1159,11 +962,11 @@ class TelegramGateway:
                         f"🧩 {self._model_summary(summary)}"
                     )
                 self._report_run_outcome(
-                    conv_id=conv_id, summary=summary, final_text=msg, chat_id=chat_id
+                    conv_id=conv_id, summary=summary, final_text=msg, audience=audience
                 )
             except Exception:
                 logger.exception(f"background agent loop for '{scope.name}' ({conv_id}) failed")
-                self.send_message(chat_id, f"⚠️「{scope.name}」的任務執行時發生未預期錯誤，請查看日誌。")
+                self.send_message(audience, f"⚠️「{scope.name}」的任務執行時發生未預期錯誤，請查看日誌。")
                 if schedule_id:
                     # The human just got a failure notice for this schedule; without a
                     # row the chat model would know nothing about it.
@@ -1187,7 +990,7 @@ class TelegramGateway:
         )
 
     def drain_task_queues(self) -> None:
-        """Start queued tasks wherever a worker slot is free. Also called on the gateway
+        """Start queued tasks wherever a worker slot is free. Also called on the Harness
         tick, so work queued before a restart is picked up again."""
         trace_store = self.approval_manager.trace_store
         queued = set(trace_store.queued_workspace_ids())
@@ -1224,7 +1027,7 @@ class TelegramGateway:
             logger.exception(f"draining the task queue for '{scope.name}' failed")
 
     def _start_queued_item(self, scope: ProjectScope, item: dict, conv_id: str) -> None:
-        chat_id = item["chat_id"]
+        audience = item["audience"]
         if item["kind"] == "resume":
             req = self.approval_manager.get_request(item["payload"]["request_id"])
             if req is None or req.status != "approved":
@@ -1233,11 +1036,11 @@ class TelegramGateway:
             self._launch_resume(req, item["payload"].get("answer"))
             return
         goal = item["payload"]["goal"]
-        if chat_id is not None:
+        if audience is not None:
             self.send_message(
-                chat_id, f"▶️ 輪到排隊中的任務了，開始執行「{scope.name}」：{goal[:80]}"
+                audience, f"▶️ 輪到排隊中的任務了，開始執行「{scope.name}」：{goal[:80]}"
             )
-        self._launch_task(scope, conv_id, goal, chat_id, item["schedule_id"])
+        self._launch_task(scope, conv_id, goal, audience, item["schedule_id"])
 
     # ---- per-task git worktrees (see worktrees.py)
 
@@ -1594,7 +1397,7 @@ class TelegramGateway:
         return items
 
     def _report_run_outcome(
-        self, *, conv_id: str, summary, final_text: str, chat_id: int | None = None
+        self, *, conv_id: str, summary, final_text: str, audience: str | None = None
     ) -> None:
         """Report a finished (or checkpoint-stopped) Agent Loop run. A 'needs_human'
         status can mean a fresh ApprovalRequest is now pending (e.g. the git-push
@@ -1610,57 +1413,53 @@ class TelegramGateway:
         if claim is not None:
             claim_id, extra_lines = claim
             text = "\n".join([final_text, *extra_lines]) + "\n\n請驗收：完成了就按「驗收通過」，不是你要的就按「還沒完成」（沒有期限，沒按就一直維持待驗收）。"
-            for cid in [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids):
-                self.send_message_with_keyboard(cid, text, claim_keyboard(claim_id))
+            self.send_message_with_keyboard(audience, text, claim_keyboard(claim_id))
             return
-        if chat_id is not None:
-            self.send_message(chat_id, final_text)
+        if audience is not None:
+            self.send_message(audience, final_text)
         else:
-            self.notify_all_allowlisted(final_text)
+            self.notify_operator(final_text)
 
-    def notify_garden_outcome(self, outcome: GardenOutcome, chat_id: int | None = None) -> None:
+    def notify_garden_outcome(self, outcome: GardenOutcome, audience: str | None = None) -> None:
         """Tell the operator what a tidying pass did, with a one-tap undo when it deleted
         anything (the nodes are in MemTrace's trash and copied locally)."""
         text = describe_outcome(outcome)
         keyboard = (
-            [[{"text": "↩️ 還原這批刪除", "callback_data": f"kb_undo:{outcome.run_id}"}]]
+            [[{"label": "↩️ 還原這批刪除", "id": f"kb_undo:{outcome.run_id}"}]]
             if outcome.deleted
             else None
         )
-        for cid in [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids):
-            if keyboard:
-                self.send_message_with_keyboard(cid, text, keyboard)
-            else:
-                self.send_message(cid, text)
+        if keyboard:
+            self.send_message_with_keyboard(audience, text, keyboard)
+        else:
+            self.send_message(audience, text)
         self.primary_session_mgr.record_turn(
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
 
-    def _start_work_review(self, scope: ProjectScope | None, chat_id: int) -> str:
+    def _start_work_review(self, scope: ProjectScope | None, audience: str | None) -> str:
         """Start a review of the harness's own work for a project, in the background. Shared by
         the /review command and the chat model's request. Returns what to tell the operator."""
         if scope is None:
             return "請指定專案，例如 /review TWTradingStrategy。"
         if self.work_review_now is None:
-            return "工作復盤在這個 gateway 沒有啟用。"
-        self.work_review_now(scope, chat_id)
+            return "工作復盤在這個 Harness 沒有啟用。"
+        self.work_review_now(scope, audience)
         return f"🔍 開始復盤「{scope.name}」自上次復盤以來的工作，完成後會回報（可能要一兩分鐘）。"
 
-    def notify_review_outcome(self, outcome: ReviewOutcome, scope: ProjectScope, chat_id: int | None = None) -> None:
+    def notify_review_outcome(self, outcome: ReviewOutcome, scope: ProjectScope, audience: str | None = None) -> None:
         """Report a work review: the findings, then each proposed change as a decision card the
         operator answers (the answer is kept as precedent; the harness changes nothing by itself)."""
         text = describe_review(outcome)
         keyboard = (
-            [[{"text": "↩️ 撤銷這次寫入的教訓", "callback_data": f"kb_undo:{outcome.lesson_run_id}"}]]
+            [[{"label": "↩️ 撤銷這次寫入的教訓", "id": f"kb_undo:{outcome.lesson_run_id}"}]]
             if outcome.lesson_run_id is not None and outcome.lessons
             else None
         )
-        targets = [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids)
-        for cid in targets:
-            if keyboard:
-                self.send_message_with_keyboard(cid, text, keyboard)
-            else:
-                self.send_message(cid, text)
+        if keyboard:
+            self.send_message_with_keyboard(audience, text, keyboard)
+        else:
+            self.send_message(audience, text)
         self.primary_session_mgr.record_turn(
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
@@ -1675,44 +1474,42 @@ class TelegramGateway:
             )
             self.notify_approval_request(req)
 
-    def notify_promotion_outcome(self, outcome: PromotionOutcome, chat_id: int | None = None) -> None:
+    def notify_promotion_outcome(self, outcome: PromotionOutcome, audience: str | None = None) -> None:
         """Tell the operator what a promotion pass wrote, with an undo for what it created."""
         text = describe_promotion(outcome)
         keyboard = (
-            [[{"text": "↩️ 撤銷這批新增", "callback_data": f"kb_undo:{outcome.run_id}"}]]
+            [[{"label": "↩️ 撤銷這批新增", "id": f"kb_undo:{outcome.run_id}"}]]
             if outcome.created and outcome.run_id is not None
             else None
         )
-        for cid in [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids):
-            if keyboard:
-                self.send_message_with_keyboard(cid, text, keyboard)
-            else:
-                self.send_message(cid, text)
+        if keyboard:
+            self.send_message_with_keyboard(audience, text, keyboard)
+        else:
+            self.send_message(audience, text)
         self.primary_session_mgr.record_turn(
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
 
-    def _resolve_garden_undo(self, run_id_text: str, chat_id: int, message_id: int | None) -> str:
+    def _resolve_garden_undo(self, run_id_text: str, audience: str | None, message_ref: str | None) -> str:
         if self.memtrace_client is None or not run_id_text.isdigit():
             return "無法還原"
         trace_store = self.approval_manager.trace_store
         restored, recreated, failed = undo_gardening_run(self.memtrace_client, trace_store, int(run_id_text))
         removed, remove_failed = undo_created_nodes(self.memtrace_client, trace_store, int(run_id_text))
         failed += remove_failed
-        if message_id is not None:
-            self.clear_message_keyboard(chat_id, message_id)
+        self.clear_actions(message_ref)
         if removed and not (restored or recreated):
             text = f"↩️ 已撤銷 {removed} 個新增的節點（進了垃圾桶，30 天內可由 MemTrace 還原）"
             if failed:
                 text += f"；{failed} 個撤銷失敗，請看日誌"
-            self.send_message(chat_id, text + "。")
+            self.send_message(audience, text + "。")
             return "已撤銷" if not failed else "部分撤銷"
         text = f"↩️ 已還原 {restored + recreated} 個節點"
         if recreated:
             text += f"（其中 {recreated} 個已不在垃圾桶，用本機留的內容重建）"
         if failed:
             text += f"；{failed} 個還原失敗，請看日誌"
-        self.send_message(chat_id, text + "。")
+        self.send_message(audience, text + "。")
         return "已還原" if not failed else "部分還原"
 
     def _file_completion_claim(self, conv_id: str, summary) -> tuple[str, list[str]] | None:
@@ -1765,7 +1562,7 @@ class TelegramGateway:
             logger.exception(f"filing the completion claim for {conv_id} failed; reporting without it")
             return None
 
-    def _resolve_claim(self, action: str, claim_id: str, chat_id: int, message_id: int | None) -> str:
+    def _resolve_claim(self, action: str, claim_id: str, audience: str | None, message_ref: str | None) -> str:
         """The operator's answer to a completion claim. Accepting moves the claimed node to
         done; sending it back reopens it and is kept as the decision the Controller learns from
         (listed, marked, in the precedent it reads next)."""
@@ -1803,15 +1600,14 @@ class TelegramGateway:
                 recommended_label=None,
             ),
         )
-        if message_id is not None:
-            self.clear_message_keyboard(chat_id, message_id)
+        self.clear_actions(message_ref)
         if accepted:
             note = f"（知識庫更新有問題：{problem}）" if problem else ""
-            self.send_message(chat_id, f"✅ 已驗收 {claim_id}。{note}")
+            self.send_message(audience, f"✅ 已驗收 {claim_id}。{note}")
             return "已驗收"
         note = f"（知識庫更新有問題：{problem}）" if problem else ""
         self.send_message(
-            chat_id,
+            audience,
             f"↩️ 已退回 {claim_id}，相關節點重新標為未完成，這次的宣告也記下來了，之後的判斷會參考。"
             f"哪裡沒完成可以直接回覆這則訊息告訴我。{note}",
         )
@@ -1872,7 +1668,7 @@ class TelegramGateway:
             "使用者問某個排程、腳本或外部服務為什麼失敗、現在連不連得上時，先用 MCP 工具 `ops` 自己查，"
             "再回答，不要要使用者等或叫他去查：`http_probe`（從外面實際發請求，回報狀態碼、耗時、大小、"
             "錯誤；attempts 可重複測幾次看耗時是否穩定）、`read_log`（看失敗的 log，名稱用 list_logs）、"
-            "`list_jobs`／`run_job`（要把失敗的工作重跑時，run_job 只是提出要求，使用者要在 Telegram 按"
+            "`list_jobs`／`run_job`（要把失敗的工作重跑時，run_job 只是提出要求，使用者要在聊天裡按"
             "「確認執行」才會跑；你要說「已請你確認」，不要說已經跑了）。回答要寫出量測到的事實，並判斷"
             "是服務端的問題，還是專案自己的程式（逾時太短、舊的端點、被限流）。確定原因在專案程式、需要"
             "改程式時，才用上面的任務啟動標記交給開發流程；只是診斷或重跑，不要開任務。\n\n"
@@ -1895,14 +1691,14 @@ class TelegramGateway:
         if project and project.lower() in order_projects():
             notice += (
                 "下單：你可以用 `create_order_intent` 提出委託（限價單；盤中零股要設 is_odd_lot=true，"
-                "數量單位是股）。它不會真的下單——只會建立一筆待確認的委託，系統會在 Telegram 給使用者"
+                "數量單位是股）。它不會真的下單——只會建立一筆待確認的委託，系統會在聊天裡給使用者"
                 "「確認／取消」按鈕，使用者按確認後才會送到券商，結果也會由系統自動回報給使用者。"
                 "所以：使用者要下單時，先確認股票、買賣方向、數量、價格都清楚（缺價格就問，不要自己"
                 "猜；使用者說「開盤價」但還沒有開盤價時，如實說還沒有，請他給價格），再呼叫工具，然後"
-                "告訴使用者「已提出委託，請到 Telegram 按確認」。不要說已經下單，也不要叫使用者去券商"
+                "告訴使用者「已提出委託，請到聊天裡按確認」。不要說已經下單，也不要叫使用者去券商"
                 "App 自己下。\n"
                 "撤單：用 `request_order_cancel`（先用 list_orders 找到委託編號），一樣只是提出撤單，"
-                "使用者在 Telegram 按「確認撤單」後才會送出。注意：系統記錄的委託狀態可能落後券商"
+                "使用者在聊天裡按「確認撤單」後才會送出。注意：系統記錄的委託狀態可能落後券商"
                 "（已成交的單可能還顯示 PendingSubmit），判斷有沒有成交要以 get_positions 為準；已成交的單"
                 "撤不了，如實告訴使用者。你不能改單。\n"
             )
@@ -1933,7 +1729,7 @@ class TelegramGateway:
     def _chat_reply_and_maybe_start_task(
         self,
         scope: ProjectScope,
-        chat_id: int,
+        audience: str | None,
         text: str,
         quoted_text: str | None = None,
         pending_approval: ApprovalRequestData | None = None,
@@ -1964,7 +1760,7 @@ class TelegramGateway:
         candidates = self.config.chat_candidates_for(scope.name)
         if not candidates:
             msg = "（對話尚未設定：HARNESS_CHAT_PROVIDER 沒有值)"
-            self.send_message(chat_id, msg)
+            self.send_message(audience, msg)
             self.primary_session_mgr.record_turn(
                 project=scope.name, speaker="assistant", turn_type="chat", content=msg
             )
@@ -2060,31 +1856,31 @@ class TelegramGateway:
                 self.primary_session_mgr.record_turn(
                     project=scope.name, speaker="assistant", turn_type="chat", content=reply_text or reply
                 )
-                self.send_message(chat_id, reply)
+                self.send_message(audience, reply)
                 if approval_answer and pending_approval is not None and not goal:
                     # Only honored for the approval this very message replied to, and only
                     # while it is still pending (a double reply must not resume twice).
                     current = self.approval_manager.get_request(pending_approval.id)
                     if current is not None and current.status == "pending":
-                        self._resolve_approval_action(current.id, "clarify", chat_id, approval_answer)
+                        self._resolve_approval_action(current.id, "clarify", audience, approval_answer)
                 if goal:
                     self.primary_session_mgr.record_turn(
                         project=scope.name, speaker="user", turn_type="decision", content=goal
                     )
-                    self._start_or_queue_task(scope, goal, chat_id)
+                    self._start_or_queue_task(scope, goal, audience)
                 if review_request and not goal:
-                    self.send_message(chat_id, self._start_work_review(scope, chat_id))
+                    self.send_message(audience, self._start_work_review(scope, audience))
                 if schedule_directive:
-                    self._create_schedule(scope, chat_id, schedule_directive)
+                    self._create_schedule(scope, audience, schedule_directive)
                 for action, payload in schedule_controls:
-                    self._apply_schedule_control(scope, chat_id, action, payload)
+                    self._apply_schedule_control(scope, audience, action, payload)
                 return reply
             detail = result.error or result.stderr.strip() or f"exit code {result.return_code}"
             failures.append(f"{provider}/{model or '預設模型'}：{detail}")
 
         joined = "；".join(failures)
         msg = f"（回覆失敗：{joined}）"
-        self.send_message(chat_id, msg)
+        self.send_message(audience, msg)
         self.primary_session_mgr.record_turn(
             project=scope.name, speaker="assistant", turn_type="chat", content=msg
         )
@@ -2292,7 +2088,7 @@ class TelegramGateway:
             return None
 
     def _pause_and_notify(
-        self, scope: ProjectScope, schedule_id: str, summary, delivery: ScheduleDelivery, chat_id: int | None
+        self, scope: ProjectScope, schedule_id: str, summary, delivery: ScheduleDelivery, audience: str | None
     ) -> None:
         """The Controller judged that a schedule no longer has a reason to run: pause it
         (kept, not cancelled), say why, and give the operator a one-tap way to undo or finish
@@ -2322,19 +2118,17 @@ class TelegramGateway:
         )
         keyboard = [
             [
-                {"text": "▶️ 繼續排程", "callback_data": f"sched_resume:{schedule_id}"},
-                {"text": "🗑 取消排程", "callback_data": f"sched_cancel:{schedule_id}"},
+                {"label": "▶️ 繼續排程", "id": f"sched_resume:{schedule_id}"},
+                {"label": "🗑 取消排程", "id": f"sched_cancel:{schedule_id}"},
             ]
         ]
-        targets = [chat_id] if chat_id is not None else sorted(self.allowed_chat_ids)
-        for cid in targets:
-            self.send_message_with_keyboard(cid, text, keyboard)
+        self.send_message_with_keyboard(audience, text, keyboard)
         self.primary_session_mgr.record_turn(
             project=scope.name, speaker="assistant", turn_type="chat", content=text
         )
 
     def _resolve_schedule_button(
-        self, action: str, schedule_id: str, chat_id: int, message_id: int | None
+        self, action: str, schedule_id: str, audience: str | None, message_ref: str | None
     ) -> str:
         """A tap on the buttons of _pause_and_notify(). Resuming is the operator disagreeing
         with the Controller's judgment, cancelling is agreeing; either is kept as precedent."""
@@ -2349,7 +2143,7 @@ class TelegramGateway:
             if r["subject"] == schedule_id and r["outcome"].startswith(CONTROLLER_OUTCOME_PREFIX)
         ]
         situation = paused[0]["situation"] if paused else f"排程 {schedule_id} 被暫停"
-        self._apply_schedule_control(scope, chat_id, "resume" if action == "resume" else "cancel", schedule_id)
+        self._apply_schedule_control(scope, audience, "resume" if action == "resume" else "cancel", schedule_id)
         outcome = "resumed" if action == "resume" else "cancelled"
         record_id = trace_store.add_decision_record(
             project=scope.name,
@@ -2373,12 +2167,11 @@ class TelegramGateway:
                 recommended_label="暫停" if action == "resume" else None,
             ),
         )
-        if message_id is not None:
-            self.clear_message_keyboard(chat_id, message_id)
+        self.clear_actions(message_ref)
         return "已繼續排程" if action == "resume" else "已取消排程"
 
     def _apply_schedule_control(
-        self, scope: ProjectScope, chat_id: int, action: str, payload: str
+        self, scope: ProjectScope, audience: str | None, action: str, payload: str
     ) -> None:
         """Execute one pause/resume/cancel directive and confirm the real outcome to the
         chat; failures are reported, never raised (this runs inside the reply path)."""
@@ -2386,7 +2179,7 @@ class TelegramGateway:
         schedule_id, _, extra = (p.strip() for p in payload.partition("::"))
         row = trace_store.get_schedule(schedule_id)
         if row is None or not row["active"] or row["project"] != scope.name:
-            self.send_message(chat_id, f"⚠️ 找不到可操作的排程 {schedule_id}，狀態沒有改變。")
+            self.send_message(audience, f"⚠️ 找不到可操作的排程 {schedule_id}，狀態沒有改變。")
             return
         tz = ZoneInfo(self.config.schedule_timezone)
         now = datetime.now(timezone.utc)
@@ -2394,12 +2187,12 @@ class TelegramGateway:
         try:
             if action == "cancel":
                 trace_store.deactivate_schedule(schedule_id)
-                self.send_message(chat_id, f"✅ 已取消排程 {schedule_id}。")
+                self.send_message(audience, f"✅ 已取消排程 {schedule_id}。")
             elif action == "resume":
                 next_run_at = compute_next_run(spec, after=now, tz=tz)
                 trace_store.resume_schedule(schedule_id, next_run_at=next_run_at)
                 local_next = next_run_at.astimezone(tz).strftime("%Y-%m-%d %H:%M")
-                self.send_message(chat_id, f"▶️ 已恢復排程 {schedule_id}，下次執行：{local_next}。")
+                self.send_message(audience, f"▶️ 已恢復排程 {schedule_id}，下次執行：{local_next}。")
             else:
                 if not extra or extra.lower() == "indefinite":
                     until = self._PAUSE_INDEFINITELY
@@ -2413,13 +2206,13 @@ class TelegramGateway:
                         next_run_at = max(until, now)
                 trace_store.pause_schedule(schedule_id, paused_until=until, next_run_at=next_run_at)
                 self.send_message(
-                    chat_id,
+                    audience,
                     f"⏸ 已暫停排程 {schedule_id}"
                     f"{self._paused_until_text(until.isoformat(), tz)}。用 /schedules 查看。",
                 )
         except Exception as exc:
             logger.exception(f"schedule {action} for {schedule_id} failed")
-            self.send_message(chat_id, f"⚠️ 排程 {schedule_id} 操作失敗，狀態沒有改變：{exc}")
+            self.send_message(audience, f"⚠️ 排程 {schedule_id} 操作失敗，狀態沒有改變：{exc}")
 
     @staticmethod
     def _parse_pause_until(value: str, tz: ZoneInfo) -> datetime:
@@ -2427,7 +2220,7 @@ class TelegramGateway:
         fmt = "%Y-%m-%d %H:%M" if " " in value else "%Y-%m-%d"
         return datetime.strptime(value, fmt).replace(tzinfo=tz).astimezone(timezone.utc)
 
-    def _create_schedule(self, scope: ProjectScope, chat_id: int, directive: str) -> None:
+    def _create_schedule(self, scope: ProjectScope, audience: str | None, directive: str) -> None:
         """Parse a HARNESS_SCHEDULE_START directive's "<kind>::<spec>::<goal>" payload,
         persist it to TraceStore, and confirm back to the chat that raised it. Bad
         input (malformed kind/spec) is reported to the chat rather than raised —
@@ -2436,20 +2229,20 @@ class TelegramGateway:
         parts = directive.split("::", 2)
         if len(parts) != 3:
             self.send_message(
-                chat_id,
+                audience,
                 f"⚠️ 排程指令格式有誤，未建立：「{directive}」（預期格式：kind::spec::goal）",
             )
             return
         kind, spec, goal = (p.strip() for p in parts)
         if not goal:
-            self.send_message(chat_id, "⚠️ 排程指令缺少任務內容，未建立。")
+            self.send_message(audience, "⚠️ 排程指令缺少任務內容，未建立。")
             return
         try:
             parsed = parse_schedule_spec(kind, spec)
             tz = ZoneInfo(self.config.schedule_timezone)
             next_run_at = compute_next_run(parsed, after=datetime.now(timezone.utc), tz=tz)
         except Exception as exc:
-            self.send_message(chat_id, f"⚠️ 排程設定有誤，未建立：{exc}")
+            self.send_message(audience, f"⚠️ 排程設定有誤，未建立：{exc}")
             return
 
         trace_store = self.approval_manager.trace_store
@@ -2462,12 +2255,12 @@ class TelegramGateway:
             time_of_day=parsed.time_of_day,
             end_time_of_day=parsed.end_time_of_day,
             weekdays_only=parsed.weekdays_only,
-            chat_id=chat_id,
+            audience=audience,
             next_run_at=next_run_at,
         )
         local_next = next_run_at.astimezone(tz).strftime("%Y-%m-%d %H:%M")
         self.send_message(
-            chat_id,
+            audience,
             f"⏰ 已建立排程 {schedule_id}（{describe_schedule(parsed)}）。"
             f"下次執行時間：{local_next}（{self.config.schedule_timezone}）。\n"
             f"任務內容：{goal}\n"
@@ -2475,11 +2268,11 @@ class TelegramGateway:
         )
 
     def run_due_schedule(self, schedule: dict) -> None:
-        """Trigger one due schedule row from the gateway serve loop. Reuses the exact
+        """Trigger one due schedule row from the Harness serve loop. Reuses the exact
         same governed-task-start path a chat-triggered "HARNESS_TASK_START::" goal
         does (_start_or_queue_task) — a scheduled run is not a different kind of task,
         just a different trigger — notifying back to the chat that created the
-        schedule. Best-effort: a schedule row this gateway doesn't own any project for
+        schedule. Best-effort: a schedule row this Harness doesn't own any project for
         (project removed from the index after the schedule was created) is skipped
         and logged rather than raised, so one stale schedule can't break the tick."""
         scope = next((p for p in self.projects if p.name == schedule["project"]), None)
@@ -2489,10 +2282,7 @@ class TelegramGateway:
                 f"'{schedule['project']}'; skipping this run"
             )
             return
-        chat_id = schedule.get("chat_id")
-        if chat_id is None:
-            logger.error(f"schedule {schedule['id']} has no chat_id to notify; skipping this run")
-            return
+        audience = schedule.get("audience")  # None: whoever the operator is
         if self.approval_manager.trace_store.schedule_in_flight(schedule["id"]):
             # Its previous run hasn't finished: skip this occurrence rather than stack a
             # second copy of the same schedule. Logged for the chat model, not pushed.
@@ -2512,7 +2302,7 @@ class TelegramGateway:
             content=f"排程 {schedule['id']} 觸發：{schedule['goal']}",
             schedule_id=schedule["id"],
         )
-        self._start_or_queue_task(scope, schedule["goal"], chat_id, schedule_id=schedule["id"])
+        self._start_or_queue_task(scope, schedule["goal"], audience, schedule_id=schedule["id"])
 
     def list_schedules_message(self, scope: ProjectScope) -> str:
         """Deterministic /schedules reply — no model call, just a formatted read of
@@ -2546,7 +2336,7 @@ class TelegramGateway:
             context_items=self._project_context_items(scope),
             constraints=list(scope.off_limits or []),
             risk_level=scope.default_risk_level,
-            source="telegram-chat",
+            source="chat",
         )
         profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
         work_dir, worktree = self._provision_workdir(scope, conv_id)
@@ -2568,7 +2358,7 @@ class TelegramGateway:
             verify_timeout_seconds=scope.verify_timeout_seconds or 1200,
             config=self.config,
             agent_loop_enabled=scope.agent_loop_enabled,
-            alert_callback=self.notify_all_allowlisted,
+            alert_callback=self.notify_operator,
             worktree=worktree,
             worktree_manager=self._worktree_manager() if worktree else None,
             repo_root=scope.working_directory if worktree else None,
@@ -2615,8 +2405,7 @@ class TelegramGateway:
         if req_data.reason == PROPOSAL_REASON:
             # A proposal from a work review resumes no task: the answer is the whole outcome. It
             # has been kept as precedent; implementing a change is a separate, explicit request.
-            self.send_message(
-                req_data.telegram_chat_id if req_data.telegram_chat_id is not None else sorted(self.allowed_chat_ids)[0],
+            self.notify_operator(
                 "📝 已記下你的選擇，之後的判斷會參考；harness 不會自己改動。想照這個做的話，直接告訴我，我會開成開發任務。",
             )
             return
@@ -2639,7 +2428,7 @@ class TelegramGateway:
                 e["conversation_id"] == req_data.conversation_id
                 for e in default_tracker.snapshot()
             ):
-                self.notify_all_allowlisted(f"對話 {req_data.conversation_id} 已經在執行中。")
+                self.notify_operator(f"對話 {req_data.conversation_id} 已經在執行中。")
                 return
             outcome = "acquired"
         if outcome != "acquired":
@@ -2648,9 +2437,9 @@ class TelegramGateway:
                 kind="resume",
                 payload={"request_id": req_data.id, "answer": answer},
                 conversation_id=req_data.conversation_id,
-                chat_id=req_data.telegram_chat_id,
+                audience=None,
             )
-            self.notify_all_allowlisted(
+            self.notify_operator(
                 f"✅ 已核准，但「{matching_scope.name if matching_scope else req_data.workspace}」"
                 "的任務位都在忙，已排入佇列，有空位時會自動繼續。"
             )
@@ -2672,7 +2461,7 @@ class TelegramGateway:
         # poll loop for the minutes a governed run can take; say so up front rather
         # than leaving the user staring at silence after the "Approval update:
         # approved" message.
-        self.notify_all_allowlisted(
+        self.notify_operator(
             f"🔧 已核准，繼續執行「{matching_scope.name if matching_scope else req_data.workspace}」："
             f"{req_data.resume_goal or req_data.proposed_action or req_data.reason}"
         )
@@ -2724,7 +2513,7 @@ class TelegramGateway:
                     context_items=context_items,
                     constraints=list(matching_scope.off_limits or []) if matching_scope else [],
                     risk_level="medium",
-                    source="telegram-approval-resume",
+                    source="approval-resume",
                 )
                 profiles_file = (
                     self.config.role_profiles_file_for(matching_scope.name) if matching_scope else None
@@ -2760,7 +2549,7 @@ class TelegramGateway:
                     agent_loop_enabled=(
                         matching_scope.agent_loop_enabled if matching_scope else True
                     ),
-                    alert_callback=self.notify_all_allowlisted,
+                    alert_callback=self.notify_operator,
                     worktree=worktree,
                     worktree_manager=self._worktree_manager() if worktree else None,
                     repo_root=matching_scope.working_directory if worktree and matching_scope else None,
@@ -2800,7 +2589,7 @@ class TelegramGateway:
                 )
             except Exception:
                 logger.exception(f"background resume for conversation {req_data.conversation_id} failed")
-                self.notify_all_allowlisted(
+                self.notify_operator(
                     f"⚠️ 對話 {req_data.conversation_id} 恢復執行時發生未預期錯誤，請查看日誌。"
                 )
             finally:
@@ -2819,17 +2608,3 @@ class TelegramGateway:
             conversation_id=req_data.conversation_id,
             trace_store=self.approval_manager.trace_store,
         )
-
-    def poll_once(self, timeout: int = 1) -> int:
-        updates = self.get_updates(timeout=timeout)
-        processed = 0
-        for update in updates:
-            # Advance and persist the offset even for updates process_update() drops
-            # (e.g. non-allowlisted chats) so a dropped message doesn't get refetched
-            # forever; process_update() bumps self.offset before its allowlist check.
-            res = self.process_update(update)
-            if res is not None:
-                processed += 1
-        if self._offset_key:
-            self.approval_manager.trace_store.set_telegram_offset(self._offset_key, self.offset)
-        return processed

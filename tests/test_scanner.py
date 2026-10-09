@@ -81,9 +81,6 @@ class ScannerTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="token",
-                telegram_allowed_chat_ids={123},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,
@@ -123,9 +120,9 @@ class ScannerTests(TestCase):
                     "body": ready_task_body,
                 },
             ]
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr
             )
 
             # First scan pass should find 2 backlog items and request approval for unattended run
@@ -160,9 +157,6 @@ class ScannerTests(TestCase):
             antigravity_command="agy",
             antigravity_output_mode="auto",
             cli_timeout_seconds=900,
-            telegram_bot_token="token",
-            telegram_allowed_chat_ids={123},
-            project_index_path=None,
             chat_provider="claude",
             chat_model="haiku",
             unattended_write_requires_approval=True,
@@ -203,9 +197,9 @@ class ScannerTests(TestCase):
                     "created_at": "2026-09-01T00:00:00Z",
                 },
             ]
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr
             )
 
             res = scanner.run_scan_pass()
@@ -257,9 +251,9 @@ class ScannerTests(TestCase):
                     "created_at": "2026-09-02T00:00:00Z",
                 },
             ]
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr
             )
 
             # Operator declines the first-proposed (oldest) task and the lock frees up.
@@ -314,9 +308,9 @@ class ScannerTests(TestCase):
                     "created_at": "2026-09-02T00:00:00Z",
                 },
             ]
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr
             )
 
             # Operator approves the first-proposed (oldest) task and the lock frees up.
@@ -372,9 +366,9 @@ class ScannerTests(TestCase):
                 },
             ]
             pushed: list[tuple[str, str]] = []
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], mock_memtrace, gateway=None, approval_mgr=approval_mgr,
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr,
                 record_push=lambda project, text: pushed.append((project, text)),
             )
 
@@ -444,7 +438,7 @@ class ScannerTests(TestCase):
                     },
                 ]
             )
-            scanner = UnattendedScanner(config, trace_store, [scope], None, gateway=None, approval_mgr=None)
+            scanner = UnattendedScanner(config, trace_store, [scope], None, service=None, approval_mgr=None)
             fake_result = MagicMock(returncode=0, stdout=fake_issues, stderr="")
             with patch("memtrace_harness.scanner.subprocess.run", return_value=fake_result) as mock_run:
                 candidates = scanner._find_ready_github_issues(scope)
@@ -484,9 +478,9 @@ class ScannerTests(TestCase):
                     }
                 ]
             )
-            approval_mgr = ApprovalManager(trace_store, {123})
+            approval_mgr = ApprovalManager(trace_store)
             scanner = UnattendedScanner(
-                config, trace_store, [scope], None, gateway=None, approval_mgr=approval_mgr
+                config, trace_store, [scope], None, service=None, approval_mgr=approval_mgr
             )
             fake_result = MagicMock(returncode=0, stdout=fake_issues, stderr="")
             with patch("memtrace_harness.scanner.subprocess.run", return_value=fake_result):

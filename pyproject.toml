@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memtrace-harness"
-version = "0.4.0"
-description = "CLI-only execution and token measurement harness for MemTrace workflows"
+version = "0.5.0"
+description = "CLI-only execution and token measurement harness for MemTrace workflows, with its Telegram and web services"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
 memtrace-harness = "memtrace_harness.cli:main"
+memtrace-telegram = "memtrace_services.telegram.main:main"
+memtrace-web = "memtrace_services.web.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

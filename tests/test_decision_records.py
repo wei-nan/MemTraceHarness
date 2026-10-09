@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.support import tap
 
 import tempfile
 from pathlib import Path
@@ -17,7 +18,7 @@ from memtrace_harness.decision_records import (
 )
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 
@@ -40,7 +41,7 @@ class _Env:
     def __init__(self, tmp: str) -> None:
         self.tmp = tmp
         self.store = TraceStore(Path(tmp) / "t.sqlite3")
-        self.approvals = ApprovalManager(self.store, {12345})
+        self.approvals = ApprovalManager(self.store)
 
     def request(self, *, with_card=True, reason="ambiguous_requirement"):
         return self.approvals.request_approval(
@@ -139,15 +140,14 @@ def _gateway(tmp: str):
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=path / "t.sqlite3",
         trace_root=path, claude_command="claude", codex_command="codex",
         antigravity_command="agy", antigravity_output_mode="auto", cli_timeout_seconds=900,
-        telegram_bot_token="fake", telegram_allowed_chat_ids={12345}, project_index_path=None,
         chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
-    approvals = ApprovalManager(store, {12345})
+    approvals = ApprovalManager(store)
     scope = ProjectScope(
         name="test_proj", workspace_id="ws_test", working_directory=path,
         scope_file_path=path / "harness-scope.md",
     )
-    gateway = TelegramGateway(
+    gateway = HarnessService(
         config, approvals, ChatTriage([scope]), PrimarySessionManager(store), [scope]
     )
     gateway.send_message = MagicMock()
@@ -166,7 +166,7 @@ class GatewayWiringTests(TestCase):
                 reason="ambiguous_requirement", proposed_action="raw", decision_card=card(),
             )
 
-            gateway._handle_callback_query(
+            tap(gateway, 
                 {"id": "cb", "data": f"pick:{req.id}:1", "message": {"chat": {"id": 12345}, "message_id": 9}}
             )
 
@@ -205,9 +205,9 @@ class RunRecordsStayLocalTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gateway, _, _ = _gateway(tmp)
             summary = MagicMock(conversation_id="chat_x", status="succeeded", recommendation="ok", stages=[])
-            with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
-                "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
-            ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+            with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+                "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+            ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
                 runner.return_value.run.return_value = summary
                 gateway._run_new_task(gateway.projects[0], "chat_x", "追蹤持股", schedule_id="sched_a")
                 gateway._run_new_task(gateway.projects[0], "chat_y", "請開發功能")

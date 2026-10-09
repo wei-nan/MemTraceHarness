@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from memtrace_harness.taiwantrade_mcp import mcp_server_spec
+from memtrace_harness.workspace import STATE_DIR_NAME
 
 
 @dataclass(frozen=True)
 class HarnessConfig:
+    """Everything one Harness needs, read from its workspace's `.harness.env` (workspace.py).
+
+    A Harness is one workspace: one project, one set of models, one MemTrace workspace. There is
+    nothing Telegram- or web-shaped in here — those are services (memtrace_services/) with their
+    own environment files, and they only reach the Harness through its local HTTP API (api.py).
+    """
+
     memtrace_mcp_url: str | None
     memtrace_api_token: str | None
     trace_db_path: Path
@@ -20,9 +27,6 @@ class HarnessConfig:
     antigravity_command: str
     antigravity_output_mode: str
     cli_timeout_seconds: int
-    telegram_bot_token: str | None
-    telegram_allowed_chat_ids: set[int]
-    project_index_path: Path | None
     chat_provider: str
     chat_model: str
     unattended_write_requires_approval: bool
@@ -43,9 +47,14 @@ class HarnessConfig:
     recall_fallbacks: tuple[tuple[str, str], ...] = ()
     recall_ttl_hours: int = 72
     operator_preference_workspace_id: str | None = None
-    status_server_enabled: bool = True
-    status_server_host: str = "127.0.0.1"
-    status_server_port: int = 8787
+    # The Harness's local HTTP API, the only door services use (api.py). Loopback by default; the
+    # token is what stops any other local process from posting as the operator.
+    api_host: str = "127.0.0.1"
+    api_port: int = 8800
+    api_token: str | None = None
+    # The workspace this Harness is (None only for legacy/one-off CLI use without a workspace).
+    workspace_root: Path | None = None
+    role_profiles_file: Path | None = None
     shutdown_grace_seconds: int = 120
     reply_language: str | None = "Traditional Chinese (繁體中文，台灣用語與正體字)"
     schedule_timezone: str = "Asia/Taipei"
@@ -79,7 +88,7 @@ class HarnessConfig:
         # reach 127.0.0.1:8000. Opt-in, and only for the chat reply (taiwantrade=True):
         # digests, classifiers and JSON repair have no use for trading data.
         # order_project (the chat's project) also lets the model *propose* orders, if the
-        # operator allowed that project; the human still has to confirm in Telegram.
+        # operator allowed that project; the human still has to confirm in the chat.
         proxy = (
             mcp_server_spec(order_project=order_project, trace_db_path=self.trace_db_path)
             if taiwantrade
@@ -120,7 +129,7 @@ class HarnessConfig:
                     "--config", f"mcp_servers.ops.args={json.dumps(ops_server['args'])}",
                     "--config", f"mcp_servers.ops.env={{{env_toml}}}",
                     # Safe to approve up front: run_job only records a request the human must
-                    # confirm in Telegram; the other tools read.
+                    # confirm in the chat; the other tools read.
                     "--config", 'mcp_servers.ops.default_tools_approval_mode="approve"',
                 ]
             if model:
@@ -150,21 +159,19 @@ class HarnessConfig:
             return self.antigravity_command
         return provider
 
-    def telegram_bot_token_for(self, project_name: str) -> str | None:
-        """Per-project bot token, read from the Harness's own .env — never from the
-        target project's repo, so a project's harness-scope.md never has to carry a
-        secret. Falls back to the shared HARNESS_TELEGRAM_BOT_TOKEN bot."""
-        return os.getenv(project_bot_token_env_var(project_name)) or self.telegram_bot_token
+    # The `project_name` parameters below are kept so callers written for the old
+    # one-process-many-projects Harness read the same; a workspace has exactly one project, so
+    # the name no longer selects anything. The model settings are read from the environment at
+    # call time (falling back to what was loaded at startup) so that changing one — from the status
+    # page, through the Harness API — takes effect on the next call without a restart.
 
-    def chat_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
-        """Ordered (provider, model) list for that project's quick-chat-reply model:
-        that project's own HARNESS_CHAT_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT>
-        if set, else the shared HARNESS_CHAT_PROVIDER/MODEL/FALLBACKS. Chat is cheap and
-        low-stakes (no repo writes), so unlike Agent Loop roles it's fine for a project
-        to just pick whichever model is good enough and cheapest — no vendor lock."""
-        provider = os.getenv(project_chat_provider_env_var(project_name)) or self.chat_provider
-        model = os.getenv(project_chat_model_env_var(project_name), self.chat_model)
-        fallbacks_override = os.getenv(project_chat_fallbacks_env_var(project_name))
+    def chat_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for the quick chat reply. Chat is cheap and
+        low-stakes (no repo writes), so unlike Agent Loop roles a workspace just picks whichever
+        model is good enough and cheapest — no vendor lock."""
+        provider = os.getenv("HARNESS_CHAT_PROVIDER") or self.chat_provider
+        model = os.getenv("HARNESS_CHAT_MODEL", self.chat_model)
+        fallbacks_override = os.getenv("HARNESS_CHAT_FALLBACKS")
         fallbacks = (
             _parse_chat_fallbacks(fallbacks_override)
             if fallbacks_override is not None
@@ -174,18 +181,16 @@ class HarnessConfig:
             return ()
         return ((provider, model), *fallbacks)
 
-    def digest_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
-        """Ordered (provider, model) list for that project's nightly memory digest:
-        HARNESS_DIGEST_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT> if set,
-        else the shared HARNESS_DIGEST_PROVIDER/MODEL/FALLBACKS. When no digest provider
-        is configured at either level it falls back to chat_candidates_for(), the
-        behavior before the digest got its own model. A configured digest chain is used
-        as-is — it never silently degrades into the (weaker) chat chain."""
-        provider = os.getenv(project_digest_provider_env_var(project_name)) or self.digest_provider
+    def digest_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for the nightly memory digest. When no digest provider
+        is configured it falls back to chat_candidates_for(), the behavior before the digest got
+        its own model. A configured digest chain is used as-is — it never silently degrades into
+        the (weaker) chat chain."""
+        provider = os.getenv("HARNESS_DIGEST_PROVIDER") or self.digest_provider
         if not provider:
-            return self.chat_candidates_for(project_name)
-        model = os.getenv(project_digest_model_env_var(project_name)) or self.digest_model
-        fallbacks_override = os.getenv(project_digest_fallbacks_env_var(project_name))
+            return self.chat_candidates_for()
+        model = os.getenv("HARNESS_DIGEST_MODEL") or self.digest_model
+        fallbacks_override = os.getenv("HARNESS_DIGEST_FALLBACKS")
         fallbacks = (
             _parse_chat_fallbacks(fallbacks_override)
             if fallbacks_override is not None
@@ -193,17 +198,15 @@ class HarnessConfig:
         )
         return ((provider, model or ""), *fallbacks)
 
-    def recall_candidates_for(self, project_name: str) -> tuple[tuple[str, str], ...]:
-        """Ordered (provider, model) list for that project's topic recall:
-        HARNESS_RECALL_PROVIDER_<PROJECT>/_MODEL_<PROJECT>/_FALLBACKS_<PROJECT> if set,
-        else the shared HARNESS_RECALL_*; with none configured at all it uses the digest
-        chain (itself falling back to chat). Same rule as digest_candidates_for(): a
-        configured chain is used as-is and never degrades into a weaker one."""
-        provider = os.getenv(project_recall_provider_env_var(project_name)) or self.recall_provider
+    def recall_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for topic recall; with none configured it uses the
+        digest chain (itself falling back to chat). A configured chain is used as-is and never
+        degrades into a weaker one."""
+        provider = os.getenv("HARNESS_RECALL_PROVIDER") or self.recall_provider
         if not provider:
-            return self.digest_candidates_for(project_name)
-        model = os.getenv(project_recall_model_env_var(project_name)) or self.recall_model
-        fallbacks_override = os.getenv(project_recall_fallbacks_env_var(project_name))
+            return self.digest_candidates_for()
+        model = os.getenv("HARNESS_RECALL_MODEL") or self.recall_model
+        fallbacks_override = os.getenv("HARNESS_RECALL_FALLBACKS")
         fallbacks = (
             _parse_chat_fallbacks(fallbacks_override)
             if fallbacks_override is not None
@@ -211,26 +214,41 @@ class HarnessConfig:
         )
         return ((provider, model or ""), *fallbacks)
 
-    def role_profiles_file_for(self, project_name: str) -> Path | None:
-        """Per-project role-profile override (e.g. a different fallback order), read
-        from the Harness's own env — not from harness-scope.md, so the target project's
-        repo never carries Harness-internal routing policy. None means: use the
-        packaged default-role-profiles.toml."""
-        override = os.getenv(project_role_profiles_env_var(project_name))
-        return Path(override) if override else None
+    def role_profiles_file_for(self, project_name: str | None = None) -> Path | None:
+        """This workspace's role-profile override (e.g. a different fallback order), kept in
+        its own `.harness/roles.toml` — not in harness-scope.md, so the target project's repo never
+        carries Harness-internal routing policy. None means: the packaged default-role-profiles.toml."""
+        override = os.getenv("HARNESS_ROLE_PROFILES_FILE")
+        return Path(override) if override else self.role_profiles_file
+
+    def memory_workspace_id_for(self, project_name: str | None, project_workspace_id: str) -> str:
+        """Cold-memory consolidation target: a dedicated memory workspace (runtime/conversation
+        memory — what happened) is intentionally separate from the project's own spec/planning
+        workspace (what should be built). HARNESS_MEMORY_WORKSPACE_ID if set, else the project's
+        own spec workspace."""
+        return (
+            os.getenv("HARNESS_MEMORY_WORKSPACE_ID")
+            or self.harness_memory_workspace_id
+            or project_workspace_id
+        )
 
     @classmethod
     def from_env(cls) -> "HarnessConfig":
-        trace_path = os.getenv("HARNESS_TRACE_DB", "data/harness.sqlite3")
-        trace_root = os.getenv("HARNESS_TRACE_ROOT", "data/traces")
-        allowed_chat_ids_str = os.getenv("HARNESS_TELEGRAM_ALLOWED_CHAT_IDS", "")
-        allowed_chat_ids = {
-            int(cid.strip())
-            for cid in allowed_chat_ids_str.split(",")
-            if cid.strip().isdigit() or (cid.strip().startswith("-") and cid.strip()[1:].isdigit())
-        }
-        project_index = os.getenv("HARNESS_PROJECT_INDEX")
+        """Read the process environment, which `workspace.load_workspace()` has already filled
+        from the workspace's `.harness.env`. Relative state paths resolve against the workspace."""
+        root_text = os.getenv("HARNESS_WORKSPACE")
+        root = Path(root_text).resolve() if root_text else None
+        state = (root / STATE_DIR_NAME) if root else Path("data")
+        trace_path = os.getenv("HARNESS_TRACE_DB") or str(state / "harness.sqlite3")
+        trace_root = os.getenv("HARNESS_TRACE_ROOT") or str(state / "traces")
         unattended_approval_str = os.getenv("HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL", "true").lower()
+        roles_text = os.getenv("HARNESS_ROLE_PROFILES_FILE")
+        if roles_text:
+            roles_file: Path | None = Path(roles_text)
+        elif root and (state / "roles.toml").is_file():
+            roles_file = state / "roles.toml"
+        else:
+            roles_file = None
         return cls(
             memtrace_mcp_url=os.getenv("MEMTRACE_MCP_URL"),
             memtrace_api_token=os.getenv("MEMTRACE_API_TOKEN"),
@@ -243,9 +261,6 @@ class HarnessConfig:
                 os.getenv("HARNESS_ANTIGRAVITY_OUTPUT_MODE", "auto")
             ),
             cli_timeout_seconds=_positive_int(os.getenv("HARNESS_CLI_TIMEOUT_SECONDS"), 900),
-            telegram_bot_token=os.getenv("HARNESS_TELEGRAM_BOT_TOKEN"),
-            telegram_allowed_chat_ids=allowed_chat_ids,
-            project_index_path=Path(project_index) if project_index else None,
             chat_provider=os.getenv("HARNESS_CHAT_PROVIDER", "claude"),
             chat_model=os.getenv("HARNESS_CHAT_MODEL", "haiku"),
             unattended_write_requires_approval=unattended_approval_str not in {"false", "0", "no"},
@@ -261,10 +276,11 @@ class HarnessConfig:
             recall_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_RECALL_FALLBACKS", "")),
             recall_ttl_hours=_positive_int(os.getenv("HARNESS_RECALL_TTL_HOURS"), 72),
             operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
-            status_server_enabled=os.getenv("HARNESS_STATUS_SERVER_ENABLED", "true").lower()
-            not in {"false", "0", "no"},
-            status_server_host=os.getenv("HARNESS_STATUS_SERVER_HOST", "127.0.0.1"),
-            status_server_port=_positive_int(os.getenv("HARNESS_STATUS_SERVER_PORT"), 8787),
+            api_host=os.getenv("HARNESS_API_HOST", "127.0.0.1"),
+            api_port=_positive_int(os.getenv("HARNESS_API_PORT"), 8800),
+            api_token=os.getenv("HARNESS_API_TOKEN") or None,
+            workspace_root=root,
+            role_profiles_file=roles_file,
             shutdown_grace_seconds=_positive_int(os.getenv("HARNESS_SHUTDOWN_GRACE_SECONDS"), 120),
             reply_language=(
                 os.getenv("HARNESS_REPLY_LANGUAGE")
@@ -274,22 +290,6 @@ class HarnessConfig:
             or None,
             schedule_timezone=os.getenv("HARNESS_SCHEDULE_TIMEZONE", "Asia/Taipei"),
             approval_ttl_hours=_non_negative_int(os.getenv("HARNESS_APPROVAL_TTL_HOURS"), 12),
-        )
-
-    def memory_workspace_id_for(self, project_name: str, project_workspace_id: str) -> str:
-        """Cold-memory consolidation target: a dedicated memory workspace (runtime/
-        conversation memory — what happened) is intentionally separate from a project's
-        own spec/planning workspace (what should be built). Resolution order:
-        1. HARNESS_MEMORY_WORKSPACE_ID_<PROJECT> — that project's own dedicated memory KB
-        2. HARNESS_MEMORY_WORKSPACE_ID — one shared memory KB across every project
-        3. the project's own spec workspace, if neither is set
-        Same per-project-override-over-shared-default shape as telegram_bot_token_for()
-        and role_profiles_file_for() — adding a project with its own memory KB is a
-        one-line .env addition, never a code change."""
-        return (
-            os.getenv(project_memory_workspace_env_var(project_name))
-            or self.harness_memory_workspace_id
-            or project_workspace_id
         )
 
 
@@ -315,66 +315,6 @@ def _parse_chat_fallbacks(value: str) -> tuple[tuple[str, str], ...]:
         provider, model = item.split("/", 1)
         pairs.append((provider.strip(), model.strip()))
     return tuple(pairs)
-
-
-def project_bot_token_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_TELEGRAM_BOT_TOKEN_{slug}"
-
-
-def project_role_profiles_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_ROLE_PROFILES_FILE_{slug}"
-
-
-def project_memory_workspace_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_MEMORY_WORKSPACE_ID_{slug}"
-
-
-def project_chat_provider_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_CHAT_PROVIDER_{slug}"
-
-
-def project_chat_model_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_CHAT_MODEL_{slug}"
-
-
-def project_chat_fallbacks_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_CHAT_FALLBACKS_{slug}"
-
-
-def project_digest_provider_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_DIGEST_PROVIDER_{slug}"
-
-
-def project_digest_model_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_DIGEST_MODEL_{slug}"
-
-
-def project_digest_fallbacks_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_DIGEST_FALLBACKS_{slug}"
-
-
-def project_recall_provider_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_RECALL_PROVIDER_{slug}"
-
-
-def project_recall_model_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_RECALL_MODEL_{slug}"
-
-
-def project_recall_fallbacks_env_var(project_name: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").upper()
-    return f"HARNESS_RECALL_FALLBACKS_{slug}"
 
 
 def _positive_int(value: str | None, default: int) -> int:
