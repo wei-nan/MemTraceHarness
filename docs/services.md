@@ -128,8 +128,8 @@ Order matters; the legacy files are never changed or deleted, so every step befo
 2. **Dry run** — what would be written where: `memtrace-harness migrate --env .env`.
 3. **Apply**: `memtrace-harness migrate --env .env --apply`. A separate legacy instance (project-c) is a second
    run with its own env and a higher first port, into the same services dir:
-   `migrate --env instances/project-c/.env --first-port 8810 --apply` (the status page's `web.toml` is merged,
-   not replaced).
+   `migrate --env instances/project-c/.env --apply` (the status page's `web.toml` is merged, not replaced, and the
+   ports the first run handed out are skipped).
 4. **Check** each workspace: `memtrace-harness -C <workspace> doctor`.
 5. **Install** the plists from `~/.config/memtraceharness/launchd/`: Harness first, then its Telegram service,
    then the page; send a message to the bot and confirm the reply.
