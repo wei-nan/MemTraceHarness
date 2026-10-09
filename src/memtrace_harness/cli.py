@@ -281,6 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--env", type=Path, default=Path(".env"), help="The legacy Harness env file")
     migrate_parser.add_argument("--index", type=Path, help="The legacy project index (default: from the env file)")
     migrate_parser.add_argument("--services-dir", type=Path, help="Where to write each service's env file (default ~/.config/memtraceharness)")
+    migrate_parser.add_argument("--first-port", type=int, default=8800, help="First Harness API port to hand out (use a higher one when migrating a second legacy instance)")
     migrate_parser.add_argument("--apply", action="store_true", help="Write the files (default: only print the plan)")
 
     subparsers.add_parser(

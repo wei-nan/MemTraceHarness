@@ -1,6 +1,8 @@
 import argparse
+import json
 import sqlite3
 import stat
+import tomllib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -83,7 +85,11 @@ class MigrationFixture(TestCase):
                 (self.traces / run).mkdir(parents=True)
                 (self.traces / run / "out.log").write_text(f"trace of {project}", encoding="utf-8")
             conn.execute("CREATE TABLE telegram_gateway_state (bot_token_hash TEXT PRIMARY KEY, last_offset INTEGER NOT NULL)")
-            conn.execute("INSERT INTO telegram_gateway_state VALUES ('h', 5)")
+            import hashlib
+
+            conn.execute(
+                "INSERT INTO telegram_gateway_state VALUES (?, 77)", (hashlib.sha256(b"alpha-bot").hexdigest(),)
+            )
             # the old shape: an approval remembered as a (chat, message) pair, a schedule by chat id
             conn.execute("ALTER TABLE approval_requests ADD COLUMN telegram_chat_id INTEGER")
             conn.execute("ALTER TABLE approval_requests ADD COLUMN telegram_message_id INTEGER")
@@ -101,7 +107,7 @@ class MigrationFixture(TestCase):
 
     def apply(self) -> int:
         return migrate_command(
-            argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", apply=True)
+            argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", first_port=8800, apply=True)
         )
 
 
@@ -143,7 +149,7 @@ class PlanTests(MigrationFixture):
 class ApplyTests(MigrationFixture):
     def test_a_dry_run_writes_nothing(self) -> None:
         self.assertEqual(
-            migrate_command(argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", apply=False)), 0
+            migrate_command(argparse.Namespace(env=self.env, index=None, services_dir=self.tmp / "services", first_port=8800, apply=False)), 0
         )
         self.assertFalse((self.alpha / ENV_FILE_NAME).exists())
         self.assertFalse((self.tmp / "services").exists())
@@ -221,3 +227,34 @@ class LegacyStoreTests(MigrationFixture):
         self.assertEqual(store.get_approval_request_by_message_ref("tg:111:42")["id"], "appr_old")
         [schedule] = store.list_schedules("alpha")
         self.assertEqual(schedule["audience"], "tg:111")
+
+
+class SecondInstanceTests(MigrationFixture):
+    def test_the_telegram_offset_is_carried_so_nothing_is_replayed(self) -> None:
+        self.apply()
+        state = json.loads((self.tmp / "services" / "alpha" / "telegram.state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state, {"offset": 77})
+        # and the Telegram service starts from it
+        from memtrace_services.telegram.service import TelegramSettings
+
+        settings = TelegramSettings.from_values(
+            {**parse_env_file(self.tmp / "services" / "alpha" / "telegram.env")}, env_file=self.tmp / "services" / "alpha" / "telegram.env"
+        )
+        self.assertEqual(json.loads(settings.state_file.read_text(encoding="utf-8"))["offset"], 77)
+
+    def test_a_second_migration_keeps_the_first_ones_harnesses_on_the_status_page(self) -> None:
+        self.apply()
+        other = self.tmp / "other"
+        other.mkdir()
+        (other / "harness-scope.md").write_text("# s\n\n- workspace_id: ws_other\n", encoding="utf-8")
+        index2 = self.tmp / "index2.txt"
+        index2.write_text(f"{other / 'harness-scope.md'}\n", encoding="utf-8")
+        env2 = self.tmp / "second.env"
+        env2.write_text(f"MEMTRACE_MCP_URL=https://kb.example/mcp\nHARNESS_PROJECT_INDEX={index2}\n", encoding="utf-8")
+        migrate_command(argparse.Namespace(env=env2, index=None, services_dir=self.tmp / "services", first_port=8805, apply=True))
+        web = tomllib.loads((self.tmp / "services" / "web.toml").read_text(encoding="utf-8"))
+        self.assertEqual([h["name"] for h in web["harness"]], ["alpha", "beta-project", "other"])
+        ports = [int(h["url"].rsplit(":", 1)[1]) for h in web["harness"]]
+        self.assertEqual(len(set(ports)), 3)
+        self.assertGreaterEqual(ports[2], 8805)  # no clash with the first run's ports
+        self.assertEqual(web["port"], 8787)
