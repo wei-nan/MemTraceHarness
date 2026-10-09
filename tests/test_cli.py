@@ -160,7 +160,9 @@ class CliTests(TestCase):
         trace_store = MagicMock()
         trace_store.list_due_schedules.return_value = []
 
-        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
+        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)), patch(
+            "memtrace_harness.agy_mcp_check.check_antigravity_mcp", return_value=[]
+        ):
             _serve_gateway_loop(
                 [gw],
                 scanner,
@@ -217,7 +219,9 @@ class CliTests(TestCase):
 
         trace_store.list_due_schedules.side_effect = fake_list_due
 
-        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)):
+        with patch("memtrace_harness.status_server.start_status_server", return_value=(None, None)), patch(
+            "memtrace_harness.agy_mcp_check.check_antigravity_mcp", return_value=[]
+        ):
             _serve_gateway_loop(
                 [gw],
                 scanner,
