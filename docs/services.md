@@ -119,22 +119,37 @@ or the page does not touch a running task, and a Harness restart only pauses del
 
 ## Migrating from the shared `.env`
 
-```bash
-memtrace-harness migrate --env .env                 # dry run: what would be written where
-memtrace-harness migrate --env .env --apply         # write it
-memtrace-harness migrate --env instances/project-c/.env --apply --services-dir ~/.config/memtraceharness   # another legacy instance
-```
+Order matters; the legacy files are never changed or deleted, so every step before the last can be undone.
 
-For each project in the index it writes `<project>/.harness.env` (the environment, with a fresh API
-token and the next free port) and `<project>/.harness/models.toml` (the suffixed model settings made plain), copies that project's slice of the shared store and its
-raw traces into `<project>/.harness/` (rows of other projects are dropped; the operator's global
-preferences stay; old Telegram `(chat, message)` ids become `tg:<chat>:<message>` references),
-copies its roles file, writes `<services>/<project>/telegram.env` when the project had a bot of its
-own, `<services>/web.toml`, and launchd plists under `<services>/launchd/`. A project that shared the
-global bot is reported: a bot now serves exactly one Harness. The legacy files are never changed or
-deleted, and an existing `.harness.env` is never overwritten.
+1. **Stop the old gateway(s)** (`launchctl bootout gui/$(id -u)/com.memtraceharness.gateway`, and `.project-c`
+   if you run it). The copy of the store is an online backup and safe, but a running gateway leaves a
+   workspace lock and an `active` conversation in it, and those would be carried over and block the new
+   Harness. A bot also cannot be polled by two processes at once.
+2. **Dry run** — what would be written where: `memtrace-harness migrate --env .env`.
+3. **Apply**: `memtrace-harness migrate --env .env --apply`. A separate legacy instance (project-c) is a second
+   run with its own env and a higher first port, into the same services dir:
+   `migrate --env instances/project-c/.env --first-port 8810 --apply` (the status page's `web.toml` is merged,
+   not replaced).
+4. **Check** each workspace: `memtrace-harness -C <workspace> doctor`.
+5. **Install** the plists from `~/.config/memtraceharness/launchd/`: Harness first, then its Telegram service,
+   then the page; send a message to the bot and confirm the reply.
+6. Keep the old `.env` until nothing else reads it (a script that posts to Telegram with the old bot token should
+   move to the Telegram service's relay).
 
-Switching over: stop the old gateway, copy the plists into `~/Library/LaunchAgents` and
-`launchctl bootstrap gui/$(id -u) <plist>`; `memtrace-harness -C <workspace> doctor` first.
-Scripts that read the old `.env` for a bot token (e.g. a daily-report script) should post to the
-Telegram service's relay instead.
+What is carried: each project's environment (MemTrace URL/token, CLI paths, TaiwanTrade settings → `.harness.env`),
+its preferences (suffixed chat/digest/recall/memory settings made plain → `models.toml`), its roles file, its slice of the
+shared store and raw traces, its bot token and chat allowlist (→ the Telegram service's env), and the bot's update
+offset (so nothing is replayed). Every legacy key is accounted for; the store paths and the project index are
+replaced by the workspace layout, the status page's port by `web.toml`.
+
+The store: a copy of the shared SQLite file per project (online backup), then everything that belongs to another project
+is deleted and the file vacuumed. Global things stay (provider cooldowns, the operator's global preferences). Old
+Telegram `(chat, message)` ids become `tg:<chat>:<message>` references and old schedule `chat_id`s become `tg:<chat>`
+addresses the first time the new store opens; the old gateway's offset table is dropped. Nothing else needs doing by hand.
+
+**Two projects on one MemTrace workspace** (Beri and beri-android today). Allowed, but the old single process
+coordinated them (one workspace lock per MemTrace workspace, one set of per-workspace tidy/promotion records); two
+Harnesses no longer share that. Each has its own lock and its own records, so both may scan the same backlog, tidy the
+same knowledge base in the same night window, and run a task on it at the same time. Give each its own
+`[memory] workspace_id` (cold memory is then separate), and decide which of the two owns the shared spec workspace's
+scanning and tidying.

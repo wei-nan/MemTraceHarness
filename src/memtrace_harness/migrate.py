@@ -17,10 +17,13 @@ Dry run unless `--apply`. The legacy files are never changed or deleted.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import re
 import secrets
 import shutil
 import sqlite3
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -209,6 +212,38 @@ def _move_traces(db: Path, old_root: Path, new_root: Path) -> int:
     return copied
 
 
+def legacy_telegram_offset(db: Path, bot_token: str) -> int | None:
+    """Where the old gateway had read this bot's updates up to (it stored sha256(token) -> offset)."""
+    if not db.is_file():
+        return None
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT last_offset FROM telegram_gateway_state WHERE bot_token_hash = ?",
+            (hashlib.sha256(bot_token.encode("utf-8")).hexdigest(),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    return int(row[0]) if row else None
+
+
+def merged_web_config(existing: Path, entries: list[dict[str, str]]) -> str:
+    """web.toml with `entries` added to (or replacing, by name) what an earlier migration wrote —
+    migrating the second legacy instance must not erase the first one's Harnesses."""
+    host, port, kept = "127.0.0.1", 8787, []
+    if existing.is_file():
+        data = tomllib.loads(existing.read_text(encoding="utf-8"))
+        host, port = str(data.get("host", host)), int(data.get("port", port))
+        kept = [h for h in data.get("harness", []) if h["name"] not in {e["name"] for e in entries}]
+    blocks = [
+        f'[[harness]]\nname = {json.dumps(h["name"])}\nurl = {json.dumps(h["url"])}\ntoken = {json.dumps(h["token"])}\n'
+        for h in [*kept, *entries]
+    ]
+    return f'host = {json.dumps(host)}\nport = {port}\n\n' + "\n".join(blocks)
+
+
 # ---- launchd
 
 def plist(label: str, argv: list[str], *, log: Path, exit_timeout: int | None = None) -> str:
@@ -257,7 +292,7 @@ def migrate_command(args: argparse.Namespace) -> int:
         raise ValueError(f"{index} lists no projects")
     services = (args.services_dir or DEFAULT_SERVICES_DIR).expanduser()
     repo_python = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"
-    plans = plan_workspaces(legacy, scopes)
+    plans = plan_workspaces(legacy, scopes, first_port=args.first_port)
 
     old_db = Path(legacy.get("HARNESS_TRACE_DB", "data/harness.sqlite3"))
     old_db = old_db if old_db.is_absolute() else base / old_db
@@ -281,7 +316,7 @@ def migrate_command(args: argparse.Namespace) -> int:
         print("\ndry run: nothing was written (use --apply)")
         return 0
 
-    web_entries: list[str] = []
+    web_entries: list[dict[str, str]] = []
     for plan in plans:
         scope = plan.scope
         paths = init_workspace(plan.root)
@@ -304,6 +339,9 @@ def migrate_command(args: argparse.Namespace) -> int:
         if plan.telegram:
             target = services / scope.name / "telegram.env"
             write_env_updates(target, plan.telegram)
+            offset = legacy_telegram_offset(old_db, plan.telegram["TELEGRAM_BOT_TOKEN"])
+            if offset is not None:  # carry on where the old gateway stopped reading, so nothing is replayed
+                (services / scope.name / "telegram.state.json").write_text(json.dumps({"offset": offset}), encoding="utf-8")
             (services / "launchd").mkdir(parents=True, exist_ok=True)
             (services / "launchd" / f"com.memtraceharness.{scope.name}.telegram.plist").write_text(
                 plist(
@@ -323,13 +361,11 @@ def migrate_command(args: argparse.Namespace) -> int:
             ),
             encoding="utf-8",
         )
-        web_entries.append(
-            f'[[harness]]\nname = "{scope.name}"\nurl = "http://127.0.0.1:{plan.api_port}"\ntoken = "{plan.api_token}"\n'
-        )
+        web_entries.append({"name": scope.name, "url": f"http://127.0.0.1:{plan.api_port}", "token": plan.api_token})
 
     web = services / "web.toml"
     web.parent.mkdir(parents=True, exist_ok=True)
-    web.write_text('host = "127.0.0.1"\nport = 8787\n\n' + "\n".join(web_entries), encoding="utf-8")
+    web.write_text(merged_web_config(web, web_entries), encoding="utf-8")
     web.chmod(0o600)
     (services / "launchd" / "com.memtraceharness.web.plist").write_text(
         plist(
