@@ -84,13 +84,12 @@ class ChatModelSaveTests(TestCase):
         import os
 
         from memtrace_harness import admin
-        from memtrace_harness.workspace import ENV_FILE_NAME
+        from memtrace_harness.workspace import models_file, read_model_settings
         from tests.workspace_support import workspace
 
         with workspace({"HARNESS_CHAT_PROVIDER": "claude"}) as (root, config):
             admin.update_chat_model(config, "codex", "gpt-6-luna")
             self.assertEqual(os.environ["HARNESS_CHAT_PROVIDER"], "codex")
             self.assertEqual(os.environ["HARNESS_CHAT_MODEL"], "gpt-6-luna")
-            saved = (root / ENV_FILE_NAME).read_text(encoding="utf-8")
-            self.assertIn("HARNESS_CHAT_MODEL=gpt-6-luna", saved)
+            self.assertEqual(read_model_settings(models_file(root))["HARNESS_CHAT_MODEL"], "gpt-6-luna")
             self.assertEqual(config.chat_candidates_for()[0], ("codex", "gpt-6-luna"))

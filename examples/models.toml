@@ -1,0 +1,36 @@
+# .harness/models.toml — this Harness's model preferences. The status page edits it (comments you
+# add here survive); changes take effect at once, no restart. Secrets do not belong here.
+# One workspace is one project, so there are no per-project overrides.
+
+[chat]                      # the quick reply to a message
+provider = "claude"
+model = "haiku"
+# fallbacks = ["antigravity/gemini-3.6-flash-high"]
+
+# Nightly memory digest: use a stronger model than chat. Unset = reuse the chat model.
+# [digest]
+# provider = "claude"
+# model = "sonnet"
+# fallbacks = ["codex/gpt-6"]
+
+# Background topic recall (finds earlier discussion of the current topic; see
+# docs/operating-contract.md). Unset = reuse the digest model.
+# [recall]
+# enabled = true
+# provider = "claude"
+# model = "claude-sonnet-5-5"
+# fallbacks = ["codex/gpt-6"]
+# ttl_hours = 72
+
+# [memory]
+# workspace_id = "ws_..."                    # where conversation memory is written; unset = the project's own
+# operator_preference_workspace_id = "ws_..."
+
+[behavior]
+unattended_write_requires_approval = true
+schedule_timezone = "Asia/Taipei"           # for "daily"/"weekdays" schedule times; any IANA zone
+# approval_ttl_hours = 12
+# reply_language = "Traditional Chinese (繁體中文，台灣用語與正體字)"
+
+# The Agent Loop's role profiles (Controller / Planner / Red Team / Developer) are a separate file,
+# .harness/roles.toml, used automatically when it exists.

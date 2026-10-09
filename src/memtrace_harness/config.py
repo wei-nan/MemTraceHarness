@@ -11,7 +11,8 @@ from memtrace_harness.workspace import STATE_DIR_NAME
 
 @dataclass(frozen=True)
 class HarnessConfig:
-    """Everything one Harness needs, read from its workspace's `.harness.env` (workspace.py).
+    """Everything one Harness needs, read from the process environment that `workspace.load_workspace()`
+    fills from the workspace's `.harness/models.toml` (preferences) and `.harness.env` (environment).
 
     A Harness is one workspace: one project, one set of models, one MemTrace workspace. There is
     nothing Telegram- or web-shaped in here — those are services (memtrace_services/) with their
@@ -235,7 +236,7 @@ class HarnessConfig:
     @classmethod
     def from_env(cls) -> "HarnessConfig":
         """Read the process environment, which `workspace.load_workspace()` has already filled
-        from the workspace's `.harness.env`. Relative state paths resolve against the workspace."""
+        from the workspace's `models.toml` and `.harness.env`. State paths default into the workspace."""
         root_text = os.getenv("HARNESS_WORKSPACE")
         root = Path(root_text).resolve() if root_text else None
         state = (root / STATE_DIR_NAME) if root else Path("data")

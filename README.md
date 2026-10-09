@@ -193,8 +193,10 @@ repository — and everything it needs is in that folder:
 
 ```text
 my-project/
-  .harness.env        this Harness's settings and secrets (MemTrace token, models, its API token), mode 0600
-  .harness/           its state: harness.sqlite3, raw provider traces, git worktrees, roles.toml
+  .harness.env        its environment: MemTrace URL/token, its API token, CLI paths — mode 0600
+  .harness/           its state: harness.sqlite3, raw provider traces, git worktrees, and the
+                      preference files models.toml (chat/digest/recall models, memory, behaviour)
+                      and roles.toml (the Agent Loop's role profiles)
   harness-scope.md    what the project is: MemTrace workspace id, off-limits, jobs, worker slots
 ```
 
@@ -224,7 +226,10 @@ work with or without one.
 
 ## Configuration
 
-See `examples/harness.env`. Command variables accept an executable name or explicit path, which is
+Two files, one purpose each: `.harness.env` is the *environment* (`examples/harness.env`: secrets,
+endpoints, CLI paths) and `.harness/models.toml` the *preferences* (`examples/models.toml`: which model
+chats, digests and recalls, what falls back to what; the status page edits it and a change takes
+effect at once). Command variables accept an executable name or explicit path, which is
 useful when WindowsApps or PATH resolution prevents a CLI from starting.
 
 ```text
@@ -239,8 +244,8 @@ HARNESS_CLI_TIMEOUT_SECONDS=900
 verified Antigravity 1.1.10 advertises stream JSON and model selection. Its usage schema remains
 version-sensitive and is normalized as partial until pinned by real fixtures.
 
-Settings have no per-project suffixes: a workspace is one project, so `HARNESS_CHAT_MODEL` is that
-project's chat model. The models a child process runs under never inherit this file's secrets — a
+Settings have no per-project suffixes: a workspace is one project, so `[chat] model` is that
+project's chat model (the same setting is the environment variable `HARNESS_CHAT_MODEL`, which still wins if set). The models a child process runs under never inherit this file's secrets — a
 provider CLI, a verify command or a job gets only `PATH`, `HOME`, the locale, proxy and CLI-login
 variables (`HARNESS_PASSTHROUGH_ENV` adds names), and only a Codex call wired to the MemTrace MCP
 server gets `MEMTRACE_API_TOKEN`.

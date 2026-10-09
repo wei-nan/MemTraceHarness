@@ -11,7 +11,7 @@ from unittest import TestCase
 from memtrace_harness.api import HarnessApi
 from memtrace_harness.runtime import build_harness
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file
+from memtrace_harness.workspace import models_file, read_model_settings
 from memtrace_services.web.aggregate import Aggregator, HarnessTarget
 from memtrace_services.web.main import load_config
 from memtrace_services.web.server import start_server
@@ -70,8 +70,8 @@ class WebServiceTests(TestCase):
         aggregator, base = self._web([a, b])
         status, _ = self._post(base, "/api/chat-model", {"project": "beta", "provider": "codex", "model": "gpt-6-luna"})
         self.assertEqual(status, 200)
-        self.assertEqual(parse_env_file(root_b / ENV_FILE_NAME)["HARNESS_CHAT_MODEL"], "gpt-6-luna")
-        self.assertEqual(parse_env_file(root_a / ENV_FILE_NAME)["HARNESS_CHAT_MODEL"], "haiku")  # untouched
+        self.assertEqual(read_model_settings(models_file(root_b))["HARNESS_CHAT_MODEL"], "gpt-6-luna")
+        self.assertEqual(read_model_settings(models_file(root_a))["HARNESS_CHAT_MODEL"], "haiku")  # untouched
 
     def test_errors_from_the_harness_come_back_as_the_pages_error_text(self) -> None:
         _, _, a = self._harness("alpha", "ta")

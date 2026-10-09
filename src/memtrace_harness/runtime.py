@@ -13,7 +13,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from memtrace_harness.api import ChangeBus, HarnessApi
@@ -236,7 +236,7 @@ def serve(
             try:
                 service.expire_stale_approvals(config.approval_ttl_hours)
                 trace_store.prune_outbox(
-                    (datetime.now(timezone.utc) - _hours(OUTBOX_RETENTION_HOURS)).isoformat()
+                    (datetime.now(timezone.utc) - timedelta(hours=OUTBOX_RETENTION_HOURS)).isoformat()
                 )
             except Exception:
                 logger.exception("expiring stale approvals failed; continuing")
@@ -346,12 +346,6 @@ def serve(
     api.stop()
     print("Harness serve loop stopped.", flush=True)
     return 0
-
-
-def _hours(n: int):
-    from datetime import timedelta
-
-    return timedelta(hours=n)
 
 
 def drain_inflight_agent_loops(grace_seconds: int) -> None:

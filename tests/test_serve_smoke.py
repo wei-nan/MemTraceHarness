@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from memtrace_harness.init_workspace import init_workspace_command
-from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file, write_env_updates
+from memtrace_harness.workspace import ENV_FILE_NAME, models_file, parse_env_file, update_model_settings, write_env_updates
 
 REPO = Path(__file__).resolve().parent.parent
 FAKE_CLAUDE = """#!/bin/sh
@@ -106,12 +106,9 @@ class ServeSmokeTests(TestCase):
             port = free_port()
             write_env_updates(
                 root / ENV_FILE_NAME,
-                {
-                    "HARNESS_API_PORT": str(port), "HARNESS_CLAUDE_COMMAND": str(fake),
-                    "HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku",
-                    "HARNESS_SHUTDOWN_GRACE_SECONDS": "1",
-                },
+                {"HARNESS_API_PORT": str(port), "HARNESS_CLAUDE_COMMAND": str(fake), "HARNESS_SHUTDOWN_GRACE_SECONDS": "1"},
             )
+            update_model_settings(models_file(root), {"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"})
             token = parse_env_file(root / ENV_FILE_NAME)["HARNESS_API_TOKEN"]
             bot = StubBotApi(chat_id=4242, text="你好")
             self.addCleanup(bot.close)

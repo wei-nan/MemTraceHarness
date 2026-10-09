@@ -19,8 +19,8 @@ Hard project boundaries:
 - The Harness and its services are separate: `memtrace_harness` never imports `memtrace_services` and
   vice versa; a service reaches a Harness only through its local HTTP API; the Harness holds no chat
   transport, bot token or chat id (see "Harness and services" in the operating contract). Each Harness
-  runs against one workspace folder and keeps its settings in that folder's `.harness.env` — never read
-  or print it, and never put a secret in a command line or a log.
+  runs against one workspace folder and keeps its environment in that folder's `.harness.env` and its model
+  preferences in `.harness/models.toml` — never read or print the former, and never put a secret in a command line or a log.
 - Harness output remains draft evidence; it cannot approve its own Agent Loop gate or Improvement
   Loop proposal.
 - Role identity is the job in the pipeline (route, plan, escalate, verify, implement), not a vendor

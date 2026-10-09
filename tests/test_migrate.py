@@ -8,7 +8,7 @@ from unittest import TestCase
 from memtrace_harness.migrate import migrate_command, plan_workspaces, slug
 from memtrace_harness.scope import load_project_index
 from memtrace_harness.trace_store import TraceStore
-from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file
+from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file, read_model_settings
 
 LEGACY = """\
 MEMTRACE_MCP_URL=https://kb.example/mcp
@@ -92,7 +92,11 @@ class MigrationFixture(TestCase):
                 "status, created_at, telegram_chat_id, telegram_message_id) "
                 "VALUES ('appr_old', 'chat_alp', 'ws_alpha', '/x', 'git_push', 'x', 'pending', 't', 111, 42)"
             )
-            conn.execute("ALTER TABLE schedules ADD COLUMN chat_id INTEGER") if False else None
+            conn.execute("ALTER TABLE schedules ADD COLUMN chat_id INTEGER")
+            conn.execute(
+                "INSERT INTO schedules (id, project, workspace_id, goal, kind, active, created_at, next_run_at, chat_id) "
+                "VALUES ('sched_old', 'alpha', 'ws_alpha', 'g', 'daily', 1, 't', 't', 111)"
+            )
             conn.commit()
 
     def apply(self) -> int:
@@ -125,6 +129,12 @@ class PlanTests(MigrationFixture):
         self.assertIsNone(beta.telegram)
         self.assertTrue(any("shared the global bot" in n for n in beta.notes))
 
+    def test_two_projects_on_one_memtrace_workspace_are_flagged(self) -> None:
+        (self.beta / "harness-scope.md").write_text("# scope\n\n- workspace_id: ws_alpha\n", encoding="utf-8")
+        alpha, beta = plan_workspaces(parse_env_file(self.env), load_project_index(self.index))
+        self.assertTrue(any("shares MemTrace workspace ws_alpha with beta-project" in n for n in alpha.notes))
+        self.assertTrue(any("with alpha" in n for n in beta.notes))
+
     def test_slug_matches_the_old_suffix_rule(self) -> None:
         self.assertEqual(slug("beri-android"), "BERI_ANDROID")
         self.assertEqual(slug("project-c"), "PROJECT_C")
@@ -146,8 +156,15 @@ class ApplyTests(MigrationFixture):
             self.assertEqual(stat.S_IMODE((root / ENV_FILE_NAME).stat().st_mode), 0o600)
             self.assertTrue((root / ".harness" / "harness.sqlite3").is_file())
         alpha_env = parse_env_file(self.alpha / ENV_FILE_NAME)
-        self.assertEqual(alpha_env["HARNESS_ROLE_PROFILES_FILE"], str(self.alpha / ".harness" / "roles.toml"))
+        self.assertNotIn("HARNESS_ROLE_PROFILES_FILE", alpha_env)  # found by its place
         self.assertEqual((self.alpha / ".harness" / "roles.toml").read_text(encoding="utf-8"), "[profiles.controller]\n")
+        # environment and preferences are two files
+        self.assertEqual(set(alpha_env), {"MEMTRACE_MCP_URL", "MEMTRACE_API_TOKEN", "HARNESS_CLAUDE_COMMAND", "HARNESS_API_PORT", "HARNESS_API_TOKEN"})
+        preferences = read_model_settings(self.alpha / ".harness" / "models.toml")
+        self.assertEqual(preferences["HARNESS_CHAT_MODEL"], "sonnet")
+        self.assertEqual(preferences["HARNESS_CHAT_FALLBACKS"], "antigravity/gemini")
+        self.assertEqual(preferences["HARNESS_MEMORY_WORKSPACE_ID"], "ws_shared_mem")
+        self.assertEqual(read_model_settings(self.beta / ".harness" / "models.toml")["HARNESS_MEMORY_WORKSPACE_ID"], "ws_beta_mem")
         telegram = parse_env_file(self.tmp / "services" / "alpha" / "telegram.env")
         self.assertEqual(telegram["TELEGRAM_BOT_TOKEN"], "alpha-bot")
         self.assertEqual(telegram["HARNESS_API_TOKEN"], alpha_env["HARNESS_API_TOKEN"])
@@ -202,3 +219,5 @@ class LegacyStoreTests(MigrationFixture):
         store = TraceStore(self.alpha / ".harness" / "harness.sqlite3")
         self.assertEqual(store.get_approval_request("appr_old")["message_ref"], "tg:111:42")
         self.assertEqual(store.get_approval_request_by_message_ref("tg:111:42")["id"], "appr_old")
+        [schedule] = store.list_schedules("alpha")
+        self.assertEqual(schedule["audience"], "tg:111")

@@ -298,7 +298,7 @@ class _Handler(BaseHTTPRequestHandler):
         # Same code path a text command, a button or a reply goes through — one place resolves an
         # approval, this is just another door to it. A resulting Agent Loop resumption runs in a
         # background thread, so this returns at once.
-        msg = service._resolve_approval_action(request_id, action, None, None)
+        msg = service.resolve_approval(request_id, action)
         self.api.bus.publish()
         self._send(200, {"ok": True, "message": msg})
 

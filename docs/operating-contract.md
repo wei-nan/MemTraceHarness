@@ -19,8 +19,10 @@ The Harness is the model-based work of one project; transports and presentation 
 services. **ENFORCED** (`tests/test_service_boundary.py` and the API/service tests):
 
 - One Harness serves one workspace (a folder; empty and non-git are fine) and keeps everything in it:
-  `.harness.env` (settings and secrets, mode 0600), `.harness/` (store, raw traces, worktrees,
-  `roles.toml`), `harness-scope.md`. Settings have no per-project suffixes. When the workspace is a git
+  `.harness.env` (environment: secrets, endpoints, CLI paths; mode 0600), `.harness/` (store, raw traces,
+  worktrees, and the preference files `models.toml` and `roles.toml`), `harness-scope.md`. Preferences are
+  not in the secrets file: the status page edits `models.toml`, never `.harness.env`. Settings have no
+  per-project suffixes. When the workspace is a git
   checkout, `.harness.env` and `.harness/` are excluded locally (`.git/info/exclude`), and the project's
   off-limits list always includes them.
 - The Harness has no chat transport: no Bot API call, no bot token, no chat id. What it wants said goes

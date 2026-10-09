@@ -14,13 +14,41 @@ environment files and are deliberately not configured here: this file never hold
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
+import tomllib
 from pathlib import Path
 
 ENV_FILE_NAME = ".harness.env"
 STATE_DIR_NAME = ".harness"
 SCOPE_FILE_NAME = "harness-scope.md"
+MODELS_FILE_NAME = "models.toml"
+
+# models.toml <-> the environment variable HarnessConfig reads for it: (table, key) -> (variable, kind).
+# Environment and preferences are two files: secrets and endpoints in `.harness.env`, what the
+# operator chooses (which model, what falls back to what) here, where the status page can edit it.
+MODEL_SETTINGS: dict[tuple[str, str], tuple[str, str]] = {
+    ("chat", "provider"): ("HARNESS_CHAT_PROVIDER", "str"),
+    ("chat", "model"): ("HARNESS_CHAT_MODEL", "str"),
+    ("chat", "fallbacks"): ("HARNESS_CHAT_FALLBACKS", "list"),
+    ("digest", "provider"): ("HARNESS_DIGEST_PROVIDER", "str"),
+    ("digest", "model"): ("HARNESS_DIGEST_MODEL", "str"),
+    ("digest", "fallbacks"): ("HARNESS_DIGEST_FALLBACKS", "list"),
+    ("recall", "enabled"): ("HARNESS_RECALL_ENABLED", "bool"),
+    ("recall", "provider"): ("HARNESS_RECALL_PROVIDER", "str"),
+    ("recall", "model"): ("HARNESS_RECALL_MODEL", "str"),
+    ("recall", "fallbacks"): ("HARNESS_RECALL_FALLBACKS", "list"),
+    ("recall", "ttl_hours"): ("HARNESS_RECALL_TTL_HOURS", "int"),
+    ("memory", "workspace_id"): ("HARNESS_MEMORY_WORKSPACE_ID", "str"),
+    ("memory", "operator_preference_workspace_id"): ("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID", "str"),
+    ("behavior", "unattended_write_requires_approval"): ("HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL", "bool"),
+    ("behavior", "schedule_timezone"): ("HARNESS_SCHEDULE_TIMEZONE", "str"),
+    ("behavior", "approval_ttl_hours"): ("HARNESS_APPROVAL_TTL_HOURS", "int"),
+    ("behavior", "reply_language"): ("HARNESS_REPLY_LANGUAGE", "str"),
+}
+MODEL_ENV_VARS = {name: (table, key, kind) for (table, key), (name, kind) in MODEL_SETTINGS.items()}
 
 # Keys that identify a service's secret rather than the Harness's: if one of these shows up in a
 # `.harness.env` the workspace is still configured the old way and the Harness refuses to carry
@@ -81,6 +109,66 @@ def _restrict(path: Path) -> None:
         pass
 
 
+def _toml_literal(value: str, kind: str) -> str:
+    """The TOML text of one setting. Strings use JSON's escaping, which TOML's basic strings share."""
+    if kind == "list":
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        return "[" + ", ".join(json.dumps(item, ensure_ascii=False) for item in items) + "]"
+    if kind == "bool":
+        return "true" if value.strip().lower() in {"1", "true", "yes", "on"} else "false"
+    if kind == "int":
+        return str(int(value))
+    return json.dumps(value, ensure_ascii=False)
+
+
+def read_model_settings(path: Path) -> dict[str, str]:
+    """models.toml as the environment variables HarnessConfig reads (name -> string)."""
+    if not path.is_file():
+        return {}
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, str] = {}
+    for (table, key), (name, kind) in MODEL_SETTINGS.items():
+        value = (data.get(table) or {}).get(key)
+        if value is None:
+            continue
+        if kind == "list":
+            out[name] = ",".join(str(v) for v in value)
+        elif kind == "bool":
+            out[name] = "true" if value else "false"
+        else:
+            out[name] = str(value)
+    return out
+
+
+def update_model_settings(path: Path, updates: dict[str, str]) -> None:
+    """Set settings (by environment-variable name) in models.toml with a surgical text patch, so the
+    comments an operator writes there survive; creates the file and any table that is missing."""
+    text = path.read_text(encoding="utf-8") if path.is_file() else "# Models and preferences of this Harness (the status page edits it too).\n"
+    for name, value in updates.items():
+        if name not in MODEL_ENV_VARS:
+            raise ValueError(f"{name} is not a models.toml setting")
+        table, key, kind = MODEL_ENV_VARS[name]
+        line = f"{key} = {_toml_literal(value, kind)}"
+        header = re.search(rf"(?m)^\[{re.escape(table)}\][ \t]*$", text)
+        if header is None:
+            text = text.rstrip("\n") + f"\n\n[{table}]\n{line}\n"
+            continue
+        body_start = header.end()
+        following = re.search(r"(?m)^\[", text[body_start:])
+        body_end = body_start + following.start() if following else len(text)
+        body = text[body_start:body_end]
+        new_body, replaced = re.subn(rf"(?m)^{re.escape(key)}[ \t]*=.*$", lambda _m: line, body, count=1)
+        if not replaced:
+            new_body = body.rstrip("\n") + f"\n{line}\n" + ("\n" if following else "")
+        text = text[:body_start] + new_body + text[body_end:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def models_file(root: Path) -> Path:
+    return root / STATE_DIR_NAME / MODELS_FILE_NAME
+
+
 def workspace_paths(root: Path) -> dict[str, Path]:
     root = root.resolve()
     state = root / STATE_DIR_NAME
@@ -91,6 +179,7 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "db": state / "harness.sqlite3",
         "traces": state / "traces",
         "roles": state / "roles.toml",
+        "models": state / MODELS_FILE_NAME,
         "scope": root / SCOPE_FILE_NAME,
     }
 
@@ -148,6 +237,10 @@ def load_workspace(root: Path | str, *, environ: dict[str, str] | None = None) -
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
         raise WorkspaceError(f"workspace {root_path} is not a directory")
+    # The real environment wins, then the preference file, then the environment file: a model chosen
+    # on the status page must not be shadowed by an old line in `.harness.env`.
+    for key, value in read_model_settings(models_file(root_path)).items():
+        target.setdefault(key, value)
     env_file = root_path / ENV_FILE_NAME
     if env_file.is_file():
         for key, value in parse_env_file(env_file).items():
@@ -168,4 +261,6 @@ def env_file_problems(root: Path) -> list[str]:
     for key in keys:
         if key in SERVICE_ONLY_KEYS or key.startswith("HARNESS_TELEGRAM_"):
             problems.append(f"{key} belongs in the Telegram service's env file, not in {env_file.name}")
+        elif key in MODEL_ENV_VARS:
+            problems.append(f"{key} is a preference: it belongs in {STATE_DIR_NAME}/{MODELS_FILE_NAME}, not in {env_file.name}")
     return problems

@@ -3,8 +3,8 @@
 `collect_status_data()` is the one JSON-safe description of this Harness (one workspace, one
 project) that the CLI's `status` command, the Harness API (api.py) and, through it, the status web
 service all read, so they never drift apart. The `update_*` functions change this workspace's model
-settings: they write `.harness.env` (so a restart keeps them) and the process environment (so the
-next call already uses them).
+settings: they write `.harness/models.toml` (so a restart keeps them) and the process environment (so
+the next call already uses them).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from memtrace_harness.memory_digest import PREFERENCE_CATEGORY_LABELS
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.scope import ProjectScope
 from memtrace_harness.trace_store import TraceStore
-from memtrace_harness.workspace import ENV_FILE_NAME, STATE_DIR_NAME, write_env_updates
+from memtrace_harness.workspace import STATE_DIR_NAME, models_file, update_model_settings
 
 logger = logging.getLogger(__name__)
 
@@ -280,18 +280,14 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
 
 
 
-def _env_file(config: HarnessConfig) -> Path:
-    if config.workspace_root is None:
-        raise ValueError("this Harness was not started from a workspace; there is no .harness.env to change")
-    return config.workspace_root / ENV_FILE_NAME
-
-
 def _apply(config: HarnessConfig, updates: dict[str, str]) -> None:
-    """Persist in `.harness.env` and take effect immediately: the model-candidate helpers on
-    HarnessConfig read os.environ on every call. Until 2026-10-02 only the file was written, so the
-    page re-rendered the still-running old model right after "saved" — it looked as if the save had
-    bounced back."""
-    write_env_updates(_env_file(config), updates)
+    """Persist in this workspace's `models.toml` and take effect immediately: the model-candidate
+    helpers on HarnessConfig read os.environ on every call. Until 2026-10-02 only the file was written,
+    so the page re-rendered the still-running old model right after "saved" — it looked as if the save
+    had bounced back."""
+    if config.workspace_root is None:
+        raise ValueError("this Harness was not started from a workspace; there is no models.toml to change")
+    update_model_settings(models_file(config.workspace_root), updates)
     os.environ.update(updates)
 
 
@@ -405,7 +401,7 @@ def create_dedicated_role_profiles_file(config: HarnessConfig) -> Path:
     if not dest.is_file():
         default_toml = Path(__file__).with_name("default-role-profiles.toml")
         dest.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
-    _apply(config, {"HARNESS_ROLE_PROFILES_FILE": str(dest)})
+    os.environ["HARNESS_ROLE_PROFILES_FILE"] = str(dest)  # `.harness/roles.toml` is found again at every start
     return dest
 
 

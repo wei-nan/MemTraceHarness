@@ -30,7 +30,8 @@ A folder, empty or not, git or not (`memtrace-harness init-workspace <folder>`):
 
 | path | what | mode |
 | --- | --- | --- |
-| `.harness.env` | this Harness's settings and secrets | 0600 |
+| `.harness.env` | its environment: secrets, endpoints, CLI paths (`MEMTRACE_*`, `HARNESS_API_*`, `HARNESS_*_COMMAND`) | 0600 |
+| `.harness/models.toml` | its preferences: chat / digest / recall models and fallbacks, memory workspace, behaviour | |
 | `.harness/harness.sqlite3` | its store (turns, approvals, schedules, outbox, ...) | |
 | `.harness/traces/` | raw provider output, git worktrees | |
 | `.harness/roles.toml` | its own role profiles (optional; else the packaged default) | |
@@ -40,12 +41,15 @@ When the folder is a git checkout, `.harness.env` and `.harness/` go into `.git/
 project's own `.gitignore` is not touched), and `.harness.env` / `.harness` are always in the
 project's off-limits list.
 
-`.harness.env` holds only what the Harness needs: `MEMTRACE_MCP_URL`/`MEMTRACE_API_TOKEN`, the CLI
-commands, the chat / digest / recall models and fallbacks, `HARNESS_MEMORY_WORKSPACE_ID`, approval and
-schedule settings, and the API's `HARNESS_API_HOST` / `HARNESS_API_PORT` / `HARNESS_API_TOKEN`. There are no
-per-project suffixes. A service's settings (bot token, chat ids) are never in it — `doctor` flags them if they are.
-Changing a model from the status page writes the file and takes effect in the running process at
-once.
+Environment and preferences are separate files. `.harness.env` holds what the Harness needs to run and
+reach things — `MEMTRACE_MCP_URL`/`MEMTRACE_API_TOKEN`, the CLI paths and timeout, the API's
+`HARNESS_API_HOST` / `HARNESS_API_PORT` / `HARNESS_API_TOKEN`; `models.toml` holds what the operator
+chooses (`[chat]`, `[digest]`, `[recall]` provider/model/fallbacks, `[memory]`, `[behavior]`) and is what the
+status page edits — by a comment-preserving text patch, so what you write there survives — taking effect in
+the running process at once and never rewriting the file that holds the secrets. The loader reads the real
+environment first, then `models.toml`, then `.harness.env`. There are no per-project suffixes. A service's
+settings (bot token, chat ids) are in neither — `doctor` flags them, and a preference left in
+`.harness.env`, if they are.
 
 ## The Harness API
 
@@ -121,8 +125,8 @@ memtrace-harness migrate --env .env --apply         # write it
 memtrace-harness migrate --env instances/project-c/.env --apply --services-dir ~/.config/memtraceharness   # another legacy instance
 ```
 
-For each project in the index it writes `<project>/.harness.env` (suffixed settings made plain,
-a fresh API token and the next free port), copies that project's slice of the shared store and its
+For each project in the index it writes `<project>/.harness.env` (the environment, with a fresh API
+token and the next free port) and `<project>/.harness/models.toml` (the suffixed model settings made plain), copies that project's slice of the shared store and its
 raw traces into `<project>/.harness/` (rows of other projects are dropped; the operator's global
 preferences stay; old Telegram `(chat, message)` ids become `tg:<chat>:<message>` references),
 copies its roles file, writes `<services>/<project>/telegram.env` when the project had a bot of its
