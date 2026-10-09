@@ -25,6 +25,7 @@ def build_provider_adapter(
     adapter_id: str | None = None,
     fallback_index: int = 0,
     cli_version: str | None = None,
+    read_directories: tuple[Path, ...] = (),
 ) -> ModelAdapter:
     if candidate is not None and profile is None:
         raise ValueError("A model candidate requires a role profile")
@@ -68,6 +69,7 @@ def build_provider_adapter(
         "fallback_index": fallback_index,
         "reply_language": config.reply_language,
         "memtrace_mcp_url": config.memtrace_mcp_url,
+        "read_directories": read_directories if (profile is None or profile.permission == "read-only") else (),
     }
     if effective_provider == "claude":
         return ClaudeCliAdapter(**common)
@@ -107,6 +109,7 @@ def build_role_adapter_candidates(
     config: HarnessConfig,
     working_directory: Path,
     timeout_seconds: int,
+    read_directories: tuple[Path, ...] = (),
 ) -> dict[str, list[ModelAdapter]]:
     versions = probe_cli_versions(
         config=config,
@@ -131,6 +134,7 @@ def build_role_adapter_candidates(
                 working_directory=working_directory,
                 timeout_seconds=timeout_seconds,
                 cli_version=versions.get(candidate.provider),
+                read_directories=read_directories,
             )
             for index, candidate in enumerate(profile.candidates)
         ]

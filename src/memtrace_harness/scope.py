@@ -1,13 +1,80 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
+import tomllib
 
 from memtrace_harness.workspace import ENV_FILE_NAME, STATE_DIR_NAME
 
 
 DEFAULT_MAX_WORKERS = 3
+
+
+REPO_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# A goal that starts `repo=<name>::` is for that repo (a chat task marker, a schedule, a scanner proposal).
+REPO_GOAL_PREFIX = re.compile(r"^repo=([A-Za-z0-9_-]{1,40})::(.*)$", re.DOTALL)
+
+
+def split_repo_goal(goal: str) -> tuple[str | None, str]:
+    """(`repo` name or None, the goal without its `repo=<name>::` prefix)."""
+    match = REPO_GOAL_PREFIX.match(goal.strip())
+    return (match.group(1), match.group(2).strip()) if match else (None, goal)
+
+
+@dataclass
+class RepoScope:
+    """A repo a Harness also works in and helps maintain, besides its primary one. Declared in the
+    workspace's `.harness/repos.toml` (machine-local, never committed): where it is on this machine, how to
+    verify a change, and what is off-limits in it."""
+
+    name: str
+    path: Path
+    verify_command: str | None = None
+    verify_timeout_seconds: int | None = None
+    worktree_setup_command: str | None = None
+    github_repo: str | None = None
+    off_limits: list[str] = field(default_factory=list)
+
+
+def load_repos(path: Path) -> dict[str, RepoScope]:
+    if not path.is_file():
+        return {}
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    repos: dict[str, RepoScope] = {}
+    for name, entry in (data.get("repos") or {}).items():
+        if not REPO_NAME.match(name):
+            raise ValueError(f"{path}: {name!r} is not a usable repo name (letters, digits, - and _)")
+        if not entry.get("path"):
+            raise ValueError(f"{path}: repo {name!r} has no path")
+        repos[name] = RepoScope(
+            name=name,
+            path=Path(str(entry["path"])).expanduser().resolve(),
+            verify_command=entry.get("verify_command"),
+            verify_timeout_seconds=entry.get("verify_timeout_seconds"),
+            worktree_setup_command=entry.get("worktree_setup_command"),
+            github_repo=entry.get("github_repo"),
+            off_limits=[str(x) for x in entry.get("off_limits", [])],
+        )
+    return repos
+
+
+def dump_repos(repos: dict[str, RepoScope]) -> str:
+    """repos.toml text. (The file is managed by `memtrace-harness repo ...`; comments are not kept.)"""
+    import json
+
+    lines = ["# The repos this Harness also works in. Managed by `memtrace-harness repo add|remove`."]
+    for name, repo in repos.items():
+        lines += ["", f"[repos.{name}]", f"path = {json.dumps(str(repo.path), ensure_ascii=False)}"]
+        for key in ("verify_command", "worktree_setup_command", "github_repo"):
+            value = getattr(repo, key)
+            if value:
+                lines.append(f"{key} = {json.dumps(value, ensure_ascii=False)}")
+        if repo.verify_timeout_seconds:
+            lines.append(f"verify_timeout_seconds = {int(repo.verify_timeout_seconds)}")
+        if repo.off_limits:
+            lines.append("off_limits = [" + ", ".join(json.dumps(x, ensure_ascii=False) for x in repo.off_limits) + "]")
+    return "\n".join(lines) + "\n"
 
 
 @dataclass
@@ -40,6 +107,56 @@ class ProjectScope:
     probe_hosts: list[str] | None = None
     log_files: list[str] | None = None
     jobs: dict[str, str] | None = None
+    # Other repos this Harness works in (see RepoScope); the scope above describes the primary one.
+    repos: dict[str, RepoScope] = field(default_factory=dict)
+    # Which repo this view of the scope is for: None = the primary one. See for_repo().
+    repo: str | None = None
+    base: "ProjectScope | None" = field(default=None, repr=False, compare=False)
+
+    def resolve_repo(self, name: str | None) -> str | None:
+        """None for the primary repo (also when named by the project's own name or `primary`), the
+        declared repo's name otherwise; ValueError for one that does not exist."""
+        if name is None:
+            return None
+        lowered = name.lower()
+        if lowered in {"primary", self.name.lower()}:
+            return None
+        for declared in self.repos:
+            if declared.lower() == lowered:
+                return declared
+        known = ", ".join([self.name, *self.repos]) or self.name
+        raise ValueError(f"no repo named {name!r} (this project's repos: {known})")
+
+    def for_repo(self, name: str | None) -> "ProjectScope":
+        """This scope as seen by a task in one repo: that repo's directory, verify command, setup command
+        and GitHub repo, and its off-limits added to the project's. Everything about the project (workspace
+        id, name, worker slots) is unchanged. Asking a repo's view for another repo (or None) starts again
+        from the project's own scope."""
+        base = self.base or self
+        resolved = base.resolve_repo(name)
+        if resolved is None:
+            return base
+        repo = base.repos[resolved]
+        return replace(
+            base,
+            base=base,
+            repo=resolved,
+            working_directory=repo.path,
+            verify_command=repo.verify_command,
+            verify_timeout_seconds=repo.verify_timeout_seconds,
+            worktree_setup_command=repo.worktree_setup_command,
+            github_repo=repo.github_repo,
+            off_limits=[*(base.off_limits or []), *[o for o in repo.off_limits if o not in (base.off_limits or [])]],
+        )
+
+    @property
+    def lock_key(self) -> str:
+        """What one Developer at a time is serialized on: the MemTrace workspace for the primary repo,
+        that workspace plus the repo for another one (two repos can be edited side by side)."""
+        return self.workspace_id if self.repo is None else f"{self.workspace_id}#{self.repo}"
+
+    def repo_label(self) -> str:
+        return self.name if self.repo is None else self.repo
 
     @classmethod
     def from_file(cls, path: Path) -> ProjectScope:

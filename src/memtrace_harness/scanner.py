@@ -4,6 +4,7 @@ import json
 import logging
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 from uuid import uuid4
 
@@ -132,56 +133,71 @@ class UnattendedScanner:
         need ids (in queue order), e.g. status reporting."""
         return [str(node["id"]) for node in self._find_ready_candidates(scope, run_id=run_id)]
 
+    @staticmethod
+    def _github_sources(scope: ProjectScope) -> list[tuple[str | None, str, Path]]:
+        """(repo name or None for the primary one, owner/repo, checkout) for every repo of the project
+        that has a GitHub repo set."""
+        sources: list[tuple[str | None, str, Path]] = []
+        if scope.github_repo:
+            sources.append((None, scope.github_repo, scope.working_directory))
+        for name, repo in scope.repos.items():
+            if repo.github_repo:
+                sources.append((name, repo.github_repo, repo.path))
+        return sources
+
     def _find_ready_github_issues(self, scope: ProjectScope) -> list[dict[str, Any]]:
         """Alternative backlog source to MemTrace Task Nodes: GitHub Issues via the
-        `gh` CLI, for any project whose harness-scope.md sets `github_repo`
+        `gh` CLI, for any project whose harness-scope.md sets `github_repo` (and any extra repo of
+        it that has one, see `.harness/repos.toml`)
         (2026-09-05 — the MemTrace Task Node tagging convention proved hard to
         keep in sync with actual work in practice, so git/GitHub became the source
         of truth for "what's ready to build" instead). Readiness judgment: an open
         issue with no assignee — anything still being discussed or already claimed
         (assigned to a human or a prior harness run) is excluded. Sorted
-        oldest-first, same queue-order convention as _find_ready_task_nodes()."""
-        if not scope.github_repo:
-            return []
+        oldest-first across the repos, same queue-order convention as _find_ready_task_nodes().
+        Each candidate says which repo it belongs to."""
+        found: list[dict[str, Any]] = []
+        for repo_name, github_repo, checkout in self._github_sources(scope):
+            found.extend(self._list_github_issues(repo_name, github_repo, checkout))
+        found.sort(key=lambda item: str(item.get("created_at") or ""))
+        return found
+
+    @staticmethod
+    def _list_github_issues(repo_name: str | None, github_repo: str, checkout: Path) -> list[dict[str, Any]]:
         try:
             result = subprocess.run(
                 [
                     "gh", "issue", "list",
-                    "--repo", scope.github_repo,
+                    "--repo", github_repo,
                     "--state", "open",
                     "--json", "number,title,body,assignees,createdAt,url",
                     "--limit", "50",
                 ],
-                cwd=scope.working_directory,
+                cwd=checkout,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
             if result.returncode != 0:
-                logger.error(
-                    f"gh issue list failed for {scope.github_repo}: {result.stderr.strip()}"
-                )
+                logger.error(f"gh issue list failed for {github_repo}: {result.stderr.strip()}")
                 return []
             issues = json.loads(result.stdout)
         except Exception as exc:
-            logger.error(f"Failed to list GitHub issues for {scope.github_repo}: {exc}")
+            logger.error(f"Failed to list GitHub issues for {github_repo}: {exc}")
             return []
         if not isinstance(issues, list):
             return []
-        ready = [
-            issue
-            for issue in issues
-            if isinstance(issue, dict) and not issue.get("assignees")
-        ]
+        ready = [issue for issue in issues if isinstance(issue, dict) and not issue.get("assignees")]
         ready.sort(key=lambda issue: str(issue.get("createdAt") or ""))
         return [
             {
-                "id": f"gh:{scope.github_repo}#{issue['number']}",
+                "id": f"gh:{github_repo}#{issue['number']}",
                 "title": issue.get("title"),
                 "created_at": issue.get("createdAt"),
                 "body": issue.get("body"),
                 "url": issue.get("url"),
                 "number": issue.get("number"),
+                "repo": repo_name,
             }
             for issue in ready
             if issue.get("number") is not None
@@ -194,7 +210,7 @@ class UnattendedScanner:
         `github_repo` is set in its harness-scope.md, else the MemTrace Task Node
         judgment. A project uses one or the other, not both, so there's a single
         unambiguous queue order."""
-        if scope.github_repo:
+        if self._github_sources(scope):
             return self._find_ready_github_issues(scope)
         return self._find_ready_task_nodes(scope, run_id=run_id)
 
@@ -367,14 +383,21 @@ class UnattendedScanner:
                     "（拒絕這項會換下一項來問，不會整批一起做）。"
                 )
 
+            # An issue of one of the project's other repos is worked on in that repo.
+            candidate_repo = next_task.get("repo")
+            repo_scope = scope.for_repo(candidate_repo)
+            if candidate_repo:
+                proposed_action = f"（repo：{candidate_repo}）{proposed_action}"
+                self.trace_store.set_conversation_repo(conv_id, candidate_repo)
             req = self.approval_mgr.request_approval(
                 conversation_id=conv_id,
                 workspace=ws_id,
-                working_directory=str(scope.working_directory),
+                working_directory=str(repo_scope.working_directory),
                 reason="unattended_write",
                 stage_ref=next_id,
                 proposed_action=proposed_action,
-                resume_goal=f"Implement planned backlog item: {next_id}",
+                resume_goal=(f"repo={candidate_repo}::" if candidate_repo else "")
+                + f"Implement planned backlog item: {next_id}",
             )
             gw = self._service_for(scope)
             if gw:

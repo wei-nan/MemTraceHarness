@@ -1,0 +1,13 @@
+# .harness/repos.toml — the other repos this Harness works in and helps maintain, besides its primary
+# one (the folder holding .harness.env / harness-scope.md). Machine-local: paths are this computer's,
+# so it lives with the Harness, never in a repo. Manage it with:
+#   memtrace-harness repo add android <workspace>/beri-android --verify "./gradlew test" --github acme/beri-android
+# One MemTrace workspace = one Harness: repos that share a knowledge base belong here, not in a second Harness.
+
+[repos.android]
+path = "/Users/me/Workspace/beri-android"
+verify_command = "./gradlew test"
+verify_timeout_seconds = 1800
+# worktree_setup_command = "cp \"$HARNESS_REPO_ROOT/local.properties\" ."
+github_repo = "acme/beri-android"        # its open, unassigned issues join the backlog the scanner proposes from
+off_limits = ["google-services.json"]    # added to the project's own off-limits for tasks in this repo

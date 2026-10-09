@@ -135,12 +135,6 @@ class PlanTests(MigrationFixture):
         self.assertIsNone(beta.telegram)
         self.assertTrue(any("shared the global bot" in n for n in beta.notes))
 
-    def test_two_projects_on_one_memtrace_workspace_are_flagged(self) -> None:
-        (self.beta / "harness-scope.md").write_text("# scope\n\n- workspace_id: ws_alpha\n", encoding="utf-8")
-        alpha, beta = plan_workspaces(parse_env_file(self.env), load_project_index(self.index))
-        self.assertTrue(any("shares MemTrace workspace ws_alpha with beta-project" in n for n in alpha.notes))
-        self.assertTrue(any("with alpha" in n for n in beta.notes))
-
     def test_slug_matches_the_old_suffix_rule(self) -> None:
         self.assertEqual(slug("beri-android"), "BERI_ANDROID")
         self.assertEqual(slug("project-c"), "PROJECT_C")
@@ -258,3 +252,72 @@ class SecondInstanceTests(MigrationFixture):
         self.assertEqual(len(set(ports)), 3)
         self.assertGreaterEqual(ports[2], 8805)  # no clash with the first run's ports
         self.assertEqual(web["port"], 8787)
+
+
+class SharedKnowledgeBaseTests(MigrationFixture):
+    """Two legacy projects on one MemTrace workspace are one Harness with two repos."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.beta / "harness-scope.md").write_text(
+            "# scope\n\n- workspace_id: ws_alpha\n- verify_command: ./gradlew test\n- github_repo: acme/beta\n"
+            "- off_limits: google-services.json\n",
+            encoding="utf-8",
+        )
+        with sqlite3.connect(self.db) as conn:
+            for table in ("runs", "conversations"):  # the second project's work was recorded against the shared workspace
+                conn.execute(f"UPDATE {table} SET workspace_id = 'ws_alpha' WHERE workspace_id = 'ws_beta'")
+            conn.execute(
+                "INSERT INTO schedules (id, project, workspace_id, goal, kind, active, created_at, next_run_at) "
+                "VALUES ('sched_beta', 'beta-project', 'ws_alpha', '每天跑測試', 'daily', 1, 't', 't')"
+            )
+            conn.execute(
+                "INSERT INTO approval_requests (id, conversation_id, workspace, working_directory, reason, proposed_action, "
+                "status, created_at) VALUES ('appr_beta', 'chat_bet', 'ws_alpha', ?, 'git_push', 'x', 'pending', 't')",
+                (str(self.beta),),
+            )
+            conn.execute(
+                "INSERT INTO decision_records (created_at, project, kind, situation, outcome) "
+                "VALUES ('t', 'beta-project', 'task_claim', 's', 'claim_accepted')"
+            )
+            conn.commit()
+
+    def test_they_become_one_plan_with_the_second_as_a_repo(self) -> None:
+        plans = plan_workspaces(parse_env_file(self.env), load_project_index(self.index))
+        self.assertEqual([p.scope.name for p in plans], ["alpha"])
+        [plan] = plans
+        repo = plan.repos["beta-project"]
+        self.assertEqual((repo.path, repo.verify_command, repo.github_repo, repo.off_limits),
+                         (self.beta, "./gradlew test", "acme/beta", ["google-services.json"]))
+        self.assertTrue(any("also serves beta-project as repo 'beta-project'" in n for n in plan.notes))
+        by_choice = plan_workspaces(parse_env_file(self.env), load_project_index(self.index), primaries=("beta-project",))
+        self.assertEqual(by_choice[0].scope.name, "beta-project")
+        self.assertEqual(list(by_choice[0].repos), ["alpha"])
+
+    def test_apply_writes_one_workspace_a_repos_file_and_one_bot(self) -> None:
+        self.apply()
+        self.assertFalse((self.beta / ENV_FILE_NAME).exists())  # no workspace of its own
+        from memtrace_harness.scope import load_repos
+
+        repos = load_repos(self.alpha / ".harness" / "repos.toml")
+        self.assertEqual(list(repos), ["beta-project"])
+        self.assertEqual(repos["beta-project"].path, self.beta)
+        self.assertEqual(
+            sorted(p.name for p in (self.tmp / "services" / "launchd").iterdir()),
+            ["com.memtraceharness.alpha.plist", "com.memtraceharness.alpha.telegram.plist", "com.memtraceharness.web.plist"],
+        )
+        self.assertEqual((self.tmp / "services" / "web.toml").read_text(encoding="utf-8").count("[[harness]]"), 1)
+
+    def test_the_merged_projects_history_joins_the_primary_without_its_transcript(self) -> None:
+        self.apply()
+        store = TraceStore(self.alpha / ".harness" / "harness.sqlite3")
+        with store._connection() as conn:
+            projects = {r[0] for r in conn.execute("SELECT project FROM primary_sessions_hot_log")}
+            decisions = [r[0] for r in conn.execute("SELECT project FROM decision_records")]
+            runs = sorted(r[0] for r in conn.execute("SELECT id FROM runs"))
+        self.assertEqual(projects, {"alpha"})  # its chat transcript is not merged
+        self.assertEqual(decisions, ["alpha"])  # its decisions are, under the primary's name
+        self.assertEqual(runs, ["run_alp", "run_bet"])  # both repos' runs, as they share the workspace
+        [schedule] = [s for s in store.list_schedules("alpha") if s["id"] == "sched_beta"]
+        self.assertEqual(schedule["goal"], "repo=beta-project::每天跑測試")
+        self.assertEqual(store.get_conversation_repo("chat_bet"), "beta-project")  # a pending approval resumes in its repo

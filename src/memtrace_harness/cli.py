@@ -23,13 +23,14 @@ from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
 from memtrace_harness.schemas import TaskEnvelope
-from memtrace_harness.scope import ProjectScope
+from memtrace_harness.scope import ProjectScope, load_repos
 from memtrace_harness.trace_store import TraceStore
 from memtrace_harness.workspace import (
     ENV_FILE_NAME,
     SCOPE_FILE_NAME,
     WorkspaceError,
     load_workspace,
+    workspace_paths,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             return status_command(args)
         if args.command == "doctor":
             return doctor_command(args)
+        if args.command == "repo":
+            return repo_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
         if args.command == "memory-drafts":
@@ -118,7 +121,9 @@ def load_scope(config: HarnessConfig) -> ProjectScope:
     path = config.workspace_root / SCOPE_FILE_NAME
     if not path.is_file():
         raise ValueError(f"{path} does not exist; init-workspace writes it, or create it by hand")
-    return ProjectScope.from_file(path)
+    scope = ProjectScope.from_file(path)
+    scope.repos = load_repos(workspace_paths(config.workspace_root)["repos"])
+    return scope
 
 
 def _config_and_scope() -> tuple[HarnessConfig, ProjectScope]:
@@ -281,6 +286,10 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--env", type=Path, default=Path(".env"), help="The legacy Harness env file")
     migrate_parser.add_argument("--index", type=Path, help="The legacy project index (default: from the env file)")
     migrate_parser.add_argument("--services-dir", type=Path, help="Where to write each service's env file (default ~/.config/memtraceharness)")
+    migrate_parser.add_argument(
+        "--primary", action="append",
+        help="When projects share a MemTrace workspace they become one Harness; name the project that is its primary repo (default: the first in the index). Repeatable.",
+    )
     migrate_parser.add_argument("--first-port", type=int, default=8800, help="First Harness API port to hand out (use a higher one when migrating a second legacy instance)")
     migrate_parser.add_argument("--apply", action="store_true", help="Write the files (default: only print the plan)")
 
@@ -291,6 +300,22 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "doctor", help="Check the workspace: env file, API token, scope file, tools the models need"
     )
+
+    repo_parser = subparsers.add_parser(
+        "repo", help="The other repos this Harness works in besides its primary one (.harness/repos.toml)"
+    )
+    repo_sub = repo_parser.add_subparsers(dest="repo_action", required=True)
+    repo_sub.add_parser("list", help="Show the primary repo and the others")
+    repo_add = repo_sub.add_parser("add", help="Declare another repo of this project")
+    repo_add.add_argument("name", help="Short name used to aim a task at it (repo=<name>::...)")
+    repo_add.add_argument("path", type=Path, help="Where it is checked out on this machine")
+    repo_add.add_argument("--verify", help="Command that must pass before a change in it is reviewed")
+    repo_add.add_argument("--verify-timeout", type=int, help="Seconds that command may take (default 1200)")
+    repo_add.add_argument("--setup", help="Command to make a fresh worktree of it usable")
+    repo_add.add_argument("--github", help="owner/repo, to scan its open issues as backlog")
+    repo_add.add_argument("--off-limits", help="Comma-separated phrases that are off-limits in it")
+    repo_remove = repo_sub.add_parser("remove", help="Stop treating a folder as a repo of this project")
+    repo_remove.add_argument("name")
 
     digest_parser = subparsers.add_parser(
         "memory-digest",
@@ -678,17 +703,68 @@ def doctor_command(args: argparse.Namespace) -> int:
         problems.append("HARNESS_API_TOKEN is not set; the API (and so every service) cannot start")
     if not config.memtrace_mcp_url:
         problems.append("MEMTRACE_MCP_URL is not set; the Harness has no knowledge base")
+    scope: ProjectScope | None = None
     try:
         scope = load_scope(config)
-        print(f"project: {scope.name} (MemTrace workspace {scope.workspace_id})")
-        problems += check_chat_tools(config, [scope.name])
     except ValueError as exc:
         problems.append(str(exc))
+    if scope is not None:
+        print(f"project: {scope.name} (MemTrace workspace {scope.workspace_id})")
+        for name, repo in scope.repos.items():
+            print(f"repo: {name} -> {repo.path}")
+            if not repo.path.is_dir():
+                problems.append(f"repo {name}: {repo.path} is not a folder")
+            elif repo.path.resolve() == scope.working_directory.resolve():
+                problems.append(f"repo {name} is the primary repo's own folder")
+        problems += check_chat_tools(config, [scope.name])
     for problem in problems:
         print(f"PROBLEM: {problem}")
     if not problems:
         print("OK: nothing to fix")
     return 1 if problems else 0
+
+
+def repo_command(args: argparse.Namespace) -> int:
+    """List, add or remove the other repos this Harness works in (`.harness/repos.toml`)."""
+    from memtrace_harness.scope import REPO_NAME, RepoScope, dump_repos
+
+    config, scope = _config_and_scope()
+    path = workspace_paths(config.workspace_root)["repos"]
+    repos = dict(scope.repos)
+    if args.repo_action == "list":
+        print(f"{scope.name} (primary): {scope.working_directory}")
+        for name, repo in repos.items():
+            extras = [f"verify: {repo.verify_command}"] if repo.verify_command else []
+            extras += [f"github: {repo.github_repo}"] if repo.github_repo else []
+            print(f"{name}: {repo.path}" + (f"  ({'; '.join(extras)})" if extras else ""))
+        return 0
+    if args.repo_action == "remove":
+        if args.name not in repos:
+            raise ValueError(f"no repo named {args.name!r}")
+        del repos[args.name]
+    else:  # add
+        if not REPO_NAME.match(args.name):
+            raise ValueError(f"{args.name!r} is not a usable repo name (letters, digits, - and _)")
+        if args.name.lower() in {"primary", scope.name.lower()} or args.name in repos:
+            raise ValueError(f"{args.name!r} is already a repo of this project")
+        directory = args.path.expanduser().resolve()
+        if not directory.is_dir():
+            raise ValueError(f"{directory} is not a folder")
+        if directory == scope.working_directory.resolve():
+            raise ValueError("that is the primary repo's own folder")
+        repos[args.name] = RepoScope(
+            name=args.name,
+            path=directory,
+            verify_command=args.verify,
+            verify_timeout_seconds=args.verify_timeout,
+            worktree_setup_command=args.setup,
+            github_repo=args.github,
+            off_limits=[x.strip() for x in (args.off_limits or "").split(",") if x.strip()],
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dump_repos(repos), encoding="utf-8")
+    print(f"{path} updated; the running Harness picks it up at its next restart.")
+    return 0
 
 
 def _deduplicate(values: list[str]) -> list[str]:

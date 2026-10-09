@@ -956,6 +956,11 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_task_queue_ws
                     ON task_queue(workspace_id, id);
 
+                CREATE TABLE IF NOT EXISTS conversation_repos (
+                    conversation_id TEXT PRIMARY KEY,
+                    repo TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS outbox (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL,
@@ -3125,6 +3130,25 @@ class TraceStore:
                 "UPDATE schedules SET last_run_at = ?, last_run_status = ?, next_run_at = ? WHERE id = ?",
                 (ran_at.isoformat(), status, next_run_at.isoformat(), schedule_id),
             )
+
+    def set_conversation_repo(self, conversation_id: str, repo: str | None) -> None:
+        """Which of the project's repos a conversation works in (a conversation in the primary repo has no
+        row), so a resumed run goes back to the same one."""
+        if repo is None:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO conversation_repos (conversation_id, repo) VALUES (?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET repo = excluded.repo",
+                (conversation_id, repo),
+            )
+
+    def get_conversation_repo(self, conversation_id: str) -> str | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT repo FROM conversation_repos WHERE conversation_id = ?", (conversation_id,)
+            ).fetchone()
+        return row[0] if row else None
 
     # ---- outbox: what the Harness wants said to the operator. Services (Telegram, ...) fetch it
     # over the API, deliver it their own way and acknowledge it; the Harness never talks to a chat.

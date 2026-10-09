@@ -840,6 +840,11 @@ function renderProject(project, q) {
     '<h2 onclick="toggleCard(\\'' + esc(project.name) + '\\')"><span class="caret">▾</span>' + esc(project.name) + runningBadge + "</h2>" +
     '<div class="body">' +
     '<div class="path">' + esc(project.working_directory) + "</div>" +
+    ((project.repos || []).length > 1
+      ? '<div class="path">repos：' + project.repos.map(function (r) {
+          return esc(r.name) + (r.primary ? "（主要）" : "") + (r.exists ? "" : " ⚠️");
+        }).join("、") + "</div>"
+      : "") +
     '<div class="chips">' +
     '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "已設定" : "預設") + "</span>" +
     '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "同專案") + "</span>" +

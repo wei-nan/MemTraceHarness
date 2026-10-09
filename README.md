@@ -345,9 +345,25 @@ without `HARNESS_API_TOKEN` refuses to serve its API.
 Full design rationale and the open decisions behind this feature are in
 [`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).
 
+### Several repos, one project
+
+A product often lives in more than one repo (a backend and an Android app) with one knowledge base. One
+MemTrace workspace is one Harness, so those repos are one Harness too: its primary repo is the workspace
+folder, the others are declared in `.harness/repos.toml` (`memtrace-harness repo add <name> <path> [--verify ...]
+[--github owner/repo] [--setup ...] [--off-limits ...]`, see `examples/repos.toml`). There is one bot, one
+conversation, one scanner and one nightly tidy for all of them.
+
+A task works in exactly one repo: the chat model aims it with a `repo=<name>::` prefix on the task (the same
+prefix works in a schedule's task text); no prefix means the primary repo. The task runs in that repo's git
+worktree with that repo's verify command, setup command and off-limits, and only that repo is writable — a
+read-only role (planner, reviewer) may also read the project's other repos (Claude roles only). A change that
+needs two repos is two tasks, one per repo, in the order the plan says. Scanner proposals from a repo's GitHub
+issues are worked in that repo, and a resumed conversation goes back to the repo it was in. Two repos are edited
+side by side; one repo is edited by one Developer at a time.
+
 ### Several projects
 
-One workspace, one `serve`, one bot per project; the status page lists them all. A project runs up to
+One workspace, one `serve`, one bot per project (a project being one knowledge base); the status page lists them all. A project runs up to
 `max_workers` tasks at once (default 3), each in its own `git worktree` on branch
 `harness/<conversation_id>` so Developers never edit the same files; further tasks wait in a queue
 and start as slots free up. A schedule never overlaps itself: if its previous run is still running (or
