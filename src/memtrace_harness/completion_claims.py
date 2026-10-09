@@ -140,6 +140,22 @@ def normalize_kb_updates(raw: Any) -> list[dict[str, Any]]:
     return ops
 
 
+CHAT_NOTE_MARKER = "HARNESS_KB_NOTE::"
+CHAT_NOTE_TAGS = ["harness", "chat", "note"]
+
+
+def chat_notes_to_ops(payloads: list[str]) -> list[dict[str, Any]]:
+    """`HARNESS_KB_NOTE::<content_type>::<title>::<body>` lines from a chat reply, as `note`
+    ops. The chat model holds no write tool; like the Controller it proposes and the Harness
+    validates and writes (same cap, same content types)."""
+    raw = []
+    for payload in payloads:
+        parts = payload.split("::", 2)
+        if len(parts) == 3:
+            raw.append({"op": "note", "content_type": parts[0].strip(), "title": parts[1], "body": parts[2], "links": []})
+    return normalize_kb_updates(raw)
+
+
 def kb_updates_from_artifact(artifact: dict[str, Any] | None) -> list[dict[str, Any]]:
     return normalize_kb_updates((artifact or {}).get("kb_updates"))
 
@@ -177,6 +193,8 @@ def apply_kb_updates(
     claim_id: str,
     conversation_id: str,
     claim_summary: str,
+    origin: str = "Controller",
+    note_tags: list[str] | None = None,
 ) -> dict[str, Any]:
     """Apply validated proposals. Returns {"lines": [...human-readable results...], "node_id":
     the node claimed done or None, "claim_node_id": the completion node or None}. A failed op is
@@ -220,9 +238,9 @@ def apply_kb_updates(
                 node = client.create_node(
                     workspace_id=workspace_id,
                     title=op["title"],
-                    body=f"{op['body']}\n\n---\n來源：對話 {conversation_id}（Controller 整理）。",
+                    body=f"{op['body']}\n\n---\n來源：對話 {conversation_id}（{origin} 整理）。",
                     content_type=op["content_type"],
-                    tags=list(NOTE_NODE_TAGS),
+                    tags=list(note_tags or NOTE_NODE_TAGS),
                     run_id=conversation_id,
                     stage="controller_kb_update",
                 )

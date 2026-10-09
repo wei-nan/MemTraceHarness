@@ -36,6 +36,10 @@ stable cross-run aggregates and may create proposals; it cannot adopt its own pr
   MemTrace workspace as a "Harness loop draft" node (explicit operator decision, 2026-10-07: those drafts had
   become 95% of one specification workspace); what a run teaches reaches the knowledge base through the
   Controller's own `kb_updates`. The `--writeback` CLI flag still writes one on request;
+- the chat model holds no MemTrace write tool, on any vendor; it reads (Codex and Claude alike) and asks the
+  Harness to write with `HARNESS_KB_NOTE::<type>::<title>::<body>` lines, which the Harness validates (max 3 per
+  reply), writes to the project's memory workspace tagged `harness`, `chat`, `note`, and reports back to the
+  operator, failures included (2026-10-09);
 - operator preferences are adopted and retired by the Harness itself, with the safeguards below;
 - missing usage remains `unavailable`, never zero.
 
@@ -408,6 +412,8 @@ reserves `retry_after` and `reset_at`, but provider-specific five-hour/weekly re
 yet parsed into the availability ledger.
 
 ## Gate and adoption boundary
+
+**POLICY_ONLY** (operator decision 2026-10-09): G1 and G2 are told to PASS unless the plan or change violates safety/security (secret or identifier exposure, unauthorized external side effect, destructive action, off-limits access, bypassed control); everything else is a low/medium finding on a PASS. They are told not to require a git repository or diff. Only the prompt carries this; the verdict stays the model's and the Harness does not override it. **Tiers** (same date): the Planner marks each acceptance criterion `[必要]` (essential) or `[建議]` (hardening) up front; G1 gates only `[必要]` and safety, and after the plan was revised once it rejects only for `security`. What G1 notices beyond that is returned as findings with severity `defer…` (or low/medium on a PASS); the Harness collects them (`deferred_findings`, max 12) and hands them to the Developer and G2 as a `deferred-notes` context item, which G2 must not reject over. Plan revisions fix only blocking findings and may not add scope. All prompt/convention based; no schema change.
 
 Harness results are draft evidence. They do not prove that MemTrace changed `gate_state`, `blocked`,
 `gate-rejected`, `reject_count` or `completed` state. An unavailable Sol run cannot produce a gate

@@ -287,6 +287,7 @@ class AgentLoopRunner:
                     writeback=writeback,
                 )
 
+        g1_artifacts: list[dict[str, Any] | None] = []
         reused_g1 = reconstructed.get("g1")
         if reused_g1 is not None:
             g1 = reused_g1
@@ -303,6 +304,7 @@ class AgentLoopRunner:
             if stopped:
                 return self._persist(stopped, writeback=writeback)
 
+            g1_artifacts.append(g1.artifact)
             gate = normalized_gate(g1.artifact)
             reason_code = str((g1.artifact or {}).get("reason_code", "other"))
             if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
@@ -366,7 +368,7 @@ class AgentLoopRunner:
                     )
                 plan = revised_plan
                 g1 = self._execute(
-                    task=gate_task(task, "G1", plan.artifact or {}),
+                    task=gate_task(task, "G1", plan.artifact or {}, tighten=True),
                     trace_id=trace_id,
                     stages=stages,
                     stage="g1-recheck",
@@ -375,6 +377,7 @@ class AgentLoopRunner:
                 stopped = self._stop_after_execution(task, trace_id, stages, g1)
                 if stopped:
                     return self._persist(stopped, writeback=writeback)
+                g1_artifacts.append(g1.artifact)
                 gate = normalized_gate(g1.artifact)
 
             if gate != "PASS":
@@ -415,7 +418,7 @@ class AgentLoopRunner:
             development = reused_develop
         else:
             development = self._execute(
-                task=developer_task(task, plan.artifact or {}),
+                task=developer_task(task, plan.artifact or {}, deferred_findings(*g1_artifacts) or None),
                 trace_id=trace_id,
                 stages=stages,
                 stage="develop",
@@ -461,6 +464,7 @@ class AgentLoopRunner:
                     task=gate_task(
                         task, "G2", development.artifact or {}, plan.artifact or {},
                         verification=verification,
+                        deferred=deferred_findings(*g1_artifacts) or None,
                     ),
                     trace_id=trace_id,
                     stages=stages,
@@ -1609,6 +1613,7 @@ def planner_task(task: TaskEnvelope) -> TaskEnvelope:
             "(string), acceptance_criteria (string array), open_questions (string array), "
             "and scope_exclusions (string array). "
             "Do not make product decisions when required input is missing.\n"
+            f"{_TIER_RULE}"
             f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
@@ -1626,6 +1631,7 @@ def planner_escalation_task(
         goal=(
             f"Revise the plan only because G1 identified a reasoning gap: {task.goal}\n"
             "Return the same JSON plan contract as the standard planner.\n"
+            f"{_TIER_RULE}{_TIER_REVISION_RULE}"
             f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
@@ -1646,6 +1652,7 @@ def planner_revision_task(
         goal=(
             f"Revise the Sonnet plan using the first G1 rejection: {task.goal}\n"
             "Return the same valid JSON plan contract. This is one bounded correction, not a retry.\n"
+            f"{_TIER_RULE}{_TIER_REVISION_RULE}"
             f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
@@ -1681,6 +1688,95 @@ _G2_SCOPE = (
     "\nThis is G2, the IMPLEMENTATION gate: development has finished. Judge the Developer's evidence "
     "and the actual changes against the accepted plan and its acceptance criteria."
 )
+# Operator decision 2026-10-09: a gate's job is to stop what is unsafe, not to perfect the work. A
+# trivial request (add sendPhoto) spent four G1 rounds, ~80% of its tokens and the operator's
+# attention on rounds of spec polish, each round's revision adding detail the next found
+# contradictory. Prompt policy, not enforced: the gate stays a model verdict the Harness cannot
+# override, only told what is worth a REJECT.
+_GATE_PASS_POLICY = (
+    "\nPASS BY DEFAULT. Return REJECT only for a safety or security violation: exposing a secret, "
+    "token or personal identifier (in code, logs, output or tests), an unsafe or unauthorized external "
+    "side effect, a destructive or irreversible action, reading or writing something the project marks "
+    "off-limits, or bypassing a protective control. Missing edge-case tests, unclear wording, "
+    "inconsistent field names, extra polish, style, scope you would have drawn differently and "
+    "anything you could not verify are NOT grounds to reject: return PASS and list them in findings "
+    "with severity 'low' or 'medium' for the Developer and operator to see. Use reason_code "
+    "'security' for a REJECT. If the request itself cannot be understood or a needed input is "
+    "missing, use NEEDS_HUMAN/'missing_input', not REJECT.\n"
+    "Do NOT require a git repository, a git diff or a version-control baseline: many governed "
+    "projects are plain folders. Read the files as they are; the lack of a diff is neither a finding "
+    "nor a reason to withhold PASS."
+)
+
+
+# Requirement tiers (operator decision 2026-10-09): the plan states up front which acceptance
+# criteria are essential and which are hardening, G1 only gates the essential ones, and what it
+# notices beyond that is handed to the Developer and G2 instead of bouncing the plan. Convention
+# in existing free-text fields (no schema change): criteria start with "[必要]" or "[建議]";
+# a non-blocking G1 observation has a severity starting with "defer".
+TIER_REQUIRED = "[必要]"
+TIER_OPTIONAL = "[建議]"
+DEFER_SEVERITY = "defer"
+MAX_DEFERRED_NOTES = 12
+
+_TIER_RULE = (
+    f"\nTIER every acceptance criterion by starting it with '{TIER_REQUIRED}' or '{TIER_OPTIONAL}'. "
+    f"'{TIER_REQUIRED}' is only what the request cannot be called done or safe without: the behaviour "
+    "the operator asked for, and not exposing secrets/identifiers or causing an unauthorized or "
+    f"destructive side effect. '{TIER_OPTIONAL}' is hardening: extra edge-case tests, extra error "
+    "classes, output formats, polish. Plan the smallest implementation that satisfies the request; do "
+    "not widen scope to look thorough, and keep '[必要]' items few.\n"
+)
+_TIER_REVISION_RULE = (
+    "\nRevise ONLY for the blocking findings (a [必要] criterion that is unmet or contradicted, or a "
+    "safety/security problem). Findings whose severity starts with 'defer' are not yours to fix now: "
+    "leave them out, they go to the Developer. Do not add new criteria, fields or scope while revising.\n"
+)
+_G1_TIER_POLICY = (
+    f"\nThe plan's acceptance criteria are tiered. Gate ONLY the '{TIER_REQUIRED}' ones and safety/"
+    f"security. Anything you notice on '{TIER_OPTIONAL}' items or beyond must not change the verdict: "
+    f"list it in findings with severity '{DEFER_SEVERITY}' (e.g. '{DEFER_SEVERITY}: edge case') and it "
+    f"will be handed to the Developer and G2. If a criterion has no tier, treat it as '{TIER_OPTIONAL}'."
+)
+_G1_TIGHTEN = (
+    "\nThis is a re-check after the plan was already revised once. Reject now ONLY for a safety/"
+    "security violation (reason_code 'security'). Every other finding, including new ones, is a "
+    f"'{DEFER_SEVERITY}' finding on a PASS."
+)
+_G2_DEFERRED_NOTE = (
+    "\nThe 'deferred-notes' context item lists non-blocking observations G1 passed on to the "
+    "Developer. They are not acceptance criteria: do not reject because one is unaddressed."
+)
+
+
+_DEFERRED_FOR_DEVELOPER = (
+    "G1 passed the plan and left the 'deferred-notes' context item for you. Handle a note only when it "
+    "is cheap and inside the request; otherwise list it under gaps. Implement the '[必要]' criteria "
+    "first and do not grow the change to cover every note.\n"
+)
+
+
+def deferred_findings(*gates: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """G1 observations that must not block, from every G1 result of the run, de-duplicated and
+    capped. A PASS verdict's low/medium findings count too: a gate that passes has nothing blocking
+    left to say."""
+    notes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for gate in gates:
+        if not isinstance(gate, dict):
+            continue
+        passed = str(gate.get("verdict", "")).upper() == "PASS"
+        for finding in gate.get("findings") or []:
+            if not isinstance(finding, dict):
+                continue
+            severity = str(finding.get("severity", "")).strip().lower()
+            if not (severity.startswith(DEFER_SEVERITY) or (passed and severity in {"low", "medium", "低", "中"})):
+                continue
+            text = str(finding.get("description", "")).strip()
+            if text and text not in seen:
+                seen.add(text)
+                notes.append({"note": text, "suggested": str(finding.get("required_action", "")).strip()})
+    return notes[:MAX_DEFERRED_NOTES]
 
 
 def gate_task(
@@ -1691,8 +1787,12 @@ def gate_task(
     verification: dict[str, Any] | None = None,
     *,
     rescope: bool = False,
+    tighten: bool = False,
+    deferred: list[dict[str, Any]] | None = None,
 ) -> TaskEnvelope:
     items = [artifact_item(f"harness:{gate_name.lower()}-evidence", "Gate evidence", evidence)]
+    if deferred:
+        items.append(artifact_item("harness:deferred-notes", "Non-blocking notes passed on from G1", deferred))
     if plan is not None:
         items.append(artifact_item("harness:accepted-plan", "Accepted plan", plan))
     verification_note = ""
@@ -1724,6 +1824,10 @@ def gate_task(
             "(string array), and confidence (number). Do not edit files."
             f"{_G1_SCOPE if gate_name == 'G1' else _G2_SCOPE if gate_name == 'G2' else ''}"
             f"{_G1_RESCOPE if rescope else ''}"
+            f"{_GATE_PASS_POLICY if gate_name in ('G1', 'G2') else ''}"
+            f"{_G1_TIER_POLICY if gate_name == 'G1' else ''}"
+            f"{_G1_TIGHTEN if gate_name == 'G1' and tighten else ''}"
+            f"{_G2_DEFERRED_NOTE if gate_name == 'G2' and deferred else ''}"
             f"{verification_note}\n"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
@@ -1799,7 +1903,9 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
     )
 
 
-def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
+def developer_task(
+    task: TaskEnvelope, plan: dict[str, Any], deferred: list[dict[str, Any]] | None = None
+) -> TaskEnvelope:
     return stage_task(
         task,
         suffix="develop",
@@ -1808,6 +1914,7 @@ def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
             "Return only a valid JSON object after the work with status ('completed', "
             "'needs_human', or 'failed'), summary (string), changed_files (string array), "
             "tests (string array), and gaps (string array).\n"
+            f"{_DEFERRED_FOR_DEVELOPER if deferred else ''}"
             f"{_tool_first_note()}"
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
@@ -1815,6 +1922,11 @@ def developer_task(task: TaskEnvelope, plan: dict[str, Any]) -> TaskEnvelope:
         context_items=[
             *_for_working_roles(task.context_items),
             artifact_item("harness:accepted-plan", "Accepted plan", plan),
+            *(
+                [artifact_item("harness:deferred-notes", "Non-blocking notes passed on from G1", deferred)]
+                if deferred
+                else []
+            ),
         ],
     )
 
@@ -1864,7 +1976,7 @@ def stage_task(
     )
 
 
-def artifact_item(ref: str, title: str, value: dict[str, Any]) -> ContextItem:
+def artifact_item(ref: str, title: str, value: dict[str, Any] | list[Any]) -> ContextItem:
     return ContextItem(
         ref=ref,
         title=title,

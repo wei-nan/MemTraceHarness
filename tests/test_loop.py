@@ -736,6 +736,15 @@ class AgentLoopRunnerTests(TestCase):
         self.assertIn("CORRECTION", gate_task(self.task, "G1", ready_plan(), rescope=True).goal)
         self.assertNotIn("CORRECTION", goal_g1)
 
+    def test_both_gates_pass_by_default_and_never_require_a_git_diff(self) -> None:
+        for goal in (
+            gate_task(self.task, "G1", ready_plan()).goal,
+            gate_task(self.task, "G2", completed_development(), ready_plan()).goal,
+        ):
+            self.assertIn("PASS BY DEFAULT", goal)
+            self.assertIn("safety or security violation", goal)
+            self.assertIn("Do NOT require a git repository, a git diff", goal)
+
     def test_g1_implementation_gap_is_asked_again_not_sent_to_plan_revision(self) -> None:
         adapters = self._adapters()
         adapters["red-team"] = QueueAdapter(
@@ -1480,3 +1489,45 @@ class MalformedOutputRepairTests(TestCase):
 
         self.assertEqual(summary.status, "needs_human")
         self.assertEqual(summary.stages[0].state, "invalid_output")
+
+
+class TieredGateTests(TestCase):
+    def setUp(self) -> None:
+        self.task = TaskEnvelope(task_id="t", workspace_id="w", goal="g", context_refs=[], context_items=[], constraints=[])
+
+    def test_planners_tier_criteria_and_revisions_only_fix_blocking_findings(self) -> None:
+        from memtrace_harness.loop import planner_escalation_task, planner_revision_task, planner_task
+
+        self.assertIn("[必要]", planner_task(self.task).goal)
+        for goal in (
+            planner_revision_task(self.task, {}, {}).goal,
+            planner_escalation_task(self.task, {}, {}).goal,
+        ):
+            self.assertIn("ONLY for the blocking findings", goal)
+
+    def test_g1_gates_required_items_only_and_tightens_on_recheck(self) -> None:
+        first = gate_task(self.task, "G1", {}).goal
+        recheck = gate_task(self.task, "G1", {}, tighten=True).goal
+        self.assertIn("Gate ONLY the '[必要]'", first)
+        self.assertNotIn("re-check after the plan was already revised", first)
+        self.assertIn("re-check after the plan was already revised", recheck)
+        self.assertNotIn("re-check", gate_task(self.task, "G2", {}, {}, tighten=True).goal)
+
+    def test_deferred_findings_reach_developer_and_g2_but_not_blocking_ones(self) -> None:
+        from memtrace_harness.loop import deferred_findings, developer_task
+
+        gate = {
+            "verdict": "PASS",
+            "findings": [
+                {"severity": "defer: edge", "description": "empty caption", "required_action": "test it"},
+                {"severity": "medium", "description": "naming", "required_action": ""},
+                {"severity": "high", "description": "secret in log", "required_action": "mask"},
+                {"severity": "defer: edge", "description": "empty caption", "required_action": "dup"},
+            ],
+        }
+        rejected = {"verdict": "REJECT", "findings": [{"severity": "medium", "description": "blocking", "required_action": ""}]}
+        notes = deferred_findings(rejected, gate)
+        self.assertEqual([n["note"] for n in notes], ["empty caption", "naming"])
+        self.assertIn("deferred-notes", developer_task(self.task, {}, notes).context_items[-1].ref)
+        self.assertIn("deferred-notes", gate_task(self.task, "G2", {}, {}, deferred=notes).goal)
+        self.assertEqual(deferred_findings(None, {"verdict": "REJECT", "findings": "x"}), [])

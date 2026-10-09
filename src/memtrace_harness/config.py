@@ -65,6 +65,7 @@ class HarnessConfig:
         taiwantrade: bool = False,
         order_project: str | None = None,
         ops_server: dict | None = None,
+        memtrace_read: bool = False,
     ) -> list[str]:
         """argv for one plain, non-interactive "answer this prompt" call — the quick
         chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
@@ -97,6 +98,21 @@ class HarnessConfig:
                     # tool of this proxy is a read-only GET, so approve them up front.
                     "--config", 'mcp_servers.taiwantrade.default_tools_approval_mode="approve"',
                 ]
+            if memtrace_read and self.memtrace_mcp_url:
+                # Until 2026-10-09 only the Agent Loop's Codex adapter got this; a Codex chat
+                # model (own CODEX_HOME, no MCP servers) therefore had no MemTrace at all and
+                # told the operator so. Read-only here; writes go through the Harness
+                # (HARNESS_KB_NOTE::), never a model-held write tool.
+                from memtrace_harness.adapters.codex import MEMTRACE_READ_TOOLS, MEMTRACE_TOKEN_ENV
+
+                prefix = "mcp_servers.memtrace"
+                command += [
+                    "--config", f"{prefix}.url={json.dumps(self.memtrace_mcp_url)}",
+                    "--config", f"{prefix}.enabled_tools={json.dumps(MEMTRACE_READ_TOOLS)}",
+                    "--config", f'{prefix}.default_tools_approval_mode="approve"',
+                ]
+                if os.getenv(MEMTRACE_TOKEN_ENV):
+                    command += ["--config", f'{prefix}.bearer_token_env_var="{MEMTRACE_TOKEN_ENV}"']
             if ops_server:
                 env_toml = ",".join(f"{k}={json.dumps(v)}" for k, v in ops_server["env"].items())
                 command += [

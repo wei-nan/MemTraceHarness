@@ -779,6 +779,36 @@ class ChatCommandTests(TestCase):
             off = HarnessConfig.chat_command(config, "codex", "m", "p", taiwantrade=True)
         self.assertNotIn("mcp_servers.taiwantrade.command=", " ".join(off))
 
+    def test_codex_chat_gets_read_only_memtrace_only_when_asked_and_configured(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+        from memtrace_harness.config import HarnessConfig
+
+        config = self._config()
+        try:
+            config = replace(config, memtrace_mcp_url="https://mt.example/mcp")
+        except TypeError:
+            config.memtrace_mcp_url = "https://mt.example/mcp"
+        with patch.dict("os.environ", {"MEMTRACE_API_TOKEN": "secret-value"}):
+            on = HarnessConfig.chat_command(config, "codex", "m", "p", memtrace_read=True)
+            off = HarnessConfig.chat_command(config, "codex", "m", "p")
+        joined = " ".join(on)
+        self.assertIn('mcp_servers.memtrace.url="https://mt.example/mcp"', joined)
+        self.assertIn('enabled_tools=["search_nodes", "get_node", "list_nodes", "traverse"]', joined)
+        self.assertIn('bearer_token_env_var="MEMTRACE_API_TOKEN"', joined)
+        self.assertNotIn("secret-value", joined)  # the token goes by env var name only
+        self.assertNotIn("mcp_servers.memtrace", " ".join(off))
+
+    def test_chat_notes_become_validated_note_ops(self) -> None:
+        from memtrace_harness.completion_claims import chat_notes_to_ops
+
+        ops = chat_notes_to_ops(
+            ["factual::GCP 分客戶::每客戶一個 GCP Project:: 由 Org 管理", "bad", "nonsense::t::b", "factual::::empty title"]
+        )
+        self.assertEqual([o["title"] for o in ops], ["GCP 分客戶", "t"])
+        self.assertEqual(ops[0]["body"], "每客戶一個 GCP Project:: 由 Org 管理")
+        self.assertEqual(ops[1]["content_type"], "factual")  # unknown type falls back, not dropped
+
 
 class BotPollerTests(TestCase):
     """2026-10-02: four bots were polled one after another (each long-poll blocking up
