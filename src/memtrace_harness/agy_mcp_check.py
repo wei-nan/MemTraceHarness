@@ -10,14 +10,57 @@ registers anything itself.
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
+import urllib.error
+import urllib.request
 
 from memtrace_harness.taiwantrade_mcp import mcp_server_spec
 
 CHECK_TIMEOUT_SECONDS = 15
+AGY_MCP_CONFIG = Path.home() / ".gemini" / "config" / "mcp_config.json"
+_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "harness-check", "version": "0"}},
+}
+
+
+def _same_memtrace_endpoint(registered: str, expected: str) -> bool:
+    """The server serves the same MCP at both `<origin>/mcp` and `<origin>/api/v1/mcp/mcp`."""
+
+    def normalise(url: str) -> str:
+        url = url.strip().rstrip("/")
+        return url.removesuffix("/api/v1/mcp/mcp").removesuffix("/mcp")
+
+    return normalise(registered) == normalise(expected)
+
+
+def _probe_memtrace_key(config_path: Path = AGY_MCP_CONFIG) -> str | None:
+    """Send an MCP initialize with the credentials agy has registered. Returns a problem
+    line when the server rejects them, None when accepted or when the probe itself cannot
+    run (no config / network) — an unreachable server is not evidence of a bad key."""
+    try:
+        entry = json.loads(config_path.read_text())["mcpServers"]["memtrace"]
+        url = entry.get("serverUrl") or entry["url"]
+        headers = {**entry.get("headers", {}), "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        request = urllib.request.Request(url, json.dumps(_INITIALIZE).encode(), headers)
+        urllib.request.urlopen(request, timeout=CHECK_TIMEOUT_SECONDS).close()
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return (
+                f"Antigravity's MemTrace MCP credentials were rejected (HTTP {exc.code}); its roles cannot reach "
+                "MemTrace. Re-register with `agy mcp add --header \"Authorization: Bearer <key>\" "
+                "--header \"X-MemTrace-Tool-Profile: core+agent_loop\" memtrace <MEMTRACE_MCP_URL>`."
+            )
+    except Exception:
+        pass
+    return None
 
 
 def _run_agy_list(executable: str) -> str:
@@ -66,6 +109,7 @@ def check_antigravity_mcp(
     executable: str = "agy",
     run: Callable[[str], str] = _run_agy_list,
     which: Callable[[str], str | None] = shutil.which,
+    probe: Callable[[], str | None] = _probe_memtrace_key,
 ) -> list[str]:
     """Problems found, as human-readable lines; empty when fine or when agy is not installed
     (then no role can be using it)."""
@@ -85,8 +129,12 @@ def check_antigravity_mcp(
             problems.append(f"Antigravity has no MCP server '{name}'.{hint}")
         elif entry["status"] != "enabled":
             problems.append(f"Antigravity MCP server '{name}' is {entry['status']}, not enabled (agy mcp enable {name}).")
-        elif needle not in entry["command"]:
+        elif (not _same_memtrace_endpoint(entry["command"], needle) if name == "memtrace" else needle not in entry["command"]):
             problems.append(
                 f"Antigravity MCP server '{name}' points at '{entry['command']}', not the expected '{needle}'."
             )
+    if "memtrace" in expected and "memtrace" in registered:
+        key_problem = probe()
+        if key_problem:
+            problems.append(key_problem)
     return problems
