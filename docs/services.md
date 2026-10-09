@@ -147,9 +147,15 @@ is deleted and the file vacuumed. Global things stay (provider cooldowns, the op
 Telegram `(chat, message)` ids become `tg:<chat>:<message>` references and old schedule `chat_id`s become `tg:<chat>`
 addresses the first time the new store opens; the old gateway's offset table is dropped. Nothing else needs doing by hand.
 
-**Two projects on one MemTrace workspace** (Beri and beri-android today). Allowed, but the old single process
-coordinated them (one workspace lock per MemTrace workspace, one set of per-workspace tidy/promotion records); two
-Harnesses no longer share that. Each has its own lock and its own records, so both may scan the same backlog, tidy the
-same knowledge base in the same night window, and run a task on it at the same time. Give each its own
-`[memory] workspace_id` (cold memory is then separate), and decide which of the two owns the shared spec workspace's
-scanning and tidying.
+**Several repos on one MemTrace workspace** (Beri and beri-android). They are one Harness with several repos
+(`.harness/repos.toml`, `memtrace-harness repo ...`): the knowledge base is the Harness's identity, so what belongs
+to it — one scanner, one nightly tidy, one workspace lock, one conversation and bot — exists once. `migrate` does
+this by itself for scope files that name the same `workspace_id` (the first in the index is the primary repo;
+`--primary NAME` picks another): the others become repos with their verify command, GitHub repo and off-limits, their
+approvals (resuming in their own repo), decisions, preferences and schedules (gaining a `repo=<name>::` prefix) join
+the primary's store, their bots are retired, and their chat transcript and digests stay in the legacy store (the digests
+are already in MemTrace). A task works in one repo (`repo=<name>::<goal>`; none = primary); that repo's worktree and
+edit lock, verify command and off-limits apply, a read-only Claude role can read the other repos, and no role ever
+writes outside the task's repo.
+
+**Not supported:** two Harnesses on one MemTrace workspace — they would each scan the same backlog, tidy the same knowledge base and run tasks on it at once, with nothing to coordinate them. Declare the second repo instead.

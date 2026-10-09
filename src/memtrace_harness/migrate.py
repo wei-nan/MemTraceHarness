@@ -11,6 +11,11 @@ project into a workspace:
 * `<services>/web.toml`      the status page's list of Harnesses
 * `<services>/launchd/*.plist`       one job per Harness / bot / the page (written, never loaded)
 
+Projects that share one MemTrace workspace are one Harness: the first of them in the index (or the one
+named by `--primary`) is its primary repo, the others become repos of it (`.harness/repos.toml`), and their
+approvals, decisions, preferences and schedules join the primary's. Their chat transcripts and digests are not
+merged (they stay in the legacy store; the digests are already in MemTrace), and their bots are retired.
+
 Dry run unless `--apply`. The legacy files are never changed or deleted.
 """
 
@@ -28,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from memtrace_harness.init_workspace import DEFAULT_API_PORT, DEFAULT_SERVICES_DIR, free_port
-from memtrace_harness.scope import ProjectScope, load_project_index
+from memtrace_harness.scope import REPO_NAME, ProjectScope, RepoScope, dump_repos, load_project_index
 from memtrace_harness.workspace import (
     MODEL_ENV_VARS,
     STATE_DIR_NAME,
@@ -71,14 +76,33 @@ class WorkspacePlan:
     roles_source: Path | None
     telegram: dict[str, str] | None
     notes: list[str] = field(default_factory=list)
+    # Other projects of the legacy index that share this one's MemTrace workspace, and the repo name each gets.
+    merged: dict[str, ProjectScope] = field(default_factory=dict)
+    repos: dict[str, RepoScope] = field(default_factory=dict)
+
+
+def repo_name_for(scope: ProjectScope) -> str:
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", scope.name).strip("-")[:40]
+    return name if REPO_NAME.match(name) else "repo"
 
 
 def plan_workspaces(
-    legacy: dict[str, str], scopes: list[ProjectScope], *, first_port: int = DEFAULT_API_PORT
+    legacy: dict[str, str],
+    scopes: list[ProjectScope],
+    *,
+    first_port: int = DEFAULT_API_PORT,
+    primaries: tuple[str, ...] = (),
 ) -> list[WorkspacePlan]:
+    groups: dict[str, list[ProjectScope]] = {}
+    for scope in scopes:
+        groups.setdefault(scope.workspace_id, []).append(scope)
+    ordered: list[tuple[ProjectScope, list[ProjectScope]]] = []
+    for members in groups.values():
+        primary = next((m for m in members if m.name in primaries), members[0])
+        ordered.append((primary, [m for m in members if m is not primary]))
     plans: list[WorkspacePlan] = []
     taken: set[int] = set()
-    for scope in scopes:
+    for scope, others in ordered:
         suffix = slug(scope.name)
         env: dict[str, str] = {k: legacy[k] for k in GLOBAL_KEYS if legacy.get(k)}
         for key in PER_PROJECT_KEYS:
@@ -117,23 +141,53 @@ def plan_workspaces(
                 f"harness-scope.md says working_directory {scope.working_directory} but sits in "
                 f"{scope.scope_file_path.parent}; the workspace is the folder holding the scope file"
             )
-        plans.append(WorkspacePlan(scope, scope.scope_file_path.parent.resolve(), env, port, token, roles_source, telegram, notes))
-    for plan in plans:
-        sharing = [o.scope.name for o in plans if o is not plan and o.scope.workspace_id == plan.scope.workspace_id]
-        if sharing:
-            plan.notes.append(
-                f"shares MemTrace workspace {plan.scope.workspace_id} with {', '.join(sharing)}: the run history "
-                "recorded against that workspace is copied into each of their stores"
+        merged = {repo_name_for(o): o for o in others}
+        repos = {
+            name: RepoScope(
+                name=name,
+                path=o.working_directory,
+                verify_command=o.verify_command,
+                verify_timeout_seconds=o.verify_timeout_seconds,
+                worktree_setup_command=o.worktree_setup_command,
+                github_repo=o.github_repo,
+                off_limits=[x for x in (o.off_limits or []) if x not in (scope.off_limits or [])],
             )
+            for name, o in merged.items()
+        }
+        for name, o in merged.items():
+            notes.append(
+                f"also serves {o.name} as repo '{name}' (same MemTrace workspace {scope.workspace_id}): its approvals, "
+                "decisions, preferences and schedules join this Harness; its chat transcript and digests stay in the "
+                "legacy store (the digests are already in MemTrace)"
+            )
+            other_bot = o.telegram_bot_token or legacy.get(f"HARNESS_TELEGRAM_BOT_TOKEN_{slug(o.name)}")
+            if other_bot:
+                notes.append(f"the Telegram bot of {o.name} is no longer used: one bot serves one Harness")
+        plans.append(
+            WorkspacePlan(
+                scope, scope.scope_file_path.parent.resolve(), env, port, token, roles_source, telegram, notes,
+                merged=merged, repos=repos,
+            )
+        )
     return plans
 
 
 # ---- splitting the shared store
 
-def _split_store(source: Path, dest: Path, scope: ProjectScope, memory_workspace: str) -> None:
+def _split_store(
+    source: Path,
+    dest: Path,
+    scope: ProjectScope,
+    memory_workspace: str,
+    merged: dict[str, ProjectScope] | None = None,
+) -> None:
     """Copy `source` (online backup, safe while the old Harness runs) to `dest` and drop everything
     that belongs to another project. Global things stay: provider cooldowns, and the operator's
-    global preferences."""
+    global preferences. `merged` are projects that become repos of this one (repo name -> scope): the
+    decisions, approvals, preferences and schedules recorded under their names are kept and renamed to
+    this project's, a schedule's goal gaining its `repo=<name>::` prefix; their chat transcript and
+    digests are dropped."""
+    merged = merged or {}
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         raise RuntimeError(f"{dest} already exists; refusing to overwrite a workspace's store")
@@ -145,6 +199,9 @@ def _split_store(source: Path, dest: Path, scope: ProjectScope, memory_workspace
         src.close()
     name, ws = scope.name, scope.workspace_id
     mine_ws = (ws, memory_workspace)
+    secondary = {o.name: repo for repo, o in merged.items()}  # legacy project name -> repo name
+    keep_names = (name, *secondary)
+    name_marks = ",".join("?" for _ in keep_names)
 
     def tables() -> set[str]:
         return {r[0] for r in out.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -171,8 +228,30 @@ def _split_store(source: Path, dest: Path, scope: ProjectScope, memory_workspace
         "order_intents", "primary_sessions_hot_log", "topic_briefs", "topic_recall_state", "work_reviews",
     ):
         if table in tables() and "project" in columns(table):
-            delete(table, "project = ?", (name,))
-    delete("preference_rules", "scope = 'global' OR project = ?", (name,))
+            delete(table, f"project IN ({name_marks})", keep_names)
+    delete("preference_rules", f"scope = 'global' OR project IN ({name_marks})", keep_names)
+    # a merged project is now this one: what is only meaningful per conversation or per day is dropped,
+    # the rest is renamed (a schedule keeps pointing at the repo it ran in)
+    for other, repo in secondary.items():
+        for table in ("primary_sessions_hot_log", "memory_digests", "memory_drafts", "topic_briefs", "topic_recall_state"):
+            if table in tables():
+                out.execute(f"DELETE FROM {table} WHERE project = ?", (other,))
+        if "schedules" in tables():
+            out.execute(
+                "UPDATE schedules SET goal = ? || goal WHERE project = ? AND goal NOT LIKE 'repo=%'",
+                (f"repo={repo}::", other),
+            )
+        if "approval_requests" in tables():
+            out.execute("CREATE TABLE IF NOT EXISTS conversation_repos (conversation_id TEXT PRIMARY KEY, repo TEXT NOT NULL)")
+            out.execute(
+                "INSERT OR IGNORE INTO conversation_repos (conversation_id, repo) "
+                "SELECT conversation_id, ? FROM approval_requests WHERE working_directory = ?",
+                (repo, str(merged[repo].working_directory)),
+            )
+        for table in ("completion_claims", "decision_records", "job_requests", "order_intents", "preference_rules",
+                      "schedules", "work_reviews"):
+            if table in tables() and "project" in columns(table):
+                out.execute(f"UPDATE {table} SET project = ? WHERE project = ?", (name, other))
     # children of what is left
     delete("checkpoints", "conversation_id IN (SELECT id FROM conversations)")
     for table in ("cli_executions", "conflicts", "loop_stages", "model_responses"):
@@ -292,7 +371,9 @@ def migrate_command(args: argparse.Namespace) -> int:
         raise ValueError(f"{index} lists no projects")
     services = (args.services_dir or DEFAULT_SERVICES_DIR).expanduser()
     repo_python = Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"
-    plans = plan_workspaces(legacy, scopes, first_port=args.first_port)
+    plans = plan_workspaces(
+        legacy, scopes, first_port=args.first_port, primaries=tuple(getattr(args, "primary", None) or ())
+    )
 
     old_db = Path(legacy.get("HARNESS_TRACE_DB", "data/harness.sqlite3"))
     old_db = old_db if old_db.is_absolute() else base / old_db
@@ -302,7 +383,7 @@ def migrate_command(args: argparse.Namespace) -> int:
     print(f"legacy env: {env_path}\nlegacy store: {old_db}\nservices dir: {services}\n")
     for plan in plans:
         scope = plan.scope
-        print(f"[{scope.name}] -> workspace {plan.root}")
+        print(f"[{scope.name}] -> workspace {plan.root}" + (f" (+ repos: {', '.join(plan.repos)})" if plan.repos else ""))
         preferences = [k for k in plan.env if k in MODEL_ENV_VARS]
         print(
             f"    .harness.env: {len(plan.env) - len(preferences)} settings, API on 127.0.0.1:{plan.api_port}; "
@@ -329,11 +410,13 @@ def migrate_command(args: argparse.Namespace) -> int:
             if roles_source.is_file():
                 shutil.copyfile(roles_source, paths["roles"])  # found by its place, no setting needed
         write_env_updates(paths["env"], env)
+        if plan.repos:
+            paths["repos"].write_text(dump_repos(plan.repos), encoding="utf-8")
         if preferences:
             update_model_settings(paths["models"], preferences)
         memory_ws = preferences.get("HARNESS_MEMORY_WORKSPACE_ID", scope.workspace_id)
         if old_db.is_file():
-            _split_store(old_db, paths["db"], scope, memory_ws)
+            _split_store(old_db, paths["db"], scope, memory_ws, plan.merged)
             copied = _move_traces(paths["db"], old_traces, paths["traces"])
             print(f"[{scope.name}] store split; {copied} run trace folder(s) copied")
         if plan.telegram:

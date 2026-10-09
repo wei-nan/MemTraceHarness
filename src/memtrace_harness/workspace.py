@@ -180,6 +180,7 @@ def workspace_paths(root: Path) -> dict[str, Path]:
         "traces": state / "traces",
         "roles": state / "roles.toml",
         "models": state / MODELS_FILE_NAME,
+        "repos": state / "repos.toml",
         "scope": root / SCOPE_FILE_NAME,
     }
 

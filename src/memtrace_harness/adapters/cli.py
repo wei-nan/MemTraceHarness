@@ -46,6 +46,7 @@ class CliModelAdapter(ModelAdapter):
         fallback_index: int = 0,
         reply_language: str | None = None,
         memtrace_mcp_url: str | None = None,
+        read_directories: tuple[Path, ...] = (),
     ) -> None:
         self.adapter_id = adapter_id
         self.role = role
@@ -67,6 +68,8 @@ class CliModelAdapter(ModelAdapter):
         # Where the read-only MemTrace lookup tools are reachable, for providers that cannot
         # pick them up from the user's own CLI configuration (see CodexCliAdapter).
         self.memtrace_mcp_url = memtrace_mcp_url
+        # Other repos of the same project a read-only role may look at (only Claude can be told to; see its adapter).
+        self.read_directories = tuple(read_directories)
 
     def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
         prompt = render_agent_prompt(task, self.role, reply_language=self.reply_language)

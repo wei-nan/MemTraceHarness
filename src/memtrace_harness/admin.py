@@ -149,6 +149,16 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                 "name": scope.name,
                 "workspace_id": scope.workspace_id,
                 "working_directory": str(scope.working_directory),
+                "repos": [
+                    {"name": scope.name, "primary": True, "path": str(scope.working_directory),
+                     "exists": scope.working_directory.is_dir(), "verify_command": scope.verify_command,
+                     "github_repo": scope.github_repo},
+                    *[
+                        {"name": name, "primary": False, "path": str(repo.path), "exists": repo.path.is_dir(),
+                         "verify_command": repo.verify_command, "github_repo": repo.github_repo}
+                        for name, repo in scope.repos.items()
+                    ],
+                ],
                 "dedicated": {
                     "chat_model": bool(os.getenv("HARNESS_CHAT_PROVIDER")),
                     "memory": bool(os.getenv("HARNESS_MEMORY_WORKSPACE_ID") or config.harness_memory_workspace_id),
@@ -418,6 +428,12 @@ def render_status_text(data: dict) -> str:
     for project in data["projects"]:
         lines.append(f"\n  【{project['name']}】 workspace_id={project['workspace_id']}")
         lines.append(f"    working_directory: {project['working_directory']}")
+        if len(project.get("repos", [])) > 1:
+            lines.append("    repos：")
+            for repo in project["repos"]:
+                mark = "（主要）" if repo["primary"] else ""
+                missing = "" if repo["exists"] else "  ⚠️ 資料夾不存在"
+                lines.append(f"      - {repo['name']}{mark}：{repo['path']}{missing}")
         dedicated = project["dedicated"]
         lines.append(
             "    設定："

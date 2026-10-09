@@ -75,6 +75,9 @@ class ClaudeCliAdapter(CliModelAdapter):
                     read_tools + write_tools,
                 ]
             )
+            # The project's other repos, to read — only here: a role that may write never gets a second root.
+            for directory in self.read_directories:
+                command.extend(["--add-dir", str(directory)])
         else:
             command.extend(
                 ["--permission-mode", "acceptEdits", "--allowedTools", read_tools + write_tools]

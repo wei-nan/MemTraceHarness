@@ -73,6 +73,7 @@ from memtrace_harness.schedule import (
     spec_from_row,
 )
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
+from memtrace_harness.scope import split_repo_goal
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
@@ -890,6 +891,13 @@ class HarnessService:
         """Start a governed task now if the project has a free worker slot, otherwise
         queue it. A schedule whose previous run is still running (or still queued) is
         skipped instead — it must never pile up behind itself."""
+        repo_name, _ = split_repo_goal(goal)
+        try:
+            scope.resolve_repo(repo_name)
+        except ValueError as exc:
+            msg = f"⚠️ 任務沒有開始：{exc}"
+            self.send_message(audience, msg)
+            return msg
         ws_id = scope.workspace_id
         trace_store = self.approval_manager.trace_store
         conv_id = f"chat_{uuid4().hex[:8]}"
@@ -1065,7 +1073,7 @@ class HarnessService:
         Otherwise it shares one folder with its siblings and takes turns to develop."""
         if worktree is not None or self._slot_limit(scope) <= 1:
             return None
-        ws_id = scope.workspace_id
+        ws_id = scope.lock_key
         return (
             lambda: trace_store.acquire_edit_lock(ws_id, conv_id),
             lambda: trace_store.release_edit_lock(ws_id, conv_id),
@@ -1094,7 +1102,9 @@ class HarnessService:
             # (TWTradingStrategy): edit in place, one task at a time per checkout.
             return scope.working_directory, None
         manager = self._worktree_manager()
-        worktree = manager.create(scope.working_directory, scope.name, conv_id)
+        worktree = manager.create(
+            scope.working_directory, scope.name if scope.repo is None else f"{scope.name}-{scope.repo}", conv_id
+        )
         if scope.worktree_setup_command:
             try:
                 manager.run_setup_command(
@@ -1186,6 +1196,36 @@ class HarnessService:
             ]
         )
 
+    @staticmethod
+    def _other_repo_dirs(scope: ProjectScope) -> tuple[Path, ...]:
+        """The project's repos other than the one this task works in, for a read-only role to read."""
+        everything = {None: (scope.base or scope).working_directory, **{n: r.path for n, r in scope.repos.items()}}
+        return tuple(path for name, path in everything.items() if name != scope.repo and path.is_dir())
+
+    @staticmethod
+    def _repos_text(scope: ProjectScope) -> str:
+        """The repos this Harness works in, one per line — empty when it has only the primary one."""
+        if not scope.repos:
+            return ""
+        lines = [f"- {scope.name}（主要）：{scope.working_directory}"]
+        for name, repo in scope.repos.items():
+            extra = f"；verify：{repo.verify_command}" if repo.verify_command else ""
+            lines.append(f"- {name}：{repo.path}{extra}")
+        return "\n".join(lines)
+
+    def _repos_notice(self, scope: ProjectScope) -> str:
+        """Tell the chat model there is more than one repo and how to aim a task or a schedule at one."""
+        text = self._repos_text(scope)
+        if not text:
+            return ""
+        return (
+            "這個專案的程式碼分在多個 repo（同一份知識庫、同一段對話；每個任務只會在一個 repo 裡動手）：\n"
+            f"{text}\n"
+            "要動手開發時，任務描述最前面加上「repo=<repo 名稱>::」指定在哪一個 repo 做（不加就是主要的那個），"
+            f"例如「{self._TASK_START_MARKER}repo={next(iter(scope.repos))}::<任務>」；排程的任務內容也一樣。"
+            "一件事要同時改兩個 repo 時，拆成各自在一個 repo 裡的兩個任務，先後順序在任務描述裡寫清楚。\n\n"
+        )
+
     def _identity_context(self, scope: ProjectScope) -> str:
         parts = [
             f"You are the Harness agent for project '{scope.name}' (workspace "
@@ -1193,6 +1233,7 @@ class HarnessService:
             f"identity, default risk level, and off-limits rules — do not ask the user to repeat "
             f"it:\n\n{scope.raw_markdown.strip()}",
             self._knowledge_base_locations(scope),
+            *([f"Repos this project works in:\n{self._repos_text(scope)}"] if scope.repos else []),
             "Language policy: every reply, recommendation, and summary sent back to the "
             "human — in every stage of this run — must be written in Traditional Chinese "
             "(繁體中文，台灣用語與正體字), never Simplified Chinese and never simplified "
@@ -1341,6 +1382,21 @@ class HarnessService:
                 source="harness",
             ),
         ]
+        if scope.repos:
+            items.append(
+                ContextItem(
+                    ref=f"harness:repos:{scope.name}",
+                    title="Repos of this project",
+                    body=(
+                        f"This task works in the repo `{scope.repo_label()}` (your working directory); "
+                        "do not edit any other repo — if the change needs one, say so in your result as a separate "
+                        "follow-up task for that repo. The project's repos:\n"
+                        + self._repos_text(scope.for_repo(None) if scope.repo is not None else scope)
+                    ),
+                    content_type="context",
+                    source="harness",
+                )
+            )
         for workspace_id, label in self._charter_workspaces(scope):
             charter = self.approval_manager.trace_store.get_workspace_charter(workspace_id)
             if charter:
@@ -1814,6 +1870,7 @@ class HarnessService:
             "哪裡卡住或失敗、要怎麼改進（不是要你檢討交易損益，也不是要你開發某個功能）——才在回覆"
             f"最後另起一行，格式為「{self._REVIEW_START_MARKER}<一句話說明想看什麼>」。系統會自動產生"
             "有數據的復盤報告，你不需要自己整理數字。同一則回覆不要同時輸出任務啟動標記。\n\n"
+            f"{self._repos_notice(scope)}"
             f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
             f"{self._schedule_control_notice(scope)}"
@@ -2335,6 +2392,10 @@ class HarnessService:
         return f"⚠️ 找不到可取消的排程 {schedule_id}（可能已經被取消，或 ID 打錯了）。"
 
     def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str, schedule_id: str | None = None):
+        # A task works in one repo of the project: the one its goal names, else the primary one.
+        repo_name, goal = split_repo_goal(goal)
+        scope = scope.for_repo(scope.resolve_repo(repo_name))
+        self.approval_manager.trace_store.set_conversation_repo(conv_id, scope.repo)
         task = TaskEnvelope(
             task_id=f"task_{conv_id}",
             workspace_id=scope.workspace_id,
@@ -2352,6 +2413,7 @@ class HarnessService:
             config=self.config,
             working_directory=work_dir,
             timeout_seconds=self.config.cli_timeout_seconds,
+            read_directories=self._other_repo_dirs(scope),
         )
         runner = AgentLoopRunner(
             adapters={p_id: items[0] for p_id, items in candidate_adapters.items()},
@@ -2476,9 +2538,14 @@ class HarnessService:
         # summary of why it stopped) — approving must continue the actual task, not
         # re-run with the stop reason as the new goal. Older rows predating this field
         # fall back to the old behavior.
-        goal = req_data.resume_goal or req_data.proposed_action or req_data.reason
+        goal_repo, goal = split_repo_goal(req_data.resume_goal or req_data.proposed_action or req_data.reason)
         if answer:
             goal = f"{goal}\n\nHuman clarification: {answer}"
+        if matching_scope is not None:
+            # Back to the repo the conversation was working in (what it recorded, else what its goal named).
+            stored = self.approval_manager.trace_store.get_conversation_repo(req_data.conversation_id)
+            matching_scope = matching_scope.for_repo(matching_scope.resolve_repo(stored or goal_repo))
+            self.approval_manager.trace_store.set_conversation_repo(req_data.conversation_id, matching_scope.repo)
 
         def _run() -> None:
             # A fresh TraceStore/connection per background thread — sqlite3
@@ -2539,6 +2606,7 @@ class HarnessService:
                     config=self.config,
                     working_directory=run_dir,
                     timeout_seconds=self.config.cli_timeout_seconds,
+                    read_directories=self._other_repo_dirs(matching_scope) if matching_scope else (),
                 )
                 runner = AgentLoopRunner(
                     adapters={p_id: items[0] for p_id, items in candidate_adapters.items()},

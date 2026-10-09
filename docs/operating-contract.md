@@ -47,6 +47,18 @@ that can read the workspace can read those files. Keeping service secrets (bot t
 is what protects them; the Harness's own secrets (MemTrace token, API token) rely on the allowlisted child
 environment and file mode.
 
+**Repos (operator decision, 2026-10-09).** One MemTrace workspace is one Harness; the other repos of the same product
+are `.harness/repos.toml` entries (`ProjectScope.repos`, `for_repo()`). **ENFORCED**: a task works in exactly one repo
+(`repo=<name>::` goal prefix, none = primary; an unknown name is refused before a slot is taken); that repo's directory,
+git worktree, verify command, setup command, GitHub repo and off-limits (added to the project's) apply; the Developer's
+working directory is only that repo; the edit lock is per repo (`<workspace>#<repo>`) while worker slots, the workspace
+lock, approvals, schedules and the conversation are the Harness's; a conversation's repo is recorded and a resumed run
+returns to it; scanner candidates from a repo's GitHub issues are proposed and worked in that repo. Read-only Claude
+roles are given the other repos' directories to read. **POLICY_ONLY**: the chat model decides which repo a task is for;
+a change that needs two repos is split into two tasks by the Controller/chat, nothing enforces the split or the order.
+**Not implemented:** one task editing two repos; read access to other repos for Codex/Antigravity roles; jobs and ops
+tools are the primary repo's only.
+
 ## Authority and memory routing
 
 The Harness uses three authoritative memory planes:
