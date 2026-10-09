@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from memtrace_harness.scope import DEFAULT_MAX_WORKERS, ProjectScope
 from memtrace_harness.trace_store import TraceStore
-from tests.test_telegram_gateway import _build_schedule_gateway
+from tests.test_service import _build_schedule_gateway
 from tests.test_worktrees import git, make_repo
 
 
@@ -68,7 +68,7 @@ class TaskSlotTests(TestCase):
 
     def test_a_schedule_still_waiting_in_the_queue_also_counts_as_in_flight(self) -> None:
         self.store.enqueue_task(
-            workspace_id="ws", kind="new", payload={"goal": "g"}, schedule_id="sch_a", chat_id=1
+            workspace_id="ws", kind="new", payload={"goal": "g"}, schedule_id="sch_a", audience=1
         )
         self.assertTrue(self.store.schedule_in_flight("sch_a"))
         self.assertEqual(
@@ -101,8 +101,8 @@ class TaskSlotTests(TestCase):
         self.assertEqual(outcomes.count("acquired"), 3)
 
     def test_the_queue_is_first_in_first_out_and_claimed_once(self) -> None:
-        first = self.store.enqueue_task(workspace_id="ws", kind="new", payload={"goal": "1"}, chat_id=1)
-        self.store.enqueue_task(workspace_id="ws", kind="new", payload={"goal": "2"}, chat_id=1)
+        first = self.store.enqueue_task(workspace_id="ws", kind="new", payload={"goal": "1"}, audience=1)
+        self.store.enqueue_task(workspace_id="ws", kind="new", payload={"goal": "2"}, audience=1)
         self.assertEqual(self.store.peek_next_queued_task("ws")["payload"], {"goal": "1"})
         self.assertTrue(self.store.claim_queued_task(first))
         self.assertFalse(self.store.claim_queued_task(first))
@@ -167,7 +167,7 @@ class GatewayTaskSchedulingTests(TestCase):
         gateway.send_message = MagicMock()
         # The fixture folder isn't a git repo; pretend it can use worktrees so the
         # configured worker count applies (the real fallback is tested below).
-        patcher = patch("memtrace_harness.telegram_gateway.can_use_worktrees", return_value=True)
+        patcher = patch("memtrace_harness.service.can_use_worktrees", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
         # Hold every started task open so slots stay taken until the test releases them.
@@ -237,11 +237,11 @@ class GatewayTaskSchedulingTests(TestCase):
         gateway, store, scope = self._gateway()
         first = store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="追蹤持股", kind="interval",
-            interval_seconds=600, chat_id=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            interval_seconds=600, audience=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
         other = store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="另一個", kind="interval",
-            interval_seconds=600, chat_id=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            interval_seconds=600, audience=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         gateway.run_due_schedule(store.get_schedule(first))
@@ -266,7 +266,7 @@ class GatewayTaskSchedulingTests(TestCase):
         self._wait_started(1)
         sched = store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="s", kind="interval",
-            interval_seconds=600, chat_id=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            interval_seconds=600, audience=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
         gateway.run_due_schedule(store.get_schedule(sched))   # queued behind the blocker
         gateway.run_due_schedule(store.get_schedule(sched))   # skipped: already waiting
@@ -347,7 +347,7 @@ class ResumeSlotTests(TestCase):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         gateway, store, scope = _build_schedule_gateway(Path(tmp.name))
-        patcher = patch("memtrace_harness.telegram_gateway.can_use_worktrees", return_value=True)
+        patcher = patch("memtrace_harness.service.can_use_worktrees", return_value=True)
         patcher.start()
         self.addCleanup(patcher.stop)
         gateway.notify_all_allowlisted = MagicMock()
@@ -408,14 +408,14 @@ class ResumeSlotTests(TestCase):
 
 class TaiwanTradeChatNoticeTests(TestCase):
     def test_chat_model_is_told_about_the_tools_only_when_the_proxy_is_on(self) -> None:
-        from memtrace_harness.telegram_gateway import TelegramGateway
+        from memtrace_harness.service import HarnessService
 
         with patch.dict("os.environ", {"HARNESS_TAIWANTRADE_API_KEY_FILE": "/keys/tw"}):
-            notice = TelegramGateway._taiwantrade_notice()
+            notice = HarnessService._taiwantrade_notice()
         self.assertIn("get_balance", notice)
         self.assertIn("不要用 shell/curl", notice)
         with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(TelegramGateway._taiwantrade_notice(), "")
+            self.assertEqual(HarnessService._taiwantrade_notice(), "")
 
 
 class NoWorktreeFallbackTests(TestCase):
@@ -506,9 +506,9 @@ class NoWorktreeFallbackTests(TestCase):
     def test_the_runner_is_given_the_edit_lock_when_the_folder_is_shared(self) -> None:
         with TemporaryDirectory() as tmp:
             gateway, store, scope = self._gateway(Path(tmp))
-            with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
-                "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
-            ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+            with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+                "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+            ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
                 runner.return_value.run.return_value = MagicMock(
                     conversation_id="c1", status="succeeded", recommendation="ok"
                 )

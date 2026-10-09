@@ -581,8 +581,7 @@ class DigestModelSelectionTests(TestCase):
             trace_db_path=Path("t.sqlite3"), trace_root=Path("."),
             claude_command="claude", codex_command="codex", antigravity_command="agy",
             antigravity_output_mode="auto", cli_timeout_seconds=900,
-            telegram_bot_token=None, telegram_allowed_chat_ids=set(),
-            project_index_path=None, chat_provider="claude", chat_model="haiku",
+            chat_provider="claude", chat_model="haiku",
             unattended_write_requires_approval=True, **kwargs,
         )
 
@@ -599,23 +598,21 @@ class DigestModelSelectionTests(TestCase):
         )
         self.assertEqual(config.chat_candidates_for("p"), (("claude", "haiku"),))
 
-    def test_project_override_beats_shared_digest_model(self) -> None:
+    def test_the_environment_beats_the_loaded_digest_model_at_call_time(self) -> None:
         import os
         from unittest.mock import patch
 
         config = self._config(digest_provider="claude", digest_model="sonnet")
         env = {
-            "HARNESS_DIGEST_PROVIDER_MYPROJ": "codex",
-            "HARNESS_DIGEST_MODEL_MYPROJ": "gpt-6",
-            "HARNESS_DIGEST_FALLBACKS_MYPROJ": "claude/opus",
+            "HARNESS_DIGEST_PROVIDER": "codex",
+            "HARNESS_DIGEST_MODEL": "gpt-6",
+            "HARNESS_DIGEST_FALLBACKS": "claude/opus",
         }
         with patch.dict(os.environ, env):
             self.assertEqual(
                 config.digest_candidates_for("myproj"), (("codex", "gpt-6"), ("claude", "opus"))
             )
 
-
-class FormatLogCompletenessTest(TestCase):
     def test_day_that_fits_the_budget_is_not_truncated(self) -> None:
         from memtrace_harness.memory_digest import _format_log
 

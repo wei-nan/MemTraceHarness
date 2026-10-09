@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
+from memtrace_harness.workspace import ENV_FILE_NAME, STATE_DIR_NAME
+
 
 DEFAULT_MAX_WORKERS = 3
 
@@ -17,6 +19,8 @@ class ProjectScope:
     default_risk_level: str = "medium"
     off_limits: list[str] | None = None
     raw_markdown: str = ""
+    # Legacy: a bot token written into the project's own scope file. Only `migrate` reads it (to
+    # move it into the Telegram service's env file); the Harness itself has no use for one.
     telegram_bot_token: str | None = None
     verify_command: str | None = None
     verify_timeout_seconds: int | None = None
@@ -32,7 +36,7 @@ class ProjectScope:
     # What the chat model's operations tools (ops_mcp.py) may touch, all declared by the
     # operator in the scope file: hostnames http_probe may request, log files read_log may
     # read (paths relative to working_directory), and named shell commands run_job may run
-    # after the human taps confirm in Telegram ("- job: name = command", one per line).
+    # after the human taps confirm in the chat ("- job: name = command", one per line).
     probe_hosts: list[str] | None = None
     log_files: list[str] | None = None
     jobs: dict[str, str] | None = None
@@ -60,6 +64,11 @@ class ProjectScope:
 
         off_limits_str = _extract_field(content, "off_limits")
         off_limits = [s.strip() for s in off_limits_str.split(",") if s.strip()] if off_limits_str else []
+        # The Harness's own files sit in the workspace its agents work in: they are never theirs to
+        # read, whatever the scope file says.
+        for guarded in (ENV_FILE_NAME, STATE_DIR_NAME):
+            if guarded not in off_limits:
+                off_limits.append(guarded)
 
         telegram_bot_token = _extract_field(content, "telegram_bot_token", "bot_token")
 

@@ -185,10 +185,47 @@ Writeback contains status, normalized usage, claims, and local trace references.
 stdout/stderr is not copied into MemTrace. Local summary and execution rows are committed before the
 optional MCP writeback, so an external write failure does not erase already-spent model evidence.
 
+## Workspaces, the Harness and its services
+
+A **Harness** is the model-based work of one project: its roles and models, its Agent Loop, its
+memory. It runs against exactly one **workspace** — a folder that may be empty and need not be a git
+repository — and everything it needs is in that folder:
+
+```text
+my-project/
+  .harness.env        this Harness's settings and secrets (MemTrace token, models, its API token), mode 0600
+  .harness/           its state: harness.sqlite3, raw provider traces, git worktrees, roles.toml
+  harness-scope.md    what the project is: MemTrace workspace id, off-limits, jobs, worker slots
+```
+
+A Harness has no chat transport and no web page of its own. Those are **services**, separate
+processes with their own env files that only ever reach a Harness through its local HTTP API
+(`HARNESS_API_PORT`, bearer token `HARNESS_API_TOKEN`):
+
+| process | command | holds | talks to |
+| --- | --- | --- | --- |
+| Harness | `memtrace-harness -C <workspace> serve` | `.harness.env` | model CLIs, MemTrace |
+| Telegram service (one bot, one Harness) | `python -m memtrace_services.telegram.main --env-file telegram.env` | bot token, chat allowlist | Telegram, its Harness's API |
+| status page (any number of Harnesses) | `python -m memtrace_services.web.main --config web.toml` | each Harness's API token | the Harnesses' APIs |
+
+See [`docs/services.md`](docs/services.md) for the design (the outbox, addresses, what a service may
+and may not do) and the migration runbook. `memtrace-harness migrate` turns an old shared `.env` +
+`projects.index.txt` setup into workspaces; `examples/` has a commented file for each of the three.
+
+```powershell
+# a new project, from an empty folder
+memtrace-harness init-workspace ~/Workspace/my-project
+memtrace-harness -C ~/Workspace/my-project doctor      # what would keep it from working
+memtrace-harness -C ~/Workspace/my-project serve       # (or let launchd do it)
+```
+
+The `-C <folder>` option may be left out when you are inside the workspace. `run`, `loop` and `probe`
+work with or without one.
+
 ## Configuration
 
-See `.env.example`. Command variables accept an executable name or explicit path, which is useful
-when WindowsApps or PATH resolution prevents a CLI from starting.
+See `examples/harness.env`. Command variables accept an executable name or explicit path, which is
+useful when WindowsApps or PATH resolution prevents a CLI from starting.
 
 ```text
 HARNESS_CLAUDE_COMMAND=claude
@@ -196,31 +233,32 @@ HARNESS_CODEX_COMMAND=codex
 HARNESS_ANTIGRAVITY_COMMAND=agy
 HARNESS_ANTIGRAVITY_OUTPUT_MODE=auto
 HARNESS_CLI_TIMEOUT_SECONDS=900
-HARNESS_TRACE_DB=data/harness.sqlite3
-HARNESS_TRACE_ROOT=data/traces
 ```
 
 `HARNESS_ANTIGRAVITY_OUTPUT_MODE=auto` inspects `agy --help` without a model call. The locally
 verified Antigravity 1.1.10 advertises stream JSON and model selection. Its usage schema remains
 version-sensitive and is normalized as partial until pinned by real fixtures.
 
-## Remote operations (Telegram gateway + unattended scanner)
+Settings have no per-project suffixes: a workspace is one project, so `HARNESS_CHAT_MODEL` is that
+project's chat model. The models a child process runs under never inherit this file's secrets — a
+provider CLI, a verify command or a job gets only `PATH`, `HOME`, the locale, proxy and CLI-login
+variables (`HARNESS_PASSTHROUGH_ENV` adds names), and only a Codex call wired to the MemTrace MCP
+server gets `MEMTRACE_API_TOKEN`.
 
-One Harness installation can drive multiple target projects — **you do not clone this repo per
-project.** You clone `MemTraceHarness` once, keep your actual project repos wherever they already
-live, and point the Harness at each of them by path. See "Running multiple projects" below.
+## Remote operations (chat service + unattended scanner)
 
-### 1. Register a project
+You clone `MemTraceHarness` once; every project you operate gets its own workspace and its own
+`serve` process (they share the code and `.venv`, nothing else).
 
-Each project you want the gateway/scanner to know about needs one `harness-scope.md` file, placed
-anywhere convenient (typically at the root of that project's own repo). It's plain markdown; the
-Harness reads a handful of `key: value` lines out of it:
+### 1. The project: `harness-scope.md`
+
+Each workspace holds one `harness-scope.md`. It's plain markdown; the Harness reads a handful of
+`key: value` lines out of it:
 
 ```markdown
 # Harness scope — MemTrace
 
 - workspace_id: ws_spec_plan_memtrace
-- working_directory: D:\Workspace\MemTrace
 - default_risk_level: medium
 - off_limits: production database, deploy to prod
 
@@ -228,84 +266,67 @@ This project is the MemTrace core service. Backlog items live in the workspace a
 ```
 
 Required: `workspace_id` (the MemTrace workspace this project's specs/decisions live in). Optional:
-`working_directory` (defaults to the folder the `harness-scope.md` file is in), `name` (defaults to
-the working-directory folder name), `default_risk_level` (`low`/`medium`/`high`, defaults to
-`medium`), `off_limits` (comma-separated phrases the Harness refuses to act on even inside the working
-tree), `max_workers` (how many tasks of this project may run at once, default `3`; extra tasks queue,
-and `1` keeps one-at-a-time editing in place), `worktree_setup_command` (shell command run inside a
-task's fresh git worktree, with `HARNESS_REPO_ROOT` set to the main checkout, to make it usable — e.g.
-link `node_modules` or copy an `.env`).
+`working_directory` (defaults to the folder the file is in), `name` (defaults to the folder name),
+`default_risk_level` (`low`/`medium`/`high`, defaults to `medium`), `off_limits` (comma-separated
+phrases the Harness refuses to act on even inside the working tree; `.harness.env` and `.harness` are
+always added), `max_workers` (how many tasks of this project may run at once, default `3`; extra
+tasks queue, and `1` keeps one-at-a-time editing in place), `worktree_setup_command` (shell command
+run inside a task's fresh git worktree, with `HARNESS_REPO_ROOT` set to the main checkout, to make it
+usable — e.g. link `node_modules` or copy an `.env`).
 
-### 2. Build the project index
+`init-workspace` writes this file for a new workspace. When the workspace is a git checkout it also
+adds `.harness.env` and `.harness/` to `.git/info/exclude`, so secrets and state never show in
+`git status` and are never committed, without touching the project's own `.gitignore`.
 
-`HARNESS_PROJECT_INDEX` points at one small text file listing the path to every project's
-`harness-scope.md`, one per line:
-
-```text
-# projects.index.txt
-D:\Workspace\MemTraceHarness\harness-scope.md
-D:\Workspace\MemTrace\harness-scope.md
-```
-
-The real `projects.index.txt` holds local paths and is gitignored; copy `projects.index.example.txt`
-to start.
-
-This index file is the only thing that has to live near the Harness install; everything else about a
-project's scope stays in that project's own `harness-scope.md`.
-
-### 3. Configure the Telegram channel
-
-```text
-HARNESS_TELEGRAM_BOT_TOKEN=<token from @BotFather>
-HARNESS_TELEGRAM_ALLOWED_CHAT_IDS=123456789,987654321
-HARNESS_CHAT_PROVIDER=claude
-HARNESS_CHAT_MODEL=haiku
-HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL=true
-```
-
-`HARNESS_TELEGRAM_ALLOWED_CHAT_IDS` is a hard allowlist enforced before any message is even read —
-a chat ID that isn't listed gets silently dropped, token or no token. Without
-`HARNESS_TELEGRAM_BOT_TOKEN` the gateway simply doesn't start; nothing else in the Harness requires
-it.
-
-### 4. Run it
+### 2. Run it
 
 ```powershell
-# One poll cycle: process pending Telegram messages, then run one backlog scan pass
-.\.venv\Scripts\python -m memtrace_harness gateway
+# the Harness: its housekeeping plus the local API the services connect to
+memtrace-harness -C <workspace> serve
 
-# Backlog scan only (no Telegram polling) — useful for a scheduled task
-.\.venv\Scripts\python -m memtrace_harness scan
+# the bot in front of it (its own env file, outside the workspace)
+python -m memtrace_services.telegram.main --env-file ~/.config/memtraceharness/<project>/telegram.env
+
+# the status page over every Harness you list in web.toml
+python -m memtrace_services.web.main --config ~/.config/memtraceharness/web.toml
+
+# Backlog scan only, one pass (no API) — useful for a scheduled task
+memtrace-harness -C <workspace> scan
 ```
 
-Both commands do one pass and exit; there is no built-in daemon loop yet. Schedule `gateway`
-repeatedly (e.g. every minute via Windows Task Scheduler) for near-real-time chat, and/or schedule
-`scan` hourly if you want chat polling and backlog scanning on different cadences.
+`serve` runs until stopped (SIGTERM drains in-flight runs within `HARNESS_SHUTDOWN_GRACE_SECONDS`).
+The Telegram service's `TELEGRAM_ALLOWED_CHAT_IDS` is a hard allowlist enforced before anything is
+relayed — a chat that isn't listed gets silently dropped, token or no token. A Harness started
+without `HARNESS_API_TOKEN` refuses to serve its API.
 
 ### What happens on each
 
-- **`gateway`**: fetches new Telegram messages. A message resolves to a registered project by name
-  or workspace ID; replies to `/approve <id>`, `/reject <id> <reason>`, `/clarify <id> <answer>`
-  resolve pending approvals and, on approval, resume that conversation's Agent Loop automatically.
-  Anything asking for something out of scope (GitHub PRs, email, an off-limits phrase from that
-  project's `harness-scope.md`) is rejected with an explanation instead of acted on.
-- **`scan`**: for each registered project, checks MemTrace for planned-but-not-implemented backlog
-  items. If `HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL=true` (the default), it sends a Telegram
-  approval request before doing any work; otherwise it runs the Agent Loop immediately. A project
-  already mid-loop is skipped for that pass (workspace lock), so the same backlog won't be triggered
-  twice while it's still running.
-- Every chat message and every Agent Loop outcome is appended to that project's own running
+- **Telegram service**: long-polls the bot; relays each allowed message (and the message it replies to)
+  to its Harness, and each button tap; delivers what the Harness wants said — replies, approval
+  requests, schedule results, notices — as Telegram messages and tells the Harness which message
+  carries what, so a reply to an approval still resolves to that approval. If the Harness is down,
+  nothing is lost: updates wait in Telegram, and the Harness's outbox waits for the service.
+- **Harness**: a message goes to the chat model (or is a command: `/approve <id>`, `/reject <id>
+  <reason>`, `/clarify <id> <answer>`, `/schedules`, `/status`, ...); approvals resume that
+  conversation's Agent Loop automatically. Anything asking for something out of scope (GitHub PRs,
+  email, an off-limits phrase from `harness-scope.md`) is rejected with an explanation.
+- **`scan`** (also run every `--scan-interval-seconds` by `serve`): checks MemTrace for
+  planned-but-not-implemented backlog items. If `HARNESS_UNATTENDED_WRITE_REQUIRES_APPROVAL=true` (the
+  default), it asks for approval before doing any work; otherwise it runs the Agent Loop immediately.
+  A project already mid-loop is skipped for that pass (workspace lock), so the same backlog won't be
+  triggered twice while it's still running.
+- Every chat message and every Agent Loop outcome is appended to the project's own running
   transcript (its "primary session"), so a later question like "what happened with that last task"
   is answerable from the same conversation, and a periodic consolidation pass can promote the
   substantive parts back into MemTrace as draft evidence — never silently, never as canonical
-  knowledge. `git push` always requires a separate Telegram approval, even after a full Agent Loop
-  pass.
+  knowledge. `git push` always requires a separate approval, even after a full Agent Loop pass.
 - A scheduled run is logged as a `schedule_trigger` / `schedule_report` pair carrying the schedule's
   id, kept out of the conversation window and the hourly MemTrace archive; chat and the Agent Loop
-  instead get one line per schedule (latest result, firings in the last 24h). Swipe-replying to any
+  instead get one line per schedule (latest result, firings in the last 24h). Replying to any
   message — including pushes from this bot's schedules or from external scripts using the same bot
-  token, which the Harness never otherwise sees — puts that message's text in front of the model.
-- **Nightly memory digest** (`gateway --serve`, 02:00–02:59 in `HARNESS_SCHEDULE_TIMEZONE`, Asia/Taipei by default): each
+  through the service's relay, which the Harness never otherwise sees — puts that message's text in
+  front of the model.
+- **Nightly memory digest** (`serve`, 02:00–02:59 in `HARNESS_SCHEDULE_TIMEZONE`, Asia/Taipei by default): each
   finished day of a project's transcript is replayed through one tool-less chat-model call into a
   digest (decisions, facts, open items carried forward until resolved, process lessons). Every item
   must cite turns from that day or it is discarded; the last few digests are injected into chat and
@@ -313,34 +334,24 @@ repeatedly (e.g. every minute via Windows Task Scheduler) for near-real-time cha
   found the same way may only cite the human's own turns, and the Harness adopts, replaces and
   retires them itself (at most 5 new per project-day; the rest wait on the status page). The
   operator corrects one by saying so in chat, or retires/restores it on the status page; the
-  adopted rules reach the chat model numbered, newest 40 first. `memory-digest [--project X] [--date YYYY-MM-DD] [--backfill] [--dry-run]` runs it
+  adopted rules reach the chat model numbered, newest 40 first. `memory-digest [--date YYYY-MM-DD] [--backfill] [--dry-run]` runs it
   by hand; the automatic pass only catches up the last 2 days.
 
 Full design rationale and the open decisions behind this feature are in
 [`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).
 
-### Running multiple projects
+### Several projects
 
-No, you do not need multiple clones of `MemTraceHarness`. One installation (one `.venv`, one
-`data/harness.sqlite3`, one running `gateway`/`scan` process) serves every project listed in
-`HARNESS_PROJECT_INDEX`. Each project only needs:
-
-1. its own `harness-scope.md` (in its own repo, pointing at its own `working_directory` and
-   MemTrace `workspace_id`);
-2. a line in the shared `projects.index.txt` pointing at that file.
-
-The Harness itself stays a single install; what varies per project is only which folder it's told to
-operate in for that turn (`--working-directory` for `run`/`loop`, or the resolved `working_directory`
-from `harness-scope.md` for `gateway`/`scan`). A project runs up to `max_workers` tasks at once (default
-3), each in its own `git worktree` on branch `harness/<conversation_id>` so Developers never edit the
-same files; further tasks wait in a queue and start as slots free up. A schedule never overlaps itself:
-if its previous run is still running (or queued) the next occurrence is skipped. When a task finishes,
-the converge-stage Controller sees what it would bring back and may choose `merge`; the harness merges
-the branch into the checkout's base branch only if that checkout is clean, and stops for a human on
-conflict. Projects that are not git repositories or have no commit yet still run `max_workers` tasks side by side,
-in place; only their development (the Developer stage) takes turns, via a per-project edit lock, so checks
-and queries never wait behind a code change. `max_workers: 1` runs one task at a time. Two overlapping *scans* of the same project are still serialized, and two *different*
-projects always run independently.
+One workspace, one `serve`, one bot per project; the status page lists them all. A project runs up to
+`max_workers` tasks at once (default 3), each in its own `git worktree` on branch
+`harness/<conversation_id>` so Developers never edit the same files; further tasks wait in a queue
+and start as slots free up. A schedule never overlaps itself: if its previous run is still running (or
+queued) the next occurrence is skipped. When a task finishes, the converge-stage Controller sees what
+it would bring back and may choose `merge`; the harness merges the branch into the checkout's base
+branch only if that checkout is clean, and stops for a human on conflict. Projects that are not git
+repositories or have no commit yet still run `max_workers` tasks side by side, in place; only their
+development (the Developer stage) takes turns, via a per-project edit lock, so checks and queries
+never wait behind a code change. `max_workers: 1` runs one task at a time.
 
 ## Traces
 
@@ -393,7 +404,7 @@ export HARNESS_TAIWANTRADE_API_URL=http://127.0.0.1:8000/api/v1   # optional, th
 
 Only the key *path* is passed to the CLI. All roles, Controller included, receive the server; the Controller prompt is amended to allow it.
 
-### Orders: the model proposes, you confirm in Telegram
+### Orders: the model proposes, you confirm in the chat
 
 Placing an order is off by default. List a project in `HARNESS_TAIWANTRADE_ORDER_PROJECTS`
 (comma-separated, e.g. `TWTradingStrategy`) and only that project's **chat** gets one extra tool,
@@ -402,15 +413,15 @@ Placing an order is off by default. List a project in `HARNESS_TAIWANTRADE_ORDER
 ```text
 model --create_order_intent--> TaiwanTrade /trade/order-intents   (nothing reaches the broker)
         one-time confirmation token -> harness SQLite, NOT to the model
-gateway --> Telegram: "買進 2327 | 1 股 | 限價 628" [✅ 確認下單] [❌ 取消]
-you tap confirm --> gateway calls /trade/orders with the token --> result sent to you and logged
+Harness --> chat: "買進 2327 | 1 股 | 限價 628" [✅ 確認下單] [❌ 取消]
+you tap confirm --> the Harness calls /trade/orders with the token --> result sent to you and logged
 ```
 
 The confirmation is enforced in code, not by the prompt: the model has no tool that places, confirms,
-cancels or amends an order; the token never enters the model's context; only an allowlisted chat's
+cancels or amends an order; the token never enters the model's context; only a tap that an allowlisted chat made (relayed by its service)
 button tap can send the order, at most once per intent (compare-and-set on the intent's status); an
 unconfirmed proposal expires with TaiwanTrade's own TTL (5 min) and is reported as not placed. A
 harness-side per-order value limit applies on top of TaiwanTrade's own risk limits
 (`HARNESS_TAIWANTRADE_MAX_ORDER_VALUE`, default 100000 TWD). The API key needs TaiwanTrade's `trade`
 scope. The model can also propose **cancelling** an order (`request_order_cancel`), confirmed the same
-way (the gateway, not the model, sends the `DELETE`). Amending an order is not available.
+way (the Harness, not the model, sends the `DELETE`). Amending an order is not available.

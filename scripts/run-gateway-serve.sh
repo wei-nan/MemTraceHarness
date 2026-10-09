@@ -1,8 +1,0 @@
-#!/bin/bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-set -a
-source .env
-set +a
-exec ./.venv/bin/python -m memtrace_harness gateway --serve \
-    --scan-interval-seconds "${SCAN_INTERVAL_SECONDS:-1800}"

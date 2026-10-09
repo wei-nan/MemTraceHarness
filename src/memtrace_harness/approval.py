@@ -52,17 +52,17 @@ class ApprovalRequestData:
     status: str
     created_at: str
     responded_at: str | None = None
-    responded_by_chat_id: int | None = None
+    responded_by: str | None = None
     resume_goal: str | None = None
-    telegram_chat_id: int | None = None
-    telegram_message_id: int | None = None
+    # Opaque reference to the message a service delivered this request in (see the outbox ack).
+    message_ref: str | None = None
     decision_card: dict | None = None
 
-    def format_telegram_message(self) -> str:
-        # No /approve or /reject lines: those are now inline-keyboard buttons attached
-        # to this message (see TelegramGateway's approval-send path) — typing an ID is
-        # no longer required for either. A native swipe-reply to THIS message is how to answer
-        # from plain text: the chat model reads it (see TelegramGateway.process_update()) and
+    def format_message(self) -> str:
+        # No /approve or /reject lines: those are now buttons attached to this message (see
+        # HarnessService.notify_approval_request()) — typing an ID is no longer required for
+        # either. A reply to THIS message is how to answer from plain text: the chat model reads it
+        # (see HarnessService.handle_message()) and
         # resumes the loop only if the reply is an answer — a question to the model, or a reply
         # it is unsure about, leaves the task paused. The /approve, /reject, /clarify commands
         # and the buttons always work.
@@ -127,14 +127,11 @@ class ApprovalRequestData:
 
 
 class ApprovalManager:
-    def __init__(self, trace_store: TraceStore, allowed_chat_ids: set[int]) -> None:
-        self.trace_store = trace_store
-        self.allowed_chat_ids = allowed_chat_ids
+    """Who may answer is the service's business: a service only forwards what its own allowlist
+    lets through, and the API itself needs the Harness's token. Nothing here knows about chats."""
 
-    def is_chat_id_allowed(self, chat_id: int) -> bool:
-        if not self.allowed_chat_ids:
-            return False
-        return chat_id in self.allowed_chat_ids
+    def __init__(self, trace_store: TraceStore) -> None:
+        self.trace_store = trace_store
 
     def request_approval(
         self,
@@ -193,25 +190,20 @@ class ApprovalManager:
             return None
         return self._with_card(data)
 
-    def record_telegram_message(self, request_id: str, *, chat_id: int, message_id: int) -> None:
-        self.trace_store.set_approval_telegram_message(
-            request_id, chat_id=chat_id, message_id=message_id
-        )
+    def record_message_ref(self, request_id: str, message_ref: str) -> None:
+        self.trace_store.set_approval_message_ref(request_id, message_ref)
 
-    def get_by_telegram_message(self, chat_id: int, message_id: int) -> ApprovalRequestData | None:
-        """Resolve a swipe-reply back to the approval it's replying to — unambiguous,
+    def get_by_message_ref(self, message_ref: str) -> ApprovalRequestData | None:
+        """Resolve a reply back to the approval it's replying to — unambiguous,
         no ID typing or guessing required."""
-        data = self.trace_store.get_approval_request_by_message_id(chat_id, message_id)
+        data = self.trace_store.get_approval_request_by_message_ref(message_ref)
         if not data:
             return None
         return self._with_card(data)
 
     def respond(
-        self, request_id: str, action: str, chat_id: int, reason_or_answer: str | None = None
+        self, request_id: str, action: str, audience: str | None, reason_or_answer: str | None = None
     ) -> tuple[bool, str, ApprovalRequestData | None]:
-        if not self.is_chat_id_allowed(chat_id):
-            return False, "此 chat ID 未經授權", None
-
         req = self.get_request(request_id)
         if not req:
             return False, f"找不到核准請求 {request_id}", None
@@ -245,7 +237,7 @@ class ApprovalManager:
             return False, f"未知的操作「{action}」", None
 
         success = self.trace_store.resolve_approval_request(
-            request_id, new_status, responded_by_chat_id=chat_id
+            request_id, new_status, responded_by=audience
         )
         if not success:
             return False, "更新核准請求狀態失敗", None

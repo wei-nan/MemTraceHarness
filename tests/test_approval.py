@@ -13,7 +13,7 @@ class ApprovalMessageTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             trace_store = TraceStore(tmp_path / "test.sqlite3")
-            mgr = ApprovalManager(trace_store, {12345})
+            mgr = ApprovalManager(trace_store)
             req = mgr.request_approval(
                 conversation_id="conv_1",
                 workspace="ws_test",
@@ -21,7 +21,7 @@ class ApprovalMessageTests(TestCase):
                 reason="ambiguous_requirement",
                 proposed_action="需要澄清「個別存在 commit 內」的意思",
             )
-            msg = req.format_telegram_message()
+            msg = req.format_message()
             self.assertIn("需要你回答問題", msg)
             self.assertIn("不用按鈕", msg)
 
@@ -29,7 +29,7 @@ class ApprovalMessageTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             trace_store = TraceStore(tmp_path / "test.sqlite3")
-            mgr = ApprovalManager(trace_store, {12345})
+            mgr = ApprovalManager(trace_store)
             req = mgr.request_approval(
                 conversation_id="conv_3",
                 workspace="ws_test",
@@ -37,7 +37,7 @@ class ApprovalMessageTests(TestCase):
                 reason="model_output_invalid",
                 proposed_action='Controller: structured output was returned but failed schema validation.\nRaw output:\n{"action": "finish"}',
             )
-            msg = req.format_telegram_message()
+            msg = req.format_message()
             self.assertIn("系統技術性錯誤", msg)
             self.assertIn("不是要問你問題", msg)
             self.assertNotIn("需要你回答問題", msg)
@@ -45,7 +45,7 @@ class ApprovalMessageTests(TestCase):
     def test_config_change_required_says_approving_cannot_help(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"))
             req = mgr.request_approval(
                 conversation_id="conv_cfg",
                 workspace="ws_test",
@@ -53,7 +53,7 @@ class ApprovalMessageTests(TestCase):
                 reason="config_change_required",
                 proposed_action="agent_loop 已停用，需要修改程式碼",
             )
-            msg = req.format_telegram_message()
+            msg = req.format_message()
             self.assertIn("需要先改設定", msg)
             self.assertIn("核准或回覆都無法解決", msg)
             self.assertNotIn("需要你回答問題", msg)
@@ -61,7 +61,7 @@ class ApprovalMessageTests(TestCase):
     def test_bare_approve_on_a_question_is_refused_and_leaves_it_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"))
             req = mgr.request_approval(
                 conversation_id="conv_q",
                 workspace="ws_test",
@@ -81,7 +81,7 @@ class ApprovalMessageTests(TestCase):
     def test_repeated_questions_on_one_conversation_are_flagged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"), {12345})
+            mgr = ApprovalManager(TraceStore(tmp_path / "test.sqlite3"))
             texts = []
             for _ in range(4):
                 req = mgr.request_approval(
@@ -101,7 +101,7 @@ class ApprovalMessageTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             trace_store = TraceStore(tmp_path / "test.sqlite3")
-            mgr = ApprovalManager(trace_store, {12345})
+            mgr = ApprovalManager(trace_store)
             req = mgr.request_approval(
                 conversation_id="conv_2",
                 workspace="ws_test",
@@ -109,7 +109,7 @@ class ApprovalMessageTests(TestCase):
                 reason="unattended_write",
                 proposed_action="掃描器發現待辦，是否核准開始？",
             )
-            msg = req.format_telegram_message()
+            msg = req.format_message()
             self.assertIn("核准請求", msg)
             self.assertNotIn("需要你回答問題", msg)
 
@@ -120,8 +120,7 @@ class ApprovalTests(TestCase):
             tmp_path = Path(tmp_dir)
             db_path = tmp_path / "test_approval.sqlite3"
             trace_store = TraceStore(db_path)
-            allowed_chat_ids = {12345}
-            mgr = ApprovalManager(trace_store, allowed_chat_ids)
+            mgr = ApprovalManager(trace_store)
 
             # 1. Create approval request
             req = mgr.request_approval(
@@ -134,20 +133,15 @@ class ApprovalTests(TestCase):
             self.assertTrue(req.id.startswith("appr_"))
             self.assertEqual(req.status, "pending")
 
-            # 2. Reject response from non-allowed chat ID
-            ok, msg, req_updated = mgr.respond(req.id, "approve", chat_id=99999)
-            self.assertFalse(ok)
-            self.assertIn("未經授權", msg)
-
-            # 3. Approve response from allowed chat ID
-            ok, msg, req_updated = mgr.respond(req.id, "approve", chat_id=12345)
+            # 2. Approve (who may answer is the transport's business — see test_telegram_service)
+            ok, msg, req_updated = mgr.respond(req.id, "approve", audience=12345)
             self.assertTrue(ok)
             self.assertIn("approved", msg)
             self.assertIsNotNone(req_updated)
             self.assertEqual(req_updated.status, "approved")
 
-            # 4. Single terminal response constraint (cannot double-spend or re-respond)
-            ok_second, msg_second, _ = mgr.respond(req.id, "reject", chat_id=12345)
+            # 3. Single terminal response constraint (cannot double-spend or re-respond)
+            ok_second, msg_second, _ = mgr.respond(req.id, "reject", audience=12345)
             self.assertFalse(ok_second)
             self.assertIn("已經是", msg_second)
 
@@ -159,7 +153,7 @@ class ApprovalTests(TestCase):
             tmp_path = Path(tmp_dir)
             db_path = tmp_path / "test_approval_resume_goal.sqlite3"
             trace_store = TraceStore(db_path)
-            mgr = ApprovalManager(trace_store, {12345})
+            mgr = ApprovalManager(trace_store)
 
             req = mgr.request_approval(
                 conversation_id="conv_002",
@@ -184,7 +178,7 @@ class ApprovalTests(TestCase):
             tmp_path = Path(tmp_dir)
             db_path = tmp_path / "test_approval_no_resume_goal.sqlite3"
             trace_store = TraceStore(db_path)
-            mgr = ApprovalManager(trace_store, {12345})
+            mgr = ApprovalManager(trace_store)
 
             req = mgr.request_approval(
                 conversation_id="conv_003",

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tests.support import tap
 
 import json
 import tempfile
@@ -23,7 +24,7 @@ from memtrace_harness.decision_records import precedent_block
 from memtrace_harness.output_contracts import output_schema_path
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 from memtrace_harness.config import HarnessConfig
 
@@ -33,7 +34,6 @@ def _config(tmp: Path) -> HarnessConfig:
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=tmp / "t.sqlite3",
         trace_root=tmp, claude_command="claude", codex_command="codex",
         antigravity_command="agy", antigravity_output_mode="auto", cli_timeout_seconds=900,
-        telegram_bot_token="fake", telegram_allowed_chat_ids={12345}, project_index_path=None,
         chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
 
@@ -215,8 +215,8 @@ class GatewayClaimTests(TestCase):
         )
         self.mgr = PrimarySessionManager(self.store)
         self.kb = kb if kb is not None else FakeKb()
-        gateway = TelegramGateway(
-            _config(tmp), ApprovalManager(self.store, {12345}), ChatTriage([scope]), self.mgr, [scope],
+        gateway = HarnessService(
+            _config(tmp), ApprovalManager(self.store), ChatTriage([scope]), self.mgr, [scope],
             memtrace_client=self.kb,
         )
         gateway.send_message = MagicMock()
@@ -226,15 +226,15 @@ class GatewayClaimTests(TestCase):
         return gateway
 
     def _tap(self, gateway, data):
-        return gateway._handle_callback_query(
+        return tap(gateway, 
             {"id": "cb", "data": data, "message": {"chat": {"id": 12345}, "message_id": 9}}
         )
 
     def _file(self, gateway, summary=None):
-        gateway._report_run_outcome(conv_id="chat_1", summary=summary or run_summary(), final_text="✅ 完成", chat_id=12345)
+        gateway._report_run_outcome(conv_id="chat_1", summary=summary or run_summary(), final_text="✅ 完成", audience=12345)
         [call] = gateway.send_message_with_keyboard.call_args_list
         text, keyboard = call.args[1], call.args[2]
-        claim_id = keyboard[0][0]["callback_data"].split(":")[1]
+        claim_id = keyboard[0][0]["id"].split(":")[1]
         return claim_id, text
 
     def test_a_finished_run_is_reported_as_awaiting_acceptance_with_the_kb_update_applied(self) -> None:
@@ -293,7 +293,7 @@ class GatewayClaimTests(TestCase):
             run_summary(stages=[converge_stage("ask_human")]),
             run_summary(workspace="ws_someone_else"),
         ):
-            gateway._report_run_outcome(conv_id="chat_1", summary=summary, final_text="結果", chat_id=12345)
+            gateway._report_run_outcome(conv_id="chat_1", summary=summary, final_text="結果", audience=12345)
         gateway.send_message_with_keyboard.assert_not_called()
         self.assertEqual(gateway.send_message.call_count, 5)
 

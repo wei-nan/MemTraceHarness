@@ -3,15 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-import re
-import signal
-import subprocess
-import threading
-import time
-from datetime import datetime, timezone
-from pathlib import Path
 import sys
+from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -23,55 +17,20 @@ from memtrace_harness.adapter_factory import (
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
-from memtrace_harness.topic_recall import TopicRecallService
-from memtrace_harness.kb_gardening import (
-    GARDEN_TIMEOUT_SECONDS,
-    garden_due,
-    run_gardening_pass,
-    workspaces_to_garden,
-)
-from memtrace_harness.decision_records import precedent_block
-from memtrace_harness.kb_promotion import PROMOTION_TIMEOUT_SECONDS, run_promotion_pass
-from memtrace_harness.work_review import (
-    MIN_RUNS_FOR_AUTO_REVIEW,
-    REVIEW_TIMEOUT_SECONDS as WORK_REVIEW_TIMEOUT_SECONDS,
-    review_due,
-    run_work_review,
-    write_lessons,
-    write_review_index,
-)
-from memtrace_harness.trigger_review import make_review_caller
-from memtrace_harness.approval import ApprovalManager
-from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.loop import AgentLoopRunner
-from memtrace_harness.memory_digest import (
-    AUTO_CATCH_UP_DAYS,
-    PREFERENCE_CATEGORY_LABELS,
-    DigestError,
-    PreferenceChanges,
-    due_digest_dates,
-    in_digest_window,
-    preference_context_for,
-    run_digest_for_date,
-    sync_digests_to_memtrace,
-    sync_operator_profile,
-)
+from memtrace_harness.memory_digest import AUTO_CATCH_UP_DAYS
 from memtrace_harness.memtrace_client import MemTraceClient
-from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.runner import HarnessRunner
-from memtrace_harness.scanner import UnattendedScanner
-from memtrace_harness.schedule import (
-    compute_next_run,
-    is_outside_interval_window,
-    is_past_window_end,
-    spec_from_row,
-)
 from memtrace_harness.schemas import TaskEnvelope
-from memtrace_harness.scope import load_project_index
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.scope import ProjectScope
 from memtrace_harness.trace_store import TraceStore
-
+from memtrace_harness.workspace import (
+    ENV_FILE_NAME,
+    SCOPE_FILE_NAME,
+    WorkspaceError,
+    load_workspace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,37 +61,81 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "init-workspace":
+            from memtrace_harness.init_workspace import init_workspace_command
+
+            return init_workspace_command(args)
+        if args.command == "migrate":
+            from memtrace_harness.migrate import migrate_command
+
+            return migrate_command(args)
+        if args.command:
+            _load_workspace_for(args)
         if args.command == "run":
             return run_command(args)
         if args.command == "probe":
             return probe_command(args)
         if args.command == "loop":
             return loop_command(args)
-        if args.command == "gateway":
-            return gateway_command(args)
+        if args.command == "serve":
+            return serve_command(args)
         if args.command == "scan":
             return scan_command(args)
-        if args.command == "init-project":
-            return init_project_command(args)
         if args.command == "status":
             return status_command(args)
-        if args.command == "remove-project":
-            return remove_project_command(args)
+        if args.command == "doctor":
+            return doctor_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
         if args.command == "memory-drafts":
             return memory_drafts_command(args)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     parser.print_help()
     return 2
 
 
+def _load_workspace_for(args: argparse.Namespace) -> Path | None:
+    """Put the workspace's `.harness.env` in the environment. The workspace is `-C DIR`, else the
+    current directory when it holds a `.harness.env`; a command that needs one (serve, scan, status,
+    ...) says so itself, the one-off `run`/`probe`/`loop` work without."""
+    chosen = getattr(args, "workspace_dir", None)
+    if chosen is None and (Path.cwd() / ENV_FILE_NAME).is_file():
+        chosen = Path.cwd()
+    if chosen is None:
+        return None
+    return load_workspace(chosen)
+
+
+def load_scope(config: HarnessConfig) -> ProjectScope:
+    """The project this Harness serves: `harness-scope.md` in its workspace."""
+    if config.workspace_root is None:
+        raise ValueError(
+            "no workspace: run inside a folder that has a .harness.env, or pass -C <folder> "
+            "(`memtrace-harness init-workspace <folder>` creates one)"
+        )
+    path = config.workspace_root / SCOPE_FILE_NAME
+    if not path.is_file():
+        raise ValueError(f"{path} does not exist; init-workspace writes it, or create it by hand")
+    return ProjectScope.from_file(path)
+
+
+def _config_and_scope() -> tuple[HarnessConfig, ProjectScope]:
+    config = HarnessConfig.from_env()
+    return config, load_scope(config)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memtrace-harness",
         description="Run Claude, Codex, and Antigravity through local CLIs only.",
+    )
+    parser.add_argument(
+        "-C",
+        "--workspace-dir",
+        type=Path,
+        help="The Harness workspace (a folder holding .harness.env); default: the current folder if it has one",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -225,48 +228,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     loop_parser.add_argument("--json", action="store_true")
 
-    gateway_parser = subparsers.add_parser(
-        "gateway", help="Start the Telegram gateway and unattended scanner"
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run this workspace's Harness: its housekeeping plus the local API services connect to",
     )
-    gateway_parser.add_argument(
-        "--serve",
-        action="store_true",
-        help=(
-            "Run continuously using Telegram long-polling instead of one "
-            "poll-and-exit pass. No public endpoint required."
-        ),
-    )
-    gateway_parser.add_argument(
-        "--poll-timeout-seconds",
-        type=int,
-        default=30,
-        help="Telegram getUpdates long-poll timeout per cycle in --serve mode (default 30).",
-    )
-    gateway_parser.add_argument(
+    serve_parser.add_argument(
         "--scan-interval-seconds",
         type=int,
         default=1800,
-        help="Minimum seconds between unattended backlog scan passes in --serve mode (default 1800). "
-        "Each pass costs one search_nodes call per project even when the backlog is empty — keep this "
+        help="Minimum seconds between unattended backlog scan passes (default 1800). "
+        "Each pass costs one search_nodes call even when the backlog is empty — keep this "
         "well above a few minutes or idle scanning dominates MemTrace token spend (was 60s, see "
         "ws_spec_plan/mem_c9c4affd).",
     )
-    gateway_parser.add_argument(
+    serve_parser.add_argument(
         "--consolidation-interval-seconds",
         type=int,
         default=3600,
         help=(
             "Minimum seconds between cold-memory consolidation passes (hot primary-session "
-            "turns -> draft MemTrace nodes) per project in --serve mode (default 3600)."
+            "turns -> draft MemTrace nodes) (default 3600)."
         ),
     )
-    gateway_parser.add_argument(
+    serve_parser.add_argument(
         "--schedule-check-interval-seconds",
         type=int,
         default=30,
         help=(
             "Minimum seconds between checks for due chat-created schedules "
-            "(see HARNESS_SCHEDULE_START in the chat) in --serve mode (default 30). "
+            "(see HARNESS_SCHEDULE_START in the chat) (default 30). "
             "Cheap (a single indexed SQLite query), safe to keep short."
         ),
     )
@@ -275,14 +265,30 @@ def build_parser() -> argparse.ArgumentParser:
         "scan", help="Run a single pass of the unattended backlog scanner"
     )
 
-    subparsers.add_parser(
-        "init-project",
-        help="Interactive wizard to register a new project (harness-scope.md, .env entries)",
+    init_parser = subparsers.add_parser(
+        "init-workspace",
+        help="Create (or finish) a workspace: .harness.env, .harness/, harness-scope.md",
     )
+    init_parser.add_argument("directory", nargs="?", type=Path, help="The workspace folder (may be empty, need not be a git repo)")
+    init_parser.add_argument("--name", help="Project name (default: the folder name)")
+    init_parser.add_argument("--memtrace-workspace", help="MemTrace workspace id (ws_...) of the project's spec/backlog")
+    init_parser.add_argument("--non-interactive", action="store_true", help="Ask nothing; use flags and defaults")
+
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Move a legacy .env + projects.index.txt Harness into per-workspace .harness.env files",
+    )
+    migrate_parser.add_argument("--env", type=Path, default=Path(".env"), help="The legacy Harness env file")
+    migrate_parser.add_argument("--index", type=Path, help="The legacy project index (default: from the env file)")
+    migrate_parser.add_argument("--services-dir", type=Path, help="Where to write each service's env file (default ~/.config/memtraceharness)")
+    migrate_parser.add_argument("--apply", action="store_true", help="Write the files (default: only print the plan)")
 
     subparsers.add_parser(
         "status",
-        help="Show running gateway process(es), registered projects, locks, and pending approvals",
+        help="Show this Harness's projects, locks, queue and pending approvals",
+    )
+    subparsers.add_parser(
+        "doctor", help="Check the workspace: env file, API token, scope file, tools the models need"
     )
 
     digest_parser = subparsers.add_parser(
@@ -326,15 +332,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--plan-file", type=Path, help="Also write the full old -> new plan to this markdown file"
     )
 
-    remove_project_parser = subparsers.add_parser(
-        "remove-project", help="Unregister a project (does not delete its harness-scope.md)"
-    )
-    remove_project_parser.add_argument(
-        "name", nargs="?", help="Project name to remove; omit to be prompted interactively"
-    )
-    remove_project_parser.add_argument(
-        "--yes", action="store_true", help="Skip the confirmation prompt"
-    )
     return parser
 
 
@@ -570,639 +567,30 @@ def _print_loop_summary(summary, config: HarnessConfig) -> None:
     print(f"trace_db: {config.trace_db_path}")
 
 
-def gateway_command(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
-    trace_store = TraceStore(config.trace_db_path)
-    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
-    projects = load_project_index(config.project_index_path)
-    memtrace_client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token) if config.memtrace_mcp_url else None
-    primary_session_mgr = PrimarySessionManager(trace_store, memtrace_client)
-
-    # Each project's harness-scope.md may carry its own telegram_bot_token, giving it a
-    # dedicated bot (its own identity, KB, Agent Loop and Improvement Loop context — all
-    # already scoped per-project via ProjectScope.workspace_id/working_directory). Projects
-    # without one share the fallback HARNESS_TELEGRAM_BOT_TOKEN bot and must name themselves
-    # in chat text to route correctly; a project with its own bot needs no naming at all,
-    # since ChatTriage defaults to the sole project registered to that bot.
-    groups: dict[str, list] = {}
-    for scope in projects:
-        # harness-scope.md's telegram_bot_token stays supported for anyone who already
-        # set it, but config.telegram_bot_token_for() (a HARNESS_TELEGRAM_BOT_TOKEN_<NAME>
-        # var in this Harness's own .env) is how a project gets a dedicated bot without
-        # writing a secret into that project's own repo.
-        token = scope.telegram_bot_token or config.telegram_bot_token_for(scope.name)
-        if token:
-            groups.setdefault(token, []).append(scope)
-    if not groups and config.telegram_bot_token:
-        groups[config.telegram_bot_token] = []
-    if not groups:
-        raise RuntimeError(
-            "No Telegram bot token configured: set HARNESS_TELEGRAM_BOT_TOKEN, or a "
-            "per-project telegram_bot_token in that project's harness-scope.md"
-        )
-
-    gateways = []
-    gateway_for_project: dict[str, TelegramGateway] = {}
-    for token, group_projects in groups.items():
-        triage = ChatTriage(group_projects)
-        gw = TelegramGateway(config, approval_mgr, triage, primary_session_mgr, group_projects, memtrace_client, bot_token=token)
-        gw.topic_recall = TopicRecallService(
-            config,
-            trace_store,
-            memtrace_client,
-            call_model_factory=lambda project: make_recall_model_caller(config, project),
-            send=gw.send_message,
-            record_push=lambda project, text, _mgr=primary_session_mgr: _mgr.record_turn(
-                project=project, speaker="assistant", turn_type="chat", content=text
-            ),
-        )
-        gw.review_caller_factory = lambda project: make_review_caller(config, project)
-        gw.garden_now = lambda scope, chat_id, _gw=gw: threading.Thread(
-            target=run_knowledge_gardening,
-            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
-            kwargs={"only_project": scope.name, "force": True, "chat_id": chat_id},
-            name=f"kb-garden-{scope.name}",
-            daemon=True,
-        ).start()
-        gw.promote_now = lambda scope, chat_id, _gw=gw: threading.Thread(
-            target=run_knowledge_promotion,
-            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
-            kwargs={"only_project": scope.name, "chat_id": chat_id, "force": True},
-            name=f"kb-promote-{scope.name}",
-            daemon=True,
-        ).start()
-        gw.work_review_now = lambda scope, chat_id, _gw=gw: threading.Thread(
-            target=run_work_reviews,
-            args=(config, trace_store, memtrace_client, projects, gateway_for_project),
-            kwargs={"only_project": scope.name, "chat_id": chat_id, "force": True},
-            name=f"work-review-{scope.name}",
-            daemon=True,
-        ).start()
-        gateways.append(gw)
-        for scope in group_projects:
-            gateway_for_project[scope.name] = gw
-
-    scanner = UnattendedScanner(
-        config,
-        trace_store,
-        projects,
-        memtrace_client,
-        gateway_for_project,
-        approval_mgr,
-        record_push=lambda project, text, _mgr=primary_session_mgr: _mgr.record_turn(
-            project=project, speaker="assistant", turn_type="chat", content=text
-        ),
-        review_caller_factory=lambda project: make_review_caller(config, project),
-    )
-
-    if args.serve:
-        return _serve_gateway_loop(
-            gateways,
-            scanner,
-            primary_session_mgr,
-            projects,
-            config,
-            trace_store,
-            gateway_for_project,
-            poll_timeout=max(1, args.poll_timeout_seconds),
-            scan_interval=max(1, args.scan_interval_seconds),
-            consolidation_interval=max(1, args.consolidation_interval_seconds),
-            schedule_check_interval=max(1, args.schedule_check_interval_seconds),
-        )
-
-    print(f"Starting Telegram gateway ({len(gateways)} bot(s)) and unattended scanner...")
-    processed = sum(gw.poll_once() for gw in gateways)
-    scan_results = scanner.run_scan_pass()
-    print(f"Processed {processed} Telegram updates; scan pass results: {scan_results}")
-    return 0
-
-
-def _classify_via_model(
-    candidates: tuple[tuple[str, str], ...],
-    config: HarnessConfig,
-    working_directory: Path,
-    prompt: str,
-    contents: list[str],
-    positive_word: str,
-) -> list[bool]:
-    """Shared shape for both classifiers below: try each (provider, model) candidate in
-    order, ask for exactly one verdict line per input, and parse it. A provider outage
-    (not logged in, quota exhausted) falls through to the next candidate rather than
-    failing the whole classification pass."""
-    if not contents or not candidates:
-        return [False] * len(contents)
-    for provider, model in candidates:
-        cmd = config.chat_command(provider, model, prompt)
-        result = CliProcessRunner().run(cmd, cwd=working_directory, timeout_seconds=60)
-        if result.return_code != 0 or not result.stdout.strip():
-            continue
-        lines = [ln.strip().upper() for ln in result.stdout.strip().splitlines() if ln.strip()]
-        return [ln.startswith(positive_word) for ln in lines]
-    return [False] * len(contents)
-
-
-def _make_chat_classifier(config: HarnessConfig, project_name: str, working_directory: Path):
-    """Build the classify_chat_fn consolidate_to_memtrace() uses to judge plain chat
-    turns. Deliberately a cheap, low-stakes model call — that project's own chat model
-    (chat_candidates_for(), same resolution as the quick-chat-reply path) — since this
-    only decides whether to write a draft note, never whether to run real work; a model
-    verdict is an acceptable amount of risk here in a way it would not be for the
-    Agent Loop itself."""
-    candidates = config.chat_candidates_for(project_name)
-
-    def classify(contents: list[str]) -> list[bool]:
-        prompt = (
-            "Below are chat messages from a project's conversation log, numbered in "
-            "order. For each one, decide if it is substantive — a decision, "
-            "requirement, agreed plan, important fact, or something that should be "
-            "remembered later — versus just small talk, a greeting, or a status check "
-            "with no lasting value.\n\n"
-            f"Reply with EXACTLY {len(contents)} lines, one per message in the same "
-            "order, each line either the single word SUBSTANTIVE or the single word "
-            "CHAT and nothing else.\n\n"
-            + "\n".join(f"{i + 1}. {c}" for i, c in enumerate(contents))
-        )
-        return _classify_via_model(candidates, config, working_directory, prompt, contents, "SUBSTANTIVE")
-
-    return classify
-
-
-# The main thread no longer polls Telegram (see start_bot_pollers), it only runs the
-# timed housekeeping, so it just wakes up this often to see whether anything is due.
-MAIN_LOOP_TICK_SECONDS = 1.0
-# A getUpdates call that comes back empty this fast failed (network error, Telegram
-# hiccup) rather than long-polling; back off instead of spinning on it.
-POLL_FAILURE_BACKOFF_SECONDS = 3.0
-
-
-def _poll_bot_forever(gw: TelegramGateway, stop_event: threading.Event, *, poll_timeout: int, status_bus) -> None:
-    label = ", ".join(p.name for p in gw.projects) or "unassigned"
-    while not stop_event.is_set():
-        started = time.monotonic()
-        processed = 0
-        try:
-            processed = gw.poll_once(timeout=poll_timeout)
-            if processed:
-                print(f"[{label}] processed {processed} update(s)", flush=True)
-                if status_bus is not None:
-                    status_bus.publish()
-        except Exception:
-            logger.exception(f"[{label}] gateway poll cycle failed; continuing")
-        if not processed and time.monotonic() - started < 1.0:
-            stop_event.wait(POLL_FAILURE_BACKOFF_SECONDS)
-
-
-def start_bot_pollers(
-    gateways: list[TelegramGateway], stop_event: threading.Event, *, poll_timeout: int, status_bus=None
-) -> list[threading.Thread]:
-    """One long-polling thread per bot. Until 2026-10-02 a single loop polled the bots
-    one after another, each getUpdates blocking up to poll_timeout (30s) when that bot
-    had nothing new, and answered messages in the same loop: with four bots a message
-    could wait ~90s before it was even read, and one bot's 2-minute reply held up all
-    the others. Each bot still handles its own messages in order."""
-    threads = []
-    for gw in gateways:
-        label = ", ".join(p.name for p in gw.projects) or "unassigned"
-        thread = threading.Thread(
-            target=_poll_bot_forever,
-            args=(gw, stop_event),
-            kwargs={"poll_timeout": poll_timeout, "status_bus": status_bus},
-            name=f"telegram-poll-{label}",
-            daemon=True,
-        )
-        thread.start()
-        threads.append(thread)
-    return threads
-
-
-# How often the gateway loop checks whether a nightly memory digest is due. Cheap when
-# nothing is due (SQLite reads only); the digest itself runs in its own thread so a
-# multi-minute model call never stalls Telegram polling.
-DIGEST_CHECK_SECONDS = 600
-# A project-day whose digest failed (provider down, unparseable answer) is retried at
-# most this often, instead of on every check.
-DIGEST_RETRY_SECONDS = 3600
-DIGEST_TIMEOUT_SECONDS = 300
-_digest_failures: dict[tuple[str, str], float] = {}
-
-
-def make_digest_model_caller(config: HarnessConfig, project_name: str):
-    """One tool-less call through that project's digest candidates (its own model,
-    independent of chat; chat candidates only when none is configured), in order. Runs in a
-    neutral empty directory (like Controller's sandbox) rather than the project repo,
-    so a provider CLI's own repo-scoped instructions or auto-memory can't leak into
-    the digest."""
-    candidates = config.digest_candidates_for(project_name)
-    sandbox = (config.trace_root / "digest-workspace").resolve()
-    sandbox.mkdir(parents=True, exist_ok=True)
-
-    def call(prompt: str) -> tuple[str, str | None, str | None]:
-        errors = []
-        for provider, model in candidates:
-            cmd = config.chat_command(provider, model, prompt)
-            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=DIGEST_TIMEOUT_SECONDS)
-            if result.return_code == 0 and result.stdout.strip():
-                return result.stdout, provider, model
-            errors.append(f"{provider}/{model}: exit {result.return_code}")
-        raise DigestError("no digest candidate produced a digest (" + "; ".join(errors) + ")")
-
-    return call
-
-
-def make_recall_model_caller(config: HarnessConfig, project_name: str):
-    """One call through that project's recall candidates (its own stronger model, see
-    HarnessConfig.recall_candidates_for), in order. Like the digest it runs in a neutral
-    directory so no repo-scoped CLI instructions leak in, but unlike the digest it may use
-    MemTrace's read-only tools to dig past the search hits the harness already supplied."""
-    from memtrace_harness.topic_recall import RECALL_TIMEOUT_SECONDS, RecallError
-
-    candidates = config.recall_candidates_for(project_name)
-    sandbox = (config.trace_root / "recall-workspace").resolve()
-    sandbox.mkdir(parents=True, exist_ok=True)
-
-    def call(prompt: str) -> tuple[str, str | None, str | None]:
-        errors = []
-        for provider, model in candidates:
-            cmd = config.chat_command(
-                provider,
-                model,
-                prompt,
-                claude_allowed_tools=TelegramGateway._CHAT_MEMTRACE_READ_TOOLS,
-                memtrace_read=True,
-            )
-            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=RECALL_TIMEOUT_SECONDS)
-            if result.return_code == 0 and result.stdout.strip():
-                return result.stdout, provider, model
-            errors.append(f"{provider}/{model}: exit {result.return_code}")
-        raise RecallError("no recall candidate answered (" + "; ".join(errors) + ")")
-
-    return call
-
-
-def run_memory_digests(
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    memtrace_client: MemTraceClient | None,
-    projects: list,
-    *,
-    max_days_back: int | None,
-    only_date: str | None = None,
-    dry_run: bool = False,
-    respect_retry_backoff: bool = False,
-    log=print,
-    triage_out: dict[str, list[dict]] | None = None,
-) -> dict[str, PreferenceChanges]:
-    """Shared by the gateway's nightly trigger and the `memory-digest` command.
-    Returns {project: the preferences the Harness adopted / retired / left waiting}. One
-    project-day failing never stops the others; MemTrace sync is best-effort and retried
-    next pass."""
-    tz = ZoneInfo(config.schedule_timezone)
-    now = datetime.now(timezone.utc)
-    changed: dict[str, PreferenceChanges] = {}
-    for scope in projects:
-        session_id = f"psess_{scope.name}"
-        if only_date is not None:
-            dates = [only_date]
-        else:
-            dates = due_digest_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
-        if dry_run:
-            for d in dates:
-                log(f"[{scope.name}] would digest {d}")
-            continue
-        call_model = make_digest_model_caller(config, scope.name)
-        for d in dates:
-            key = (scope.name, d)
-            if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
-                continue
-            try:
-                outcome = run_digest_for_date(trace_store, scope.name, session_id, d, tz, call_model)
-            except Exception as exc:
-                _digest_failures[key] = time.monotonic()
-                logger.exception(f"[{scope.name}] memory digest for {d} failed; will retry later")
-                log(f"[{scope.name}] digest {d} failed: {exc}")
-                continue
-            _digest_failures.pop(key, None)
-            total = changed.setdefault(scope.name, PreferenceChanges())
-            total.adopted += outcome.preferences.adopted
-            total.retired += outcome.preferences.retired
-            total.waiting += outcome.preferences.waiting
-            if triage_out is not None:
-                reviewed = [
-                    i for i in outcome.digest["resolved_items"] if i.get("resolution") in ("decided", "stale")
-                ] + [i for i in outcome.digest["open_items"] if i.get("needs_operator")]
-                if reviewed:
-                    triage_out.setdefault(scope.name, []).extend(reviewed)
-            log(
-                f"[{scope.name}] digested {d}: {outcome.turn_count} turn(s), "
-                f"{len(outcome.digest['decisions'])} decision(s), "
-                f"{len(outcome.digest['open_items'])} open item(s), "
-                f"preferences +{len(outcome.preferences.adopted)} "
-                f"-{len(outcome.preferences.retired)} "
-                f"(waiting {len(outcome.preferences.waiting)}), "
-                f"{outcome.digest['discarded_ungrounded']} ungrounded item(s) discarded "
-                f"({outcome.provider}/{outcome.model})"
-            )
-        if memtrace_client is not None:
-            workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-            try:
-                synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)
-                if synced:
-                    log(f"[{scope.name}] wrote {synced} digest(s) to MemTrace {workspace_id}")
-            except Exception:
-                logger.exception(f"[{scope.name}] syncing digests to MemTrace failed; will retry next pass")
-    if (
-        memtrace_client is not None
-        and config.operator_preference_workspace_id
-        and any(c.adopted or c.retired for c in changed.values())
-    ):
-        try:
-            sync_operator_profile(trace_store, memtrace_client, config.operator_preference_workspace_id)
-        except Exception:
-            logger.exception("mirroring the operator profile to MemTrace failed; will retry on the next change")
-    return changed
-
-
-def _describe_preference_changes(changes: PreferenceChanges, limit: int = 8) -> list[str]:
-    lines = [f"- [#{r['id']}] {r['text']}" for r in changes.adopted[:limit]]
-    lines += [f"- 撤回 [#{r['id']}] {r['text']}（{r['retire_reason'] or ''}）" for r in changes.retired[:limit]]
-    hidden = len(changes.adopted) + len(changes.retired) - len(lines)
-    if hidden > 0:
-        lines.append(f"…另外 {hidden} 條")
-    return lines
-
-
-def _describe_open_item_triage(project: str, items: list[dict]) -> str:
-    decided = [i for i in items if i.get("resolution") == "decided"]
-    stale = [i for i in items if i.get("resolution") == "stale"]
-    asking = [i for i in items if i.get("needs_operator")]
-    lines = [f"🗂 [{project}] 昨晚整理了未結事項，想跟你確認："]
-    if decided:
-        lines.append("已決議（我已關閉）：")
-        lines += [f"- {i['text']} → {i.get('resolution_reason', '')}" for i in decided[:10]]
-    if stale:
-        lines.append("已過時（我已關閉）：")
-        lines += [f"- {i['text']} → {i.get('resolution_reason', '')}" for i in stale[:10]]
-    if asking:
-        lines.append("需要你決定：")
-        lines += [f"- {i['text']} → {i.get('operator_question', '')}" for i in asking[:12]]
-    lines.append("我關錯的請直接回覆告訴我，我會重新打開；要決定的事回覆我，我們可以一起討論。")
-    return "\n".join(lines)
-
-
-def run_knowledge_gardening(
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    memtrace_client: MemTraceClient | None,
-    projects: list,
-    gateway_for_project: dict[str, TelegramGateway],
-    *,
-    only_project: str | None = None,
-    force: bool = False,
-    chat_id: int | None = None,
-) -> int:
-    """Tidy and re-map the knowledge-base workspaces of the harness's projects (kb_gardening.py):
-    the ones that are due (not tidied for a week), or all of a project's when forced. One
-    workspace failing never stops the others. Returns how many passes ran."""
-    if memtrace_client is None:
-        return 0
-    ran = 0
-    scopes = [p for p in projects if only_project is None or p.name == only_project]
-    for workspace_id, project, label, purpose in workspaces_to_garden(config, scopes):
-        if not force and not garden_due(trace_store, workspace_id):
-            continue
-        try:
-            outcome = run_gardening_pass(
-                client=memtrace_client,
-                trace_store=trace_store,
-                workspace_id=workspace_id,
-                project=project,
-                role_label=label,
-                purpose=purpose,
-                caller=make_review_caller(config, project, timeout_seconds=GARDEN_TIMEOUT_SECONDS),
-            )
-        except Exception:
-            logger.exception(f"[{project}] tidying {workspace_id} failed; will retry next pass")
-            continue
-        if outcome is None:
-            continue
-        ran += 1
-        gw = gateway_for_project.get(project)
-        if gw is not None:
-            try:
-                gw.notify_garden_outcome(outcome, chat_id)
-            except Exception:
-                logger.exception(f"[{project}] reporting the tidying pass failed")
-    return ran
-
-
-def run_knowledge_promotion(
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    memtrace_client: MemTraceClient | None,
-    projects: list,
-    gateway_for_project: dict[str, TelegramGateway],
-    *,
-    only_project: str | None = None,
-    chat_id: int | None = None,
-    force: bool = False,
-) -> int:
-    """Promote a project's cold-memory findings into its specification workspace as conclusion
-    notes and an overview (kb_promotion.py). On demand (/promote, force=True: always runs and
-    always reports) or from the nightly window (due weekly, and only when the digests have
-    changed since the last pass; the operator is told only if something was written or flagged).
-    Returns the passes run."""
-    if memtrace_client is None:
-        return 0
-    ran = 0
-    for scope in projects:
-        if only_project is not None and scope.name != only_project:
-            continue
-        if not force and not garden_due(trace_store, scope.workspace_id, kind="promote"):
-            continue
-        try:
-            outcome = run_promotion_pass(
-                client=memtrace_client,
-                trace_store=trace_store,
-                project=scope.name,
-                spec_workspace_id=scope.workspace_id,
-                memory_workspace_id=config.memory_workspace_id_for(scope.name, scope.workspace_id),
-                purpose=scope.raw_markdown,
-                caller=make_review_caller(config, scope.name, timeout_seconds=PROMOTION_TIMEOUT_SECONDS),
-                only_if_new=not force,
-            )
-        except Exception:
-            logger.exception(f"[{scope.name}] promoting research conclusions failed")
-            gw = gateway_for_project.get(scope.name)
-            if gw is not None and chat_id is not None:
-                gw.send_message(chat_id, "📚 整理研究結論時發生錯誤，請看日誌。")
-            continue
-        gw = gateway_for_project.get(scope.name)
-        if outcome is None:
-            if gw is not None and chat_id is not None:
-                gw.send_message(chat_id, f"📚 [{scope.name}] 沒有可整理的來源（沒有獨立的冷記憶工作區、沒有每日摘要，或模型沒有給出可用的答案）。")
-            continue
-        ran += 1
-        wrote = bool(outcome.created or outcome.updated or outcome.index or outcome.stale or outcome.dropped)
-        if gw is not None and (force or wrote):
-            try:
-                gw.notify_promotion_outcome(outcome, chat_id)
-            except Exception:
-                logger.exception(f"[{scope.name}] reporting the promotion pass failed")
-    return ran
-
-
-def run_work_reviews(
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    memtrace_client: MemTraceClient | None,
-    projects: list,
-    gateway_for_project: dict[str, TelegramGateway],
-    *,
-    only_project: str | None = None,
-    chat_id: int | None = None,
-    force: bool = False,
-) -> int:
-    """Review how the harness's own work went since the last review (work_review.py), one review
-    per workspace (projects sharing a workspace are reviewed together). On demand (/review or a
-    request in chat; force=True) or weekly from the nightly window, after a first review exists and
-    when the period holds enough runs. Returns the reviews made."""
-    ran = 0
-    seen: set[str] = set()
-    for scope in projects:
-        if only_project is not None and scope.name != only_project:
-            continue
-        workspace_id = scope.workspace_id
-        if workspace_id in seen:
-            continue
-        seen.add(workspace_id)
-        if not force and not review_due(trace_store, workspace_id):
-            continue
-        gw = gateway_for_project.get(scope.name)
-        try:
-            outcome = run_work_review(
-                trace_store=trace_store,
-                workspace_id=workspace_id,
-                project=scope.name,
-                project_names=[p.name for p in projects if p.workspace_id == workspace_id],
-                caller=make_review_caller(config, scope.name, timeout_seconds=WORK_REVIEW_TIMEOUT_SECONDS),
-                precedent=precedent_block(
-                    trace_store, scope.name,
-                    preferences=preference_context_for(trace_store, scope.name, with_ids=True),
-                ),
-                min_runs=0 if force else MIN_RUNS_FOR_AUTO_REVIEW,
-            )
-        except Exception:
-            logger.exception(f"[{scope.name}] the work review failed")
-            outcome = None
-        if outcome is None:
-            if gw is not None and chat_id is not None:
-                gw.send_message(chat_id, f"🔍 [{scope.name}] 這段期間沒有足夠的紀錄可以復盤，或模型沒有給出可用的答案。")
-            continue
-        if memtrace_client is not None:
-            memory_ws = config.memory_workspace_id_for(scope.name, workspace_id)
-            write_lessons(memtrace_client, trace_store, outcome, memory_ws)
-            write_review_index(memtrace_client, trace_store, outcome, memory_ws)
-        ran += 1
-        if gw is not None:
-            try:
-                gw.notify_review_outcome(outcome, scope, chat_id)
-            except Exception:
-                logger.exception(f"[{scope.name}] reporting the work review failed")
-    return ran
-
-
-def _run_nightly_digest_pass(
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    memtrace_client: MemTraceClient | None,
-    projects: list,
-    *,
-    gateway_for_project: dict[str, TelegramGateway],
-    status_bus,
-) -> None:
-    triage: dict[str, list[dict]] = {}
-    try:
-        changed = run_memory_digests(
-            config,
-            trace_store,
-            memtrace_client,
-            projects,
-            max_days_back=AUTO_CATCH_UP_DAYS,
-            respect_retry_backoff=True,
-            triage_out=triage,
-        )
-    except Exception:
-        logger.exception("nightly memory digest pass failed")
-        return
-    if status_bus is not None:
-        status_bus.publish()
-    for project, items in triage.items():
-        gw = gateway_for_project.get(project)
-        if gw is None:
-            continue
-        text = _describe_open_item_triage(project, items)
-        try:
-            gw.notify_all_allowlisted(text)
-            # Into the chat log too, so the chat model can discuss it when the operator replies.
-            gw.primary_session_mgr.record_turn(
-                project=project, speaker="assistant", turn_type="chat", content=text
-            )
-        except Exception:
-            logger.exception(f"[{project}] notifying about the open-item review failed")
-    per_gateway: dict[int, tuple[TelegramGateway, PreferenceChanges]] = {}
-    for project, changes in changed.items():
-        gw = gateway_for_project.get(project)
-        if gw is None or not (changes.adopted or changes.retired or changes.waiting):
-            continue
-        _, merged = per_gateway.setdefault(id(gw), (gw, PreferenceChanges()))
-        merged.adopted += changes.adopted
-        merged.retired += changes.retired
-        merged.waiting += changes.waiting
-    for gw, changes in per_gateway.values():
-        lines = ["🧠 昨晚的記憶整理自動調整了你的偏好："]
-        lines += _describe_preference_changes(changes)
-        if changes.waiting:
-            lines.append(f"另有 {len(changes.waiting)} 條超過每日自動採用上限，等你到網頁確認。")
-        lines.append(
-            "不同意的話，直接在聊天裡說（例如「那個不用了」），或到狀態網頁撤銷："
-            f"http://{config.status_server_host}:{config.status_server_port}"
-        )
-        try:
-            gw.notify_all_allowlisted("\n".join(lines))
-        except Exception:
-            logger.exception("notifying about preference changes failed")
-
-
 def memory_drafts_command(args: argparse.Namespace) -> int:
     from memtrace_harness.memory_drafts import apply_draft_retitle, plan_draft_retitle
 
-    config = HarnessConfig.from_env()
+    config, scope = _config_and_scope()
     if not config.memtrace_mcp_url:
         raise RuntimeError("MEMTRACE_MCP_URL is required")
     trace_store = TraceStore(config.trace_db_path)
-    projects = load_project_index(config.project_index_path)
-    if args.project:
-        projects = [p for p in projects if p.name == args.project]
-        if not projects:
-            raise ValueError(f"no registered project named {args.project!r}")
     client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
     tz = ZoneInfo(config.schedule_timezone)
     report: list[str] = []
     total = 0
-    for scope in projects:
-        workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-        plans, skipped = plan_draft_retitle(client, trace_store, scope.name, workspace_id, tz)
-        print(f"[{scope.name}] {workspace_id}: {len(plans)} draft(s) to rename, {len(skipped)} skipped")
-        report.append(f"## {scope.name} — `{workspace_id}` ({len(plans)} to rename, {len(skipped)} skipped)\n")
-        report += [f"- `{p.node_id}` → {p.new_title}" for p in plans]
-        report += [f"- `{k.node_id}` **skipped**: {k.reason}" for k in skipped]
-        report.append("")
-        for p in plans[:3] + plans[-1:]:
-            print(f"    {p.node_id}  →  {p.new_title}")
-        for k in skipped:
-            print(f"    skipped {k.node_id}: {k.reason}")
-        if args.apply and plans:
-            total += apply_draft_retitle(client, trace_store, scope.name, workspace_id, plans)
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    plans, skipped = plan_draft_retitle(client, trace_store, scope.name, workspace_id, tz)
+    print(f"[{scope.name}] {workspace_id}: {len(plans)} draft(s) to rename, {len(skipped)} skipped")
+    report.append(f"## {scope.name} — `{workspace_id}` ({len(plans)} to rename, {len(skipped)} skipped)\n")
+    report += [f"- `{p.node_id}` → {p.new_title}" for p in plans]
+    report += [f"- `{k.node_id}` **skipped**: {k.reason}" for k in skipped]
+    report.append("")
+    for p in plans[:3] + plans[-1:]:
+        print(f"    {p.node_id}  →  {p.new_title}")
+    for k in skipped:
+        print(f"    skipped {k.node_id}: {k.reason}")
+    if args.apply and plans:
+        total += apply_draft_retitle(client, trace_store, scope.name, workspace_id, plans)
     if args.plan_file:
         args.plan_file.write_text("\n".join(report), encoding="utf-8")
         print(f"full plan written to {args.plan_file}")
@@ -1211,13 +599,10 @@ def memory_drafts_command(args: argparse.Namespace) -> int:
 
 
 def memory_digest_command(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
+    from memtrace_harness.duties import run_memory_digests
+
+    config, scope = _config_and_scope()
     trace_store = TraceStore(config.trace_db_path)
-    projects = load_project_index(config.project_index_path)
-    if args.project:
-        projects = [p for p in projects if p.name == args.project]
-        if not projects:
-            raise ValueError(f"no registered project named {args.project!r}")
     if args.date:
         datetime.strptime(args.date, "%Y-%m-%d")
     memtrace_client = (
@@ -1229,7 +614,7 @@ def memory_digest_command(args: argparse.Namespace) -> int:
         config,
         trace_store,
         memtrace_client,
-        projects,
+        [scope],
         max_days_back=None if args.backfill else AUTO_CATCH_UP_DAYS,
         only_date=args.date,
         dry_run=args.dry_run,
@@ -1245,1401 +630,68 @@ def memory_digest_command(args: argparse.Namespace) -> int:
     return 0
 
 
-# How often the gateway loop looks for pending approvals that have outlived their TTL.
-APPROVAL_EXPIRY_CHECK_SECONDS = 600
+def serve_command(args: argparse.Namespace) -> int:
+    from memtrace_harness.runtime import serve
 
-
-def _serve_gateway_loop(
-    gateways: list[TelegramGateway],
-    scanner: UnattendedScanner,
-    primary_session_mgr: PrimarySessionManager,
-    projects: list,
-    config: HarnessConfig,
-    trace_store: TraceStore,
-    gateway_for_project: dict[str, TelegramGateway],
-    *,
-    poll_timeout: int,
-    scan_interval: int,
-    consolidation_interval: int,
-    schedule_check_interval: int,
-) -> int:
-    """Long-poll continuously instead of the one-shot poll-and-exit gateway command.
-    Telegram's getUpdates blocks server-side up to `poll_timeout` seconds when there is
-    nothing new, so this stays near-real-time without a public webhook endpoint — no
-    inbound port, no TLS certificate, nothing exposed to the internet. A crash in one
-    poll/scan/consolidation cycle is logged and the loop continues rather than taking
-    the whole process down; only SIGINT/SIGTERM stop it cleanly."""
-    print(
-        f"Serving Telegram gateway ({len(gateways)} bot(s)); "
-        f"poll_timeout={poll_timeout}s scan_interval={scan_interval}s "
-        f"consolidation_interval={consolidation_interval}s "
-        f"schedule_check_interval={schedule_check_interval}s. Ctrl-C to stop."
+    config, scope = _config_and_scope()
+    return serve(
+        config,
+        scope,
+        scan_interval=max(1, args.scan_interval_seconds),
+        consolidation_interval=max(1, args.consolidation_interval_seconds),
+        schedule_check_interval=max(1, args.schedule_check_interval_seconds),
     )
-
-    from memtrace_harness.status_server import start_status_server
-
-    status_server, status_bus = start_status_server(config, gateway_for_project)
-    if status_server is not None:
-        print(f"Status dashboard: http://{config.status_server_host}:{config.status_server_port}")
-
-    stop_event = threading.Event()
-
-    def _handle_stop(signum: int, frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, _handle_stop)
-    signal.signal(signal.SIGTERM, _handle_stop)
-
-    for gw in gateways:
-        label = ", ".join(p.name for p in gw.projects) or "unassigned"
-        try:
-            gw.register_bot_commands()
-        except Exception:
-            logger.exception(f"[{label}] registering bot commands failed; continuing")
-        try:
-            gw.notify_all_allowlisted(f"✅ Harness gateway 已啟動，開始監聽（{label}）。")
-        except Exception:
-            logger.exception(f"[{label}] startup notification failed; continuing")
-
-    from memtrace_harness.agy_mcp_check import check_antigravity_mcp
-
-    try:
-        mcp_problems = check_antigravity_mcp(config.memtrace_mcp_url)
-    except Exception:
-        logger.exception("Antigravity MCP check failed; continuing")
-        mcp_problems = []
-    for problem in mcp_problems:
-        print(f"WARNING: {problem}")
-        logger.warning(problem)
-    if mcp_problems:
-        for gw in gateways:
-            try:
-                gw.notify_all_allowlisted("⚠️ Antigravity 的 MCP 設定與 Harness 預期不符：\n" + "\n".join(mcp_problems))
-            except Exception:
-                logger.exception("Antigravity MCP warning notification failed; continuing")
-
-    from memtrace_harness.chat_tools_check import check_chat_tools
-
-    for gw in gateways:
-        try:
-            chat_problems = check_chat_tools(config, [p.name for p in gw.projects])
-        except Exception:
-            logger.exception("chat tool check failed; continuing")
-            continue
-        for problem in chat_problems:
-            print(f"WARNING: {problem}")
-            logger.warning(problem)
-        if chat_problems:
-            try:
-                gw.notify_all_allowlisted("⚠️ 聊天模型的 MemTrace 工具與預期不符：\n" + "\n".join(chat_problems))
-            except Exception:
-                logger.exception("chat tool warning notification failed; continuing")
-
-    last_scan = 0.0
-    last_consolidation = 0.0
-    last_digest_check = 0.0
-    digest_thread: threading.Thread | None = None
-    garden_thread: threading.Thread | None = None
-    promote_thread: threading.Thread | None = None
-    review_thread: threading.Thread | None = None
-    last_schedule_check = 0.0
-    last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
-    schedule_tz = ZoneInfo(config.schedule_timezone)
-    pollers = start_bot_pollers(gateways, stop_event, poll_timeout=poll_timeout, status_bus=status_bus)
-    first_tick = True
-    while not stop_event.is_set():
-        # Telegram is polled by one thread per bot (start_bot_pollers); this thread only
-        # runs the timed housekeeping below, checking about once a second.
-        if not first_tick and stop_event.wait(MAIN_LOOP_TICK_SECONDS):
-            break
-        first_tick = False
-
-        now = time.monotonic()
-        if now - last_scan >= scan_interval:
-            try:
-                scan_results = scanner.run_scan_pass()
-                noteworthy = {
-                    k: v for k, v in scan_results.items() if v not in ("no_backlog", "skipped_locked")
-                }
-                if noteworthy:
-                    print(f"scan pass: {noteworthy}")
-                    if status_bus is not None:
-                        status_bus.publish()
-            except Exception:
-                logger.exception("scan pass failed; continuing")
-            last_scan = now
-
-        for gw in gateways:
-            # Picks up queued tasks wherever a worker slot is free — including work
-            # queued before a restart.
-            try:
-                gw.drain_task_queues()
-            except Exception:
-                logger.exception("draining the task queue failed; continuing")
-            # Shows orders the model proposed (with confirm/cancel buttons) and closes
-            # the ones nobody confirmed in time.
-            try:
-                gw.process_order_intents()
-            except Exception:
-                logger.exception("processing proposed orders failed; continuing")
-            # Same for jobs the model asked to re-run: buttons now, the run only after a tap.
-            try:
-                gw.process_job_requests()
-            except Exception:
-                logger.exception("processing job requests failed; continuing")
-
-        if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
-            for gw in gateways:
-                try:
-                    gw.expire_stale_approvals(config.approval_ttl_hours)
-                except Exception:
-                    logger.exception("expiring stale approvals failed; continuing")
-            last_approval_expiry = now
-
-        if now - last_schedule_check >= schedule_check_interval:
-            try:
-                due = trace_store.list_due_schedules(datetime.now(timezone.utc))
-                for row in due:
-                    gw = gateway_for_project.get(row["project"])
-                    if gw is None:
-                        logger.error(
-                            f"schedule {row['id']} targets project '{row['project']}' with "
-                            "no active gateway; skipping this run"
-                        )
-                        continue
-                    # Advance next_run_at before triggering: run_due_schedule() only
-                    # starts a background thread (non-blocking), and if the workspace
-                    # turns out to be locked it just skips this occurrence — either
-                    # way the schedule must not re-fire every tick until it succeeds.
-                    spec = spec_from_row(row)
-                    ran_at = datetime.now(timezone.utc)
-                    next_run_at = compute_next_run(spec, after=ran_at, tz=schedule_tz)
-                    if is_past_window_end(spec, at=ran_at, tz=schedule_tz) or is_outside_interval_window(
-                        spec, at=ran_at, tz=schedule_tz
-                    ):
-                        trace_store.mark_schedule_ran(
-                            row["id"], ran_at=ran_at, next_run_at=next_run_at, status="skipped_window"
-                        )
-                        logger.info(
-                            f"schedule {row['id']} due but past its {spec.end_time_of_day} window "
-                            "end; skipping this run"
-                        )
-                        continue
-                    trace_store.mark_schedule_ran(
-                        row["id"], ran_at=ran_at, next_run_at=next_run_at, status="triggered"
-                    )
-                    try:
-                        gw.run_due_schedule(row)
-                    except Exception:
-                        logger.exception(f"scheduled run for {row['id']} failed to start; continuing")
-                if due:
-                    print(f"triggered {len(due)} due schedule(s)")
-                    if status_bus is not None:
-                        status_bus.publish()
-            except Exception:
-                logger.exception("schedule check pass failed; continuing")
-            last_schedule_check = now
-
-        if now - last_consolidation >= consolidation_interval:
-            for scope in projects:
-                try:
-                    memory_workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-                    classify_fn = _make_chat_classifier(config, scope.name, scope.working_directory)
-                    written = primary_session_mgr.consolidate_to_memtrace(
-                        scope.name, memory_workspace_id, classify_fn, tz=schedule_tz
-                    )
-                    if written:
-                        print(f"[{scope.name}] consolidated {len(written)} turn(s) to MemTrace as draft evidence")
-                        if status_bus is not None:
-                            status_bus.publish()
-                except Exception:
-                    logger.exception(f"[{scope.name}] cold-memory consolidation failed; will retry next cycle")
-
-            last_consolidation = now
-
-        if now - last_digest_check >= DIGEST_CHECK_SECONDS:
-            if (digest_thread is None or not digest_thread.is_alive()) and in_digest_window(
-                datetime.now(schedule_tz)
-            ):
-                digest_thread = threading.Thread(
-                    target=_run_nightly_digest_pass,
-                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects),
-                    kwargs={"gateway_for_project": gateway_for_project, "status_bus": status_bus},
-                    name="memory-digest",
-                    daemon=True,
-                )
-                digest_thread.start()
-            # Same night window as the digest; each workspace is only actually tidied if a week
-            # has passed since its last successful pass (kb_gardening.garden_due).
-            if (garden_thread is None or not garden_thread.is_alive()) and in_digest_window(
-                datetime.now(schedule_tz)
-            ):
-                garden_thread = threading.Thread(
-                    target=run_knowledge_gardening,
-                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
-                    name="kb-garden",
-                    daemon=True,
-                )
-                garden_thread.start()
-            # Promoting findings into the specification workspace reads the digests, so it waits
-            # for tonight's digest pass to finish. Due weekly per project, and only if the
-            # digests changed (cli.run_knowledge_promotion).
-            if (
-                (promote_thread is None or not promote_thread.is_alive())
-                and (digest_thread is None or not digest_thread.is_alive())
-                and in_digest_window(datetime.now(schedule_tz))
-            ):
-                promote_thread = threading.Thread(
-                    target=run_knowledge_promotion,
-                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
-                    name="kb-promote",
-                    daemon=True,
-                )
-                promote_thread.start()
-            # The weekly review of the harness's own work (only after a first one was asked for).
-            if (review_thread is None or not review_thread.is_alive()) and in_digest_window(
-                datetime.now(schedule_tz)
-            ):
-                review_thread = threading.Thread(
-                    target=run_work_reviews,
-                    args=(config, trace_store, primary_session_mgr.memtrace_client, projects, gateway_for_project),
-                    name="work-review",
-                    daemon=True,
-                )
-                review_thread.start()
-            last_digest_check = now
-
-    # One shutdown budget for both: let each bot finish the message it is handling (an
-    # idle long-poll returns within poll_timeout), then give in-flight Agent Loop runs
-    # whatever is left. Stays inside launchd's ExitTimeOut.
-    deadline = time.monotonic() + config.shutdown_grace_seconds
-    for poller in pollers:
-        poller.join(timeout=max(0.0, deadline - time.monotonic()))
-    _drain_inflight_agent_loops(max(1, int(deadline - time.monotonic())))
-
-    if status_server is not None:
-        status_server.shutdown()
-
-    print("Gateway serve loop stopped.")
-    return 0
-
-
-def _drain_inflight_agent_loops(grace_seconds: int) -> None:
-    """Background Agent Loop threads (Telegram tasks, approval resumes, unattended
-    scan backlog runs) are daemon threads — the interpreter doesn't wait for them or
-    guarantee their `finally` blocks run on exit, so without this, killing the process
-    mid-run leaves that workspace's lock stuck forever. Wait up to grace_seconds for
-    any in-flight runs to finish normally; if they don't, force-kill the underlying CLI
-    subprocess that thread is currently blocked on (via cli_process.py's thread-keyed
-    process registry — closes the gap noted in the shutdown-safety work: killing the
-    Harness process alone left the CLI subprocess running as an orphan, bounded only
-    by its own cli_timeout_seconds, not by this grace period) and force-release the
-    workspace lock so the next start isn't blocked. The interrupted run's outcome is
-    still unknown either way — this makes shutdown bounded and clean, not silent."""
-    from memtrace_harness.cli_process import kill_process_for_thread
-    from memtrace_harness.inflight import default_tracker
-
-    remaining = default_tracker.snapshot()
-    if not remaining:
-        return
-    print(
-        f"Waiting up to {grace_seconds}s for {len(remaining)} in-flight Agent Loop "
-        "run(s) to finish before exiting..."
-    )
-    if default_tracker.wait_for_drain(grace_seconds):
-        return
-    stuck = default_tracker.snapshot()
-    for entry in stuck:
-        thread_ident = entry["thread"].ident
-        killed = thread_ident is not None and kill_process_for_thread(thread_ident)
-        logger.warning(
-            f"Shutdown grace period exceeded; {'killed the CLI subprocess and ' if killed else ''}"
-            f"force-releasing workspace lock for {entry['workspace_id']} "
-            f"(conversation {entry['conversation_id']}) — its Agent Loop run was "
-            "interrupted mid-flight and its outcome is unknown. Check the trace store "
-            "/ raw trace logs once the new process is up."
-        )
-        try:
-            entry["trace_store"].release_workspace_lock(
-                entry["workspace_id"], entry["conversation_id"]
-            )
-        except Exception:
-            logger.exception("failed to force-release workspace lock during shutdown")
 
 
 def scan_command(args: argparse.Namespace) -> int:
-    config = HarnessConfig.from_env()
-    trace_store = TraceStore(config.trace_db_path)
-    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
-    projects = load_project_index(config.project_index_path)
-    memtrace_client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token) if config.memtrace_mcp_url else None
-    gateway = TelegramGateway(config, approval_mgr, ChatTriage(projects), PrimarySessionManager(trace_store, memtrace_client), projects) if config.telegram_bot_token else None
-    scanner = UnattendedScanner(config, trace_store, projects, memtrace_client, gateway, approval_mgr)
+    from memtrace_harness.runtime import build_harness
 
-    results = scanner.run_scan_pass()
+    config, scope = _config_and_scope()
+    parts = build_harness(config, scope)
+    results = parts.scanner.run_scan_pass()
     print(json.dumps(results, indent=2))
     return 0
 
 
+def status_command(args: argparse.Namespace) -> int:
+    """One-shot diagnostic: what this Harness has registered, running and waiting on. Read-only —
+    never modifies the trace store."""
+    from memtrace_harness.admin import collect_status_text
+
+    config, scope = _config_and_scope()
+    print(collect_status_text(config, scope))
+    return 0
+
+
+def doctor_command(args: argparse.Namespace) -> int:
+    """Check what keeps a Harness from working before it is started."""
+    from memtrace_harness.chat_tools_check import check_chat_tools
+    from memtrace_harness.workspace import env_file_problems
+
+    config = HarnessConfig.from_env()
+    problems: list[str] = []
+    if config.workspace_root is None:
+        raise ValueError("no workspace: run inside a folder that has a .harness.env, or pass -C <folder>")
+    problems += env_file_problems(config.workspace_root)
+    if not config.api_token:
+        problems.append("HARNESS_API_TOKEN is not set; the API (and so every service) cannot start")
+    if not config.memtrace_mcp_url:
+        problems.append("MEMTRACE_MCP_URL is not set; the Harness has no knowledge base")
+    try:
+        scope = load_scope(config)
+        print(f"project: {scope.name} (MemTrace workspace {scope.workspace_id})")
+        problems += check_chat_tools(config, [scope.name])
+    except ValueError as exc:
+        problems.append(str(exc))
+    for problem in problems:
+        print(f"PROBLEM: {problem}")
+    if not problems:
+        print("OK: nothing to fix")
+    return 1 if problems else 0
+
+
 def _deduplicate(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
-
-
-def init_project_command(args: argparse.Namespace) -> int:
-    """Interactive wizard for registering a new project: writes harness-scope.md,
-    adds it to projects.index.txt, and writes any per-project .env overrides the
-    operator chooses (bot token, chat model, memory workspace, role-profiles file).
-    Nothing here is hot-reloaded — see the reminder printed at the end."""
-    from memtrace_harness.config import (
-        project_bot_token_env_var,
-        project_chat_fallbacks_env_var,
-        project_chat_model_env_var,
-        project_chat_provider_env_var,
-        project_memory_workspace_env_var,
-        project_role_profiles_env_var,
-    )
-
-    config = HarnessConfig.from_env()
-
-    print("=== Harness 專案設定精靈 ===")
-    print("走過一輪問答，幫你把新專案要碰的檔案跟 .env 設定都準備好。\n")
-
-    working_dir = _wizard_prompt_path("這個專案的工作目錄（絕對路徑)")
-    default_name = working_dir.name
-    name = _wizard_prompt("專案名稱", default=default_name)
-
-    workspace_id = _wizard_prompt_workspace_id(
-        config, "這個專案的 MemTrace 規格/待辦 workspace_id（產品規劃、決策用)"
-    )
-    off_limits = _wizard_prompt("禁區關鍵字（逗號分隔，沒有就留空)", default="")
-
-    scope_path = working_dir / "harness-scope.md"
-    if scope_path.exists():
-        overwrite = _wizard_prompt_yes_no(
-            f"{scope_path} 已經存在，要覆蓋嗎？", default=False
-        )
-        if not overwrite:
-            print("保留現有的 harness-scope.md，跳過這一步。")
-        else:
-            _write_harness_scope(scope_path, name, workspace_id, off_limits)
-            print(f"已寫入 {scope_path}")
-    else:
-        _write_harness_scope(scope_path, name, workspace_id, off_limits)
-        print(f"已寫入 {scope_path}")
-
-    index_path = config.project_index_path or Path("projects.index.txt")
-    _ensure_in_project_index(index_path, scope_path)
-    print(f"已確認 {index_path} 有列到這個專案。\n")
-
-    env_updates: dict[str, str] = {}
-
-    dedicated_bot = _wizard_prompt_yes_no(
-        f"要幫「{name}」設定專屬 Telegram bot 嗎？（不然會共用全域 bot,訊息要指名專案名才能路由對)",
-        default=True,
-    )
-    if dedicated_bot:
-        print("去 Telegram 找 @BotFather，傳 /newbot 建立一個新 bot，完成後把它給你的 token 貼在這裡。")
-        token = input("Bot token: ").strip()
-        if token:
-            env_updates[project_bot_token_env_var(name)] = token
-    elif not config.telegram_bot_token:
-        print("⚠️  目前沒有全域 HARNESS_TELEGRAM_BOT_TOKEN，這個專案在你設定其中一個之前收不到任何 Telegram 訊息。")
-
-    print("\n聊天模型（快速對話用，走的不是完整 Agent Loop):")
-    print("  1) Gemini（便宜、預設建議）  2) Claude  3) Codex  4) 沿用全域預設，不覆蓋")
-    chat_choice = _wizard_prompt_choice("選擇", ["1", "2", "3", "4"], default="1")
-    if chat_choice == "1":
-        env_updates[project_chat_provider_env_var(name)] = "antigravity"
-        env_updates[project_chat_model_env_var(name)] = "gemini-3.6-flash-high"
-        env_updates[project_chat_fallbacks_env_var(name)] = "claude/haiku"
-    elif chat_choice == "2":
-        env_updates[project_chat_provider_env_var(name)] = "claude"
-        env_updates[project_chat_model_env_var(name)] = "haiku"
-        env_updates[project_chat_fallbacks_env_var(name)] = "antigravity/gemini-3.6-flash-high"
-    elif chat_choice == "3":
-        env_updates[project_chat_provider_env_var(name)] = "codex"
-        env_updates[project_chat_model_env_var(name)] = ""
-
-    dedicated_memory = _wizard_prompt_yes_no(
-        "這個專案要獨立的冷記憶 workspace 嗎？（不要的話沿用全域共用的 Harness Memory)",
-        default=False,
-    )
-    if dedicated_memory:
-        mem_ws = _wizard_prompt_workspace_id(config, "冷記憶（專案決策)要寫進哪個 workspace_id")
-        env_updates[project_memory_workspace_env_var(name)] = mem_ws
-
-    dedicated_profiles = _wizard_prompt_yes_no(
-        "要複製一份可自訂的 role-profiles.toml 給這個專案嗎？（Agent Loop 各角色用的模型)",
-        default=False,
-    )
-    if dedicated_profiles:
-        dest = Path("profiles") / f"{_slugify(name)}.toml"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not dest.exists():
-            default_toml = Path(__file__).with_name("default-role-profiles.toml")
-            dest.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
-            print(f"已複製一份到 {dest}。")
-        else:
-            print(f"沿用既有的 {dest}。")
-
-        advanced = _wizard_prompt_yes_no(
-            "── 進階設定 ── 要逐一調整 Controller/Planner/Planner-escalation/"
-            "Red Team/Developer 實際用的模型嗎？（不調整就維持該檔案目前內容)",
-            default=False,
-        )
-        if advanced:
-            text = dest.read_text(encoding="utf-8")
-            text = _wizard_configure_roles(text)
-            dest.write_text(text, encoding="utf-8")
-
-        env_updates[project_role_profiles_env_var(name)] = str(dest)
-
-    if env_updates:
-        env_path = Path(".env")
-        _write_env_updates(env_path, env_updates)
-        print(f"\n已把以下設定寫進 {env_path}：")
-        for key, value in env_updates.items():
-            display = f"{value[:6]}..." if "TOKEN" in key and value else value
-            print(f"  {key}={display}")
-    else:
-        print("\n沒有新增任何 .env 設定（都沿用全域預設)。")
-
-    print("\n=== 完成 ===")
-    print("檢查一下上面寫進 .env / harness-scope.md / role-profiles.toml 的內容是否正確。")
-    if env_updates or dedicated_profiles:
-        _wizard_offer_restart()
-    print("設定生效後，傳一句訊息到對應的 bot 測試。")
-    return 0
-
-
-def _wizard_prompt(question: str, *, default: str = "") -> str:
-    suffix = f"（預設：{default}）" if default else ""
-    answer = input(f"{question}{suffix}: ").strip()
-    return answer or default
-
-
-def _wizard_prompt_path(question: str) -> Path:
-    while True:
-        answer = input(f"{question}: ").strip()
-        if not answer:
-            print("這個一定要填。")
-            continue
-        path = Path(answer).expanduser().resolve()
-        if not path.is_dir():
-            create = _wizard_prompt_yes_no(f"{path} 不存在，要建立嗎？", default=False)
-            if create:
-                path.mkdir(parents=True, exist_ok=True)
-            else:
-                continue
-        return path
-
-
-def _wizard_prompt_choice(question: str, choices: list[str], *, default: str) -> str:
-    while True:
-        answer = input(f"{question} [{'/'.join(choices)}]（預設：{default}）: ").strip()
-        if not answer:
-            return default
-        if answer in choices:
-            return answer
-        print(f"請輸入其中一個：{', '.join(choices)}")
-
-
-def _wizard_prompt_yes_no(question: str, *, default: bool) -> bool:
-    hint = "Y/n" if default else "y/N"
-    answer = input(f"{question} [{hint}]: ").strip().lower()
-    if not answer:
-        return default
-    return answer in {"y", "yes"}
-
-
-def _wizard_prompt_workspace_id(config: HarnessConfig, question: str) -> str:
-    if config.memtrace_mcp_url:
-        try:
-            client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
-            result = client.call_tool("list_workspaces", {})
-            text = result.get("content", [{}])[0].get("text", "[]")
-            workspaces = json.loads(text)
-            if isinstance(workspaces, list) and workspaces:
-                print("\n目前 MemTrace 裡看得到的 workspace：")
-                for item in workspaces[:20]:
-                    print(f"  {item.get('id')}  {item.get('name')}")
-                print()
-        except Exception:
-            pass  # listing is a convenience, never block the wizard on it
-    while True:
-        answer = input(f"{question}（ws_ 開頭): ").strip()
-        if answer.startswith("ws_"):
-            return answer
-        print("workspace_id 應該以 ws_ 開頭，再試一次。")
-
-
-_ADVANCED_ROLE_ORDER = [
-    ("controller", "Controller（調度)"),
-    ("planner", "Planner（規劃)"),
-    ("planner-escalation", "Planner-escalation（G1 推理缺口才啟用)"),
-    ("red-team", "Red Team（G1/G2 審查)"),
-    ("developer", "Developer（實際寫程式，唯一能寫入的角色)"),
-]
-
-
-def _wizard_configure_roles(text: str) -> str:
-    """Advanced section: per-role provider/model, one role at a time. Only touches the
-    primary provider/model line for each role — fallback chains and reasoning_effort
-    stay whatever the file already has; edit the TOML directly for those."""
-    for profile_id, label in _ADVANCED_ROLE_ORDER:
-        change = _wizard_prompt_yes_no(f"要調整 {label} 的模型嗎？", default=False)
-        if not change:
-            continue
-        provider_choice = _wizard_prompt_choice(
-            "  廠商 1) codex  2) claude  3) antigravity", ["1", "2", "3"], default="1"
-        )
-        provider = {"1": "codex", "2": "claude", "3": "antigravity"}[provider_choice]
-        model = _wizard_prompt(
-            "  模型名稱（例如 gpt-5.6-sol / sonnet / gemini-3.6-flash-high)", default=""
-        )
-        if not model:
-            print("  沒填模型名稱，跳過。")
-            continue
-        updated = _set_role_model_in_toml(text, profile_id, provider, model)
-        if updated == text:
-            print(f"  ⚠️  在檔案裡找不到 [profiles.{profile_id}] 區塊，跳過。")
-        else:
-            text = updated
-            print(f"  已設定 {profile_id} = {provider}/{model}")
-    return text
-
-
-def _set_role_model_in_toml(text: str, profile_id: str, provider: str, model: str) -> str:
-    """Replace only the primary provider/model lines inside one [profiles.<id>] block —
-    stops at the next top-level [profiles.X] header, but a role's own
-    [[profiles.<id>.fallbacks]] sub-blocks stay part of the same section since they
-    don't match that boundary."""
-    import re
-
-    pattern = re.compile(
-        rf'(\[profiles\.{re.escape(profile_id)}\]\n(?:(?!\[profiles\.).)*)', re.DOTALL
-    )
-    match = pattern.search(text)
-    if not match:
-        return text
-    section = match.group(1)
-    updated_section = re.sub(r'provider = "[^"]*"', f'provider = "{provider}"', section, count=1)
-    updated_section = re.sub(r'model = "[^"]*"', f'model = "{model}"', updated_section, count=1)
-    # Keep quota_bucket consistent with the new provider — the fallback-cooldown ledger
-    # groups by this label, and leaving it pointing at the old vendor's bucket would
-    # make cooldown accounting silently wrong, not just cosmetically stale.
-    updated_section = re.sub(
-        r'quota_bucket = "[^"]*"', f'quota_bucket = "{provider}-account"', updated_section, count=1
-    )
-    return text[: match.start()] + updated_section + text[match.end() :]
-
-
-def _wizard_offer_restart() -> None:
-    label = f"gui/{os.getuid()}/com.memtraceharness.gateway"
-    restart = _wizard_prompt_yes_no("要現在重啟常駐服務讓設定生效嗎？", default=True)
-    if not restart:
-        print(f"記得之後手動重啟：launchctl kickstart -k {label}")
-        return
-    try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", label], capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            print("已重啟常駐服務。")
-        else:
-            detail = result.stderr.strip() or f"exit code {result.returncode}"
-            print(f"重啟失敗（{detail}）。可以自己手動跑：launchctl kickstart -k {label}")
-    except Exception as exc:
-        print(f"重啟失敗：{exc}。可以自己手動跑：launchctl kickstart -k {label}")
-
-
-def _write_harness_scope(path: Path, name: str, workspace_id: str, off_limits: str) -> None:
-    # default_risk_level intentionally not asked/written here: risk-level-driven
-    # behavior belongs to the Agent Loop policy/KB layer, not something the wizard
-    # should ask the operator to configure — see ProjectScope's own "medium" fallback.
-    lines = [
-        f"# Harness scope — {name}",
-        "",
-        f"- workspace_id: {workspace_id}",
-        f"- working_directory: {path.parent}",
-    ]
-    if off_limits.strip():
-        lines.append(f"- off_limits: {off_limits.strip()}")
-    lines.append("")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def _ensure_in_project_index(index_path: Path, scope_path: Path) -> None:
-    existing_lines = (
-        index_path.read_text(encoding="utf-8").splitlines() if index_path.is_file() else []
-    )
-    target = scope_path.resolve()
-    already_present = any(
-        line.strip() and not line.strip().startswith("#") and Path(line.strip()).resolve() == target
-        for line in existing_lines
-    )
-    if already_present:
-        return
-    existing_lines.append(str(target))
-    index_path.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
-
-
-def _write_env_updates(env_path: Path, updates: dict[str, str]) -> None:
-    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
-    remaining = dict(updates)
-    for i, line in enumerate(lines):
-        if "=" not in line or line.strip().startswith("#"):
-            continue
-        key = line.split("=", 1)[0]
-        if key in remaining:
-            lines[i] = f"{key}={remaining.pop(key)}"
-    for key, value in remaining.items():
-        lines.append(f"{key}={value}")
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _slugify(name: str) -> str:
-    import re
-
-    return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "project"
-
-
-def _merge_model_catalog(config: "HarnessConfig", configured: dict[str, set[str]]) -> dict[str, list[str]]:
-    """What each provider CLI currently offers (newest first, see model_catalog.py),
-    followed by anything configured here that the catalog doesn't list. A catalog
-    failure only means the menu falls back to the configured models."""
-    from memtrace_harness.model_catalog import provider_models
-
-    try:
-        catalog = provider_models(config)
-    except Exception:
-        logger.exception("model catalog lookup failed; using configured models only")
-        catalog = {}
-    merged: dict[str, list[str]] = {}
-    for provider, models in configured.items():
-        offered = list(catalog.get(provider) or [])
-        merged[provider] = offered + sorted(m for m in models if m not in offered)
-    return merged
-
-
-# How many recent nightly digests per project the status page shows.
-STATUS_DIGEST_DAYS = 7
-# How many of the most recently retired preferences the status page lists (with a way back).
-STATUS_RETIRED_PREFERENCES = 10
-
-
-def _collect_status_data(config: "HarnessConfig") -> dict:
-    """Gather the harness's current diagnostic state as plain structured data (JSON-
-    safe: only str/int/bool/list/dict). Read-only — never modifies process state,
-    files, or the trace store. This is the single source of truth for both the CLI
-    `status` command (rendered as text by _collect_status_text) and the web status
-    dashboard (rendered as cards, pushed live over SSE as JSON) — they read the same
-    shape so they never drift apart."""
-    from memtrace_harness.config import (
-        project_bot_token_env_var,
-        project_chat_provider_env_var,
-        project_digest_provider_env_var,
-        project_memory_workspace_env_var,
-        project_recall_provider_env_var,
-        project_role_profiles_env_var,
-    )
-
-    trace_store = TraceStore(config.trace_db_path)
-    projects = load_project_index(config.project_index_path)
-
-    daemon: dict = {"pids": [], "multiple_warning": False, "pgrep_error": None, "launchd": None, "launchd_error": None}
-    try:
-        result = subprocess.run(
-            ["pgrep", "-fl", "memtrace_harness gateway --serve"],
-            capture_output=True, text=True, timeout=5,
-        )
-        daemon["pids"] = result.stdout.strip().splitlines()
-        daemon["multiple_warning"] = len(daemon["pids"]) > 1
-    except Exception as exc:
-        daemon["pgrep_error"] = str(exc)
-
-    try:
-        result = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
-        matched = [line for line in result.stdout.splitlines() if "memtraceharness" in line]
-        daemon["launchd"] = matched[0] if matched else None
-    except Exception as exc:
-        daemon["launchd_error"] = str(exc)
-
-    project_entries = []
-    # Built up across every project below: every (provider, model) pair actually
-    # configured anywhere in this harness (role profiles, their fallbacks, chat
-    # candidates) — the dashboard's model dropdowns are populated from this rather
-    # than a hardcoded catalog, since model names change too often to keep a static
-    # list current (see profiles/beri.toml's own comments verifying names against
-    # `agy models` at the time). A "自訂…" option still covers anything not seen yet.
-    known_models: dict[str, set[str]] = {p: set() for p in PROVIDERS}
-    for scope in projects:
-        dedicated_bot = bool(os.getenv(project_bot_token_env_var(scope.name)))
-        dedicated_chat = bool(os.getenv(project_chat_provider_env_var(scope.name)))
-        dedicated_memory = bool(os.getenv(project_memory_workspace_env_var(scope.name)))
-        dedicated_profiles = bool(os.getenv(project_role_profiles_env_var(scope.name)))
-
-        session_id = f"psess_{scope.name}"
-        turn_count = len(trace_store.get_primary_session_turns(session_id))
-        pending_goal = len(trace_store.get_unconsolidated_turns(session_id))
-        digests = trace_store.list_memory_digests(scope.name, limit=STATUS_DIGEST_DAYS)
-        locks = trace_store.list_workspace_locks(scope.workspace_id)
-        lock = locks[0] if locks else None
-        queued_tasks = trace_store.list_queued_tasks(scope.workspace_id)
-        pending_approvals = trace_store.list_pending_approvals_for_workspace(scope.workspace_id)
-        recent_turns = trace_store.get_recent_primary_session_turns(session_id, limit=5)
-        schedules = trace_store.list_schedules(scope.name)
-
-        # A needs_human stop releases the workspace lock (approving doesn't need to
-        # hold it — see agent_loop_background_execution memory note) even though the
-        # conversation is very much unfinished: there's a pending approval sitting on
-        # it. Without this fallback, the pipeline stepper would disappear the moment a
-        # gate stops, which is exactly when a human most wants to see it. Prefer the
-        # lock's conversation when actually locked (mid-run); otherwise fall back to
-        # the oldest pending approval's conversation.
-        pipeline_conversation_id = (
-            lock["conversation_id"]
-            if lock
-            else (pending_approvals[0]["conversation_id"] if pending_approvals else None)
-        )
-        pipeline = (
-            trace_store.get_conversation_pipeline(pipeline_conversation_id)
-            if pipeline_conversation_id
-            else []
-        )
-
-        chat_candidates = config.chat_candidates_for(scope.name)
-        digest_candidates = config.digest_candidates_for(scope.name)
-        digest_is_own = bool(
-            os.getenv(project_digest_provider_env_var(scope.name)) or config.digest_provider
-        )
-        recall_candidates = config.recall_candidates_for(scope.name)
-        recall_is_own = bool(
-            os.getenv(project_recall_provider_env_var(scope.name)) or config.recall_provider
-        )
-        now_iso = datetime.now(timezone.utc).isoformat()
-        topic_briefs = trace_store.list_active_topic_briefs(scope.name, now_iso)
-        recall_state = trace_store.get_recall_state(scope.name)
-
-        role_profiles_entries: list[dict] | None = None
-        role_profiles_error: str | None = None
-        try:
-            role_profiles = load_role_profiles(config.role_profiles_file_for(scope.name))
-            role_profiles_entries = [
-                {
-                    "id": profile_id,
-                    "provider": profile.provider,
-                    "model": profile.model,
-                    "fallbacks": [
-                        {"provider": f.provider, "model": f.model} for f in profile.fallbacks
-                    ],
-                }
-                for profile_id, profile in role_profiles.items()
-            ]
-        except Exception as exc:
-            role_profiles_error = str(exc)
-
-        for provider, model in (*chat_candidates, *digest_candidates, *recall_candidates):
-            if provider in known_models and model:
-                known_models[provider].add(model)
-        for entry in role_profiles_entries or []:
-            if entry["provider"] in known_models and entry["model"]:
-                known_models[entry["provider"]].add(entry["model"])
-            for fb in entry["fallbacks"]:
-                if fb["provider"] in known_models and fb["model"]:
-                    known_models[fb["provider"]].add(fb["model"])
-
-        project_entries.append(
-            {
-                "name": scope.name,
-                "workspace_id": scope.workspace_id,
-                "working_directory": str(scope.working_directory),
-                "dedicated": {
-                    "bot": dedicated_bot,
-                    "chat_model": dedicated_chat,
-                    "memory": dedicated_memory,
-                    "role_profiles": dedicated_profiles,
-                },
-                "chat_candidates": [
-                    {"provider": p, "model": m or None} for p, m in chat_candidates
-                ],
-                "digest_candidates": [
-                    {"provider": p, "model": m or None} for p, m in digest_candidates
-                ],
-                "digest_is_own": digest_is_own,
-                "recall_candidates": [
-                    {"provider": p, "model": m or None} for p, m in recall_candidates
-                ],
-                "recall_is_own": recall_is_own,
-                "recall_enabled": config.recall_enabled,
-                "recall_state": recall_state,
-                "topic_briefs": [
-                    {
-                        "id": b["id"],
-                        "title": b["title"],
-                        "summary": b["summary"],
-                        "fresh": b["fresh"],
-                        "related": b["related"],
-                        "updated_at": b["updated_at"],
-                        "expires_at": b["expires_at"],
-                        "pushed": b["pushed_at"] is not None,
-                    }
-                    for b in topic_briefs
-                ],
-                "role_profiles": role_profiles_entries,
-                "role_profiles_error": role_profiles_error,
-                "turn_count": turn_count,
-                "pending_goal": pending_goal,
-                "memory_workspace_id": config.memory_workspace_id_for(scope.name, scope.workspace_id),
-                "digests": [
-                    {
-                        "digest_date": d["digest_date"],
-                        "turn_count": d["turn_count"],
-                        "provider": d["provider"],
-                        "model": d["model"],
-                        "synced": d["memtrace_node_id"] is not None,
-                        "digest": d["digest"],
-                    }
-                    for d in digests
-                ],
-                "recent_turns": [
-                    {
-                        "created_at": turn["created_at"],
-                        "speaker": turn["speaker"],
-                        "content": turn["content"],
-                    }
-                    for turn in recent_turns
-                ],
-                "lock": (
-                    {
-                        "conversation_id": lock["conversation_id"],
-                        "locked_at": lock["locked_at"],
-                        "latest_turn": trace_store.get_latest_turn(lock["conversation_id"]),
-                    }
-                    if lock
-                    else None
-                ),
-                "max_workers": scope.max_workers,
-                "locks": [
-                    {
-                        "conversation_id": item["conversation_id"],
-                        "locked_at": item["locked_at"],
-                        "schedule_id": item["schedule_id"],
-                        "latest_turn": trace_store.get_latest_turn(item["conversation_id"]),
-                    }
-                    for item in locks
-                ],
-                "queue": [
-                    {
-                        "id": item["id"],
-                        "kind": item["kind"],
-                        "schedule_id": item["schedule_id"],
-                        "goal": (item["payload"].get("goal") or item["conversation_id"] or "")[:120],
-                        "created_at": item["created_at"],
-                    }
-                    for item in queued_tasks
-                ],
-                "pipeline_conversation_id": pipeline_conversation_id,
-                "pipeline": pipeline,
-                "pending_approvals": [
-                    {
-                        "id": req["id"],
-                        "reason": req["reason"],
-                        "proposed_action": req["proposed_action"],
-                    }
-                    for req in pending_approvals
-                ],
-                "schedules": [
-                    {
-                        "id": s["id"],
-                        "kind": s["kind"],
-                        "interval_seconds": s["interval_seconds"],
-                        "time_of_day": s["time_of_day"],
-                        "end_time_of_day": s["end_time_of_day"],
-                        "next_run_at": s["next_run_at"],
-                        "last_run_at": s["last_run_at"],
-                        "goal": s["goal"],
-                    }
-                    for s in schedules
-                ],
-            }
-        )
-
-    preferences = trace_store.list_preference_rules(statuses=("pending", "adopted", "retired"))
-    recently_retired = sorted(
-        (r for r in preferences if r["status"] == "retired"),
-        key=lambda r: r["resolved_at"] or "",
-        reverse=True,
-    )[:STATUS_RETIRED_PREFERENCES]
-    return {
-        "daemon": daemon,
-        "project_index_path": str(config.project_index_path) if config.project_index_path else None,
-        "projects": project_entries,
-        "preferences": {
-            "pending": [r for r in preferences if r["status"] == "pending"],
-            "adopted": [r for r in preferences if r["status"] == "adopted"],
-            "retired": recently_retired,
-            "category_labels": PREFERENCE_CATEGORY_LABELS,
-        },
-        "known_models": _merge_model_catalog(config, known_models),
-    }
-
-
-def update_chat_model_for_project(
-    config: "HarnessConfig", project_name: str, provider: str, model: str
-) -> None:
-    """Set a project's quick-chat model (the cheap --print call behind ordinary
-    Telegram conversation, not an Agent Loop role) via the status dashboard's POST
-    /api/chat-model. Unlike a role profile, the chat model has no TOML file to
-    surgically patch — it's plain HARNESS_CHAT_PROVIDER_<PROJECT>/_MODEL_<PROJECT>
-    env vars (see HarnessConfig.chat_candidates_for()) — so this always writes a
-    project-specific override into .env, never the shared global
-    HARNESS_CHAT_PROVIDER/_MODEL a project without one is currently falling back to;
-    there is no "already dedicated" case to refuse the way role-profiles has, since
-    adding one more project-specific override never affects any other project. Only
-    the primary candidate is touched, never HARNESS_CHAT_FALLBACKS_<PROJECT>.
-
-    Takes effect immediately, not on the next restart: chat_candidates_for() reads
-    os.environ on every call, and the dashboard runs inside the gateway process, so
-    the same values are set there too. Until 2026-10-02 only .env was written, so the
-    page re-rendered the still-running old model right after "saved" — it looked as if
-    the save had bounced back."""
-    from memtrace_harness.config import project_chat_model_env_var, project_chat_provider_env_var
-
-    if provider not in PROVIDERS:
-        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-    if not model.strip():
-        raise ValueError("model must be a non-empty string")
-
-    projects = load_project_index(config.project_index_path)
-    scope = next((p for p in projects if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-
-    updates = {
-        project_chat_provider_env_var(scope.name): provider,
-        project_chat_model_env_var(scope.name): model,
-    }
-    _write_env_updates(Path(".env"), updates)
-    os.environ.update(updates)
-
-
-def update_digest_model_for_project(
-    config: "HarnessConfig", project_name: str, provider: str, model: str
-) -> None:
-    """Set a project's nightly-memory-digest model, independent of its chat model, via
-    the status dashboard's POST /api/digest-model. Same mechanism as
-    update_chat_model_for_project(): a project-specific HARNESS_DIGEST_PROVIDER_<PROJECT>
-    /_MODEL_<PROJECT> override written to .env and applied to os.environ so it takes
-    effect immediately (digest_candidates_for() reads os.environ on every call). Only
-    the primary candidate is touched, never HARNESS_DIGEST_FALLBACKS_<PROJECT>."""
-    from memtrace_harness.config import project_digest_model_env_var, project_digest_provider_env_var
-
-    if provider not in PROVIDERS:
-        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-    if not model.strip():
-        raise ValueError("model must be a non-empty string")
-
-    projects = load_project_index(config.project_index_path)
-    scope = next((p for p in projects if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-
-    updates = {
-        project_digest_provider_env_var(scope.name): provider,
-        project_digest_model_env_var(scope.name): model,
-    }
-    _write_env_updates(Path(".env"), updates)
-    os.environ.update(updates)
-
-
-def update_digest_fallbacks_for_project(
-    config: "HarnessConfig", project_name: str, fallbacks: str
-) -> None:
-    """Set a project's nightly-digest fallback chain from the status dashboard
-    (POST /api/digest-fallbacks): `fallbacks` is the same "provider/model,provider/model"
-    text HARNESS_DIGEST_FALLBACKS takes, written as the project-specific
-    HARNESS_DIGEST_FALLBACKS_<PROJECT> override and applied to os.environ at once. An
-    empty string is a real value — it clears the chain for that project instead of
-    falling back to the shared one."""
-    from memtrace_harness.config import _parse_chat_fallbacks, project_digest_fallbacks_env_var
-
-    pairs = _parse_chat_fallbacks(fallbacks)
-    for provider, model in pairs:
-        if provider not in PROVIDERS:
-            raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-        if not model:
-            raise ValueError("every fallback needs a model, written provider/model")
-
-    projects = load_project_index(config.project_index_path)
-    scope = next((p for p in projects if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-
-    updates = {
-        project_digest_fallbacks_env_var(scope.name): ",".join(f"{p}/{m}" for p, m in pairs)
-    }
-    _write_env_updates(Path(".env"), updates)
-    os.environ.update(updates)
-
-
-def update_recall_model_for_project(
-    config: "HarnessConfig", project_name: str, provider: str, model: str
-) -> None:
-    """Same as update_digest_model_for_project(), for the background topic-recall model
-    (HARNESS_RECALL_PROVIDER_<PROJECT>/_MODEL_<PROJECT>)."""
-    from memtrace_harness.config import project_recall_model_env_var, project_recall_provider_env_var
-
-    if provider not in PROVIDERS:
-        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-    if not model.strip():
-        raise ValueError("model must be a non-empty string")
-    scope = next((p for p in load_project_index(config.project_index_path) if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-    updates = {
-        project_recall_provider_env_var(scope.name): provider,
-        project_recall_model_env_var(scope.name): model,
-    }
-    _write_env_updates(Path(".env"), updates)
-    os.environ.update(updates)
-
-
-def update_recall_fallbacks_for_project(
-    config: "HarnessConfig", project_name: str, fallbacks: str
-) -> None:
-    """Same as update_digest_fallbacks_for_project(), for HARNESS_RECALL_FALLBACKS_<PROJECT>."""
-    from memtrace_harness.config import _parse_chat_fallbacks, project_recall_fallbacks_env_var
-
-    pairs = _parse_chat_fallbacks(fallbacks)
-    for provider, model in pairs:
-        if provider not in PROVIDERS:
-            raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-        if not model:
-            raise ValueError("every fallback needs a model, written provider/model")
-    scope = next((p for p in load_project_index(config.project_index_path) if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-    updates = {project_recall_fallbacks_env_var(scope.name): ",".join(f"{p}/{m}" for p, m in pairs)}
-    _write_env_updates(Path(".env"), updates)
-    os.environ.update(updates)
-
-
-def update_role_profile_for_project(
-    config: "HarnessConfig", project_name: str, profile_id: str, provider: str, model: str
-) -> None:
-    """Surgical, comment-preserving edit of one role's primary provider/model line in
-    its role-profiles TOML file — a targeted text patch (same spirit as
-    harness-scope.md's own field parsing in scope.py), not a full TOML parse+rewrite,
-    since these files carry load-bearing decision-rationale comments (see
-    profiles/beri.toml) a round-trip writer would silently discard. Called from the
-    status dashboard's /api/role-profile endpoint (status_server.py).
-
-    Only touches projects that already have a DEDICATED role-profiles file
-    (HARNESS_ROLE_PROFILES_FILE_<PROJECT> set) — a project still on the shared
-    packaged default-role-profiles.toml is refused, since editing that file in place
-    would silently change every project still sharing it. Only the role's own
-    primary provider/model is touched, never its [[...fallbacks]] sub-tables."""
-    from memtrace_harness.config import project_role_profiles_env_var
-
-    if provider not in PROVIDERS:
-        raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-    if not model.strip() or '"' in model or "\n" in model:
-        raise ValueError("model must be a non-empty string with no quotes or newlines")
-
-    projects = load_project_index(config.project_index_path)
-    scope = next((p for p in projects if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-
-    path = config.role_profiles_file_for(scope.name)
-    if path is None:
-        env_var = project_role_profiles_env_var(scope.name)
-        raise ValueError(
-            f"'{project_name}' has no dedicated role-profiles file yet (uses the "
-            "shared default) — editing it here would silently change every project "
-            f"still sharing that default. Give it its own file first: `memtrace-"
-            f"harness init-project`, or manually copy default-role-profiles.toml and "
-            f"set {env_var} in .env, then restart the gateway."
-        )
-    if not path.is_file():
-        raise ValueError(f"role-profiles file for '{project_name}' does not exist: {path}")
-
-    text = path.read_text(encoding="utf-8")
-    header = f"[profiles.{profile_id}]"
-    start = text.find(header)
-    if start == -1:
-        raise ValueError(f"profile {profile_id!r} not found in {path}")
-    body_start = start + len(header)
-    # Bound this profile's own primary block at the next section header of any kind
-    # (a later [profiles.X] or this role's own [[profiles.X.fallbacks]]) — the
-    # primary provider/model lines always appear once, before any such header.
-    next_header = re.search(r"\n\[", text[body_start:])
-    body_end = body_start + next_header.start() if next_header else len(text)
-    block = text[body_start:body_end]
-
-    new_block, replaced_provider = re.subn(
-        r'(?m)^provider\s*=\s*"[^"]*"', f'provider = "{provider}"', block, count=1
-    )
-    if not replaced_provider:
-        raise ValueError(f"profile {profile_id!r} in {path} has no provider line to update")
-    new_block, replaced_model = re.subn(
-        r'(?m)^model\s*=\s*"[^"]*"', f'model = "{model}"', new_block, count=1
-    )
-    if not replaced_model:
-        raise ValueError(f"profile {profile_id!r} in {path} has no model line to update")
-
-    path.write_text(text[:body_start] + new_block + text[body_end:], encoding="utf-8")
-
-
-def create_dedicated_role_profiles_file(config: "HarnessConfig", project_name: str) -> Path:
-    """Give a project its own editable role-profiles.toml, copied from the packaged
-    default-role-profiles.toml — the same one-time step as init-project's "要複製一份
-    可自訂的 role-profiles.toml 嗎" wizard question, exposed as the status dashboard's
-    "獨立出去" button (POST /api/role-profile/independent) so it doesn't require the
-    interactive CLI. Writes HARNESS_ROLE_PROFILES_FILE_<PROJECT> into .env — like any
-    other .env change, this only takes effect for THIS process on its next restart;
-    this function does not restart anything itself."""
-    from memtrace_harness.config import project_role_profiles_env_var
-
-    projects = load_project_index(config.project_index_path)
-    scope = next((p for p in projects if p.name == project_name), None)
-    if scope is None:
-        raise ValueError(f"unknown project {project_name!r}")
-    if config.role_profiles_file_for(scope.name) is not None:
-        raise ValueError(f"'{project_name}' already has a dedicated role-profiles file")
-
-    dest = Path("profiles") / f"{_slugify(scope.name)}.toml"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if not dest.is_file():
-        default_toml = Path(__file__).with_name("default-role-profiles.toml")
-        dest.write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
-
-    _write_env_updates(Path(".env"), {project_role_profiles_env_var(scope.name): str(dest)})
-    return dest
-
-
-def _render_status_text(data: dict) -> str:
-    """Render _collect_status_data()'s structure as the plain-text report the CLI
-    `status` command prints."""
-    lines: list[str] = []
-    daemon = data["daemon"]
-
-    lines.append("=== 常駐行程 ===")
-    if daemon["pgrep_error"]:
-        lines.append(f"  無法查詢行程：{daemon['pgrep_error']}")
-    elif daemon["pids"]:
-        for line in daemon["pids"]:
-            lines.append(f"  {line}")
-        if daemon["multiple_warning"]:
-            lines.append("  ⚠️  找到不只一個 --serve 行程，同一個 bot 會搶 getUpdates 連線（409 Conflict）。")
-    else:
-        lines.append("  沒有正在跑的 gateway --serve 行程")
-
-    if daemon["launchd_error"]:
-        lines.append(f"  無法查詢 launchd：{daemon['launchd_error']}")
-    else:
-        lines.append("  launchd 註冊：" + (daemon["launchd"] or "沒有註冊 com.memtraceharness.gateway"))
-
-    lines.append(f"\n=== 已註冊專案（{len(data['projects'])} 個，來自 {data['project_index_path']}）===")
-    if not data["projects"]:
-        lines.append("  （空的，或 HARNESS_PROJECT_INDEX 沒設定/找不到)")
-
-    for project in data["projects"]:
-        lines.append(f"\n  【{project['name']}】 workspace_id={project['workspace_id']}")
-        lines.append(f"    working_directory: {project['working_directory']}")
-        dedicated = project["dedicated"]
-        lines.append(
-            "    專屬設定："
-            f"bot={'有' if dedicated['bot'] else '共用全域'}, "
-            f"chat model={'有' if dedicated['chat_model'] else '共用全域'}, "
-            f"memory workspace={'有' if dedicated['memory'] else '共用全域'}, "
-            f"role-profiles={'有' if dedicated['role_profiles'] else '用預設'}"
-        )
-
-        if project["chat_candidates"]:
-            chat_line = " -> ".join(
-                f"{c['provider']}/{c['model'] or '(預設)'}" for c in project["chat_candidates"]
-            )
-            lines.append(f"    聊天模型：{chat_line}")
-        else:
-            lines.append("    聊天模型：（未設定 HARNESS_CHAT_PROVIDER）")
-
-        if project["role_profiles_error"]:
-            lines.append(f"    ⚠️  role-profiles 讀取失敗：{project['role_profiles_error']}")
-        else:
-            lines.append("    Agent Loop 角色模型：")
-            for profile in project["role_profiles"] or []:
-                entry = f"      {profile['id']}: {profile['provider']}/{profile['model']}"
-                if profile["fallbacks"]:
-                    fb = ", ".join(f"{f['provider']}/{f['model']}" for f in profile["fallbacks"])
-                    entry += f"（fallback: {fb}）"
-                lines.append(entry)
-
-        lines.append(
-            f"    對話記錄：{project['turn_count']} 則"
-            f"（目標分類待處理 {project['pending_goal']}、每日摘要 {len(project['digests'])} 天）"
-        )
-        if project["recent_turns"]:
-            lines.append("    最近對話：")
-            for turn in project["recent_turns"]:
-                content_preview = turn["content"].replace("\n", " ")[:80]
-                lines.append(f"      [{turn['created_at']}] {turn['speaker']}: {content_preview}")
-        if project["locks"]:
-            lines.append(f"    ⚠️  執行中 {len(project['locks'])}/{project['max_workers']} 個任務位：")
-        for lock in project["locks"]:
-            lines.append(f"    ⚠️  conversation_id={lock['conversation_id']}, locked_at={lock['locked_at']}")
-            turn = lock["latest_turn"]
-            if turn:
-                lines.append(
-                    f"       最新進度：{turn['stage']}/{turn['profile_id']} "
-                    f"({turn['provider']}/{turn['model'] or '?'}) state={turn['state']} @ {turn['created_at']}"
-                )
-            else:
-                lines.append("       最新進度：尚未有階段完成（可能剛啟動或卡在第一個階段）")
-        if project["queue"]:
-            lines.append(f"    ⏳ 佇列中 {len(project['queue'])} 個任務：")
-            for queued in project["queue"]:
-                lines.append(f"       - {queued['goal']}")
-        if project["pending_approvals"]:
-            lines.append(f"    ⚠️  待核准請求 {len(project['pending_approvals'])} 筆：")
-            for req in project["pending_approvals"]:
-                lines.append(f"       {req['id']} — {req['reason']} — {req['proposed_action'][:60]}")
-        if project["pipeline"]:
-            lines.append(f"    Agent Loop 進度（conversation_id={project['pipeline_conversation_id']}）：")
-            for stage in project["pipeline"]:
-                retry = f" (重試 #{stage['attempt_index']})" if stage["attempt_index"] else ""
-                lines.append(
-                    f"       {stage['stage']}/{stage['profile_id']}{retry} "
-                    f"({stage['provider']}/{stage['model'] or '?'}) state={stage['state']} @ {stage['created_at']}"
-                )
-
-    return "\n".join(lines)
-
-
-def _collect_status_text(config: "HarnessConfig") -> str:
-    """Gather the same diagnostic report status_command prints, as plain text.
-    Read-only — never modifies process state, files, or the trace store."""
-    return _render_status_text(_collect_status_data(config))
-
-
-def _collect_turn_detail(config: "HarnessConfig", turn_id: int) -> dict | None:
-    """One Agent Loop stage attempt's full detail (artifact + model's final text) for
-    the status dashboard's on-demand "click a stage" view — deliberately not part of
-    _collect_status_data()/the SSE push, since artifact/final_text bodies can be large
-    and most stages in a pipeline are never clicked. Read-only."""
-    trace_store = TraceStore(config.trace_db_path)
-    return trace_store.get_turn_detail(turn_id)
-
-
-def status_command(args: argparse.Namespace) -> int:
-    """One-shot diagnostic: what's actually running, what's registered, and what's
-    stuck. Read-only — never modifies process state, files, or the trace store."""
-    config = HarnessConfig.from_env()
-    print(_collect_status_text(config))
-    return 0
-
-
-def remove_project_command(args: argparse.Namespace) -> int:
-    """Unregister a project: remove it from projects.index.txt and, if the operator
-    confirms, its per-project .env overrides. Deliberately never touches the target
-    project's own harness-scope.md (that file belongs to that repo, not the Harness),
-    and never deletes trace_store history (that's an audit trail, not live state)."""
-    from memtrace_harness.config import (
-        project_bot_token_env_var,
-        project_chat_fallbacks_env_var,
-        project_chat_model_env_var,
-        project_chat_provider_env_var,
-        project_memory_workspace_env_var,
-        project_role_profiles_env_var,
-    )
-
-    config = HarnessConfig.from_env()
-    trace_store = TraceStore(config.trace_db_path)
-    projects = load_project_index(config.project_index_path)
-    if not projects:
-        print("沒有已註冊的專案可以移除。")
-        return 1
-
-    name = args.name
-    if not name:
-        print("已註冊的專案：")
-        for scope in projects:
-            print(f"  {scope.name}  (workspace_id={scope.workspace_id})")
-        name = input("要移除哪一個？輸入專案名稱: ").strip()
-
-    matched = next((s for s in projects if s.name == name), None)
-    if not matched:
-        print(f"找不到專案 {name!r}。", file=sys.stderr)
-        return 1
-
-    lock = trace_store.get_workspace_lock(matched.workspace_id)
-    pending_approvals = trace_store.list_pending_approvals_for_workspace(matched.workspace_id)
-    if lock or pending_approvals:
-        print(f"⚠️  「{name}」目前還有進行中的狀態：")
-        if lock:
-            print(f"  - workspace 鎖定中：conversation_id={lock['conversation_id']}")
-        if pending_approvals:
-            print(f"  - {len(pending_approvals)} 筆待核准請求")
-        print("移除註冊不會清掉這些狀態，之後如果又用同一個 workspace_id 註冊回來，鎖定/待核准可能還在。")
-
-    if not args.yes:
-        confirm = input(f"確定要移除「{name}」的註冊嗎？(y/N): ").strip().lower()
-        if confirm not in {"y", "yes"}:
-            print("已取消。")
-            return 0
-
-    index_path = config.project_index_path or Path("projects.index.txt")
-    _remove_from_project_index(index_path, matched.scope_file_path)
-    print(f"已從 {index_path} 移除。")
-    print(f"（{matched.scope_file_path} 本身沒有被刪除——那是該專案 repo 自己的檔案。)")
-
-    env_keys = [
-        project_bot_token_env_var(name),
-        project_chat_provider_env_var(name),
-        project_chat_model_env_var(name),
-        project_chat_fallbacks_env_var(name),
-        project_memory_workspace_env_var(name),
-        project_role_profiles_env_var(name),
-    ]
-    env_path = Path(".env")
-    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.is_file() else []
-    present_keys = [
-        key for key in env_keys if any(line.split("=", 1)[0] == key for line in existing_lines if "=" in line)
-    ]
-    if present_keys:
-        print(f"\n{env_path} 裡還有這個專案的專屬設定：")
-        for key in present_keys:
-            print(f"  {key}")
-        remove_env = args.yes or input("要一併移除嗎？(y/N): ").strip().lower() in {"y", "yes"}
-        if remove_env:
-            _remove_env_keys(env_path, present_keys)
-            print("已移除。")
-        else:
-            print("保留不動。")
-
-    print()
-    _wizard_offer_restart()
-    return 0
-
-
-def _remove_from_project_index(index_path: Path, scope_file_path: Path) -> None:
-    if not index_path.is_file():
-        return
-    target = scope_file_path.resolve()
-    lines = index_path.read_text(encoding="utf-8").splitlines()
-    kept = [
-        line
-        for line in lines
-        if not (line.strip() and not line.strip().startswith("#") and Path(line.strip()).resolve() == target)
-    ]
-    index_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-
-
-def _remove_env_keys(env_path: Path, keys: list[str]) -> None:
-    lines = env_path.read_text(encoding="utf-8").splitlines()
-    kept = [line for line in lines if not ("=" in line and line.split("=", 1)[0] in keys)]
-    env_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
 
 
 if __name__ == "__main__":

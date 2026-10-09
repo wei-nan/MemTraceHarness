@@ -89,7 +89,7 @@ class ScheduleStoreTests(TestCase):
                 kind="daily",
                 interval_seconds=None,
                 time_of_day="09:00",
-                chat_id=12345,
+                audience="tg:12345",
                 next_run_at=next_run,
             )
             self.assertTrue(schedule_id.startswith("sched_"))
@@ -101,7 +101,7 @@ class ScheduleStoreTests(TestCase):
             self.assertEqual(row["project"], "Beri")
             self.assertEqual(row["kind"], "daily")
             self.assertEqual(row["time_of_day"], "09:00")
-            self.assertEqual(row["chat_id"], 12345)
+            self.assertEqual(row["audience"], "tg:12345")
             self.assertTrue(row["active"])
             self.assertIsNone(row["last_run_at"])
 
@@ -115,15 +115,15 @@ class ScheduleStoreTests(TestCase):
             future = datetime(2099, 1, 1, tzinfo=timezone.utc)
             due_id = store.create_schedule(
                 project="Beri", workspace_id="ws", goal="g1", kind="interval",
-                interval_seconds=3600, next_run_at=past, chat_id=1,
+                interval_seconds=3600, next_run_at=past, audience=1,
             )
             not_due_id = store.create_schedule(
                 project="Beri", workspace_id="ws", goal="g2", kind="interval",
-                interval_seconds=3600, next_run_at=future, chat_id=1,
+                interval_seconds=3600, next_run_at=future, audience=1,
             )
             store.create_schedule(
                 project="Beri", workspace_id="ws", goal="g3", kind="interval",
-                interval_seconds=3600, next_run_at=past, chat_id=1,
+                interval_seconds=3600, next_run_at=past, audience=1,
             )
             cancelled_but_due = store.list_schedules("Beri")[-1]["id"]
             store.deactivate_schedule(cancelled_but_due)
@@ -139,7 +139,7 @@ class ScheduleStoreTests(TestCase):
             store = TraceStore(Path(directory) / "trace.sqlite3")
             schedule_id = store.create_schedule(
                 project="Beri", workspace_id="ws", goal="g", kind="interval",
-                interval_seconds=3600, next_run_at=datetime.now(timezone.utc), chat_id=1,
+                interval_seconds=3600, next_run_at=datetime.now(timezone.utc), audience=1,
             )
             self.assertTrue(store.deactivate_schedule(schedule_id))
             self.assertFalse(store.deactivate_schedule(schedule_id))
@@ -152,7 +152,7 @@ class ScheduleStoreTests(TestCase):
             store = TraceStore(Path(directory) / "trace.sqlite3")
             schedule_id = store.create_schedule(
                 project="Beri", workspace_id="ws", goal="g", kind="interval",
-                interval_seconds=3600, next_run_at=datetime.now(timezone.utc), chat_id=1,
+                interval_seconds=3600, next_run_at=datetime.now(timezone.utc), audience=1,
             )
             ran_at = datetime(2026, 9, 17, 1, 0, tzinfo=timezone.utc)
             next_run_at = datetime(2026, 9, 17, 2, 0, tzinfo=timezone.utc)

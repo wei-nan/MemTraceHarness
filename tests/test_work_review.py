@@ -4,17 +4,18 @@ import json
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from tests.support import relay, tap
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
-from memtrace_harness import cli
+from memtrace_harness import duties as cli
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.decision_records import record_resolution
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 from memtrace_harness.work_review import (
     MAX_PROPOSALS,
@@ -111,7 +112,9 @@ class ReportTests(TestCase):
                     conversation_id="chat_0000", workspace="ws_a", working_directory="/x",
                     reason="ambiguous_requirement", proposed_action="?",
                 )
-            text = report_of(ts).text
+            # approvals are stamped "now", so the period has to reach past now (it ended on a fixed
+            # 2026-10-08 in the seed, and this test failed on any later day)
+            text = report_of(ts, until=(datetime.now(timezone.utc) + timedelta(days=1)).isoformat()).text
             self.assertIn("同一個對話被問了 3 次：chat_0000，最後一次在 20", text)
 
     def test_what_the_operator_decided_and_what_the_controller_held_back_are_counted(self) -> None:
@@ -329,13 +332,12 @@ def _gateway(tmp):
     config = HarnessConfig(
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=path / "t.sqlite3", trace_root=path,
         claude_command="claude", codex_command="codex", antigravity_command="agy",
-        antigravity_output_mode="auto", cli_timeout_seconds=900, telegram_bot_token="fake",
-        telegram_allowed_chat_ids={12345}, project_index_path=None, chat_provider="claude",
-        chat_model="haiku", unattended_write_requires_approval=True,
+        antigravity_output_mode="auto", cli_timeout_seconds=900,
+        chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
     scope = ProjectScope(name="P", workspace_id="ws_a", working_directory=path,
                          scope_file_path=path / "harness-scope.md")
-    gw = TelegramGateway(config, ApprovalManager(ts, {12345}), ChatTriage([scope]), PrimarySessionManager(ts), [scope])
+    gw = HarnessService(config, ApprovalManager(ts), ChatTriage([scope]), PrimarySessionManager(ts), [scope])
     gw.send_message = MagicMock()
     gw.send_message_with_keyboard = MagicMock(return_value=3)
     gw.clear_message_keyboard = MagicMock()
@@ -358,7 +360,7 @@ class GatewayTests(TestCase):
             self.assertIn("需要人偏多", gw.send_message.call_args.args[1])
             card_text, keyboard = gw.send_message_with_keyboard.call_args.args[1:3]
             self.assertIn("需要你決定", card_text)
-            self.assertEqual([b[0]["callback_data"].split(":")[0] for b in keyboard], ["pick", "pick", "reject"])
+            self.assertEqual([b[0]["id"].split(":")[0] for b in keyboard], ["pick", "pick", "reject"])
 
     def test_answering_a_proposal_is_remembered_and_resumes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,7 +369,7 @@ class GatewayTests(TestCase):
             gw._resume_approved_conversation = MagicMock(wraps=gw._resume_approved_conversation)
             gw.notify_review_outcome(out, scope, 12345)
             [req] = ts.list_pending_approvals_for_workspace("ws_a")
-            gw._handle_callback_query({"id": "cb", "data": f"pick:{req['id']}:1",
+            tap(gw, {"id": "cb", "data": f"pick:{req['id']}:1",
                                        "message": {"chat": {"id": 12345}, "message_id": 5}})
             [rec] = ts.list_decision_records("P", kind="review_proposal")
             self.assertEqual((rec["outcome"], rec["followed"]), ("picked_other", False))
@@ -380,7 +382,7 @@ class GatewayTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gw, ts, scope = _gateway(tmp)
             gw.work_review_now = MagicMock()
-            gw.process_update({"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/review"}})
+            relay(gw, {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/review"}})
             gw.work_review_now.assert_called_once_with(scope, 12345)
             gw.work_review_now.reset_mock()
             self.assertIn("開始復盤", gw._start_work_review(scope, 12345))
@@ -410,7 +412,7 @@ class CliTests(TestCase):
             with patch.object(cli, "make_review_caller", return_value=lambda prompt: reply_json()), patch.object(
                 gw.config.__class__, "memory_workspace_id_for", lambda self, name, ws: "ws_mem"
             ):
-                ran = cli.run_work_reviews(gw.config, ts, kb, [scope, scope], {"P": gw}, chat_id=12345, force=True)
+                ran = cli.run_work_reviews(gw.config, ts, kb, [scope, scope], gw, audience=12345, force=True)
             self.assertEqual(ran, 1)                                           # the same workspace twice: one review
             gw.notify_review_outcome.assert_called_once()
             self.assertEqual([n["title"] for n in kb.created], ["監控類請求常停在授權", "工作復盤紀錄：P"])
@@ -420,7 +422,7 @@ class CliTests(TestCase):
             gw, ts, scope = _gateway(tmp)
             seed(ts, runs=[("succeeded", "a")] * 8)
             with patch.object(cli, "make_review_caller", return_value=lambda prompt: reply_json()):
-                self.assertEqual(cli.run_work_reviews(gw.config, ts, None, [scope], {"P": gw}), 0)
+                self.assertEqual(cli.run_work_reviews(gw.config, ts, None, [scope], gw), 0)
 
 
 class ReviewRecordTests(TestCase):

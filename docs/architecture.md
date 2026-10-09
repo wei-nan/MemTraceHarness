@@ -172,3 +172,10 @@ controller, planner, gate, development, correction, and convergence cost.
 CLI output is a versioned external contract. Raw events are therefore authoritative. When an
 adapter parser changes, add fixtures for the observed CLI version and reparse historical traces;
 do not rewrite historical provider output.
+
+## Harness and services
+
+The Harness is the model-based work of one project, run against one workspace folder; the Telegram
+bot and the status page are separate services that reach it only through its local HTTP API and its
+outbox. See [`services.md`](services.md) for the design and the migration runbook, and "Harness and
+services" in the operating contract for the enforced rules.

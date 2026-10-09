@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
     from memtrace_harness.memtrace_client import MemTraceClient
     from memtrace_harness.scope import ProjectScope
-    from memtrace_harness.telegram_gateway import TelegramGateway
+    from memtrace_harness.service import HarnessService
     from memtrace_harness.trace_store import TraceStore
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ class UnattendedScanner:
         trace_store: TraceStore,
         projects: list[ProjectScope],
         memtrace_client: MemTraceClient | None = None,
-        gateway: TelegramGateway | dict[str, TelegramGateway] | None = None,
+        service: HarnessService | None = None,
         approval_mgr: ApprovalManager | None = None,
         record_push: Callable[[str, str], Any] | None = None,
         review_caller_factory: Callable[[str], Callable[[str], str | None]] | None = None,
@@ -76,7 +76,7 @@ class UnattendedScanner:
         self.trace_store = trace_store
         self.projects = projects
         self.memtrace_client = memtrace_client
-        self.gateway = gateway
+        self.service = service
         self.approval_mgr = approval_mgr
         self._notified_stalled: set[str] = set()
         # Writes what the scanner pushed to the operator into the project's chat log,
@@ -86,14 +86,9 @@ class UnattendedScanner:
         # candidates are proposed to the operator without being read first, as before.
         self._review_caller_factory = review_caller_factory
 
-    def _gateway_for(self, scope: ProjectScope) -> TelegramGateway | None:
-        """Resolve the bot that owns this project. `gateway` may be a single shared
-        TelegramGateway (legacy, one bot for all projects) or a dict keyed by project
-        name (one dedicated bot per project) — notifications must go out on the bot
-        the project's users actually talk to."""
-        if isinstance(self.gateway, dict):
-            return self.gateway.get(scope.name)
-        return self.gateway
+    def _service_for(self, scope: ProjectScope) -> HarnessService | None:
+        """The Harness service that tells the operator about this project's candidates."""
+        return self.service
 
     def _find_ready_task_nodes(
         self, scope: ProjectScope, *, run_id: str | None = None
@@ -247,7 +242,7 @@ class UnattendedScanner:
         except Exception:
             logger.exception(f"reviewing backlog candidates for {scope.name} failed; proposing as before")
             return candidates, ""
-        gw = self._gateway_for(scope)
+        gw = self._service_for(scope)
         kept: list[dict[str, Any]] = []
         reason = ""
         for candidate in candidates:
@@ -271,7 +266,7 @@ class UnattendedScanner:
                     "如果我判斷錯了，直接告訴我。"
                 )
                 if gw:
-                    gw.notify_all_allowlisted(text)
+                    gw.notify_operator(text)
                 self._log_push(scope, text)
                 continue
             if not kept and verdict is not None and verdict.verdict == "propose":
@@ -283,7 +278,7 @@ class UnattendedScanner:
         """Tell the operator once per item (per process) that an already-run item is
         still open and is being withheld, so the repeat is surfaced instead of
         silently suppressed — the human decides: close it, or resume via /clarify."""
-        gw = self._gateway_for(scope)
+        gw = self._service_for(scope)
         for item in stalled:
             item_id = str(item.get("id"))
             if item_id in self._notified_stalled:
@@ -294,7 +289,7 @@ class UnattendedScanner:
                 "我不會再重複提案。若已完成請關閉 issue，需要續做請用 /clarify 回覆該任務。"
             )
             if gw:
-                gw.notify_all_allowlisted(text)
+                gw.notify_operator(text)
             self._log_push(scope, text)
 
     def run_scan_pass(self) -> dict[str, str]:
@@ -381,7 +376,7 @@ class UnattendedScanner:
                 proposed_action=proposed_action,
                 resume_goal=f"Implement planned backlog item: {next_id}",
             )
-            gw = self._gateway_for(scope)
+            gw = self._service_for(scope)
             if gw:
                 gw.notify_approval_request(req)
             self._log_push(scope, proposed_action)

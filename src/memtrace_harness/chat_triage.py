@@ -119,7 +119,7 @@ class ChatTriage:
         # secret string) usually doesn't even contain the keyword. Enforcement moves
         # to the model, same trust model as HARNESS_TASK_START: harness-scope.md's
         # full text (including off_limits) is already part of the chat prompt's
-        # identity context (see TelegramGateway._identity_context()), and the prompt
+        # identity context (see HarnessService._identity_context()), and the prompt
         # explicitly tells the model those are boundaries to respect while replying,
         # not just background text. off_limits still travels as TaskEnvelope.constraints
         # to the governed Agent Loop roles for real work — that path is unaffected.
@@ -132,7 +132,7 @@ class ChatTriage:
         # There is no more "!"/"/task" trigger that mechanically queues a governed
         # write task — whether to actually start development work is now a
         # judgment call the model makes inside the conversation itself (see
-        # TelegramGateway._chat_reply_and_maybe_start_task()), same conversation
+        # HarnessService._chat_reply_and_maybe_start_task()), same conversation
         # the human is already having with it, not a separate command.
         return TriageResult(
             kind="chat",

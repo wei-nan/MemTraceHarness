@@ -7,7 +7,7 @@ from typing import Any
 
 class InFlightTracker:
     """Tracks background daemon threads currently running an Agent Loop, so the
-    gateway's shutdown sequence can wait for them (or, past a grace period, at least
+    Harness's shutdown sequence can wait for them (or, past a grace period, at least
     force-release their workspace locks) instead of the process just vanishing out
     from under them. Daemon threads get no cleanup guarantee when the interpreter
     exits — their `finally` blocks (which release the workspace lock) may never run —
@@ -50,7 +50,7 @@ class InFlightTracker:
         return not self.snapshot()
 
 
-# One tracker per process — every background Agent Loop thread across the gateway
+# One tracker per process — every background Agent Loop thread across the Harness
 # (chat-triggered tasks, approval resumes, unattended-scanner backlog runs) registers
 # into this single instance so the shutdown sequence has one place to check.
 default_tracker = InFlightTracker()

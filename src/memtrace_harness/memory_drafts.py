@@ -25,7 +25,7 @@ _HEAD_CHARS = 24
 _QUOTE_SUFFIX = re.compile(r"\n?（回覆的訊息：「.*」）\s*$", re.DOTALL)
 _TURN_LINE = re.compile(r"^Turn #(\d+) \[", re.MULTILINE)
 
-# MemTrace rate-limits per API key, and the live gateway shares ours: bulk calls from a
+# MemTrace rate-limits per API key, and the live Harness shares ours: bulk calls from a
 # command stay well under it (a burst of ~60 deletes drew an HTTP 429 once).
 CALL_INTERVAL_SECONDS = 1.5
 BACKOFF_SECONDS = 10.0

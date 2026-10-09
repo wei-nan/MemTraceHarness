@@ -1,0 +1,16 @@
+# The status page: one service, any number of Harnesses (each reached over its own local API).
+# Keep it mode 0600 (it holds each Harness's API token).
+# Run:  python -m memtrace_services.web.main --config <this file>
+
+host = "127.0.0.1"   # loopback unless you deliberately widen it; the page has no login of its own
+port = 8787
+
+[[harness]]
+name = "my-project"
+url = "http://127.0.0.1:8800"
+token = "<that Harness's HARNESS_API_TOKEN>"
+
+# [[harness]]
+# name = "another-project"
+# url = "http://127.0.0.1:8801"
+# token = "..."

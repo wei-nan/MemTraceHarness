@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-import os
 from pathlib import Path
 import re
 import subprocess
 import threading
+
+from memtrace_harness.cli_process import child_env
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ class WorktreeManager:
         """A project's own hook to make a fresh checkout usable (link node_modules,
         copy an .env — whatever git does not carry). HARNESS_REPO_ROOT points at the
         main checkout."""
-        env = {**os.environ, "HARNESS_REPO_ROOT": str(repo)}
+        env = {**child_env(), "HARNESS_REPO_ROOT": str(repo)}
         result = subprocess.run(
             ["/bin/sh", "-c", command],
             cwd=worktree.path, capture_output=True, text=True, timeout=timeout, env=env,

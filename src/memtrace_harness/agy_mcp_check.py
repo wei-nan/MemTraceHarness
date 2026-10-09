@@ -118,7 +118,7 @@ def check_antigravity_mcp(
         return []
     try:
         registered = parse_mcp_list(run(executable))
-    except Exception as exc:  # the check must never stop the gateway
+    except Exception as exc:  # the check must never stop the Harness
         return [f"Antigravity: could not list MCP servers ({exc}); its roles may lack the Harness tools."]
     problems: list[str] = []
     spec = mcp_server_spec()

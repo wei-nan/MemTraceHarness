@@ -194,7 +194,7 @@ class ControllerTaskContextTests(TestCase):
     def test_controller_sees_project_scope_and_prior_discussion(self) -> None:
         # 2026-09-05: Controller used to be filtered down to ONLY loop-snapshot +
         # harness_resume_envelope items, silently dropping the project-scope and
-        # prior-discussion context TelegramGateway attaches to every chat-triggered
+        # prior-discussion context HarnessService attaches to every chat-triggered
         # task — which is exactly why it kept saying "I don't have context" for
         # goals like "接續 chat_3077a492 的任務" (chat_621c8bb9, generation 17).
         base_task = TaskEnvelope(

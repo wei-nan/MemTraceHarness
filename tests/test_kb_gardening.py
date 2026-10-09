@@ -6,10 +6,11 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from tests.support import relay, tap
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
-from memtrace_harness import cli
+from memtrace_harness import duties as cli
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
@@ -33,7 +34,7 @@ from memtrace_harness.kb_gardening import (
 )
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 
@@ -389,13 +390,12 @@ def _gateway(tmp, kb=None):
     config = HarnessConfig(
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=path / "t.sqlite3", trace_root=path,
         claude_command="claude", codex_command="codex", antigravity_command="agy",
-        antigravity_output_mode="auto", cli_timeout_seconds=900, telegram_bot_token="fake",
-        telegram_allowed_chat_ids={12345}, project_index_path=None, chat_provider="claude",
-        chat_model="haiku", unattended_write_requires_approval=True,
+        antigravity_output_mode="auto", cli_timeout_seconds=900,
+        chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
     scope = ProjectScope(name="test_proj", workspace_id="ws_test", working_directory=path,
                          scope_file_path=path / "harness-scope.md")
-    gw = TelegramGateway(config, ApprovalManager(ts, {12345}), ChatTriage([scope]), PrimarySessionManager(ts),
+    gw = HarnessService(config, ApprovalManager(ts), ChatTriage([scope]), PrimarySessionManager(ts),
                          [scope], memtrace_client=kb)
     gw.send_message = MagicMock()
     gw.send_message_with_keyboard = MagicMock(return_value=3)
@@ -423,9 +423,9 @@ class GatewayTests(TestCase):
             gw.notify_garden_outcome(GardenOutcome(run_id, "ws_test", "test_proj", "規格", applied={"delete": 1}, deleted=1))
             text, keyboard = gw.send_message_with_keyboard.call_args.args[1:3]
             self.assertIn("整批還原", text)
-            self.assertEqual(keyboard[0][0]["callback_data"], f"kb_undo:{run_id}")
+            self.assertEqual(keyboard[0][0]["id"], f"kb_undo:{run_id}")
 
-            gw._handle_callback_query({"id": "cb", "data": f"kb_undo:{run_id}",
+            tap(gw, {"id": "cb", "data": f"kb_undo:{run_id}",
                                        "message": {"chat": {"id": 12345}, "message_id": 4}})
             self.assertEqual(kb.restored, ["mem_1"])
             self.assertIn("已還原 1 個節點", gw.send_message.call_args.args[1])
@@ -441,10 +441,10 @@ class GatewayTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gw, ts, scope = _gateway(tmp)
             gw.garden_now = MagicMock()
-            gw.process_update({"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/garden"}})
+            relay(gw, {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/garden"}})
             gw.garden_now.assert_called_once_with(scope, 12345)
             gw.garden_now = None
-            gw.process_update({"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/garden"}})
+            relay(gw, {"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/garden"}})
             self.assertIn("沒有啟用", gw.send_message.call_args.args[1])
 
 
@@ -457,18 +457,18 @@ class CliPassTests(TestCase):
             scope.raw_markdown = "測試專案"
             reply = json.dumps({"charter": "# 地圖", "ops": [{"op": "dedupe", "group": "G1", "keep_id": "mem_5"}]})
             with patch.object(cli, "make_review_caller", return_value=lambda prompt: reply):
-                ran = cli.run_knowledge_gardening(gw.config, ts, kb, [scope], {"test_proj": gw})
+                ran = cli.run_knowledge_gardening(gw.config, ts, kb, [scope], gw)
                 self.assertEqual(ran, 1)                       # ws_test: spec (memory ws is the same one)
                 gw.notify_garden_outcome.assert_called_once()
                 self.assertEqual(len(kb.deleted), 4)
                 # Not due again for a week...
-                self.assertEqual(cli.run_knowledge_gardening(gw.config, ts, kb, [scope], {"test_proj": gw}), 0)
+                self.assertEqual(cli.run_knowledge_gardening(gw.config, ts, kb, [scope], gw), 0)
                 # ...unless forced (the /garden command).
                 self.assertEqual(
-                    cli.run_knowledge_gardening(gw.config, ts, kb, [scope], {"test_proj": gw}, force=True), 1
+                    cli.run_knowledge_gardening(gw.config, ts, kb, [scope], gw, force=True), 1
                 )
 
     def test_without_a_knowledge_base_nothing_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             gw, ts, scope = _gateway(tmp)
-            self.assertEqual(cli.run_knowledge_gardening(gw.config, ts, None, [scope], {}), 0)
+            self.assertEqual(cli.run_knowledge_gardening(gw.config, ts, None, [scope], None), 0)

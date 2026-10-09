@@ -13,6 +13,38 @@ Status labels:
 If this file, the current code, and a resolved MemTrace decision disagree, stop and record the
 conflict. Do not silently select the most convenient source.
 
+## Harness and services (operator decision, 2026-10-09)
+
+The Harness is the model-based work of one project; transports and presentation are separate
+services. **ENFORCED** (`tests/test_service_boundary.py` and the API/service tests):
+
+- One Harness serves one workspace (a folder; empty and non-git are fine) and keeps everything in it:
+  `.harness.env` (settings and secrets, mode 0600), `.harness/` (store, raw traces, worktrees,
+  `roles.toml`), `harness-scope.md`. Settings have no per-project suffixes. When the workspace is a git
+  checkout, `.harness.env` and `.harness/` are excluded locally (`.git/info/exclude`), and the project's
+  off-limits list always includes them.
+- The Harness has no chat transport: no Bot API call, no bot token, no chat id. What it wants said goes
+  into an **outbox** (neutral events: text, optional `{label, id}` button rows, a `bind` saying what to
+  remember the delivered message for); what people say reaches it as `handle_message` / `handle_action`.
+  An audience or message reference is an opaque string a service hands in (`tg:<chat>`,
+  `tg:<chat>:<message>`); the Harness only passes it back. `None` means "the operator, wherever they are".
+- A service is its own process with its own env file, outside the workspace. It never imports the Harness
+  (and the Harness never imports a service), never reads its database or env file, and reaches it only
+  through the Harness's local HTTP API (loopback, bearer `HARNESS_API_TOKEN`; the API refuses to start
+  without one). The Telegram service holds the only copy of the bot token and enforces the chat
+  allowlist before anything is relayed; one bot serves one Harness.
+- Delivery is at-least-once: an event is leased to a fetch, redelivered if not acknowledged, retried up
+  to five times, and only then given up on (an order or job proposal that never reached the operator goes
+  back to `pending`). The acknowledgement carries the message references that let a reply to an approval
+  resolve to that approval.
+- A child process (provider CLI, verify command, job, worktree setup) gets an allowlisted environment, never the
+  Harness's secrets; only a Codex call wired to the MemTrace MCP server also gets `MEMTRACE_API_TOKEN`.
+
+**POLICY_ONLY**: `off_limits` keeps agents away from `.harness.env` and `.harness/` by prompt; a Developer
+that can read the workspace can read those files. Keeping service secrets (bot token) outside the workspace
+is what protects them; the Harness's own secrets (MemTrace token, API token) rely on the allowlisted child
+environment and file mode.
+
 ## Authority and memory routing
 
 The Harness uses three authoritative memory planes:
@@ -66,7 +98,7 @@ to exist in MemTrace (anything else is dropped, and no push is sent for dropped 
 expire after `HARNESS_RECALL_TTL_HOURS` (default 72, sliding — a topic that comes up again is
 extended); at most one recall run per project at a time; a topic with no history is stored as
 fresh and never pushed. Briefs are local drafts and never written to MemTrace by this path.
-The model may push one Telegram message when it found a connection the human likely no longer
+The model may push one chat message when it found a connection the human likely no longer
 has in mind. **PLANNED, not implemented:** a reverse index so the nightly digest can mark which
 older items a day's topics continued.
 
@@ -74,7 +106,7 @@ older items a day's topics continued.
 `max_workers` governed tasks at once (`harness-scope.md`, default 3; 1 restores one-at-a-time).
 ENFORCED in code: slots are claimed atomically in SQLite (`workspace_locks`, one row per running
 task), so the limit holds across threads; a task that finds every slot busy waits in a persistent
-FIFO queue (`task_queue`) and is started when a slot frees, including after a gateway restart; a
+FIFO queue (`task_queue`) and is started when a slot frees, including after a Harness restart; a
 schedule whose previous run is still running *or still queued* is skipped for that cycle rather than
 queued behind itself (other schedules are unaffected); an approved conversation waits for a slot
 the same way. Each task in a git project runs in its own `git worktree` on branch
@@ -96,14 +128,14 @@ run is unchanged: this isolates *tasks* from each other, it is not provider fan-
 failed-with-changes runs, and the unattended scanner still wants the whole project idle.
 
 **Diagnosing and re-running without the Agent Loop (operator decision, 2026-10-08).** The chat model's sandbox
-has no network, so a connection or DNS failure seen there says nothing about an outside service (a Telegram answer
+has no network, so a connection or DNS failure seen there says nothing about an outside service (a chat answer
 once blamed "TWSE unreachable from here" when the project's own script was merely timing out on a slow legacy
 endpoint). Diagnosis and re-running a job are the harness's own job; only changing code goes through the Agent Loop.
 `ops_mcp.py` is an MCP server (spawned outside the CLI sandbox, like the TaiwanTrade proxy) given to the chat reply
 for a project whose scope file declares something: `probe_hosts` (hostnames `http_probe` may GET; redirects are
 reported, never followed), `log_files` (what `read_log` may tail) and `job: name = command` lines. **Enforced:**
-those allowlists; `run_job` never runs anything — it records a `job_requests` row, the gateway shows a Telegram
-confirm button, and the command (re-read from the scope file at tap time) runs in a daemon thread only after the
+those allowlists; `run_job` never runs anything — it records a `job_requests` row, the Harness shows a
+confirm button in the chat, and the command (re-read from the scope file at tap time) runs in a daemon thread only after the
 tap, once per request, with a 15-minute limit; its result is sent and written to the chat log. Unanswered
 requests expire after 10 minutes. **Prompt policy, not enforced:** that the model probes before answering and only
 starts a development task when the cause is in the project's code. Wired for Codex and Claude chat models only
@@ -115,12 +147,12 @@ listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a li
 (`create_order_intent`); a human must confirm it. ENFORCED in code: the tool only creates a
 TaiwanTrade order intent, which never reaches the broker; the one-time confirmation token goes to the
 harness database and never to the model; the model has no tool to place, confirm, cancel or amend;
-only a button tap from an allowlisted Telegram chat sends the order (`POST /trade/orders`), at most
+only a button tap relayed by a service's allowlisted chat sends the order (`POST /trade/orders`), at most
 once per intent; an unconfirmed proposal expires and is reported as not placed; the result of every
 confirmed, cancelled, failed or expired order is sent to the human and written to the chat log;
 Agent Loop roles never get the tool; a per-order value limit (default 100000 TWD) applies on top of
 TaiwanTrade's own risk limits. A cancellation is proposed the same way (`request_order_cancel`) and sent
-only on the human's tap (the gateway makes the `DELETE`). **Not implemented:** amending orders, market orders.
+only on the human's tap (the Harness makes the `DELETE`). **Not implemented:** amending orders, market orders.
 
 **Tool-first rule for working roles (2026-10-09, operator decision).** Planner (and its revision/escalation),
 Developer (and its revision) and operational runs are shown a tool catalog built from the TaiwanTrade tool
@@ -129,7 +161,7 @@ listed, e.g. chart images). They are told to use a listed tool instead of callin
 file, and, when no listed tool covers the need, to stop with `needs_human` and a decision card rather than
 build their own client. **Enforced:** the catalog content always matches the served tools. **Prompt policy,
 not enforced:** that a role checks it and stops; nothing scans code for direct API calls or key-file reads,
-and the key file stays readable. Antigravity's MCP registration (`agy mcp add`) is still manual, but the gateway now checks it at startup (`agy_mcp_check.py`): a missing, disabled or mis-pointed `taiwantrade`/`memtrace` server is printed, logged and sent to the allowlisted Telegram chats with the `agy mcp add` command to fix it. It only reports; it never registers anything and never blocks startup.
+and the key file stays readable. Antigravity's MCP registration (`agy mcp add`) is still manual, but the Harness now checks it at startup (`agy_mcp_check.py`): a missing, disabled or mis-pointed `taiwantrade`/`memtrace` server is printed, logged and sent to the operator (through the outbox) with the `agy mcp add` command to fix it. It only reports; it never registers anything and never blocks startup.
 
 **Replies to a paused task (2026-10-05).** A schedule run that stops `needs_human` is only a
 notification: no approval is opened for it, so a later human reply cannot resume the monitoring run with
@@ -146,7 +178,7 @@ role's output schema carries it (required, nullable), and each stage prompt appe
 `CARD_INSTRUCTION`. When a loop stops `needs_human` for an info-needed reason, the card of the *last
 executed stage* is validated (`card_from_artifact`: it must be well-formed, and the stage's own
 status/verdict/action must itself hand over to a human) and stored on the approval request; the
-Telegram message then shows the card instead of the raw artifact dump, with one button per option
+chat message then shows the card instead of the raw artifact dump, with one button per option
 (`pick:<id>:<n>`) that resumes the task exactly as `/clarify` with that option's text would. A missing
 or malformed card falls back to the previous unstructured message, so a model that fails to write one
 never blocks a stop. Cards are never used for `model_output_invalid`, `config_change_required`,
@@ -178,7 +210,7 @@ profile (its provider/model, then its own fallbacks, in the Controller's neutral
 only *reduce* what the operator is shown, on grounds the harness checks; a missing, failed or
 inadmissible verdict always degrades to the previous behaviour.
 
-- *Schedule results* (`TelegramGateway._schedule_delivery`): `push`, `digest_only` or `pause_and_notify`.
+- *Schedule results* (`HarnessService._schedule_delivery`): `push`, `digest_only` or `pause_and_notify`.
   Holding a result back must cite which of the five earlier reports it repeats (and, for a `needs_human`
   result, that report must have been pushed); `failed`/`budget_exhausted` runs are never reviewed or held
   back; twelve held-back results in a row force a push; pausing needs at least three earlier reports and is
@@ -190,7 +222,7 @@ inadmissible verdict always degrades to the previous behaviour.
   candidate can be deferred at most three times; a `drop` must cite `D<n>` operator decisions that were in
   the precedent it was shown, is told to the operator, and keeps the item out of proposals for seven days.
 
-The review is only wired in by the serve command (`gateway`); without it, behaviour is unchanged.
+The review is only wired in by the serve command (`serve`); without it, behaviour is unchanged.
 **Not implemented:** reviewing *before* a run to skip it (only the result is reviewed), rewriting the pushed
 text (it is pushed or held verbatim), and a review through the full Controller adapter — it uses the plain
 chat-command path like the digest and recall, so its raw output is not kept in the trace store and it has no
@@ -394,7 +426,7 @@ Only these failure categories may cross provider boundaries:
   script pointing at a stale path, `cannot execute`). The request was never evaluated, so the next
   candidate is safe. This category ignores a profile's `fallback_on` list, sets no cooldown (the
   primary is retried on the next stage so a fixed install recovers immediately), and always sends
-  the operator a Telegram alert via `AgentLoopRunner.alert_callback` — even when no fallback
+  the operator an alert (through the outbox) via `AgentLoopRunner.alert_callback` — even when no fallback
   exists — naming the failed and (if any) substitute provider/model.
 
 `context_limit`, timeout, network, authentication, permission, configuration, schema, safety and

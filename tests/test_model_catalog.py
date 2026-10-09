@@ -64,7 +64,7 @@ class ModelCatalogTests(TestCase):
         self.assertEqual(run.call_count, 1)
 
     def test_status_menus_put_the_catalog_first_then_configured_extras(self) -> None:
-        from memtrace_harness.cli import _merge_model_catalog
+        from memtrace_harness.admin import merge_model_catalog as _merge_model_catalog
 
         with patch(
             "memtrace_harness.model_catalog.provider_models",
@@ -83,22 +83,14 @@ class ChatModelSaveTests(TestCase):
     def test_saving_takes_effect_in_the_running_process_at_once(self) -> None:
         import os
 
-        from memtrace_harness.cli import update_chat_model_for_project
+        from memtrace_harness import admin
+        from memtrace_harness.workspace import ENV_FILE_NAME
+        from tests.workspace_support import workspace
 
-        with tempfile.TemporaryDirectory() as tmp:
-            cwd = os.getcwd()
-            os.chdir(tmp)
-            self.addCleanup(os.chdir, cwd)
-            Path(".env").write_text("HARNESS_CHAT_PROVIDER=claude\n", encoding="utf-8")
-            scope = MagicMock()
-            scope.name = "Proj"
-            keys = ("HARNESS_CHAT_PROVIDER_PROJ", "HARNESS_CHAT_MODEL_PROJ")
-            saved = {k: os.environ.pop(k, None) for k in keys}
-            self.addCleanup(lambda: [os.environ.pop(k, None) for k in keys] and None)
-            with patch("memtrace_harness.cli.load_project_index", return_value=[scope]):
-                update_chat_model_for_project(MagicMock(), "Proj", "codex", "gpt-6-luna")
-
-            self.assertEqual(os.environ["HARNESS_CHAT_PROVIDER_PROJ"], "codex")
-            self.assertEqual(os.environ["HARNESS_CHAT_MODEL_PROJ"], "gpt-6-luna")
-            self.assertIn("HARNESS_CHAT_MODEL_PROJ=gpt-6-luna", Path(".env").read_text(encoding="utf-8"))
-            self.assertIsNotNone(saved)
+        with workspace({"HARNESS_CHAT_PROVIDER": "claude"}) as (root, config):
+            admin.update_chat_model(config, "codex", "gpt-6-luna")
+            self.assertEqual(os.environ["HARNESS_CHAT_PROVIDER"], "codex")
+            self.assertEqual(os.environ["HARNESS_CHAT_MODEL"], "gpt-6-luna")
+            saved = (root / ENV_FILE_NAME).read_text(encoding="utf-8")
+            self.assertIn("HARNESS_CHAT_MODEL=gpt-6-luna", saved)
+            self.assertEqual(config.chat_candidates_for()[0], ("codex", "gpt-6-luna"))

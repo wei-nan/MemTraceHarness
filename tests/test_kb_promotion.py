@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from tests.support import relay, tap
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
-from memtrace_harness import cli
+from memtrace_harness import duties as cli
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
@@ -26,7 +27,7 @@ from memtrace_harness.kb_promotion import (
 )
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 DIGEST_A = (
@@ -308,13 +309,12 @@ def _gateway(tmp, kb_=None):
     config = HarnessConfig(
         memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=path / "t.sqlite3", trace_root=path,
         claude_command="claude", codex_command="codex", antigravity_command="agy",
-        antigravity_output_mode="auto", cli_timeout_seconds=900, telegram_bot_token="fake",
-        telegram_allowed_chat_ids={12345}, project_index_path=None, chat_provider="claude",
-        chat_model="haiku", unattended_write_requires_approval=True,
+        antigravity_output_mode="auto", cli_timeout_seconds=900,
+        chat_provider="claude", chat_model="haiku", unattended_write_requires_approval=True,
     )
     scope = ProjectScope(name="test_proj", workspace_id="ws_spec", working_directory=path,
                          scope_file_path=path / "harness-scope.md")
-    gw = TelegramGateway(config, ApprovalManager(ts, {12345}), ChatTriage([scope]), PrimarySessionManager(ts),
+    gw = HarnessService(config, ApprovalManager(ts), ChatTriage([scope]), PrimarySessionManager(ts),
                          [scope], memtrace_client=kb_)
     gw.send_message = MagicMock()
     gw.send_message_with_keyboard = MagicMock(return_value=3)
@@ -329,7 +329,7 @@ class GatewayTests(TestCase):
             gw, ts, scope = _gateway(tmp)
             gw.notify_promotion_outcome(PromotionOutcome(7, "test_proj", "ws_spec", created=["一則"]))
             text, keyboard = gw.send_message_with_keyboard.call_args.args[1:3]
-            self.assertEqual(keyboard[0][0]["callback_data"], "kb_undo:7")
+            self.assertEqual(keyboard[0][0]["id"], "kb_undo:7")
             self.assertIn("撤銷", text)
             gw.send_message_with_keyboard.reset_mock()
             gw.notify_promotion_outcome(PromotionOutcome(8, "test_proj", "ws_spec", unchanged=2))
@@ -340,7 +340,7 @@ class GatewayTests(TestCase):
             k = kb()
             gw, ts, scope = _gateway(tmp, k)
             out = run(k, ts, reply())
-            gw._handle_callback_query({"id": "cb", "data": f"kb_undo:{out.run_id}",
+            tap(gw, {"id": "cb", "data": f"kb_undo:{out.run_id}",
                                        "message": {"chat": {"id": 12345}, "message_id": 4}})
             self.assertEqual(sorted(k.deleted), ["mem_n1", "mem_n2"])
             self.assertIn("已撤銷 2 個新增的節點", gw.send_message.call_args.args[1])
@@ -357,10 +357,10 @@ class GatewayTests(TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             gw, ts, scope = _gateway(tmp)
             gw.promote_now = MagicMock()
-            gw.process_update({"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/promote"}})
+            relay(gw, {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "/promote"}})
             gw.promote_now.assert_called_once_with(scope, 12345)
             gw.promote_now = None
-            gw.process_update({"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/promote"}})
+            relay(gw, {"update_id": 2, "message": {"chat": {"id": 12345}, "text": "/promote"}})
             self.assertIn("沒有啟用", gw.send_message.call_args.args[1])
 
 
@@ -434,15 +434,15 @@ class CliScheduleTests(TestCase):
             with patch.object(gw.config.__class__, "memory_workspace_id_for", lambda self, name, ws: "ws_mem"), patch.object(
                 cli, "make_review_caller", return_value=lambda prompt: reply()
             ):
-                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}), 1)
+                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], gw), 1)
                 gw.notify_promotion_outcome.assert_called_once()              # it wrote something: tell the operator
                 gw.notify_promotion_outcome.reset_mock()
                 # Next night: not due for a week, so nothing runs and nothing is said.
-                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}), 0)
+                self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, k, [scope], gw), 0)
                 gw.notify_promotion_outcome.assert_not_called()
                 # /promote ignores the schedule and always reports, even when nothing changed.
                 self.assertEqual(
-                    cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}, chat_id=12345, force=True), 1
+                    cli.run_knowledge_promotion(gw.config, ts, k, [scope], gw, audience=12345, force=True), 1
                 )
                 gw.notify_promotion_outcome.assert_called_once()
 
@@ -457,7 +457,7 @@ class CliTests(TestCase):
             with patch.object(gw.config.__class__, "memory_workspace_id_for", lambda self, name, ws: "ws_mem"), patch.object(
                 cli, "make_review_caller", return_value=lambda prompt: reply()
             ):
-                ran = cli.run_knowledge_promotion(gw.config, ts, k, [scope], {"test_proj": gw}, chat_id=12345)
+                ran = cli.run_knowledge_promotion(gw.config, ts, k, [scope], gw, audience=12345)
             self.assertEqual(ran, 1)
             gw.notify_promotion_outcome.assert_called_once()
-            self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, None, [scope], {}), 0)
+            self.assertEqual(cli.run_knowledge_promotion(gw.config, ts, None, [scope], None), 0)

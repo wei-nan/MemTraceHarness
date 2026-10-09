@@ -62,7 +62,7 @@ def check_chat_tools(
                 if claude_listing is None and claude_error is None:
                     try:
                         claude_listing = run(config.command_for("claude"))
-                    except Exception as exc:  # the check must never stop the gateway
+                    except Exception as exc:  # the check must never stop the Harness
                         claude_error = str(exc)
                 if claude_error is not None:
                     problems.append(f"{label}: could not list Claude MCP servers ({claude_error}).")

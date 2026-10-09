@@ -120,7 +120,7 @@ class PrimarySessionManager:
     @staticmethod
     def _scheduled_runs_block(turns: list[PrimarySessionTurn], tz: tzinfo, now: datetime | None) -> str:
         """Latest result per schedule that ran recently. These were pushed to the human
-        on Telegram, so a reply like "那檔後來怎麼了" may be about one of them even though
+        in the chat, so a reply like "那檔後來怎麼了" may be about one of them even though
         none sits in the conversation window."""
         cutoff = (now or datetime.now(timezone.utc)) - SCHEDULED_RUNS_LOOKBACK
         by_schedule: dict[str, dict] = {}
@@ -156,7 +156,7 @@ class PrimarySessionManager:
                 lines.append(f"{head}；這段期間沒有執行結果")
         return (
             "Scheduled runs in the last 24 hours (latest result per schedule — the Harness "
-            "pushed these to the human on Telegram, so their next message may refer to "
+            "pushed these to the human in the chat, so their next message may refer to "
             "them):\n" + "\n".join(lines)
         )
 
@@ -186,7 +186,7 @@ class PrimarySessionManager:
         turn_type already settles "decision" and "dev_report" turns as substantive —
         those are recorded only once a governed task actually started (the model
         decided, in conversation, to emit its HARNESS_TASK_START marker — see
-        TelegramGateway._chat_reply_and_maybe_start_task()) or a loop produced a
+        HarnessService._chat_reply_and_maybe_start_task()) or a loop produced a
         result, so they don't need further judgment here. Plain "chat" turns are
         different: whether a message is worth remembering is a separate, lower-stakes
         question, so if `classify_chat_fn` is given, it's asked to judge them. This is

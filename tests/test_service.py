@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 from pathlib import Path
+from tests.support import outbox, relay
 from unittest import TestCase
 
 from memtrace_harness.approval import ApprovalManager
@@ -11,67 +12,11 @@ from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.telegram_gateway import TelegramGateway
+from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
 
 
-class TelegramGatewayTests(TestCase):
-    def test_telegram_gateway_allowlist_filtering(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            db_path = tmp_path / "test.sqlite3"
-            trace_store = TraceStore(db_path)
-            config = HarnessConfig(
-                memtrace_mcp_url=None,
-                memtrace_api_token=None,
-                trace_db_path=db_path,
-                trace_root=tmp_path,
-                claude_command="claude",
-                codex_command="codex",
-                antigravity_command="agy",
-                antigravity_output_mode="auto",
-                cli_timeout_seconds=900,
-                telegram_bot_token="fake_bot_token",
-                telegram_allowed_chat_ids={12345},
-                project_index_path=None,
-                chat_provider="claude",
-                chat_model="haiku",
-                unattended_write_requires_approval=True,
-            )
-            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
-            scope = ProjectScope(
-                name="test_proj",
-                workspace_id="ws_test",
-                working_directory=tmp_path,
-                scope_file_path=tmp_path / "harness-scope.md",
-            )
-            triage = ChatTriage([scope])
-            psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
-
-            # Update from unallowed Chat ID (99999) must be dropped at transport layer
-            unallowed_update = {
-                "update_id": 100,
-                "message": {"chat": {"id": 99999}, "text": "Run something"},
-            }
-            result = gateway.process_update(unallowed_update)
-            self.assertIsNone(result)
-
-            # Update from allowed Chat ID (12345) must be processed with mocked urlopen
-            from unittest.mock import patch, MagicMock
-            mock_response = MagicMock()
-            mock_response.read.return_value = b'{"ok": true, "result": []}'
-            mock_response.__enter__.return_value = mock_response
-
-            with patch("urllib.request.urlopen", return_value=mock_response):
-                allowed_update = {
-                    "update_id": 101,
-                    "message": {"chat": {"id": 12345}, "text": "status"},
-                }
-                result_allowed = gateway.process_update(allowed_update)
-                self.assertIsNotNone(result_allowed)
-                self.assertIn("Harness Gateway 已上線", result_allowed)
-
+class HarnessServiceTests(TestCase):
     def test_model_deciding_to_start_a_task_locks_workspace_without_approval(self) -> None:
         # There is no more "!"/"/task" marker and no more front-door approval
         # request: a plain message goes to the model, and if the model itself
@@ -92,14 +37,11 @@ class TelegramGatewayTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="fake_bot_token",
-                telegram_allowed_chat_ids={12345},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,
             )
-            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+            approval_mgr = ApprovalManager(trace_store)
             scope = ProjectScope(
                 name="test_proj",
                 workspace_id="ws_test",
@@ -108,7 +50,7 @@ class TelegramGatewayTests(TestCase):
             )
             triage = ChatTriage([scope])
             psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+            gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
 
             from unittest.mock import patch, MagicMock
             from memtrace_harness.cli_process import ProcessResult
@@ -142,7 +84,7 @@ class TelegramGatewayTests(TestCase):
                     "update_id": 200,
                     "message": {"chat": {"id": 12345}, "text": "please review the current setup"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             import threading as _threading
 
@@ -182,14 +124,11 @@ class TelegramGatewayTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="fake_bot_token",
-                telegram_allowed_chat_ids={12345},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,
             )
-            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+            approval_mgr = ApprovalManager(trace_store)
             scope = ProjectScope(
                 name="test_proj",
                 workspace_id="ws_test",
@@ -198,7 +137,7 @@ class TelegramGatewayTests(TestCase):
             )
             triage = ChatTriage([scope])
             psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+            gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
 
             from unittest.mock import patch, MagicMock
             from memtrace_harness.cli_process import ProcessResult
@@ -223,7 +162,7 @@ class TelegramGatewayTests(TestCase):
                     "update_id": 201,
                     "message": {"chat": {"id": 12345}, "text": "我想改一下設定"},
                 }
-                gateway.process_update(update)
+                relay(gateway, update)
 
             self.assertIsNone(trace_store.get_workspace_lock("ws_test"))
 
@@ -242,14 +181,11 @@ class TelegramGatewayTests(TestCase):
                 antigravity_command="agy",
                 antigravity_output_mode="auto",
                 cli_timeout_seconds=900,
-                telegram_bot_token="fake_bot_token",
-                telegram_allowed_chat_ids={12345},
-                project_index_path=None,
                 chat_provider="claude",
                 chat_model="haiku",
                 unattended_write_requires_approval=True,
             )
-            approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+            approval_mgr = ApprovalManager(trace_store)
             scope = ProjectScope(
                 name="test_proj",
                 workspace_id="ws_test",
@@ -258,7 +194,7 @@ class TelegramGatewayTests(TestCase):
             )
             triage = ChatTriage([scope])
             psess_mgr = PrimarySessionManager(trace_store)
-            gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+            gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
 
             from unittest.mock import patch, MagicMock
             from memtrace_harness.cli_process import ProcessResult
@@ -283,7 +219,7 @@ class TelegramGatewayTests(TestCase):
                     "update_id": 300,
                     "message": {"chat": {"id": 12345}, "text": "你好"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             # A plain message (no "!") must reply directly — no approval request,
             # no workspace lock, no governed loop — or "just chatting" would always
@@ -310,14 +246,11 @@ class TelegramGatewayTests(TestCase):
             antigravity_command="agy",
             antigravity_output_mode="auto",
             cli_timeout_seconds=900,
-            telegram_bot_token="fake_bot_token",
-            telegram_allowed_chat_ids={12345},
-            project_index_path=None,
             chat_provider="claude",
             chat_model="haiku",
             unattended_write_requires_approval=True,
         )
-        approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+        approval_mgr = ApprovalManager(trace_store)
         scope = ProjectScope(
             name="test_proj",
             workspace_id="ws_test",
@@ -326,7 +259,7 @@ class TelegramGatewayTests(TestCase):
         )
         triage = ChatTriage([scope])
         psess_mgr = PrimarySessionManager(trace_store)
-        gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+        gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
         self.addCleanup(tmp_dir.cleanup)
         return gateway, approval_mgr, trace_store
 
@@ -345,14 +278,14 @@ class TelegramGatewayTests(TestCase):
             proposed_action="Execute git push for task: ...",
         )
         gateway.notify_approval_request = MagicMock()
-        gateway.notify_all_allowlisted = MagicMock()
+        gateway.notify_operator = MagicMock()
         gateway.send_message = MagicMock()
 
         summary = MagicMock(status="needs_human")
         gateway._report_run_outcome(conv_id="conv_1", summary=summary, final_text="passive status line")
 
         gateway.notify_approval_request.assert_called_once_with(req)
-        gateway.notify_all_allowlisted.assert_not_called()
+        gateway.notify_operator.assert_not_called()
         gateway.send_message.assert_not_called()
 
     def test_report_run_outcome_falls_back_to_final_text_without_a_pending_approval(self) -> None:
@@ -360,13 +293,13 @@ class TelegramGatewayTests(TestCase):
 
         gateway, _approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
         gateway.notify_approval_request = MagicMock()
-        gateway.notify_all_allowlisted = MagicMock()
+        gateway.notify_operator = MagicMock()
 
         summary = MagicMock(status="needs_human")
         gateway._report_run_outcome(conv_id="conv_no_pending", summary=summary, final_text="ended without a checkpoint")
 
         gateway.notify_approval_request.assert_not_called()
-        gateway.notify_all_allowlisted.assert_called_once_with("ended without a checkpoint")
+        gateway.notify_operator.assert_called_once_with("ended without a checkpoint")
 
     def test_report_run_outcome_uses_final_text_for_non_needs_human_status(self) -> None:
         from unittest.mock import MagicMock
@@ -382,13 +315,13 @@ class TelegramGatewayTests(TestCase):
             proposed_action="unrelated",
         )
         gateway.notify_approval_request = MagicMock()
-        gateway.notify_all_allowlisted = MagicMock()
+        gateway.notify_operator = MagicMock()
 
         summary = MagicMock(status="succeeded")
         gateway._report_run_outcome(conv_id="conv_succeeded", summary=summary, final_text="all done")
 
         gateway.notify_approval_request.assert_not_called()
-        gateway.notify_all_allowlisted.assert_called_once_with("all done")
+        gateway.notify_operator.assert_called_once_with("all done")
 
     def test_unrelated_plain_text_does_not_touch_a_stale_pending_approval(self) -> None:
         # A plain message with no reply-to must never mechanically resolve some
@@ -427,26 +360,20 @@ class TelegramGatewayTests(TestCase):
                 "update_id": 402,
                 "message": {"chat": {"id": 12345}, "text": "目前任務狀態如何"},
             }
-            gateway.process_update(update)
+            relay(gateway, update)
 
         reloaded = approval_mgr.get_request(req.id)
         self.assertEqual(reloaded.status, "pending")
         gateway._resume_approved_conversation.assert_not_called()
 
-    def test_register_bot_commands_calls_set_my_commands(self) -> None:
-        from unittest.mock import patch, MagicMock
-
+    def test_the_harness_lists_its_commands_for_a_service_to_show(self) -> None:
         gateway, _approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"ok": true, "result": true}'
-        mock_response.__enter__.return_value = mock_response
-
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            ok = gateway.register_bot_commands()
-
-        self.assertTrue(ok)
-        called_url = mock_urlopen.call_args[0][0].full_url
-        self.assertIn("setMyCommands", called_url)
+        names = {c["command"] for c in gateway.commands()}
+        self.assertEqual(
+            names,
+            {"status", "approve", "reject", "clarify", "schedules", "garden", "promote", "review", "schedule_cancel"},
+        )
+        self.assertTrue(all(c["description"] for c in gateway.commands()))
 
     def test_ambiguous_requirement_approval_only_offers_an_abandon_button(self) -> None:
         gateway, approval_mgr, _trace_store = self._gateway_for_report_outcome_tests()
@@ -458,7 +385,7 @@ class TelegramGatewayTests(TestCase):
             proposed_action="需要澄清範圍",
         )
         keyboard = gateway._approval_keyboard(req.id, req.reason)
-        button_texts = [btn["text"] for row in keyboard for btn in row]
+        button_texts = [btn["label"] for row in keyboard for btn in row]
         self.assertEqual(button_texts, ["🛑 放棄這個任務"])
 
     def test_chat_reply_preallowlists_memtrace_read_tools_for_claude_only(self) -> None:
@@ -538,13 +465,11 @@ class TelegramGatewayTests(TestCase):
         from unittest.mock import MagicMock
 
         gateway, mgr, store = self._gateway_for_report_outcome_tests()
-        gateway.notify_all_allowlisted = MagicMock()
-        gateway.clear_message_keyboard = MagicMock()
         old = mgr.request_approval(
             conversation_id="conv_old", workspace="ws_test", working_directory="/tmp",
             reason="ambiguous_requirement", proposed_action="old",
         )
-        mgr.record_telegram_message(old.id, chat_id=12345, message_id=7)
+        mgr.record_message_ref(old.id, f"tg:{12345}:{7}")
         fresh = mgr.request_approval(
             conversation_id="conv_new", workspace="ws_test", working_directory="/tmp",
             reason="git_push", proposed_action="fresh",
@@ -567,8 +492,12 @@ class TelegramGatewayTests(TestCase):
         self.assertEqual(mgr.get_request(old.id).status, "expired")
         self.assertEqual(mgr.get_request(fresh.id).status, "pending")
         self.assertEqual(mgr.get_request(other.id).status, "pending")  # other workspace untouched
-        gateway.clear_message_keyboard.assert_called_once_with(12345, 7)
-        gateway.notify_all_allowlisted.assert_called_once()
+        events = outbox(gateway)
+        self.assertEqual([e["ref"] for e in events if e["kind"] == "clear"], ["tg:12345:7"])
+        notices = [e for e in events if e["kind"] == "message"]
+        self.assertEqual(len(notices), 1)
+        self.assertIn(old.id, notices[0]["text"])
+        self.assertIsNone(notices[0]["audience"])  # to the operator, wherever they are
         self.assertEqual(gateway.expire_stale_approvals(0, now=later), [])  # ttl 0 disables
 
     def test_expiring_a_scan_proposal_frees_its_workspace_lock(self) -> None:
@@ -576,7 +505,7 @@ class TelegramGatewayTests(TestCase):
         from unittest.mock import MagicMock
 
         gateway, mgr, store = self._gateway_for_report_outcome_tests()
-        gateway.notify_all_allowlisted = MagicMock()
+        gateway.notify_operator = MagicMock()
         gateway.clear_message_keyboard = MagicMock()
         self.assertTrue(store.acquire_workspace_lock("ws_test", "scan_abc"))
         mgr.request_approval(
@@ -598,7 +527,7 @@ class TelegramGatewayTests(TestCase):
             proposed_action="agent_loop 已停用",
         )
         keyboard = gateway._approval_keyboard(req.id, req.reason)
-        buttons = [(btn["text"], btn["callback_data"]) for row in keyboard for btn in row]
+        buttons = [(btn["label"], btn["id"]) for row in keyboard for btn in row]
         self.assertEqual(buttons, [("🛑 放棄這個任務", f"reject:{req.id}")])
 
     def test_model_output_invalid_approval_offers_retry_and_give_up(self) -> None:
@@ -611,7 +540,7 @@ class TelegramGatewayTests(TestCase):
             proposed_action='{"action": "finish"}',
         )
         keyboard = gateway._approval_keyboard(req.id, req.reason)
-        buttons = [(btn["text"], btn["callback_data"]) for row in keyboard for btn in row]
+        buttons = [(btn["label"], btn["id"]) for row in keyboard for btn in row]
         self.assertEqual(
             buttons,
             [("🔁 重試", f"approve:{req.id}"), ("❌ 放棄", f"reject:{req.id}")],
@@ -619,7 +548,7 @@ class TelegramGatewayTests(TestCase):
 
     def test_hydrate_github_issue_context_parses_stage_ref_and_calls_gh(self) -> None:
         from unittest.mock import patch, MagicMock
-        from memtrace_harness.telegram_gateway import _hydrate_github_issue_context
+        from memtrace_harness.service import _hydrate_github_issue_context
 
         fake_issue = json.dumps(
             {
@@ -630,7 +559,7 @@ class TelegramGatewayTests(TestCase):
             }
         )
         fake_result = MagicMock(returncode=0, stdout=fake_issue, stderr="")
-        with patch("memtrace_harness.telegram_gateway.subprocess.run", return_value=fake_result) as mock_run:
+        with patch("memtrace_harness.service.subprocess.run", return_value=fake_result) as mock_run:
             item = _hydrate_github_issue_context(
                 "gh:wei-nan/Beri#112", working_directory=Path("/tmp")
             )
@@ -646,10 +575,10 @@ class TelegramGatewayTests(TestCase):
 
     def test_hydrate_github_issue_context_handles_gh_failure(self) -> None:
         from unittest.mock import patch, MagicMock
-        from memtrace_harness.telegram_gateway import _hydrate_github_issue_context
+        from memtrace_harness.service import _hydrate_github_issue_context
 
         fake_result = MagicMock(returncode=1, stdout="", stderr="not found")
-        with patch("memtrace_harness.telegram_gateway.subprocess.run", return_value=fake_result):
+        with patch("memtrace_harness.service.subprocess.run", return_value=fake_result):
             item = _hydrate_github_issue_context(
                 "gh:wei-nan/Beri#999", working_directory=Path("/tmp")
             )
@@ -659,7 +588,7 @@ class TelegramGatewayTests(TestCase):
 
 def _build_schedule_gateway(tmp_path: Path):
     """Shared boilerplate for the schedule tests below: a real TraceStore-backed
-    TelegramGateway with one project, same construction shape every other test in
+    HarnessService with one project, same construction shape every other test in
     this file repeats inline — factored out here since every schedule test needs it."""
     db_path = tmp_path / "test.sqlite3"
     trace_store = TraceStore(db_path)
@@ -673,14 +602,11 @@ def _build_schedule_gateway(tmp_path: Path):
         antigravity_command="agy",
         antigravity_output_mode="auto",
         cli_timeout_seconds=900,
-        telegram_bot_token="fake_bot_token",
-        telegram_allowed_chat_ids={12345},
-        project_index_path=None,
         chat_provider="claude",
         chat_model="haiku",
         unattended_write_requires_approval=True,
     )
-    approval_mgr = ApprovalManager(trace_store, config.telegram_allowed_chat_ids)
+    approval_mgr = ApprovalManager(trace_store)
     scope = ProjectScope(
         name="test_proj",
         workspace_id="ws_test",
@@ -689,7 +615,7 @@ def _build_schedule_gateway(tmp_path: Path):
     )
     triage = ChatTriage([scope])
     psess_mgr = PrimarySessionManager(trace_store)
-    gateway = TelegramGateway(config, approval_mgr, triage, psess_mgr, [scope])
+    gateway = HarnessService(config, approval_mgr, triage, psess_mgr, [scope])
     return gateway, trace_store, scope
 
 
@@ -709,7 +635,7 @@ class ScheduleControlMarkerTests(TestCase):
         with patch("urllib.request.urlopen", return_value=mock_response), patch(
             "memtrace_harness.cli_process.CliProcessRunner.run", return_value=model_reply
         ):
-            return gateway.process_update(
+            return relay(gateway, 
                 {"update_id": 400, "message": {"chat": {"id": 12345}, "text": text}}
             )
 
@@ -718,7 +644,7 @@ class ScheduleControlMarkerTests(TestCase):
 
         return trace_store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="check prices",
-            kind="interval", interval_seconds=600, chat_id=12345,
+            kind="interval", interval_seconds=600, audience=12345,
             next_run_at=datetime.now(timezone.utc) - timedelta(seconds=5),
         )
 
@@ -796,7 +722,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 300,
                     "message": {"chat": {"id": 12345}, "text": "每天早上幫我檢查一次 backlog"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             # The marker line itself must not leak to the human.
             self.assertIsNotNone(result)
@@ -808,7 +734,7 @@ class ScheduleCommandTests(TestCase):
             self.assertEqual(rows[0]["kind"], "daily")
             self.assertEqual(rows[0]["time_of_day"], "09:00")
             self.assertEqual(rows[0]["goal"], "daily backlog review")
-            self.assertEqual(rows[0]["chat_id"], 12345)
+            self.assertEqual(rows[0]["audience"], "12345")  # opaque: the Harness only hands it back
 
     def test_malformed_schedule_spec_reports_error_and_creates_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -838,7 +764,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 301,
                     "message": {"chat": {"id": 12345}, "text": "每天幫我檢查"},
                 }
-                gateway.process_update(update)
+                relay(gateway, update)
 
             self.assertEqual(trace_store.list_schedules(scope.name), [])
 
@@ -853,7 +779,7 @@ class ScheduleCommandTests(TestCase):
                 goal="daily backlog review",
                 kind="daily",
                 time_of_day="09:00",
-                chat_id=12345,
+                audience=12345,
                 next_run_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
             )
 
@@ -866,7 +792,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 302,
                     "message": {"chat": {"id": 12345}, "text": "/schedules"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             self.assertIsNotNone(result)
             self.assertIn("daily backlog review", result)
@@ -886,7 +812,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 303,
                     "message": {"chat": {"id": 12345}, "text": "/schedules"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             self.assertIn("沒有排程", result)
 
@@ -901,7 +827,7 @@ class ScheduleCommandTests(TestCase):
                 goal="daily backlog review",
                 kind="interval",
                 interval_seconds=3600,
-                chat_id=12345,
+                audience=12345,
                 next_run_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
             )
 
@@ -914,7 +840,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 304,
                     "message": {"chat": {"id": 12345}, "text": f"/schedule_cancel {schedule_id}"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             self.assertIn("已取消", result)
             self.assertEqual(trace_store.list_schedules(scope.name), [])
@@ -933,7 +859,7 @@ class ScheduleCommandTests(TestCase):
                     "update_id": 305,
                     "message": {"chat": {"id": 12345}, "text": "/schedule_cancel sched_doesnotexist"},
                 }
-                result = gateway.process_update(update)
+                result = relay(gateway, update)
 
             self.assertIn("找不到", result)
 
@@ -955,7 +881,7 @@ class ScheduleCommandTests(TestCase):
                 goal="daily backlog review",
                 kind="interval",
                 interval_seconds=3600,
-                chat_id=12345,
+                audience=12345,
                 next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
             )
             row = trace_store.get_schedule(schedule_id)
@@ -1054,7 +980,7 @@ class TopicRecallWiringTests(TestCase):
             with patch("urllib.request.urlopen", return_value=response), patch(
                 "memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply
             ):
-                gateway.process_update(
+                relay(gateway, 
                     {"update_id": 9, "message": {"chat": {"id": 12345}, "text": "訂閱驗證要怎麼做"}}
                 )
             gateway.topic_recall.start.assert_called_once_with(scope, 12345, "訂閱驗證要怎麼做")
@@ -1117,7 +1043,7 @@ class RepliedToMessageTests(TestCase):
             started_at="2026-10-02T00:00:00+00:00", completed_at="2026-10-02T00:00:01+00:00", duration_ms=1,
         )
         with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply) as run:
-            gateway.process_update(update)
+            relay(gateway, update)
         turns = store.get_primary_session_turns("psess_test_proj")
         return run.call_args.args[0][-1], turns
 
@@ -1170,9 +1096,9 @@ class ScheduledRunLoggingTests(TestCase):
 
         gateway, store, scope = self._gateway()
         summary = MagicMock(conversation_id="chat_x", status="succeeded", recommendation="未達停損門檻")
-        with patch("memtrace_harness.telegram_gateway.load_role_profiles", return_value={}), patch(
-            "memtrace_harness.telegram_gateway.build_role_adapter_candidates", return_value={}
-        ), patch("memtrace_harness.telegram_gateway.AgentLoopRunner") as runner:
+        with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+            "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+        ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
             runner.return_value.run.return_value = summary
             gateway._run_new_task(scope, "chat_x", "追蹤持股", schedule_id="sched_a")
             gateway._run_new_task(scope, "chat_y", "請開發功能")
@@ -1192,7 +1118,7 @@ class ScheduledRunLoggingTests(TestCase):
         gateway._start_or_queue_task = MagicMock()
         schedule_id = store.create_schedule(
             project=scope.name, workspace_id=scope.workspace_id, goal="追蹤持股", kind="interval",
-            interval_seconds=600, chat_id=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            interval_seconds=600, audience=12345, next_run_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
 
         gateway.run_due_schedule(store.get_schedule(schedule_id))
@@ -1304,3 +1230,27 @@ class PreferenceCorrectionInChatTests(TestCase):
         self.assertEqual(store.get_preference_rule(self.rule)["status"], "adopted")
         self.assertTrue(sent.startswith("好"))
         self.assertNotIn("HARNESS_PREFERENCE_CORRECT", sent)
+
+
+class StatusAndCommandTests(TestCase):
+    def test_status_says_which_project_this_harness_serves_and_answers_through_the_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, _store, scope = _build_schedule_gateway(Path(tmp_dir))
+            result = relay(gateway, {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "status"}})
+            self.assertIn("Harness 已上線", result)
+            self.assertIn(scope.name, result)
+            [event] = outbox(gateway)
+            self.assertEqual((event["kind"], event["audience"], event["text"]), ("message", "12345", result))
+
+    def test_everything_the_harness_says_is_neutral_no_chat_ids_or_telegram_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            gateway, store, scope = _build_schedule_gateway(Path(tmp_dir))
+            req = gateway.approval_manager.request_approval(
+                conversation_id="c", workspace="ws_test", working_directory=str(tmp_dir),
+                reason="git_push", proposed_action="git push",
+            )
+            gateway.notify_approval_request(req)
+            [event] = outbox(gateway)
+            self.assertIsNone(event["audience"])
+            self.assertEqual(set(event["actions"][0][0]), {"label", "id"})
+            self.assertEqual(event["bind"], {"type": "approval", "id": req.id})

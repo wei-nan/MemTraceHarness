@@ -242,8 +242,7 @@ class CliAdapterTests(TestCase):
             memtrace_mcp_url="https://kb.example/mcp", memtrace_api_token=None,
             trace_db_path=self.root / "t.sqlite3", trace_root=self.root, claude_command="claude",
             codex_command="codex", antigravity_command="agy", antigravity_output_mode="auto",
-            cli_timeout_seconds=900, telegram_bot_token=None, telegram_allowed_chat_ids=set(),
-            project_index_path=None, chat_provider="claude", chat_model="haiku",
+            cli_timeout_seconds=900, chat_provider="claude", chat_model="haiku",
             unattended_write_requires_approval=True,
         )
         adapter = build_provider_adapter(
