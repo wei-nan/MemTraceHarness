@@ -345,9 +345,10 @@ def build_parser() -> argparse.ArgumentParser:
     drafts_parser = subparsers.add_parser(
         "memory-drafts",
         help=(
-            "Rename the old hourly archive nodes in MemTrace (all titled "
-            "'Draft primary session consolidation: <project>') by date and turn range, and "
-            "record which node holds which turns. Dry run unless --apply."
+            "Rename the hourly archive nodes in MemTrace that have no subject title yet "
+            "(identical legacy titles, or time-and-opener ones) to '<subject>（time · turns）', "
+            "the subject named by a cheap model, and record which node holds which turns. "
+            "Dry run unless --apply."
         ),
     )
     drafts_parser.add_argument("--project", help="Only this project (default: every registered project)")
@@ -605,7 +606,11 @@ def memory_drafts_command(args: argparse.Namespace) -> int:
     report: list[str] = []
     total = 0
     workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-    plans, skipped = plan_draft_retitle(client, trace_store, scope.name, workspace_id, tz)
+    from memtrace_harness.duties import make_topic_namer
+
+    plans, skipped = plan_draft_retitle(
+        client, trace_store, scope.name, workspace_id, tz, topic_fn=make_topic_namer(config, scope.name)
+    )
     print(f"[{scope.name}] {workspace_id}: {len(plans)} draft(s) to rename, {len(skipped)} skipped")
     report.append(f"## {scope.name} — `{workspace_id}` ({len(plans)} to rename, {len(skipped)} skipped)\n")
     report += [f"- `{p.node_id}` → {p.new_title}" for p in plans]

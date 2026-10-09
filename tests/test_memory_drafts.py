@@ -66,6 +66,62 @@ class DraftTitleTests(TestCase):
         self.assertEqual(parse_turn_seqs(body), [3, 4, 5])
 
 
+class TopicTitleTests(TestCase):
+    TURNS = [(4, "2026-09-30T06:05:00+00:00", "user", "sendPhoto 能不能傳圖表"), (5, "2026-09-30T06:06:00+00:00", "assistant", "可以")]
+
+    def test_topic_leads_and_time_and_turns_follow(self) -> None:
+        self.assertEqual(
+            draft_title("p", self.TURNS, TZ, "sendPhoto 圖表推送測試"),
+            "Draft: p sendPhoto 圖表推送測試（2026-09-30 14:05 · turns #4–#5）",
+        )
+
+    def test_unusable_topic_falls_back_to_the_opener(self) -> None:
+        for bad in (None, "", "  \n ", "「」"):
+            self.assertEqual(
+                draft_title("p", self.TURNS, TZ, bad), "Draft: p 2026-09-30 14:05（turns #4–#5）· sendPhoto 能不能傳圖表"
+            )
+
+    def test_clean_topic_takes_first_line_drops_label_and_quotes_and_caps_length(self) -> None:
+        self.assertEqual(memory_drafts.clean_topic("標題：「修正登入逾時」\n因為……"), "修正登入逾時")
+        self.assertEqual(memory_drafts.clean_topic("\n\n**對帳**"), "對帳")
+        self.assertEqual(len(memory_drafts.clean_topic("字" * 80)), 31)
+
+    def test_name_topic_never_raises(self) -> None:
+        def boom(_: str) -> str:
+            raise RuntimeError("provider down")
+
+        self.assertIsNone(memory_drafts.name_topic("p", self.TURNS, boom))
+        self.assertIsNone(memory_drafts.name_topic("p", self.TURNS, None))
+        self.assertEqual(memory_drafts.name_topic("p", self.TURNS, lambda _: "主題：測試傳圖\n"), "測試傳圖")
+
+    def test_prompt_lists_the_turns_without_the_reply_quote(self) -> None:
+        turns = [(1, "2026-09-30T00:00:00+00:00", "user", "這檔呢\n（回覆的訊息：「建議入場」）")]
+        prompt = memory_drafts.topic_prompt("p", turns)
+        self.assertIn("#1 [user] 這檔呢", prompt)
+        self.assertNotIn("建議入場", prompt)
+
+    def test_hourly_archive_uses_the_topic_when_a_model_names_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _store(tmp)
+            client = MagicMock()
+            client.create_node.return_value = "mem_new"
+            mgr = PrimarySessionManager(store, client)
+            mgr.record_turn(project="proj", speaker="user", turn_type="decision", content="決定資料期間三年")
+            seen: list[str] = []
+
+            def namer(prompt: str) -> str:
+                seen.append(prompt)
+                return "資料期間改為三年"
+
+            mgr.consolidate_to_memtrace("proj", "ws_mem", tz=TZ, topic_fn=namer)
+
+            self.assertRegex(
+                client.create_node.call_args.kwargs["title"],
+                r"^Draft: proj 資料期間改為三年（\d{4}-\d{2}-\d{2} \d{2}:\d{2} · turn #1）$",
+            )
+            self.assertIn("決定資料期間三年", seen[0])
+
+
 class LiveWriteTests(TestCase):
     def test_hourly_archive_uses_the_new_title_and_remembers_the_node(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +162,7 @@ class RetitleTests(TestCase):
             {"id": "mem_gone", "title": old, "body": "Turn #99 [user]: not in the local log"},
             {"id": "mem_empty", "title": old, "body": "nothing parseable"},
             {"id": "mem_spec", "title": "小說世界觀設定", "body": "Turn #1 [user]: 不是草稿"},
-            {"id": "mem_done", "title": "Draft: proj 2026-09-29 09:00（turns #1–#2）· x", "body": "Turn #1 [user]: x"},
+            {"id": "mem_done", "title": "Draft: proj 看盤流程確認（2026-09-29 09:00 · turns #1–#2）", "body": "Turn #1 [user]: x"},
         ]
 
     def test_plan_is_read_only_and_covers_only_old_style_drafts(self) -> None:
@@ -121,6 +177,23 @@ class RetitleTests(TestCase):
         self.assertEqual({k.node_id for k in skipped}, {"mem_gone", "mem_empty"})
         self.client.update_node.assert_not_called()
         self.assertEqual(self.store.list_memory_drafts("proj", "ws_mem"), [])
+
+    def test_plan_renames_stamped_titles_by_topic_and_is_idempotent(self) -> None:
+        stamped = "Draft: proj 2026-09-29 09:00（turns #1–#2）· 第一天看盤"
+        self.client.list_nodes.return_value = [
+            {"id": "mem_a", "title": stamped, "body": "Turn #1 [user]: 第一天看盤\nTurn #2 [assistant]: 收到"}
+        ]
+        with patch.object(memory_drafts.time, "sleep"):
+            plans, _ = plan_draft_retitle(self.client, self.store, "proj", "ws_mem", TZ, topic_fn=lambda p: "首日看盤流程")
+            self.assertEqual(plans[0].new_title, "Draft: proj 首日看盤流程（2026-09-29 09:00 · turns #1–#2）")
+            self.assertEqual(plans[0].old_title, stamped)
+            # no model answer: the opener-based title is what it already has, so nothing to do
+            none, _ = plan_draft_retitle(self.client, self.store, "proj", "ws_mem", TZ, topic_fn=lambda p: "")
+            self.assertEqual(none, [])
+            # already topic-titled: left alone
+            self.client.list_nodes.return_value = [{"id": "mem_a", "title": plans[0].new_title, "body": "Turn #1 [user]: x"}]
+            again, skipped = plan_draft_retitle(self.client, self.store, "proj", "ws_mem", TZ, topic_fn=lambda p: "別的")
+            self.assertEqual((again, skipped), ([], []))
 
     def test_apply_renames_and_records_the_turn_ranges(self) -> None:
         self.client.list_nodes.return_value = self._nodes()

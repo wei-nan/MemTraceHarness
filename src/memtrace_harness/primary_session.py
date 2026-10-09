@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING, Callable
 
-from memtrace_harness.memory_drafts import draft_title
+from memtrace_harness.memory_drafts import draft_title, name_topic
 
 if TYPE_CHECKING:
     from memtrace_harness.memtrace_client import MemTraceClient
@@ -178,6 +178,7 @@ class PrimarySessionManager:
         workspace_id: str,
         classify_chat_fn: Callable[[list[str]], list[bool]] | None = None,
         tz: tzinfo | None = None,
+        topic_fn: Callable[[str], str] | None = None,
     ) -> list[int]:
         """Classify unconsolidated turns and write substantive ones to MemTrace as draft
         evidence — the "cold memory" side of the hot/cold split (hot = the running
@@ -261,13 +262,10 @@ class PrimarySessionManager:
             # consolidation; see the beri-consolidation-content_type-bug memory note).
             # Titled by when and which turns (see memory_drafts.py): the same title for
             # every draft made them indistinguishable in MemTrace.
+            batch = [(t.turn_seq, t.created_at, t.speaker, t.content) for t in substantive]
             node_id = self.memtrace_client.create_node(
                 workspace_id=workspace_id,
-                title=draft_title(
-                    project,
-                    [(t.turn_seq, t.created_at, t.speaker, t.content) for t in substantive],
-                    tz or timezone.utc,
-                ),
+                title=draft_title(project, batch, tz or timezone.utc, name_topic(project, batch, topic_fn)),
                 body=summary_content,
                 content_type="context",
                 tags=["harness", "draft", "primary-session"],

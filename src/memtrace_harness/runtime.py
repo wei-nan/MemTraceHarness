@@ -24,6 +24,7 @@ from memtrace_harness.config import HarnessConfig
 from memtrace_harness.duties import (
     DIGEST_CHECK_SECONDS,
     _make_chat_classifier,
+    make_topic_namer,
     _run_nightly_digest_pass,
     make_recall_model_caller,
     run_knowledge_gardening,
@@ -297,7 +298,8 @@ def serve(
                 memory_workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
                 classify_fn = _make_chat_classifier(config, scope.name, scope.working_directory)
                 written = primary_session_mgr.consolidate_to_memtrace(
-                    scope.name, memory_workspace_id, classify_fn, tz=schedule_tz
+                    scope.name, memory_workspace_id, classify_fn, tz=schedule_tz,
+                    topic_fn=make_topic_namer(config, scope.name),
                 )
                 if written:
                     print(f"[{scope.name}] consolidated {len(written)} turn(s) to MemTrace as draft evidence", flush=True)
