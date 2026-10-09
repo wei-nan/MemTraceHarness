@@ -13,7 +13,11 @@ from memtrace_harness.workspace import (
     init_workspace,
     load_workspace,
     parse_env_file,
+    MODEL_ENV_VARS,
+    models_file,
+    read_model_settings,
     remove_env_keys,
+    update_model_settings,
     write_env_updates,
 )
 from tests.workspace_support import workspace
@@ -123,3 +127,75 @@ class WorkspaceTests(TestCase):
             self.assertIn("chmod 600", problems)
             self.assertIn("TELEGRAM_BOT_TOKEN belongs in the Telegram service", problems)
             self.assertIn("HARNESS_TELEGRAM_ALLOWED_CHAT_IDS belongs", problems)
+
+
+class ModelsFileTests(TestCase):
+    """Environment and preferences are two files: `.harness.env` (secrets, endpoints, CLI paths) and
+    `.harness/models.toml` (which model chats, what falls back to what) — the second is what the
+    status page edits, so the first is never rewritten for a model change."""
+
+    def test_settings_round_trip_with_their_types(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.toml"
+            update_model_settings(path, {
+                "HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku",
+                "HARNESS_CHAT_FALLBACKS": "antigravity/gemini-3.6-flash-high, codex/gpt-6",
+                "HARNESS_RECALL_ENABLED": "false", "HARNESS_RECALL_TTL_HOURS": "48",
+                "HARNESS_REPLY_LANGUAGE": "繁體中文 \"台灣\"",
+            })
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('fallbacks = ["antigravity/gemini-3.6-flash-high", "codex/gpt-6"]', text)
+            self.assertIn("enabled = false", text)
+            self.assertIn("ttl_hours = 48", text)
+            self.assertEqual(
+                read_model_settings(path),
+                {
+                    "HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku",
+                    "HARNESS_CHAT_FALLBACKS": "antigravity/gemini-3.6-flash-high,codex/gpt-6",
+                    "HARNESS_RECALL_ENABLED": "false", "HARNESS_RECALL_TTL_HOURS": "48",
+                    "HARNESS_REPLY_LANGUAGE": '繁體中文 "台灣"',
+                },
+            )
+
+    def test_an_update_keeps_the_comments_and_the_other_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.toml"
+            path.write_text(
+                "# why haiku: cheap\n[chat]\nprovider = \"claude\"  # keep\nmodel = \"haiku\"\n\n"
+                "# the nightly digest\n[digest]\nmodel = \"sonnet\"\n",
+                encoding="utf-8",
+            )
+            update_model_settings(path, {"HARNESS_CHAT_MODEL": "opus", "HARNESS_DIGEST_PROVIDER": "claude", "HARNESS_MEMORY_WORKSPACE_ID": "ws_m"})
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("# why haiku: cheap", text)
+            self.assertIn("# the nightly digest", text)
+            self.assertIn('model = "opus"', text)
+            self.assertEqual(text.count("[chat]"), 1)
+            settings = read_model_settings(path)
+            self.assertEqual(
+                (settings["HARNESS_CHAT_PROVIDER"], settings["HARNESS_CHAT_MODEL"], settings["HARNESS_DIGEST_MODEL"],
+                 settings["HARNESS_DIGEST_PROVIDER"], settings["HARNESS_MEMORY_WORKSPACE_ID"]),
+                ("claude", "opus", "sonnet", "claude", "ws_m"),
+            )
+
+    def test_only_known_settings_can_be_written(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                update_model_settings(Path(tmp) / "models.toml", {"MEMTRACE_API_TOKEN": "x"})
+            self.assertFalse(any(name.startswith("MEMTRACE_") or name.endswith("TOKEN") for name in MODEL_ENV_VARS))
+
+    def test_the_preference_file_beats_the_environment_file_and_the_shell_beats_both(self) -> None:
+        with TemporaryDirectory() as tmp:
+            init_workspace(Path(tmp))
+            (Path(tmp) / ENV_FILE_NAME).write_text("HARNESS_CHAT_MODEL=old-line\nHARNESS_CHAT_PROVIDER=codex\n", encoding="utf-8")
+            update_model_settings(models_file(Path(tmp)), {"HARNESS_CHAT_MODEL": "from-models"})
+            env: dict[str, str] = {"HARNESS_CHAT_PROVIDER": "from-shell"}
+            load_workspace(tmp, environ=env)
+            self.assertEqual((env["HARNESS_CHAT_MODEL"], env["HARNESS_CHAT_PROVIDER"]), ("from-models", "from-shell"))
+
+    def test_a_preference_left_in_the_environment_file_is_reported(self) -> None:
+        with workspace() as (root, _):
+            write_env_updates(root / ENV_FILE_NAME, {"HARNESS_CHAT_MODEL": "haiku"})
+            problems = " ".join(env_file_problems(root))
+            self.assertIn("HARNESS_CHAT_MODEL is a preference", problems)
+            self.assertIn("models.toml", problems)

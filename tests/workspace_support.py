@@ -9,7 +9,14 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from memtrace_harness.config import HarnessConfig
-from memtrace_harness.workspace import init_workspace, load_workspace, write_env_updates
+from memtrace_harness.workspace import (
+    MODEL_ENV_VARS,
+    init_workspace,
+    load_workspace,
+    models_file,
+    update_model_settings,
+    write_env_updates,
+)
 
 # Settings a developer's shell might carry that would leak into a test's HarnessConfig.
 _CLEAR = (
@@ -25,15 +32,21 @@ SCOPE = "# Harness scope — TestProj\n\n- workspace_id: ws_test\n"
 
 @contextmanager
 def workspace(env: dict[str, str] | None = None, *, scope: str | None = SCOPE):
-    """Yields (root, config): an initialised workspace whose `.harness.env` holds `env`, loaded
-    into a private copy of the environment."""
+    """Yields (root, config): an initialised workspace, loaded into a private copy of the
+    environment. `env` is given by environment-variable name; the preferences among it (models,
+    memory workspace, behaviour) go into `.harness/models.toml`, the rest into `.harness.env`."""
     with TemporaryDirectory() as tmp:
         root = Path(tmp) / "ws"
         paths = init_workspace(root)
         if scope is not None:
             paths["scope"].write_text(scope, encoding="utf-8")
         if env:
-            write_env_updates(paths["env"], env)
+            environment = {k: v for k, v in env.items() if k not in MODEL_ENV_VARS}
+            preferences = {k: v for k, v in env.items() if k in MODEL_ENV_VARS}
+            if environment:
+                write_env_updates(paths["env"], environment)
+            if preferences:
+                update_model_settings(models_file(root), preferences)
         with patch.dict(os.environ, {}, clear=False):
             for key in _CLEAR:
                 os.environ.pop(key, None)

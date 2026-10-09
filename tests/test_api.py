@@ -13,7 +13,7 @@ from unittest import TestCase
 from memtrace_harness.api import HarnessApi
 from memtrace_harness.runtime import build_harness
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file
+from memtrace_harness.workspace import models_file, parse_env_file, read_model_settings
 from memtrace_services.client import HarnessClient, HarnessError, HarnessUnavailable
 from tests.workspace_support import workspace
 
@@ -153,7 +153,8 @@ class StatusAndAdminTests(ApiTestCase):
 
     def test_a_model_setting_is_saved_to_the_workspace_and_effective_at_once(self) -> None:
         self.client.admin("chat-model", {"provider": "codex", "model": "gpt-6-luna"})
-        self.assertEqual(parse_env_file(self.root / ENV_FILE_NAME)["HARNESS_CHAT_MODEL"], "gpt-6-luna")
+        self.assertEqual(read_model_settings(models_file(self.root))["HARNESS_CHAT_MODEL"], "gpt-6-luna")
+        self.assertNotIn("HARNESS_CHAT_MODEL", parse_env_file(self.root / ".harness.env"))  # the secrets file is untouched
         self.assertEqual(self.config.chat_candidates_for()[0], ("codex", "gpt-6-luna"))
         with self.assertRaises(HarnessError) as caught:
             self.client.admin("chat-model", {"provider": "openai", "model": "x"})

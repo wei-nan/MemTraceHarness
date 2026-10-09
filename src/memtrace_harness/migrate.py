@@ -4,8 +4,9 @@ The old Harness was one process serving every project in `projects.index.txt` fr
 `HARNESS_*_<PROJECT>` suffixed overrides and one shared SQLite store. This turns each registered
 project into a workspace:
 
-* `<project>/.harness.env`   plain (unsuffixed) settings for that project, a fresh API token and port
-* `<project>/.harness/`      that project's slice of the shared store, its raw traces, its roles file
+* `<project>/.harness.env`   that project's environment (MemTrace URL/token, CLI paths), a fresh API token and port
+* `<project>/.harness/`      that project's slice of the shared store, its raw traces, its `models.toml`
+                             (the unsuffixed model preferences) and its roles file
 * `<services>/<name>/telegram.env`   the project's bot token and chat allowlist, outside the project
 * `<services>/web.toml`      the status page's list of Harnesses
 * `<services>/launchd/*.plist`       one job per Harness / bot / the page (written, never loaded)
@@ -26,9 +27,11 @@ from pathlib import Path
 from memtrace_harness.init_workspace import DEFAULT_API_PORT, DEFAULT_SERVICES_DIR, free_port
 from memtrace_harness.scope import ProjectScope, load_project_index
 from memtrace_harness.workspace import (
+    MODEL_ENV_VARS,
     STATE_DIR_NAME,
     init_workspace,
     parse_env_file,
+    update_model_settings,
     write_env_updates,
 )
 
@@ -112,6 +115,13 @@ def plan_workspaces(
                 f"{scope.scope_file_path.parent}; the workspace is the folder holding the scope file"
             )
         plans.append(WorkspacePlan(scope, scope.scope_file_path.parent.resolve(), env, port, token, roles_source, telegram, notes))
+    for plan in plans:
+        sharing = [o.scope.name for o in plans if o is not plan and o.scope.workspace_id == plan.scope.workspace_id]
+        if sharing:
+            plan.notes.append(
+                f"shares MemTrace workspace {plan.scope.workspace_id} with {', '.join(sharing)}: the run history "
+                "recorded against that workspace is copied into each of their stores"
+            )
     return plans
 
 
@@ -258,7 +268,11 @@ def migrate_command(args: argparse.Namespace) -> int:
     for plan in plans:
         scope = plan.scope
         print(f"[{scope.name}] -> workspace {plan.root}")
-        print(f"    .harness.env: {len(plan.env)} settings, API on 127.0.0.1:{plan.api_port}")
+        preferences = [k for k in plan.env if k in MODEL_ENV_VARS]
+        print(
+            f"    .harness.env: {len(plan.env) - len(preferences)} settings, API on 127.0.0.1:{plan.api_port}; "
+            f"models.toml: {len(preferences)} preference(s)"
+        )
         print(f"    state: {plan.root / STATE_DIR_NAME}" + (f", roles from {plan.roles_source}" if plan.roles_source else ""))
         print(f"    telegram: {'service env ' + str(services / scope.name / 'telegram.env') if plan.telegram else 'none'}")
         for note in plan.notes:
@@ -271,16 +285,18 @@ def migrate_command(args: argparse.Namespace) -> int:
     for plan in plans:
         scope = plan.scope
         paths = init_workspace(plan.root)
-        if paths["env"].read_text(encoding="utf-8").count("=") > 0:
+        if paths["env"].read_text(encoding="utf-8").count("=") > 0 or paths["models"].is_file():
             raise RuntimeError(f"{paths['env']} already has settings; refusing to overwrite a workspace")
-        env = dict(plan.env)
+        env = {k: v for k, v in plan.env.items() if k not in MODEL_ENV_VARS}
+        preferences = {k: v for k, v in plan.env.items() if k in MODEL_ENV_VARS}
         if plan.roles_source is not None:
             roles_source = plan.roles_source if plan.roles_source.is_absolute() else base / plan.roles_source
             if roles_source.is_file():
-                shutil.copyfile(roles_source, paths["roles"])
-                env["HARNESS_ROLE_PROFILES_FILE"] = str(paths["roles"])
+                shutil.copyfile(roles_source, paths["roles"])  # found by its place, no setting needed
         write_env_updates(paths["env"], env)
-        memory_ws = env.get("HARNESS_MEMORY_WORKSPACE_ID", scope.workspace_id)
+        if preferences:
+            update_model_settings(paths["models"], preferences)
+        memory_ws = preferences.get("HARNESS_MEMORY_WORKSPACE_ID", scope.workspace_id)
         if old_db.is_file():
             _split_store(old_db, paths["db"], scope, memory_ws)
             copied = _move_traces(paths["db"], old_traces, paths["traces"])

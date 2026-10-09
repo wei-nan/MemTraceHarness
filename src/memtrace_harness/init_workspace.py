@@ -1,6 +1,7 @@
 """`memtrace-harness init-workspace`: make a folder into a Harness workspace.
 
-Writes `.harness.env` (settings and secrets for this Harness, mode 0600), `.harness/`, and — when
+Writes `.harness.env` (this Harness's environment: secrets, endpoints, CLI paths; mode 0600),
+`.harness/` with its `models.toml` (the preferences: which model chats, digests, recalls), and — when
 absent — `harness-scope.md`. The folder may be empty and need not be a git repository. An optional
 last step writes the Telegram service's own env file, outside the workspace.
 """
@@ -17,10 +18,14 @@ from pathlib import Path
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.workspace import (
     ENV_FILE_NAME,
+    MODEL_ENV_VARS,
     SCOPE_FILE_NAME,
     STATE_DIR_NAME,
     init_workspace,
+    models_file,
     parse_env_file,
+    read_model_settings,
+    update_model_settings,
     write_env_updates,
 )
 
@@ -125,7 +130,7 @@ def init_workspace_command(args: argparse.Namespace) -> int:
             raise ValueError("init-workspace needs a folder: memtrace-harness init-workspace <folder>")
         directory = Path(_prompt("工作區資料夾（可以是空的，不必是 git repo)")).expanduser()
     paths = init_workspace(Path(directory).expanduser())
-    existing = parse_env_file(paths["env"]) if paths["env"].is_file() else {}
+    existing = {**read_model_settings(paths["models"]), **(parse_env_file(paths["env"]) if paths["env"].is_file() else {})}
     name = args.name or paths["root"].name
     if interactive and not args.name:
         name = _prompt("專案名稱", default=name)
@@ -184,11 +189,17 @@ def init_workspace_command(args: argparse.Namespace) -> int:
         ):
             default_toml = Path(__file__).with_name("default-role-profiles.toml")
             paths["roles"].write_text(default_toml.read_text(encoding="utf-8"), encoding="utf-8")
-            updates["HARNESS_ROLE_PROFILES_FILE"] = str(paths["roles"])
-    if updates:
-        write_env_updates(paths["env"], updates)
-        print(f"\n已更新 {paths['env']}（權限 600）：{', '.join(k for k in updates if 'TOKEN' not in k)}"
-              + ("，並產生了 API token" if "HARNESS_API_TOKEN" in updates else ""))
+    if "HARNESS_ROLE_PROFILES_FILE" in updates:
+        del updates["HARNESS_ROLE_PROFILES_FILE"]  # .harness/roles.toml is found by its place
+    preferences = {k: v for k, v in updates.items() if k in MODEL_ENV_VARS}
+    environment = {k: v for k, v in updates.items() if k not in MODEL_ENV_VARS}
+    if environment:
+        write_env_updates(paths["env"], environment)
+        print(f"\n已更新 {paths['env']}（權限 600）：{', '.join(k for k in environment if 'TOKEN' not in k)}"
+              + ("，並產生了 API token" if "HARNESS_API_TOKEN" in environment else ""))
+    if preferences:
+        update_model_settings(models_file(paths["root"]), preferences)
+        print(f"已寫入 {models_file(paths['root'])}：{', '.join(preferences)}")
     merged = {**existing, **updates}
     api_port = int(merged["HARNESS_API_PORT"])
 

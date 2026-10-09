@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from memtrace_harness import admin
 from memtrace_harness.scope import ProjectScope
-from memtrace_harness.workspace import ENV_FILE_NAME, parse_env_file
+from memtrace_harness.workspace import models_file, parse_env_file, read_model_settings
 from tests.workspace_support import workspace
 
 PROFILES = (
@@ -81,7 +81,7 @@ class DedicatedRoleProfilesTests(TestCase):
             self.assertEqual(dest, root.resolve() / ".harness" / "roles.toml")
             self.assertIn("[profiles.controller]", dest.read_text(encoding="utf-8"))
             self.assertEqual(config.role_profiles_file_for(), dest)  # live, no restart
-            self.assertEqual(parse_env_file(root / ENV_FILE_NAME)["HARNESS_ROLE_PROFILES_FILE"], str(dest))
+            self.assertNotIn("HARNESS_ROLE_PROFILES_FILE", parse_env_file(root / ".harness.env"))  # found by its place
             with self.assertRaises(ValueError):
                 admin.create_dedicated_role_profiles_file(config)
 
@@ -93,16 +93,17 @@ class ModelSettingTests(TestCase):
     def test_chat_model_is_written_and_effective_without_a_restart(self) -> None:
         with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"}) as (root, config):
             admin.update_chat_model(config, "antigravity", "gemini-3.8-flash-high")
-            saved = parse_env_file(root / ENV_FILE_NAME)
+            saved = read_model_settings(models_file(root))
             self.assertEqual((saved["HARNESS_CHAT_PROVIDER"], saved["HARNESS_CHAT_MODEL"]), ("antigravity", "gemini-3.8-flash-high"))
+            self.assertNotIn("HARNESS_CHAT_MODEL", parse_env_file(root / ".harness.env") if (root / ".harness.env").is_file() else {})
             self.assertEqual(config.chat_candidates_for()[0], ("antigravity", "gemini-3.8-flash-high"))
 
     def test_digest_and_recall_models_leave_chat_alone(self) -> None:
         with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"}) as (root, config):
             admin.update_digest_model(config, "claude", "sonnet")
             admin.update_recall_model(config, "claude", "claude-sonnet-5-5")
-            saved = parse_env_file(root / ENV_FILE_NAME)
-            self.assertEqual(saved["HARNESS_CHAT_MODEL"], "haiku")
+            saved = read_model_settings(models_file(root))
+            self.assertEqual(saved["HARNESS_CHAT_MODEL"], "haiku")  # the chat choice is still the one it was
             self.assertEqual(config.digest_candidates_for()[0], ("claude", "sonnet"))
             self.assertEqual(config.recall_candidates_for()[0], ("claude", "claude-sonnet-5-5"))
 

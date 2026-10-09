@@ -495,6 +495,13 @@ class HarnessService:
             f"被回覆的訊息：\n「{shown}」\n\n"
         )
 
+    def resolve_approval(
+        self, request_id: str, action: str, *, audience: str | None = None, answer: str | None = None
+    ) -> str:
+        """Approve, reject or clarify a pending request — the one door a text command, a button, a reply
+        and the status page all go through."""
+        return self._resolve_approval_action(request_id, action, audience, answer)
+
     def _resolve_approval_action(
         self,
         request_id: str,
