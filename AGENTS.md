@@ -7,7 +7,10 @@ work; do not report policy-only behavior as implemented.
 Hard project boundaries:
 
 - Claude, Codex, and Antigravity model execution is CLI-only. Do not add provider HTTP clients,
-  SDKs, endpoints, or provider API-key configuration.
+  SDKs, endpoints, or provider API-key configuration. The one exception (operator decision,
+  2026-10-10): a read-only `GET /v1/models` for the status page's Claude model menu, with a key
+  (`HARNESS_MODEL_LIST_ANTHROPIC_KEY`) that is used for nothing else — see "Model list key" in
+  the operating contract.
 - `MemTraceClient` is only the MemTrace MCP control-plane client; it is not a model transport.
 - Preserve raw provider output in the local trace store and write only summaries/references to
   MemTrace.

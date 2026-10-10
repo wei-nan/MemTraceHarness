@@ -250,6 +250,49 @@ def load_workspace(root: Path | str, *, environ: dict[str, str] | None = None) -
     return root_path
 
 
+# Belongs to MemTraceHarness itself rather than to one workspace: the one secret every Harness may
+# share. Only MODEL_LIST_KEY_VAR is ever read from it, on demand and never into the process
+# environment; a workspace's own `.harness.env` line for the same variable wins.
+GLOBAL_SECRETS_ENV = "HARNESS_GLOBAL_SECRETS_FILE"
+MODEL_LIST_KEY_VAR = "HARNESS_MODEL_LIST_ANTHROPIC_KEY"
+
+
+def global_secrets_file() -> Path:
+    override = os.environ.get(GLOBAL_SECRETS_ENV)
+    return Path(override).expanduser() if override else Path.home() / ".memtrace-harness" / "secrets.env"
+
+
+def model_list_key(workspace_root: Path | None) -> str | None:
+    """The Anthropic key allowed to list models (nothing else): the workspace's `.harness.env` /
+    the environment first, then the global secrets file. Returned, never stored or logged."""
+    value = os.environ.get(MODEL_LIST_KEY_VAR)
+    if not value and workspace_root is not None:
+        env_file = workspace_root / ENV_FILE_NAME
+        if env_file.is_file():
+            value = parse_env_file(env_file).get(MODEL_LIST_KEY_VAR)
+    if not value:
+        path = global_secrets_file()
+        if path.is_file():
+            try:
+                value = parse_env_file(path).get(MODEL_LIST_KEY_VAR)
+            except OSError:
+                value = None
+    return value.strip() or None if value else None
+
+
+def global_secrets_problems() -> list[str]:
+    path = global_secrets_file()
+    if not path.is_file():
+        return []
+    problems = []
+    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        problems.append(f"{path} is readable by other users; run: chmod 600 {path}")
+    for key in parse_env_file(path):
+        if key != MODEL_LIST_KEY_VAR:
+            problems.append(f"{path.name} only takes {MODEL_LIST_KEY_VAR}; {key} is ignored")
+    return problems
+
+
 def env_file_problems(root: Path) -> list[str]:
     """Things wrong with a workspace's env file that the operator should know about."""
     env_file = workspace_paths(root)["env"]

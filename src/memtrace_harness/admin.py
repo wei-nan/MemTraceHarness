@@ -31,16 +31,18 @@ def merge_model_catalog(config: HarnessConfig, configured: dict[str, set[str]]) 
     """What each provider CLI currently offers (newest first, see model_catalog.py),
     followed by anything configured here that the catalog doesn't list. A catalog
     failure only means the menu falls back to the configured models."""
-    from memtrace_harness.model_catalog import provider_models
+    from memtrace_harness.model_catalog import extra_models, provider_models
 
     try:
         catalog = provider_models(config)
     except Exception:
         logger.exception("model catalog lookup failed; using configured models only")
         catalog = {}
+    extras = extra_models(config.workspace_root)
     merged: dict[str, list[str]] = {}
     for provider, models in configured.items():
         offered = list(catalog.get(provider) or [])
+        offered += [m for m in extras.get(provider, []) if m not in offered]
         merged[provider] = offered + sorted(m for m in models if m not in offered)
     return merged
 
@@ -125,8 +127,10 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                     "id": profile_id,
                     "provider": profile.provider,
                     "model": profile.model,
+                    "reasoning_effort": profile.reasoning_effort,
                     "fallbacks": [
-                        {"provider": f.provider, "model": f.model} for f in profile.fallbacks
+                        {"provider": f.provider, "model": f.model, "reasoning_effort": f.reasoning_effort}
+                        for f in profile.fallbacks
                     ],
                 }
                 for profile_id, profile in role_profiles.items()
@@ -395,6 +399,129 @@ def update_role_profile(config: HarnessConfig, profile_id: str, provider: str, m
         raise ValueError(f"profile {profile_id!r} in {path} has no model line to update")
 
     path.write_text(text[:body_start] + new_block + text[body_end:], encoding="utf-8")
+
+
+def _check_chain(chain: object) -> list[dict]:
+    if not isinstance(chain, list) or not chain:
+        raise ValueError("the chain needs at least a primary model")
+    out = []
+    for item in chain:
+        if not isinstance(item, dict):
+            raise ValueError("malformed chain entry")
+        provider, model = str(item.get("provider", "")), str(item.get("model", "")).strip()
+        _check_model(provider, model)
+        if '"' in model or "\n" in model:
+            raise ValueError("model must have no quotes or newlines")
+        out.append({"provider": provider, "model": model, "reasoning_effort": str(item.get("reasoning_effort") or "")})
+    return out
+
+
+def _remember(config: HarnessConfig, chain: list[dict]) -> None:
+    from memtrace_harness.model_catalog import remember_models
+
+    remember_models(config.workspace_root, [(c["provider"], c["model"]) for c in chain])
+
+
+def update_model_chain(config: HarnessConfig, target: str, chain: object) -> None:
+    """Set the whole ordered chain (primary + any number of fallbacks) for `chat`, `digest` or
+    `recall` in one go. Empty fallbacks are a real value: they clear the chain."""
+    if target not in ("chat", "digest", "recall"):
+        raise ValueError(f"unknown model target {target!r}")
+    entries = _check_chain(chain)
+    prefix = f"HARNESS_{target.upper()}"
+    fallbacks = ",".join(f"{c['provider']}/{c['model']}" for c in entries[1:])
+    _apply(config, {
+        f"{prefix}_PROVIDER": entries[0]["provider"],
+        f"{prefix}_MODEL": entries[0]["model"],
+        f"{prefix}_FALLBACKS": fallbacks,
+    })
+    _remember(config, entries)
+
+
+def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: object) -> None:
+    """Rewrite one role's primary model and its whole fallback list (any number), keeping the
+    rest of the file — comments, other roles, the role's other settings — as written. The result
+    is validated as a role-profiles file before anything is written."""
+    import tomllib
+
+    from memtrace_harness.role_profiles import _validate_provider_effort, load_role_profiles
+
+    entries = _check_chain(chain)
+    path = config.role_profiles_file_for()
+    if path is None:
+        raise ValueError(
+            "this workspace has no roles file of its own yet (it uses the packaged default, shared "
+            "by every Harness) — give it one first with the 獨立出去 button or "
+            "`memtrace-harness roles-independent`"
+        )
+    text = path.read_text(encoding="utf-8")
+    header = f"[profiles.{profile_id}]"
+    start = text.find(header)
+    if start == -1:
+        raise ValueError(f"profile {profile_id!r} not found in {path}")
+    body_start = start + len(header)
+    fb_header = f"[[profiles.{profile_id}.fallbacks]]"
+    # This role's section = from its header up to the next table that is not its own fallbacks.
+    end = len(text)
+    for m in re.finditer(r"(?m)^\[+[^\]]+\]+", text[body_start:]):
+        if m.group(0) != fb_header:
+            end = body_start + m.start()
+            break
+    section = text[body_start:end]
+    fb_at = section.find(fb_header)
+    primary = section if fb_at == -1 else section[:fb_at]
+    old = tomllib.loads(text).get("profiles", {}).get(profile_id, {})
+    old_fallbacks = old.get("fallbacks", [])
+    old_effort = old
+
+    first = entries[0]
+    effort = first["reasoning_effort"] or str(old_effort.get("reasoning_effort") or "medium")
+    _validate_provider_effort(profile_id, first["provider"], effort)
+    for key, value in (("provider", first["provider"]), ("model", first["model"]), ("reasoning_effort", effort)):
+        primary, n = re.subn(rf'(?m)^{key}\s*=\s*"[^"]*"', f'{key} = "{value}"', primary, count=1)
+        if not n:
+            raise ValueError(f"profile {profile_id!r} has no {key} line to update")
+    # The primary's quota bucket follows its provider unless it names something unrelated.
+    primary = re.sub(
+        r'(?m)^quota_bucket\s*=\s*"[^"]*"',
+        f'quota_bucket = "{first["provider"]}-account"',
+        primary,
+        count=1,
+    )
+    fallbacks = entries[1:]
+    hops = len(fallbacks)
+    if re.search(r"(?m)^max_fallback_hops\s*=", primary):
+        primary = re.sub(r"(?m)^max_fallback_hops\s*=.*$", f"max_fallback_hops = {hops}", primary, count=1)
+    elif hops:
+        primary = primary.rstrip("\n") + f"\nmax_fallback_hops = {hops}\n"
+    if hops and not re.search(r"(?m)^fallback_on\s*=", primary):
+        primary = primary.rstrip("\n") + '\nfallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]\n'
+    blocks = ""
+    for index, fb in enumerate(fallbacks):
+        keep = next((o for o in old_fallbacks if o.get("provider") == fb["provider"]), {})
+        fb_effort = fb["reasoning_effort"] or str(keep.get("reasoning_effort") or "medium")
+        _validate_provider_effort(f"{profile_id}.fallbacks[{index}]", fb["provider"], fb_effort)
+        blocks += (
+            f'\n{fb_header}\nprovider = "{fb["provider"]}"\nmodel = "{fb["model"]}"\n'
+            f'reasoning_effort = "{fb_effort}"\nquota_bucket = "{fb["provider"]}-account"\n'
+        )
+    primary = primary.rstrip("\n") + "\n"
+    candidate = text[:body_start] + primary + blocks + (("\n" + text[end:]) if end < len(text) else "")
+    # Validate the whole file as the loader would before replacing the live one.
+    check = path.with_name(path.name + ".check")
+    check.write_text(candidate, encoding="utf-8")
+    try:
+        load_role_profiles(check)
+    finally:
+        check.unlink(missing_ok=True)
+    path.write_text(candidate, encoding="utf-8")
+    _remember(config, entries)
+
+
+def refresh_model_catalog() -> None:
+    from memtrace_harness.model_catalog import clear_cache
+
+    clear_cache()
 
 
 def create_dedicated_role_profiles_file(config: HarnessConfig) -> Path:

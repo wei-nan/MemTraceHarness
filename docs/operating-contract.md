@@ -59,6 +59,21 @@ a change that needs two repos is split into two tasks by the Controller/chat, no
 **Not implemented:** one task editing two repos; read access to other repos for Codex/Antigravity roles; jobs and ops
 tools are the primary repo's only.
 
+## Model list key (operator decision, 2026-10-10)
+
+Claude Code cannot list its models, so the status page's Claude menu may ask Anthropic's Models endpoint.
+**ENFORCED** (`tests/test_model_catalog.py`):
+
+- The only provider HTTP call in the Harness is `GET https://api.anthropic.com/v1/models`, made from
+  `model_catalog.py`. Model execution stays CLI-only; the key is never used for inference.
+- The key is `HARNESS_MODEL_LIST_ANTHROPIC_KEY`, looked up in the real environment, then the workspace's
+  `.harness.env`, then the Harness-wide `~/.memtrace-harness/secrets.env` (mode 0600; `HARNESS_GLOBAL_SECRETS_FILE`
+  relocates it). That file takes this one variable only, and it is read on demand, never copied into the
+  process environment; `child_env` drops it, so no model CLI ever sees it. It is not logged or shown on the
+  status page, and `doctor` checks the file's mode and stray keys.
+- No key, or a failed call, falls back to the built-in list plus models added by hand
+  (`.harness/extra_models.json`); nothing else depends on it.
+
 ## Authority and memory routing
 
 The Harness uses three authoritative memory planes:
