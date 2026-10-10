@@ -112,6 +112,8 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         chat_candidates = config.chat_candidates_for(scope.name)
         digest_candidates = config.digest_candidates_for(scope.name)
         digest_is_own = bool(os.getenv("HARNESS_DIGEST_PROVIDER") or config.digest_provider)
+        archive_candidates = config.archive_candidates_for(scope.name)
+        archive_is_own = bool(os.getenv("HARNESS_ARCHIVE_PROVIDER") or config.archive_provider)
         recall_candidates = config.recall_candidates_for(scope.name)
         recall_is_own = bool(os.getenv("HARNESS_RECALL_PROVIDER") or config.recall_provider)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -138,7 +140,7 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         except Exception as exc:
             role_profiles_error = str(exc)
 
-        for provider, model in (*chat_candidates, *digest_candidates, *recall_candidates):
+        for provider, model in (*chat_candidates, *digest_candidates, *archive_candidates, *recall_candidates):
             if provider in known_models and model:
                 known_models[provider].add(model)
         for entry in role_profiles_entries or []:
@@ -175,6 +177,10 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                     {"provider": p, "model": m or None} for p, m in digest_candidates
                 ],
                 "digest_is_own": digest_is_own,
+                "archive_candidates": [
+                    {"provider": p, "model": m or None} for p, m in archive_candidates
+                ],
+                "archive_is_own": archive_is_own,
                 "recall_candidates": [
                     {"provider": p, "model": m or None} for p, m in recall_candidates
                 ],
@@ -423,9 +429,9 @@ def _remember(config: HarnessConfig, chain: list[dict]) -> None:
 
 
 def update_model_chain(config: HarnessConfig, target: str, chain: object) -> None:
-    """Set the whole ordered chain (primary + any number of fallbacks) for `chat`, `digest` or
-    `recall` in one go. Empty fallbacks are a real value: they clear the chain."""
-    if target not in ("chat", "digest", "recall"):
+    """Set the whole ordered chain (primary + any number of fallbacks) for `chat`, `digest`,
+    `archive` or `recall` in one go. Empty fallbacks are a real value: they clear the chain."""
+    if target not in ("chat", "digest", "archive", "recall"):
         raise ValueError(f"unknown model target {target!r}")
     entries = _check_chain(chain)
     prefix = f"HARNESS_{target.upper()}"

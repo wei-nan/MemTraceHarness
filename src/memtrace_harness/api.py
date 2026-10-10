@@ -253,7 +253,7 @@ class _Handler(BaseHTTPRequestHandler):
                 admin.update_role_profile(config, str(body["profile_id"]), str(body["provider"]), str(body["model"]))
             elif setting == "role-profile-chain":
                 admin.update_role_profile_chain(config, str(body["profile_id"]), body["chain"])
-            elif setting in ("chat-chain", "digest-chain", "recall-chain"):
+            elif setting in ("chat-chain", "digest-chain", "archive-chain", "recall-chain"):
                 admin.update_model_chain(config, setting.split("-")[0], body["chain"])
             elif setting == "model-catalog-refresh":
                 admin.refresh_model_catalog()

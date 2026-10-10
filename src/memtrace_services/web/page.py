@@ -376,6 +376,11 @@ function renderDigestCandidates(project) {
     project.digest_is_own ? "" : "尚未獨立設定，目前沿用聊天模型；儲存後摘要才會改用自己的模型。");
 }
 
+function renderArchiveCandidates(project) {
+  return renderChain(project, "archive", project.archive_candidates, "（未設定）",
+    project.archive_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型；儲存後記憶整理才會改用自己的模型。");
+}
+
 function renderRoleProfiles(project) {
   if (project.role_profiles_error) {
     return '<div class="warn">⚠️ role-profiles 讀取失敗：' + esc(project.role_profiles_error) + "</div>";
@@ -815,6 +820,7 @@ function renderModelSettings(project) {
     + '沒列出的選「— 自訂 —」輸入名稱，之後所有選單都會記住。 <button class="catalog-refresh" onclick="refreshModelCatalog(this)">重新抓取模型清單</button></div>' +
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
+    '<div class="section-label">記憶整理模型（夜間分題、每週審查、重建）</div>' + renderArchiveCandidates(project) +
     '<div class="section-label">背景回想模型</div>' + renderRecallCandidates(project) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project) +
     "</details>";

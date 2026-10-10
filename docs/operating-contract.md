@@ -142,6 +142,11 @@ every Harness, because it is how the shared code works, not a per-project settin
   yesterday, a day it was down for, history from before this existed — oldest first, at most 7 days per
   project per night (a longer backlog is worked off over several nights). No operator action is needed;
   `memory-topics` only runs the same step by hand.
+- *The model* for all of this (the nightly split, the weekly review, a rebuild) is the project's own
+  **memory-archive chain** (`[archive]` in `.harness/models.toml`, chosen on the status page like the chat,
+  digest and recall chains); with none configured it follows the digest chain. A configured chain is used as
+  given and never degrades into a weaker one. The call has no tools: it is shown the day's log and the matters
+  already known, and the Harness does every write.
 - ENFORCED in code: every item cites turns that exist in that day's log, or it is dropped; a matter
   the model says continues an existing one must name an existing one; a failed model call or
   MemTrace write marks nothing archived and the next pass retries (days are caught up in order, so a

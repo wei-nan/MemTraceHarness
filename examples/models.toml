@@ -13,6 +13,13 @@ model = "haiku"
 # model = "sonnet"
 # fallbacks = ["codex/gpt-6"]
 
+# Memory archive: the nightly split of a day into matters, the weekly matter review and rebuilds
+# (see "Memory archive" in docs/operating-contract.md). Unset = reuse the digest model.
+# [archive]
+# provider = "claude"
+# model = "claude-opus-5-5"
+# fallbacks = ["codex/gpt-6"]
+
 # Background topic recall (finds earlier discussion of the current topic; see
 # docs/operating-contract.md). Unset = reuse the digest model.
 # [recall]
