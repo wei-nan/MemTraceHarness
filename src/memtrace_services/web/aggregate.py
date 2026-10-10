@@ -30,11 +30,18 @@ class HarnessTarget:
 class Changes:
     """Version counter + condition: every SSE connection waits for it to move."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_publish=None) -> None:
         self._condition = threading.Condition()
         self._version = 0
+        self._on_publish = on_publish
 
     def publish(self) -> None:
+        # Before anyone is woken: whoever wakes up must read fresh data, not the answer cached
+        # an instant ago (a save looked up the project's Harness, which cached the page's data
+        # just before the change it announces — the page then showed the old settings until the
+        # next heartbeat).
+        if self._on_publish is not None:
+            self._on_publish()
         with self._condition:
             self._version += 1
             self._condition.notify_all()
@@ -48,10 +55,14 @@ class Changes:
 class Aggregator:
     def __init__(self, targets: list[HarnessTarget]) -> None:
         self.targets = targets
-        self.changes = Changes()
         self._cache: tuple[float, dict] | None = None
         self._lock = threading.Lock()
+        self.changes = Changes(on_publish=self._invalidate)
         self._stop = threading.Event()
+
+    def _invalidate(self) -> None:
+        with self._lock:
+            self._cache = None
 
     # ---- reading
     def collect(self) -> dict[str, Any]:

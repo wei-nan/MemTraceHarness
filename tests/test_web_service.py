@@ -103,6 +103,24 @@ class WebServiceTests(TestCase):
         self.assertEqual(len({r["uid"] for r in adopted}), len(adopted))
         self.assertTrue(all(r["uid"].startswith(r["harness"] + ":") for r in adopted))
 
+    def test_a_save_is_visible_at_once_not_after_the_cached_answer_expires(self) -> None:
+        # The POST looks up the project's Harness (which caches the page's data for a second), then
+        # announces the change; what the page is pushed next must already show the save.
+        _, _, a = self._harness("alpha", "ta")
+        aggregator, base = self._web([a])
+        before = aggregator.collect()["projects"][0]
+        self.assertFalse(before["archive_is_own"])
+
+        status, _ = self._post(base, "/api/archive-chain", {
+            "project": "alpha",
+            "chain": [{"provider": "claude", "model": "opus"}, {"provider": "codex", "model": "gpt-5.6-sol"}],
+        })
+
+        self.assertEqual(status, 200)
+        after = aggregator.collect()["projects"][0]
+        self.assertTrue(after["archive_is_own"])
+        self.assertEqual([c["model"] for c in after["archive_candidates"]], ["opus", "gpt-5.6-sol"])
+
     def test_the_config_lists_the_harnesses(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "web.toml"
