@@ -456,3 +456,11 @@ harness-side per-order value limit applies on top of TaiwanTrade's own risk limi
 (`HARNESS_TAIWANTRADE_MAX_ORDER_VALUE`, default 100000 TWD). The API key needs TaiwanTrade's `trade`
 scope. The model can also propose **cancelling** an order (`request_order_cancel`), confirmed the same
 way (the Harness, not the model, sends the `DELETE`). Amending an order is not available.
+
+- **Reorganising memory** (same night pass, by the Harness itself): old hourly `Draft: …` nodes are moved to the
+  MemTrace trash once every day they span is archived into matters; once a week a model reviews the matters and may
+  merge two that are one subject, retitle one, or mark a finished one resolved (the Harness validates every change,
+  and the report carries a one-tap undo). `memory-reorg --review [--dry-run] | --retire-drafts | --undo RUN` runs
+  these by hand; `memory-topics --rebuild` derives all matters again from the local log (old notes are trashed only
+  after the new set is written; an interrupted rebuild resumes). Only the Harness's own notes are touched, every
+  removal is a soft delete.
