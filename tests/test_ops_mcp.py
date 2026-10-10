@@ -137,19 +137,22 @@ class ScopeAndSpecTests(unittest.TestCase):
         ctx = self._ctx(working_directory=tmp)
         self.assertEqual(ctx.tool_names(), {"propose_scope_change"})
 
-    def test_propose_github_issue_records_a_request_and_refuses_other_repos(self) -> None:
+    def test_propose_github_action_records_a_request_and_refuses_other_repos(self) -> None:
         ctx = self._ctx(github_repos=["wei-nan/Beri"])
-        self.assertIn("propose_github_issue", ctx.tool_names())
-        self.assertNotIn("propose_github_issue", self._ctx().tool_names())  # no repos declared: no tool
-        text = call_tool(ctx, "propose_github_issue", {"repo": "wei-nan/Beri", "title": "T", "body": "B"})
-        self.assertIn("only after they tap", text)
-        call_tool(ctx, "propose_github_issue", {"repo": "wei-nan/Beri", "title": "T", "body": "B"})  # repeat
+        self.assertIn("propose_github_action", ctx.tool_names())
+        self.assertNotIn("propose_github_action", self._ctx().tool_names())  # no repos declared: no tool
+        args = {"action": "issue_close", "repo": "wei-nan/Beri", "number": "140", "comment": "ok"}
+        self.assertIn("only after they tap", call_tool(ctx, "propose_github_action", args))
+        call_tool(ctx, "propose_github_action", args)  # repeat: still one row
         pending = ctx.store.claim_pending_job_requests(["P"])
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["kind"], "github_issue")
-        self.assertEqual(pending[0]["payload"], {"repo": "wei-nan/Beri", "title": "T", "body": "B"})
-        with self.assertRaises(OpsError):
-            call_tool(ctx, "propose_github_issue", {"repo": "evil/repo", "title": "T", "body": "B"})
+        self.assertEqual(pending[0]["kind"], "external_action")
+        self.assertEqual(pending[0]["payload"]["number"], 140)
+        for bad in (
+            {**args, "repo": "evil/repo"}, {**args, "action": "pr_merge"}, {**args, "number": "x"},
+        ):
+            with self.assertRaises(OpsError):
+                call_tool(ctx, "propose_github_action", bad)
 
 
 if __name__ == "__main__":

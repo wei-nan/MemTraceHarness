@@ -85,33 +85,3 @@ class ScopeChangeTests(TestCase):
         self.assertEqual(scope.log_files, ["logs/x.log"])
         self.assertEqual(scope.jobs, {"old": "echo new"})
         self.assertIn("# Harness scope", self.file.read_text())
-
-
-class GithubIssueValidationTests(TestCase):
-    ALLOWED = ["wei-nan/Beri", "wei-nan/beri-android"]
-
-    def test_only_the_projects_own_repos_are_accepted(self) -> None:
-        from memtrace_harness.scope import validate_github_issue
-
-        ok = validate_github_issue(self.ALLOWED, "WEI-NAN/beri-android", " T ", " body ")
-        self.assertEqual(ok, {"repo": "wei-nan/beri-android", "title": "T", "body": "body"})
-        for args in [
-            ("someone/else", "t", "b"), ("", "t", "b"), ("wei-nan/Beri", "", "b"),
-            ("wei-nan/Beri", "a\nb", "b"), ("wei-nan/Beri", "t", ""),
-            ("wei-nan/Beri", "x" * 201, "b"), ("wei-nan/Beri", "t", "x" * 8001),
-        ]:
-            with self.subTest(args=args), self.assertRaises(ValueError):
-                validate_github_issue(self.ALLOWED, *args)
-        with self.assertRaises(ValueError):
-            validate_github_issue([], "wei-nan/Beri", "t", "b")
-
-    def test_allowed_repos_come_from_the_scope_and_its_repos(self) -> None:
-        from memtrace_harness.scope import RepoScope, github_issue_repos
-
-        with TemporaryDirectory() as tmp:
-            scope_file = Path(tmp) / "harness-scope.md"
-            scope_file.write_text(f"- workspace_id: ws_x\n- working_directory: {tmp}\n- github_repo: wei-nan/Beri\n")
-            scope = ProjectScope.from_file(scope_file)
-            scope.repos = {"a": RepoScope(name="a", path=Path(tmp), github_repo="wei-nan/beri-android"),
-                           "b": RepoScope(name="b", path=Path(tmp))}
-            self.assertEqual(github_issue_repos(scope), ["wei-nan/Beri", "wei-nan/beri-android"])

@@ -74,14 +74,15 @@ from memtrace_harness.schedule import (
     spec_from_row,
 )
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
-from memtrace_harness.scope import (
-    ProjectScope,
-    apply_scope_change,
+from memtrace_harness.github_actions import (
+    ACTIONS,
+    build_argv,
+    detail_lines,
     github_issue_repos,
-    split_repo_goal,
-    validate_github_issue,
-    validate_scope_change,
+    summarize,
+    validate_action,
 )
+from memtrace_harness.scope import ProjectScope, apply_scope_change, split_repo_goal, validate_scope_change
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
@@ -762,17 +763,22 @@ class HarnessService:
                     "不按、按取消、或時間到都不會改。新增的 job 之後仍要再按一次確認才會執行。"
                 )
                 confirm_label = "✅ 確認新增"
-            elif job["kind"] == "github_issue":
-                issue = job["payload"] or {}
-                body = str(issue.get("body", ""))
-                shown = body[:2800] + (f"\n…（內文共 {len(body)} 字，這裡只顯示前 2800 字）" if len(body) > 2800 else "")
-                text = (
-                    f"📝 待確認開 GitHub 單（{job['project']}）\n"
-                    f"repo：{issue.get('repo')}\n標題：{issue.get('title')}\n\n{shown}\n\n"
-                    f"有效至：{job['expires_at']}\n"
-                    "這是模型提出的要求，還沒有開單。按「確認開單」才會建立；不按、按取消、或時間到都不會建立。"
+            elif job["kind"] == "external_action":
+                payload = job["payload"] or {}
+                spec = ACTIONS.get(payload.get("action"))
+                title = self._action_target_title(
+                    next((p for p in self.projects if p.name == job["project"]), None), payload
                 )
-                confirm_label = "✅ 確認開單"
+                details = "\n".join(detail_lines(payload))
+                if len(details) > 2800:
+                    details = details[:2800] + f"\n…（共 {len(details)} 字，這裡只顯示前 2800 字）"
+                text = (
+                    f"📝 待確認 GitHub 操作（{job['project']}）\n"
+                    f"{job['command']}" + (f"（{title}）" if title else "") + f"\n{details}\n\n"
+                    f"有效至：{job['expires_at']}\n"
+                    "這是模型提出的要求，還沒有執行。按確認才會執行；不按、按取消、或時間到都不會做。"
+                )
+                confirm_label = f"✅ 確認{spec.confirm_word if spec else '執行'}"
             else:
                 text = (
                     f"▶️ 待確認重跑工作（{job['project']}）\n"
@@ -792,7 +798,7 @@ class HarnessService:
             self.clear_actions(job["message_ref"])
             msg = {
                 "scope_change": f"⌛ 新增工具設定的要求已過期、沒有套用：{job['command']}",
-                "github_issue": f"⌛ 開單要求已過期、沒有建立：{job['command']}",
+                "external_action": f"⌛ GitHub 操作的要求已過期、沒有執行：{job['command']}",
             }.get(job["kind"], f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}")
             if job["message_ref"]:
                 self.notify_operator(msg)
@@ -813,7 +819,7 @@ class HarnessService:
             trace_store.finish_job_request(request_id, "cancelled")
             result = {
                 "scope_change": f"❌ 已取消，沒有套用：{job['command']}",
-                "github_issue": f"❌ 已取消，沒有開單：{job['command']}",
+                "external_action": f"❌ 已取消，沒有執行：{job['command']}",
             }.get(job["kind"], f"❌ 已取消，沒有執行：{job['job_name']}")
             self.send_message(audience, result)
             self._record_order_turn(job["project"], result)
@@ -824,8 +830,8 @@ class HarnessService:
             return f"這個要求已經是「{job['status']}」，沒有再執行。"
         if job["kind"] == "scope_change":
             return self._apply_scope_change(job, scope, audience)
-        if job["kind"] == "github_issue":
-            return self._create_github_issue(job, scope, audience)
+        if job["kind"] == "external_action":
+            return self._run_external_action(job, scope, audience)
         command = (scope.jobs or {}).get(job["job_name"])
         if command is None:
             trace_store.finish_job_request(request_id, "failed", {"error": "job no longer declared"})
@@ -868,29 +874,43 @@ class HarnessService:
         self._record_order_turn(job["project"], result)
         return result
 
-    def _create_github_issue(self, job: dict, scope: ProjectScope, audience: str | None) -> str:
-        """The human confirmed: re-validate against the project's own repos, then open the issue with `gh`
-        (argument list, no shell) and report its URL."""
+    @staticmethod
+    def _action_target_title(scope: ProjectScope | None, payload: dict) -> str | None:
+        """Best-effort title of the issue / PR an action points at, so the human can see what #N is."""
+        spec = ACTIONS.get(payload.get("action"))
+        if scope is None or spec is None or spec.view is None:
+            return None
+        try:
+            done = subprocess.run(
+                ["gh", spec.view, "view", str(payload.get("number")), "--repo", str(payload.get("repo")),
+                 "--json", "title", "--jq", ".title"],
+                cwd=scope.working_directory, capture_output=True, text=True, timeout=15,
+                stdin=subprocess.DEVNULL,
+            )
+            return (done.stdout.strip() or None) if done.returncode == 0 else None
+        except Exception:  # noqa: BLE001 — display only
+            return None
+
+    def _run_external_action(self, job: dict, scope: ProjectScope, audience: str | None) -> str:
+        """The human confirmed: re-validate against the project's own repos, then run the action's `gh`
+        argument list (never a shell) and report the result."""
         trace_store = self.approval_manager.trace_store
         try:
-            payload = job["payload"] or {}
-            issue = validate_github_issue(
-                github_issue_repos(scope), payload.get("repo"), payload.get("title"), payload.get("body")
-            )
+            payload = validate_action(github_issue_repos(scope), (job["payload"] or {}).get("action"), job["payload"] or {})
             done = subprocess.run(
-                ["gh", "issue", "create", "--repo", issue["repo"], "--title", issue["title"], "--body", issue["body"]],
-                cwd=scope.working_directory, capture_output=True, text=True, timeout=60,
+                build_argv(payload), cwd=scope.working_directory, capture_output=True, text=True, timeout=60,
                 stdin=subprocess.DEVNULL,
             )
             if done.returncode != 0:
                 raise RuntimeError((done.stderr or done.stdout or f"gh exited {done.returncode}").strip()[-300:])
-            url = (done.stdout or "").strip().splitlines()[-1] if (done.stdout or "").strip() else ""
+            lines = (done.stdout or "").strip().splitlines()
+            url = lines[-1] if lines and lines[-1].startswith("http") else ""
         except Exception as exc:  # noqa: BLE001 — report any failure to the human
             trace_store.finish_job_request(job["request_id"], "failed", {"error": str(exc)})
-            result = f"⚠️ 沒能開單：{job['command']}（{exc}）"
+            result = f"⚠️ 沒能執行：{job['command']}（{exc}）"
         else:
-            trace_store.finish_job_request(job["request_id"], "done", {"url": url})
-            result = f"✅ 已開單：{job['command']}\n{url}"
+            trace_store.finish_job_request(job["request_id"], "done", {"url": url} if url else None)
+            result = f"✅ 已完成：{summarize(payload)}" + (f"\n{url}" if url else "")
         self.send_message(audience, result)
         self._record_order_turn(job["project"], result)
         return result
@@ -1928,9 +1948,10 @@ class HarnessService:
             "需要的工具或 job 不存在時（例如要探測的主機不在清單、要讀的 log 沒列出、要啟動預覽服務），"
             "用 `propose_scope_change` 向使用者提出新增（probe_host／log_file／job），使用者按確認才會"
             "生效；說「已請你確認」，不要說已經加上，也不要叫使用者去改設定檔。確認後從你的下一則回覆起可用。\n"
-            "使用者要你開 GitHub issue（單）時，用 `propose_github_issue`（repo／標題／內文，內文寫清楚需求"
-            "與驗收）；它只是提出，使用者看過完整內容按「確認開單」才會建立。說「已請你確認」，不要說已經"
-            "開了，也不要試著用其他 GitHub 工具直接開單（沙盒沒有核准機制，一定會被拒絕）。\n"
+            "使用者要你對 GitHub 做任何寫入（開單、關單、重開、留言、調整標籤、在 PR 留言）時，用 "
+            "`propose_github_action`；它只是提出，使用者看過完整內容按確認才會執行。說「已請你確認」，不要說"
+            "已經做了；不要試著用其他 GitHub 工具直接寫入（沙盒沒有核准機制，一定會被拒絕）。開單的內文要寫清楚"
+            "需求與驗收。\n"
             "使用者要你做某件事（例如「開預覽」「讓我看頁面」「啟動服務」）而你的沙盒做不到時，先呼叫 "
             "`list_jobs` 看有沒有名稱或指令相符的 job（例如 preview_start），有就用 `run_job` 提出，"
             "並告訴使用者按「確認執行」後會收到網址；不要在沒查過 list_jobs 前就回答「做不到」或叫使用者自己"
