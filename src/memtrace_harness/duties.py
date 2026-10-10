@@ -98,29 +98,6 @@ def _make_chat_classifier(config: HarnessConfig, project_name: str, working_dire
     return classify
 
 
-TOPIC_TIMEOUT_SECONDS = 90
-
-
-def make_topic_namer(config: HarnessConfig, project_name: str):
-    """prompt -> the model's answer, through that project's chat candidates in order, in
-    a neutral directory. Used to give each cold-memory draft a subject as its title; an
-    error here only means the draft keeps the opener-based title."""
-    candidates = config.chat_candidates_for(project_name)
-    sandbox = (config.trace_root / "digest-workspace").resolve()
-
-    def call(prompt: str) -> str:
-        sandbox.mkdir(parents=True, exist_ok=True)
-        for provider, model in candidates:
-            result = CliProcessRunner().run(
-                config.chat_command(provider, model, prompt), cwd=sandbox, timeout_seconds=TOPIC_TIMEOUT_SECONDS
-            )
-            if result.return_code == 0 and result.stdout.strip():
-                return result.stdout
-        return ""
-
-    return call
-
-
 # How often the Harness loop checks whether a nightly memory digest is due. Cheap when
 # nothing is due (SQLite reads only); the digest itself runs in its own thread so a
 # multi-minute model call never stalls the Harness's own tick.
