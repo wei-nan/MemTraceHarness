@@ -250,6 +250,18 @@ not enforced:** that the model checks `list_jobs` first and only proposes what t
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
+**Opening GitHub issues from the chat (operator decision, 2026-10-10).** A chat model's own GitHub connector cannot
+create issues: `codex exec` runs with approval `never`, so every write tool call is refused. The chat instead calls
+`propose_github_issue` (repo, title, body), which only records a `job_requests` row of kind `github_issue`; the
+Harness shows the full repo, title and body with a "確認開單" button and runs `gh issue create` itself after the
+tap, reporting the URL. **Enforced:** the repo must be the project's `github_repo` or one of its repos' (no separate
+list to configure, checked at the proposal and again at the tap); title one line of at most 200 characters, body
+non-empty and at most 8000; `gh` is run with an argument list, never a shell; nothing is created before the tap;
+a double tap creates one issue; an unanswered request expires after 10 minutes; a project with no declared repo
+does not get the tool. **Prompt policy, not enforced:** that the model uses this tool instead of trying its own
+connector. The issue is created under the `gh` login of the account running the Harness; an unassigned open issue
+is then a scanner candidate like any other, and still needs the operator's approval to be worked on.
+
 **Orders proposed by the chat model (explicit operator decision, 2026-10-05).** For a project
 listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a limit order
 (`create_order_intent`); a human must confirm it. ENFORCED in code: the tool only creates a

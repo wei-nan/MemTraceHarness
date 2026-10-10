@@ -373,3 +373,33 @@ def _append_line(lines: list[str], new_line: str) -> list[str]:
     while trimmed and trimmed[-1] == "":
         trimmed.pop()
     return [*trimmed, new_line, ""]
+
+
+# ---- GitHub issues the chat model proposes to open (see ops_mcp.propose_github_issue). Which repos are
+# allowed is not configured separately: it is the project's own `github_repo` plus its repos' `github_repo`.
+MAX_ISSUE_TITLE_CHARS = 200
+MAX_ISSUE_BODY_CHARS = 8000
+_GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+
+
+def github_issue_repos(scope: "ProjectScope") -> list[str]:
+    repos = [scope.github_repo, *(repo.github_repo for repo in scope.repos.values())]
+    return [repo for repo in dict.fromkeys(repos) if repo]
+
+
+def validate_github_issue(allowed: list[str], repo: str | None, title: str | None, body: str | None) -> dict[str, str]:
+    """The normalized issue, or ValueError. Run again when the human confirms."""
+    wanted = (repo or "").strip()
+    match = next((a for a in allowed if a.lower() == wanted.lower()), None)
+    if not _GITHUB_REPO.match(wanted) or match is None:
+        raise ValueError(f"repo must be one of: {', '.join(allowed) or '(none declared)'}")
+    clean_title, clean_body = (title or "").strip(), (body or "").strip()
+    if not clean_title or "\n" in clean_title or "\r" in clean_title:
+        raise ValueError("title must be one non-empty line")
+    if len(clean_title) > MAX_ISSUE_TITLE_CHARS:
+        raise ValueError(f"title is longer than {MAX_ISSUE_TITLE_CHARS} characters")
+    if not clean_body:
+        raise ValueError("body must not be empty")
+    if len(clean_body) > MAX_ISSUE_BODY_CHARS:
+        raise ValueError(f"body is longer than {MAX_ISSUE_BODY_CHARS} characters")
+    return {"repo": match, "title": clean_title, "body": clean_body}

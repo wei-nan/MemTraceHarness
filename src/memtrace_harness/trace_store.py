@@ -3179,6 +3179,28 @@ class TraceStore:
         out["payload"] = json.loads(row[9]) if row[9] else None
         return out
 
+    def create_github_issue_request(
+        self, *, request_id: str, project: str, issue: dict, expires_at: str
+    ) -> bool:
+        """A GitHub issue the chat model proposed, waiting for the human. A repeat of the same pending
+        proposal (same repo and title) is accepted without a second row."""
+        now = utc_now_iso()
+        key = f"issue:{issue['repo']}:{issue['title']}"
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? AND kind = 'github_issue' "
+                "AND status IN ('pending', 'awaiting')",
+                (project, key),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at, kind, payload_json) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'github_issue', ?)",
+                (request_id, project, key, f"{issue['repo']}：{issue['title']}", expires_at, now, now,
+                 json.dumps(issue, ensure_ascii=False)),
+            ).rowcount > 0
+
     def create_scope_change_request(
         self, *, request_id: str, project: str, change: dict, summary: str, expires_at: str
     ) -> bool:

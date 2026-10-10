@@ -468,6 +468,52 @@ class HarnessServiceTests(TestCase):
         # A second tap cannot apply it again.
         self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "scope_1", 12345, 78))
 
+    def test_a_github_issue_is_created_only_after_the_human_confirms(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.github_repo = "wei-nan/Beri"
+        gateway.send_message = MagicMock()
+        gateway.send_message_with_keyboard = MagicMock(return_value=79)
+        gateway.clear_message_keyboard = MagicMock()
+        store.create_github_issue_request(
+            request_id="issue_1", project=scope.name,
+            issue={"repo": "wei-nan/Beri", "title": "T", "body": "B"}, expires_at="2999-01-01T00:00:00+00:00",
+        )
+        with patch("memtrace_harness.service.subprocess.run") as run:
+            gateway.process_job_requests()
+            self.assertIn("確認開單", str(gateway.send_message_with_keyboard.call_args))
+            run.assert_not_called()  # shown, not created
+            run.return_value = MagicMock(returncode=0, stdout="https://github.com/wei-nan/Beri/issues/9\n", stderr="")
+            result = gateway._resolve_job_action("job_confirm", "issue_1", 12345, 79)
+            command = run.call_args.args[0]
+            self.assertEqual(command[:5], ["gh", "issue", "create", "--repo", "wei-nan/Beri"])
+            self.assertFalse(run.call_args.kwargs.get("shell"))
+            self.assertIn("issues/9", result)
+            self.assertEqual(store.get_job_request("issue_1")["status"], "done")
+            run.reset_mock()
+            self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "issue_1", 12345, 79))
+            run.assert_not_called()  # a second tap cannot open a second issue
+
+    def test_a_github_issue_for_a_repo_no_longer_allowed_is_not_created(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.github_repo = None
+        gateway.send_message = MagicMock()
+        gateway.clear_message_keyboard = MagicMock()
+        store.create_github_issue_request(
+            request_id="issue_2", project=scope.name,
+            issue={"repo": "wei-nan/Beri", "title": "T", "body": "B"}, expires_at="2999-01-01T00:00:00+00:00",
+        )
+        store.transition_job_request("issue_2", ("pending",), "awaiting")
+        with patch("memtrace_harness.service.subprocess.run") as run:
+            gateway._resolve_job_action("job_confirm", "issue_2", 12345, None)
+            run.assert_not_called()
+        self.assertEqual(store.get_job_request("issue_2")["status"], "failed")
+
     def test_a_cancelled_scope_change_changes_nothing(self) -> None:
         from unittest.mock import MagicMock
 
