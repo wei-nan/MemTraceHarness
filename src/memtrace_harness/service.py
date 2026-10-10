@@ -74,7 +74,7 @@ from memtrace_harness.schedule import (
     spec_from_row,
 )
 from memtrace_harness.schemas import ContextItem, TaskEnvelope
-from memtrace_harness.scope import split_repo_goal
+from memtrace_harness.scope import ProjectScope, apply_scope_change, split_repo_goal, validate_scope_change
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
@@ -746,14 +746,25 @@ class HarnessService:
         """Harness tick: put newly requested jobs in front of the human; close the unanswered."""
         trace_store = self.approval_manager.trace_store
         for job in trace_store.claim_pending_job_requests([p.name for p in self.projects]):
-            text = (
-                f"▶️ 待確認重跑工作（{job['project']}）\n"
-                f"{job['job_name']}：{job['command']}\n"
-                f"有效至：{job['expires_at']}\n\n"
-                "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
-            )
+            if job["kind"] == "scope_change":
+                text = (
+                    f"🔧 待確認新增工具設定（{job['project']}）\n"
+                    f"{job['command']}\n"
+                    f"有效至：{job['expires_at']}\n\n"
+                    "這是模型提出的要求，還沒有套用。按「確認新增」才會寫進專案的 harness-scope.md；"
+                    "不按、按取消、或時間到都不會改。新增的 job 之後仍要再按一次確認才會執行。"
+                )
+                confirm_label = "✅ 確認新增"
+            else:
+                text = (
+                    f"▶️ 待確認重跑工作（{job['project']}）\n"
+                    f"{job['job_name']}：{job['command']}\n"
+                    f"有效至：{job['expires_at']}\n\n"
+                    "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
+                )
+                confirm_label = "✅ 確認執行"
             keyboard = [[
-                {"label": "✅ 確認執行", "id": f"job_confirm:{job['request_id']}"},
+                {"label": confirm_label, "id": f"job_confirm:{job['request_id']}"},
                 {"label": "❌ 取消", "id": f"job_cancel:{job['request_id']}"},
             ]]
             self.send_message_with_keyboard(
@@ -761,7 +772,11 @@ class HarnessService:
             )
         for job in trace_store.expire_job_requests(datetime.now(timezone.utc).isoformat()):
             self.clear_actions(job["message_ref"])
-            msg = f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}"
+            msg = (
+                f"⌛ 新增工具設定的要求已過期、沒有套用：{job['command']}"
+                if job["kind"] == "scope_change"
+                else f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}"
+            )
             if job["message_ref"]:
                 self.notify_operator(msg)
             self._record_order_turn(job["project"], msg)
@@ -779,7 +794,11 @@ class HarnessService:
             if not trace_store.transition_job_request(request_id, ("awaiting",), "cancelled"):
                 return f"這個要求已經是「{job['status']}」，沒有變動。"
             trace_store.finish_job_request(request_id, "cancelled")
-            result = f"❌ 已取消，沒有執行：{job['job_name']}"
+            result = (
+                f"❌ 已取消，沒有套用：{job['command']}"
+                if job["kind"] == "scope_change"
+                else f"❌ 已取消，沒有執行：{job['job_name']}"
+            )
             self.send_message(audience, result)
             self._record_order_turn(job["project"], result)
             return result
@@ -787,6 +806,8 @@ class HarnessService:
         # in the scope file now, not whatever text the request carried.
         if not trace_store.transition_job_request(request_id, ("awaiting",), "running"):
             return f"這個要求已經是「{job['status']}」，沒有再執行。"
+        if job["kind"] == "scope_change":
+            return self._apply_scope_change(job, scope, audience)
         command = (scope.jobs or {}).get(job["job_name"])
         if command is None:
             trace_store.finish_job_request(request_id, "failed", {"error": "job no longer declared"})
@@ -798,6 +819,36 @@ class HarnessService:
         started = f"▶️ 開始執行 {job['job_name']}，完成後會回報。"
         self.send_message(audience, started)
         return started
+
+    def _apply_scope_change(self, job: dict, scope: ProjectScope, audience: str | None) -> str:
+        """The human confirmed: re-validate the proposal, write it into the scope file, and reload the
+        scope in memory so the next chat reply has the new capability (no restart)."""
+        trace_store = self.approval_manager.trace_store
+        try:
+            change = validate_scope_change(
+                scope.working_directory,
+                str((job["payload"] or {}).get("kind", "")),
+                (job["payload"] or {}).get("value"),
+                (job["payload"] or {}).get("name"),
+                (job["payload"] or {}).get("command"),
+            )
+            changed = apply_scope_change(scope.scope_file_path, change)
+            reloaded = ProjectScope.from_file(scope.scope_file_path)
+            for field_name in ("probe_hosts", "log_files", "jobs", "raw_markdown"):
+                setattr(scope, field_name, getattr(reloaded, field_name))
+        except Exception as exc:  # noqa: BLE001 — report any failure to the human, change nothing more
+            trace_store.finish_job_request(job["request_id"], "failed", {"error": str(exc)})
+            result = f"⚠️ 沒能套用：{job['command']}（{exc}）"
+        else:
+            trace_store.finish_job_request(job["request_id"], "done", {"changed": changed})
+            result = (
+                f"✅ 已新增：{job['command']}。從下一則回覆起可用。"
+                if changed
+                else f"ℹ️ 設定裡本來就有：{job['command']}，沒有變動。"
+            )
+        self.send_message(audience, result)
+        self._record_order_turn(job["project"], result)
+        return result
 
     def _run_job(self, scope: ProjectScope, job: dict, command: str, audience: str | None) -> None:
         trace_store = self.approval_manager.trace_store
@@ -1821,10 +1872,6 @@ class HarnessService:
             "你的沙盒沒有網路：在這裡連不上、DNS 解析失敗，都不能當作外部服務（例如證交所 TWSE）真的壞了"
             "或本機被擋的證據，絕對不要拿來回答使用者。\n"
         )
-        if not ops_server_spec(scope, None):
-            return notice + (
-                "這個專案沒有設定診斷工具，查不到真相時就如實說「我在這裡驗證不了」，並說明要怎麼驗證。\n\n"
-            )
         return notice + (
             "使用者問某個排程、腳本或外部服務為什麼失敗、現在連不連得上時，先用 MCP 工具 `ops` 自己查，"
             "再回答，不要要使用者等或叫他去查：`http_probe`（從外面實際發請求，回報狀態碼、耗時、大小、"
@@ -1832,7 +1879,14 @@ class HarnessService:
             "`list_jobs`／`run_job`（要把失敗的工作重跑時，run_job 只是提出要求，使用者要在聊天裡按"
             "「確認執行」才會跑；你要說「已請你確認」，不要說已經跑了）。回答要寫出量測到的事實，並判斷"
             "是服務端的問題，還是專案自己的程式（逾時太短、舊的端點、被限流）。確定原因在專案程式、需要"
-            "改程式時，才用上面的任務啟動標記交給開發流程；只是診斷或重跑，不要開任務。\n\n"
+            "改程式時，才用上面的任務啟動標記交給開發流程；只是診斷或重跑，不要開任務。\n"
+            "需要的工具或 job 不存在時（例如要探測的主機不在清單、要讀的 log 沒列出、要啟動預覽服務），"
+            "用 `propose_scope_change` 向使用者提出新增（probe_host／log_file／job），使用者按確認才會"
+            "生效；說「已請你確認」，不要說已經加上，也不要叫使用者去改設定檔。確認後從你的下一則回覆起可用。\n"
+            "使用者要你做某件事（例如「開預覽」「讓我看頁面」「啟動服務」）而你的沙盒做不到時，先呼叫 "
+            "`list_jobs` 看有沒有名稱或指令相符的 job（例如 preview_start），有就用 `run_job` 提出，"
+            "並告訴使用者按「確認執行」後會收到網址；不要在沒查過 list_jobs 前就回答「做不到」或叫使用者自己"
+            "開終端機。用完要關閉時同樣找對應的 job（例如 preview_stop）。\n\n"
         )
 
     @staticmethod

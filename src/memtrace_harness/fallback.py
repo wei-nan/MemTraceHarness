@@ -6,7 +6,7 @@ from memtrace_harness.schemas import CliExecution, FailureCategory
 
 
 CROSS_PROVIDER_FALLBACK_CATEGORIES: frozenset[FailureCategory] = frozenset(
-    {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable"}
+    {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable", "authentication"}
 )
 
 
@@ -47,7 +47,16 @@ def classify_execution_failure(execution: CliExecution) -> FailureCategory:
         return "provider_overloaded"
     if _contains(detail, "context window", "context length", "maximum context", "too many tokens"):
         return "context_limit"
-    if _contains(detail, "authentication", "unauthorized", "invalid token", "login required"):
+    if _contains(
+        detail,
+        "authentication",
+        "failed to authenticate",
+        "unauthorized",
+        "invalid token",
+        "login required",
+        "oauth session expired",
+        "please run /login",
+    ):
         return "authentication"
     if _contains(detail, "access denied", "permission denied", "operation not permitted"):
         return "permission"

@@ -13,6 +13,10 @@ Boundaries enforced here, from what the operator declared in the project's scope
   request and the human gets a confirm button in the chat; the Harness runs the command only after
   that tap. ``list_jobs`` shows what exists.
 
+- ``propose_scope_change``: asks to add a probe host, a log file or a job to the scope file. It changes
+  nothing: it records a request, and the Harness edits the scope file only after the human taps confirm
+  in the chat. Always available, so a project that declares nothing yet can still be given tools.
+
 Run: ``python -m memtrace_harness.ops_mcp`` (JSON-RPC over stdin/stdout).
 """
 
@@ -30,6 +34,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+from memtrace_harness.scope import SCOPE_CHANGE_KINDS, describe_scope_change, validate_scope_change
 
 PROTOCOL_VERSION = "2024-11-05"
 PROBE_TIMEOUT_SECONDS = 45
@@ -90,6 +96,28 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "propose_scope_change",
+        "description": (
+            "Ask the user to give this project another ops capability when the tool or job you need does "
+            "not exist: kind=probe_host (value=hostname http_probe may request), kind=log_file "
+            "(value=path relative to the project that read_log may read) or kind=job (name + one-line shell "
+            "command that run_job may run, for example starting a preview server). This does NOT change "
+            "anything: the user sees exactly what is proposed and a confirm button, and only a tap applies "
+            "it. Say that a confirmation is waiting; the new tool or job exists from your next reply on."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": list(SCOPE_CHANGE_KINDS)},
+                "value": _string_param("hostname (probe_host) or relative file path (log_file)"),
+                "name": _string_param("job name (kind=job)"),
+                "command": _string_param("single-line shell command (kind=job)"),
+            },
+            "required": ["kind"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "run_job",
         "description": (
             "Ask to run one of the project's named jobs again. This does NOT run it: the user gets a "
@@ -125,7 +153,7 @@ class OpsContext:
         self.store = store
 
     def tool_names(self) -> set[str]:
-        names = set()
+        names = {"propose_scope_change"} if self.store is not None else set()
         if self.hosts:
             names.add("http_probe")
         if self.logs:
@@ -216,6 +244,35 @@ def request_job(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
+def propose_scope_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
+    if ctx.store is None:
+        raise OpsError("scope change requests are not available here")
+    try:
+        change = validate_scope_change(
+            ctx.working_directory,
+            str(arguments.get("kind", "")),
+            arguments.get("value"),
+            arguments.get("name"),
+            arguments.get("command"),
+        )
+    except ValueError as exc:
+        raise OpsError(str(exc)) from exc
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+    if not ctx.store.create_scope_change_request(
+        request_id=f"scope_{uuid.uuid4().hex[:10]}",
+        project=ctx.project,
+        change=change,
+        summary=describe_scope_change(change),
+        expires_at=expires,
+    ):
+        raise OpsError("could not record the request")
+    return (
+        f"Proposed: {describe_scope_change(change)}. The user now has a confirm button in the chat "
+        "(valid 10 minutes); nothing changes until they tap it. After they confirm, the new capability "
+        "is available from your next reply on."
+    )
+
+
 def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
     if name not in ctx.tool_names():
         raise OpsError(f"unknown tool: {name}")
@@ -227,6 +284,8 @@ def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
         return "\n".join(f"{n}: {p}" for n, p in sorted(ctx.logs.items()))
     if name == "list_jobs":
         return "\n".join(f"{n}: {c}" for n, c in sorted(ctx.jobs.items()))
+    if name == "propose_scope_change":
+        return propose_scope_change(ctx, arguments)
     return request_job(ctx, arguments)
 
 
@@ -301,10 +360,11 @@ def serve(stdin=None, stdout=None) -> None:
 
 
 def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str | None = None) -> dict[str, Any] | None:
-    """Launch spec for this server for one project, or None when the scope file declares nothing."""
+    """Launch spec for this server for one project. With a store, even a project that declares nothing
+    gets propose_scope_change, the way to get its first capability."""
     hosts, logs, jobs = scope.probe_hosts or [], scope.log_files or [], scope.jobs or {}
-    if not (hosts or logs or jobs):
-        return None
+    if not (hosts or logs or jobs or trace_db_path):
+        return None  # nothing declared and no store to record a proposal in: no tools at all
     env = {
         "HARNESS_OPS_PROJECT": scope.name,
         "HARNESS_OPS_CWD": str(scope.working_directory),

@@ -279,3 +279,97 @@ def load_project_index(index_path: Path | None) -> list[ProjectScope]:
         if p.is_file():
             scopes.append(ProjectScope.from_file(p))
     return scopes
+
+
+# ---- changes to the ops declarations in a scope file (probe_hosts / log_files / job), proposed by the
+# chat model and applied only after the human confirms in the chat (see ops_mcp.propose_scope_change).
+SCOPE_CHANGE_KINDS = ("probe_host", "log_file", "job")
+_HOST_NAME = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+_JOB_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+MAX_JOB_COMMAND_CHARS = 1000
+
+
+def validate_scope_change(
+    working_directory: Path,
+    kind: str,
+    value: str | None = None,
+    name: str | None = None,
+    command: str | None = None,
+) -> dict[str, str]:
+    """The normalized change, or ValueError. Run again when the human confirms: the proposal is data,
+    not trusted."""
+    if kind == "probe_host":
+        host = (value or "").strip().lower()
+        if not _HOST_NAME.match(host):
+            raise ValueError("probe_host must be a bare hostname (no scheme, port or path)")
+        return {"kind": kind, "value": host}
+    if kind == "log_file":
+        relative = (value or "").strip()
+        if not relative or "," in relative or "\n" in relative or Path(relative).is_absolute():
+            raise ValueError("log_file must be a relative path inside the project")
+        base = working_directory.resolve()
+        resolved = (base / relative).resolve()
+        if base != resolved and base not in resolved.parents:
+            raise ValueError("log_file must stay inside the project directory")
+        return {"kind": kind, "value": relative}
+    if kind == "job":
+        job_name, job_command = (name or "").strip(), (command or "").strip()
+        if not _JOB_NAME.match(job_name):
+            raise ValueError("job name must be 1-40 letters, digits, '_' or '-'")
+        if not job_command or "\n" in job_command or "\r" in job_command:
+            raise ValueError("job command must be one non-empty line")
+        if len(job_command) > MAX_JOB_COMMAND_CHARS:
+            raise ValueError(f"job command is longer than {MAX_JOB_COMMAND_CHARS} characters")
+        return {"kind": kind, "name": job_name, "command": job_command}
+    raise ValueError(f"unknown scope change kind {kind!r} (allowed: {', '.join(SCOPE_CHANGE_KINDS)})")
+
+
+def describe_scope_change(change: dict[str, str]) -> str:
+    if change["kind"] == "job":
+        return f"job {change['name']} = {change['command']}"
+    return f"{change['kind']}: {change['value']}"
+
+
+def apply_scope_change(scope_file: Path, change: dict[str, str]) -> bool:
+    """Write one validated change into the scope file; False when it is already there. Existing text
+    and comments are kept; the file is replaced atomically."""
+    text = scope_file.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    kind = change["kind"]
+    if kind == "job":
+        new_line = f"- job: {change['name']} = {change['command']}"
+        pattern = re.compile(rf"^[-*\s]*`?job`?\s*[:=]\s*{re.escape(change['name'])}\s*=")
+        for index, line in enumerate(lines):
+            if pattern.match(line):
+                if line.strip() == new_line:
+                    return False
+                lines[index] = new_line
+                break
+        else:
+            lines = _append_line(lines, new_line)
+    else:
+        field_name = "probe_hosts" if kind == "probe_host" else "log_files"
+        item = change["value"]
+        pattern = re.compile(rf"^([-*\s]*`?{field_name}`?\s*[:=]\s*)(.*)$", re.IGNORECASE)
+        for index, line in enumerate(lines):
+            match = pattern.match(line)
+            if match:
+                current = _split_list(match.group(2))
+                if item.lower() in (c.lower() for c in current):
+                    return False
+                lines[index] = f"{match.group(1)}{', '.join([*current, item])}"
+                break
+        else:
+            lines = _append_line(lines, f"- {field_name}: {item}")
+    updated = "\n".join(lines)
+    temp = scope_file.with_name(scope_file.name + ".tmp")
+    temp.write_text(updated, encoding="utf-8")
+    temp.replace(scope_file)
+    return True
+
+
+def _append_line(lines: list[str], new_line: str) -> list[str]:
+    trimmed = list(lines)
+    while trimmed and trimmed[-1] == "":
+        trimmed.pop()
+    return [*trimmed, new_line, ""]

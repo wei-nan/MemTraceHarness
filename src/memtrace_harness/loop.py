@@ -835,7 +835,7 @@ class AgentLoopRunner:
 
             if response.execution.status == "succeeded":
                 return result
-            if response.execution.failure_category == "cli_unavailable":
+            if response.execution.failure_category in {"cli_unavailable", "authentication"}:
                 self._alert_cli_unavailable(
                     profile_id=profile_id,
                     adapter=adapter,
@@ -1181,11 +1181,12 @@ class AgentLoopRunner:
         if attempt_index + 1 >= len(candidates):
             return False
         profile = self.role_profiles.get(profile_id)
-        # cli_unavailable bypasses the profile's fallback_on: that list is about capacity
-        # policy, whereas a CLI that cannot launch never evaluated the request at all.
+        # cli_unavailable and authentication bypass the profile's fallback_on: that list is
+        # about capacity policy, whereas a CLI that cannot launch or whose login has expired
+        # never evaluated the request at all.
         if (
             profile is not None
-            and category != "cli_unavailable"
+            and category not in {"cli_unavailable", "authentication"}
             and category not in profile.fallback_on
         ):
             return False
@@ -1219,10 +1220,15 @@ class AgentLoopRunner:
         else:
             follow_up = "沒有可用的備援，這個階段會停止。"
         detail = (execution.error or "").strip().splitlines()
+        if execution.failure_category == "authentication":
+            headline = f"⚠️ {profile_id} 角色的登入已失效：{failed}。{follow_up}"
+            advice = "請在終端機重新登入該 CLI（例如 claude 的 /login）。"
+        else:
+            headline = f"⚠️ {profile_id} 角色的 CLI 無法啟動：{failed}。{follow_up}"
+            advice = "請檢查該 CLI 的安裝或路徑（例如 App 更新後執行檔位置改變）。"
         try:
             self.alert_callback(
-                f"⚠️ {profile_id} 角色的 CLI 無法啟動：{failed}。{follow_up}\n"
-                "請檢查該 CLI 的安裝或路徑（例如 App 更新後執行檔位置改變）。\n"
+                f"{headline}\n{advice}\n"
                 f"錯誤：{detail[0] if detail else '(no error text)'}"
             )
         except Exception:

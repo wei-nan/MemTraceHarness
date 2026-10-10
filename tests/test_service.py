@@ -414,7 +414,7 @@ class HarnessServiceTests(TestCase):
         self.assertIn("不需要先徵求任何核准", cmd[-1])
         # A failure seen from the network-less chat sandbox is not evidence about the outside.
         self.assertIn("你的沙盒沒有網路", cmd[-1])
-        self.assertIn("沒有設定診斷工具", cmd[-1])  # this scope declares no ops tools
+        self.assertIn("propose_scope_change", cmd[-1])  # a scope that declares nothing can still ask for tools
 
     def test_a_requested_job_runs_only_after_the_human_taps_confirm(self) -> None:
         from unittest.mock import MagicMock
@@ -440,6 +440,52 @@ class HarnessServiceTests(TestCase):
         self.assertIn("ran-it", store.get_job_request("job_1")["result"]["output_tail"])
         # A second tap cannot run it again.
         self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "job_1", 12345, 77))
+
+    def test_a_scope_change_is_written_only_after_the_human_confirms(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.scope_file_path = Path(tempfile.mkdtemp()) / "harness-scope.md"
+        scope.scope_file_path.write_text(f"- workspace_id: {scope.workspace_id}\\n- working_directory: {scope.working_directory}\\n")
+        before = scope.scope_file_path.read_text()
+        gateway.send_message = MagicMock()
+        gateway.send_message_with_keyboard = MagicMock(return_value=78)
+        gateway.clear_message_keyboard = MagicMock()
+        store.create_scope_change_request(
+            request_id="scope_1", project=scope.name,
+            change={"kind": "job", "name": "preview_start", "command": "echo start"},
+            summary="job preview_start = echo start", expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self.assertIn("確認新增", str(gateway.send_message_with_keyboard.call_args))
+        self.assertEqual(scope.scope_file_path.read_text(), before)  # shown, not applied
+
+        self.assertIn("已新增", gateway._resolve_job_action("job_confirm", "scope_1", 12345, 78))
+        self.assertEqual(scope.jobs["preview_start"], "echo start")  # live scope reloaded, no restart
+        self.assertIn("job: preview_start = echo start", scope.scope_file_path.read_text())
+        self.assertEqual(store.get_job_request("scope_1")["status"], "done")
+        # A second tap cannot apply it again.
+        self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "scope_1", 12345, 78))
+
+    def test_a_cancelled_scope_change_changes_nothing(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.scope_file_path = Path(tempfile.mkdtemp()) / "harness-scope.md"
+        scope.scope_file_path.write_text(f"- workspace_id: {scope.workspace_id}\\n- working_directory: {scope.working_directory}\\n")
+        before = scope.scope_file_path.read_text()
+        gateway.send_message = MagicMock()
+        gateway.clear_message_keyboard = MagicMock()
+        store.create_scope_change_request(
+            request_id="scope_2", project=scope.name, change={"kind": "probe_host", "value": "x.example.com"},
+            summary="probe_host: x.example.com", expires_at="2999-01-01T00:00:00+00:00",
+        )
+        store.transition_job_request("scope_2", ("pending",), "awaiting")
+        gateway._resolve_job_action("job_cancel", "scope_2", 12345, None)
+        self.assertEqual(store.get_job_request("scope_2")["status"], "cancelled")
+        self.assertEqual(scope.scope_file_path.read_text(), before)
 
     def test_cancelled_or_undeclared_jobs_do_not_run(self) -> None:
         from unittest.mock import MagicMock
