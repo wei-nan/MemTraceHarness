@@ -134,6 +134,30 @@ every Harness, because it is how the shared code works, not a per-project settin
   marked archived. Schedule firings are not matters; only each schedule's last result reaches the
   digest.
 
+**Reorganising the knowledge base (explicit operator decision, 2026-10-10).** The Harness can go back and
+reorganise what it wrote, by three means. All three touch only the Harness's own notes (matters and old
+drafts, tagged `harness`) — never a node a person or another role created — and every removal is
+MemTrace's soft delete (restorable for 30 days) with the local row kept.
+
+- *Weekly matter review* (after the nightly archive, per project, at most weekly, only with at least 6
+  matters): a model reads the matter list and may propose `merge` (two or more matters that are one
+  subject), `retitle` (the title no longer names what the matter is about) and `resolve` (nothing more to
+  do on it). The Harness validates every op against the matters it showed: ids must exist and be live, a
+  matter appears in one op only, a `resolve` needs a reason and a matter untouched for 7 days, and a pass
+  does at most 10 ops. A merge combines the matters' dated entries into the kept matter, updates its node
+  and soft-deletes the others' nodes; a resolved matter stays searchable, marked resolved, and is reopened
+  by the nightly archive if it is discussed again.
+- *Draft retirement* (nightly, after the archive): an hourly `Draft: …` node written before 2026-10-10 is
+  soft-deleted once every day its turns span has been archived into matters. Nothing is lost: the words are
+  in the local log and the substance is in the matters.
+- *Rebuild* (`memory-topics --rebuild`, by hand only): the local log is complete, so all matters can be
+  derived again from the first day, with the current prompts and models. The old matters are superseded
+  first and their nodes are soft-deleted only after the new set is fully written; an interrupted rebuild
+  resumes where it stopped.
+- Every pass is recorded as a run with its ops (`memory_reorg_runs`, `memory_reorg_ops`), reported to the
+  operator with a one-tap undo (`memory-reorg --undo <run>` does the same by hand), and the matter notes are
+  protected from the weekly knowledge-base tidying (`kb_gardening`).
+
 **Topic recall (explicit operator decision, 2026-10-03).** Behind chat, a slower background
 model (`HARNESS_RECALL_*`, default: the digest chain) judges each human message's topic
 (continue an active topic / new topic / small talk), explores the cold-memory and spec
