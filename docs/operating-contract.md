@@ -150,7 +150,10 @@ MemTrace's soft delete (restorable for 30 days) with the local row kept.
 - *Draft retirement* (nightly, after the archive): an hourly `Draft: …` node written before 2026-10-10 is
   soft-deleted once every day its turns span has been archived into matters. Nothing is lost: the words are
   in the local log and the substance is in the matters.
-- *Rebuild* (`memory-topics --rebuild`, by hand only): the local log is complete, so all matters can be
+- *Rebuild* (`/rebuild`, the chat model's `HARNESS_MEMORY_REBUILD::`, or `memory-topics --rebuild`; never
+  scheduled): asking for it only shows a confirmation card, and it starts only after a tap on "開始重建".
+  `/reorganize` (or `HARNESS_MEMORY_REORG::`) runs the matter review and the draft retirement at once, without
+  a card, since every change in them can be undone. The local log is complete, so all matters can be
   derived again from the first day, with the current prompts and models. The old matters are superseded
   first and their nodes are soft-deleted only after the new set is fully written; an interrupted rebuild
   resumes where it stopped.

@@ -460,7 +460,8 @@ way (the Harness, not the model, sends the `DELETE`). Amending an order is not a
 - **Reorganising memory** (same night pass, by the Harness itself): old hourly `Draft: …` nodes are moved to the
   MemTrace trash once every day they span is archived into matters; once a week a model reviews the matters and may
   merge two that are one subject, retitle one, or mark a finished one resolved (the Harness validates every change,
-  and the report carries a one-tap undo). `memory-reorg --review [--dry-run] | --retire-drafts | --undo RUN` runs
-  these by hand; `memory-topics --rebuild` derives all matters again from the local log (old notes are trashed only
+  and the report carries a one-tap undo). You can also just say so in chat ("整理一下記憶", "重建記憶") or use
+  `/reorganize` and `/rebuild`; a rebuild only starts after you tap a confirmation card. `memory-reorg --review
+  [--dry-run] | --retire-drafts | --undo RUN` runs these by hand; `memory-topics --rebuild` derives all matters again from the local log (old notes are trashed only
   after the new set is written; an interrupted rebuild resumes). Only the Harness's own notes are touched, every
   removal is a soft delete.

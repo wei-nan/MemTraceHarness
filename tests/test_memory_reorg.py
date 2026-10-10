@@ -312,3 +312,105 @@ class RebuildTests(Base):
         undo_reorg_run(self.store, self.client, outcome.run_id)
 
         self.assertEqual(self.store.get_memory_topic(b)["node_id"], "mem_recreated")
+
+
+class ChatControlTests(Base):
+    """Telling the Harness to reorganise or rebuild its memory, by command or in chat."""
+
+    def _gateway(self):
+        from memtrace_harness.approval import ApprovalManager
+        from memtrace_harness.chat_triage import ChatTriage
+        from memtrace_harness.config import HarnessConfig
+        from memtrace_harness.primary_session import PrimarySessionManager
+        from memtrace_harness.scope import ProjectScope
+        from memtrace_harness.service import HarnessService
+
+        path = Path(self._tmp.name)
+        config = HarnessConfig(
+            memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=path / "t.sqlite3", trace_root=path,
+            claude_command="claude", codex_command="codex", antigravity_command="agy",
+            antigravity_output_mode="auto", cli_timeout_seconds=900, chat_provider="claude",
+            chat_model="haiku", unattended_write_requires_approval=True,
+        )
+        scope = ProjectScope(name="proj", workspace_id="ws_spec", working_directory=path, scope_file_path=path / "harness-scope.md")
+        gw = HarnessService(config, ApprovalManager(self.store), ChatTriage([scope]), PrimarySessionManager(self.store), [scope])
+        gw.send_message = MagicMock()
+        gw.send_message_with_keyboard = MagicMock(return_value=3)
+        gw.clear_message_keyboard = MagicMock()
+        return gw, scope
+
+    def test_the_rebuild_command_only_asks_and_a_tap_starts_it(self) -> None:
+        from tests.support import relay, tap
+
+        _add_turn(self.store, "第一天", "2026-10-01T01:00:00+00:00")
+        _add_turn(self.store, "第二天", "2026-10-02T01:00:00+00:00")
+        gw, scope = self._gateway()
+        gw.memory_rebuild_now = MagicMock()
+
+        relay(gw, {"update_id": 1, "message": {"chat": {"id": 7}, "text": "/rebuild"}})
+
+        gw.memory_rebuild_now.assert_not_called()  # asking never starts it
+        text, keyboard = gw.send_message_with_keyboard.call_args.args[1:3]
+        self.assertIn("2 天", text)
+        self.assertIn("舊的事項節點才會移到垃圾桶", text)
+        self.assertEqual([b["id"] for b in keyboard[0]], ["mem_rebuild_ok:proj", "mem_rebuild_no:proj"])
+
+        tap(gw, {"id": "cb", "data": "mem_rebuild_no:proj", "message": {"chat": {"id": 7}, "message_id": 4}})
+        gw.memory_rebuild_now.assert_not_called()
+        self.assertIn("沒有重建", gw.send_message.call_args.args[1])
+
+        tap(gw, {"id": "cb", "data": "mem_rebuild_ok:proj", "message": {"chat": {"id": 7}, "message_id": 4}})
+        gw.memory_rebuild_now.assert_called_once_with(scope, 7)
+
+    def test_the_reorganize_command_starts_at_once(self) -> None:
+        from tests.support import relay
+
+        gw, scope = self._gateway()
+        gw.memory_reorg_now = MagicMock()
+        relay(gw, {"update_id": 1, "message": {"chat": {"id": 7}, "text": "/reorganize"}})
+        gw.memory_reorg_now.assert_called_once_with(scope, 7)
+        gw.memory_reorg_now = None
+        relay(gw, {"update_id": 2, "message": {"chat": {"id": 7}, "text": "/reorganize"}})
+        self.assertIn("沒有啟用", gw.send_message.call_args.args[1])
+
+    def test_both_are_listed_as_commands(self) -> None:
+        gw, _ = self._gateway()
+        self.assertTrue({"rebuild", "reorganize"} <= {c["command"] for c in gw.commands()})
+
+    def test_the_chat_model_is_told_about_both_markers_and_that_rebuild_is_confirmed_by_a_tap(self) -> None:
+        gw, _ = self._gateway()
+        self.assertEqual(gw._extract_marker_line("好\nHARNESS_MEMORY_REBUILD::重新分題", gw._MEMORY_REBUILD_MARKER), ("好", "重新分題"))
+        self.assertEqual(gw._extract_marker_line("好\nHARNESS_MEMORY_REORG::合併", gw._MEMORY_REORG_MARKER), ("好", "合併"))
+
+    def test_a_rebuild_run_reports_and_a_failure_says_how_to_resume(self) -> None:
+        from unittest.mock import patch
+
+        from memtrace_harness import duties
+        from memtrace_harness.memory_reorg import ReorgOutcome
+
+        gw, scope = self._gateway()
+        gw.notify_reorg_outcome = MagicMock()
+        with patch.object(duties, "rebuild_matters", return_value=ReorgOutcome("rebuild", "proj", 5, ["重建完成"], 3)):
+            duties.run_memory_rebuild(MagicMock(), self.store, self.client, [scope], gw, only_project="proj", audience=7)
+        gw.notify_reorg_outcome.assert_called_once()
+        with patch.object(duties, "rebuild_matters", return_value=None):
+            duties.run_memory_rebuild(MagicMock(), self.store, self.client, [scope], gw, only_project="proj", audience=7)
+        self.assertIn("接著做", gw.send_message.call_args.args[1])
+        with patch.object(duties, "rebuild_matters", side_effect=RuntimeError("model down")):
+            duties.run_memory_rebuild(MagicMock(), self.store, self.client, [scope], gw, only_project="proj", audience=7)
+        self.assertIn("model down", gw.send_message.call_args.args[1])
+        self.assertIn("接著做", gw.send_message.call_args.args[1])
+
+    def test_a_second_rebuild_while_one_runs_is_refused(self) -> None:
+        from memtrace_harness import duties
+
+        _, scope = self._gateway()
+        duties._rebuilding.add("proj")
+        try:
+            logged: list[str] = []
+            config = MagicMock()
+            config.schedule_timezone = "Asia/Taipei"
+            self.assertIsNone(duties.rebuild_matters(config, self.store, self.client, scope, log=logged.append))
+            self.assertIn("already running", logged[0])
+        finally:
+            duties._rebuilding.discard("proj")

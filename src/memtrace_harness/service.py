@@ -195,6 +195,10 @@ class HarnessService:
         self.promote_now: Callable[[ProjectScope, str | None], None] | None = None
         # Same for the review of the harness's own work (/review, or asking for it in chat).
         self.work_review_now: Callable[[ProjectScope, str | None], None] | None = None
+        # Rebuilding every memory matter from the local log, and reorganising them now (/rebuild,
+        # /reorganize, or the chat model's request); the runtime wires them to background threads.
+        self.memory_rebuild_now: Callable[[ProjectScope, str | None], None] | None = None
+        self.memory_reorg_now: Callable[[ProjectScope, str | None], None] | None = None
         # Wakes a long-polling API call when something new goes into the outbox.
         self._outbox_signal = threading.Condition()
 
@@ -292,6 +296,8 @@ class HarnessService:
             {"command": "garden", "description": "現在就整理這個專案的知識庫"},
             {"command": "promote", "description": "把冷記憶的研究結論整理進規格工作區"},
             {"command": "review", "description": "復盤 harness 自己的工作：哪裡卡住、怎麼改進"},
+            {"command": "reorganize", "description": "現在就整理記憶：合併重複的事項、清掉舊草稿"},
+            {"command": "rebuild", "description": "用本機完整紀錄重建所有記憶事項（會先請你確認）"},
             {"command": "schedule_cancel", "description": "取消一組排程（需加排程 ID）"},
         ]
 
@@ -386,6 +392,14 @@ class HarnessService:
             else:
                 self.promote_now(scope, audience)
                 msg = f"📚 開始把「{scope.name}」冷記憶裡的研究結論整理進規格工作區，完成後會回報（可能要幾分鐘）。"
+            self.send_message(audience, msg)
+            return msg
+
+        if result.kind == "memory_rebuild":
+            return self._offer_memory_rebuild(result.project_scope, audience)
+
+        if result.kind == "memory_reorg":
+            msg = self._start_memory_reorg(result.project_scope, audience)
             self.send_message(audience, msg)
             return msg
 
@@ -613,6 +627,8 @@ class HarnessService:
             return "無法辨識的按鈕"
         if action == "kb_undo":
             return self._resolve_garden_undo(request_id, audience, message_ref)[:200]
+        if action in {"mem_rebuild_ok", "mem_rebuild_no"}:
+            return self._resolve_memory_rebuild(action, request_id, audience, message_ref)[:200]
         if action == "mem_undo":
             return self._resolve_reorg_undo(request_id, audience, message_ref)[:200]
         if action in {CLAIM_OK, CLAIM_NO}:
@@ -1505,6 +1521,54 @@ class HarnessService:
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
 
+    def _start_memory_reorg(self, scope: ProjectScope | None, audience: str | None) -> str:
+        if scope is None:
+            return "請指定專案，例如 /reorganize TWTradingStrategy。"
+        if self.memory_reorg_now is None:
+            return "記憶整理在這個 Harness 沒有啟用。"
+        self.memory_reorg_now(scope, audience)
+        return f"🗂 開始整理「{scope.name}」的記憶（合併重複的事項、清掉舊草稿），完成後會回報。"
+
+    def _offer_memory_rebuild(self, scope: ProjectScope | None, audience: str | None) -> str:
+        """A rebuild replaces every matter note of the project, so it starts only after a tap on
+        the card; asking for it (command or chat) never starts it by itself."""
+        if scope is None:
+            msg = "請指定專案，例如 /rebuild TWTradingStrategy。"
+        elif self.memory_rebuild_now is None:
+            msg = "記憶重建在這個 Harness 沒有啟用。"
+        else:
+            from memtrace_harness.memory_digest import turns_by_local_date
+
+            tz = ZoneInfo(self.config.schedule_timezone)
+            days = len(turns_by_local_date(self.approval_manager.trace_store.get_primary_session_turns(f"psess_{scope.name}"), tz))
+            text = (
+                f"🔁 重建「{scope.name}」的記憶：用本機完整紀錄（{days} 天）重新分題，每天一次模型呼叫，"
+                f"大約要 {max(1, days // 2)}–{max(2, days)} 分鐘。新版全部寫好後，舊的事項節點才會移到垃圾桶"
+                "（30 天內可還原），中途失敗舊的都還在，再說一次會接著做。要開始嗎？"
+            )
+            self.send_message_with_keyboard(
+                audience, text,
+                [[{"label": "✅ 開始重建", "id": f"mem_rebuild_ok:{scope.name}"},
+                  {"label": "❌ 取消", "id": f"mem_rebuild_no:{scope.name}"}]],
+            )
+            return text
+        self.send_message(audience, msg)
+        return msg
+
+    def _resolve_memory_rebuild(self, action: str, project: str, audience: str | None, message_ref: str | None) -> str:
+        scope = next((p for p in self.projects if p.name == project), None)
+        self.clear_actions(message_ref)
+        if scope is None:
+            return "找不到這個專案"
+        if action == "mem_rebuild_no":
+            self.send_message(audience, "已取消，沒有重建。")
+            return "已取消"
+        if self.memory_rebuild_now is None:
+            return "記憶重建在這個 Harness 沒有啟用"
+        self.memory_rebuild_now(scope, audience)
+        self.send_message(audience, f"▶️ 開始重建「{scope.name}」的記憶，完成後會回報。")
+        return "已開始"
+
     def _start_work_review(self, scope: ProjectScope | None, audience: str | None) -> str:
         """Start a review of the harness's own work for a project, in the background. Shared by
         the /review command and the chat model's request. Returns what to tell the operator."""
@@ -1724,6 +1788,8 @@ class HarnessService:
 
     _TASK_START_MARKER = "HARNESS_TASK_START::"
     _REVIEW_START_MARKER = "HARNESS_REVIEW_START::"
+    _MEMORY_REORG_MARKER = "HARNESS_MEMORY_REORG::"
+    _MEMORY_REBUILD_MARKER = "HARNESS_MEMORY_REBUILD::"
     _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
     _SCHEDULE_PAUSE_MARKER = "HARNESS_SCHEDULE_PAUSE::"
     _SCHEDULE_RESUME_MARKER = "HARNESS_SCHEDULE_RESUME::"
@@ -1902,6 +1968,11 @@ class HarnessService:
             "哪裡卡住或失敗、要怎麼改進（不是要你檢討交易損益，也不是要你開發某個功能）——才在回覆"
             f"最後另起一行，格式為「{self._REVIEW_START_MARKER}<一句話說明想看什麼>」。系統會自動產生"
             "有數據的復盤報告，你不需要自己整理數字。同一則回覆不要同時輸出任務啟動標記。\n\n"
+            "如果，而且只有在，使用者要你整理記憶庫——合併重複的記憶事項、清掉舊草稿、整理知識庫的"
+            f"記憶——才在回覆最後另起一行，格式為「{self._MEMORY_REORG_MARKER}<一句話說明>」。系統會立刻整理並回報，"
+            "每一步都可以還原。使用者要你「整個重建」記憶（從完整對話紀錄重新分題、換掉現有的所有"
+            f"記憶事項）時，改輸出「{self._MEMORY_REBUILD_MARKER}<一句話說明>」：系統會先請使用者按按鈕確認才開始，"
+            "你不需要再問一次，也不要說已經開始了。\n\n"
             f"{self._repos_notice(scope)}"
             f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
@@ -1945,6 +2016,8 @@ class HarnessService:
                     reply_text, self._APPROVAL_ANSWER_MARKER
                 )
                 reply_text, review_request = self._extract_marker_line(reply_text, self._REVIEW_START_MARKER)
+                reply_text, memory_reorg = self._extract_marker_line(reply_text, self._MEMORY_REORG_MARKER)
+                reply_text, memory_rebuild = self._extract_marker_line(reply_text, self._MEMORY_REBUILD_MARKER)
                 if confirmations:
                     reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
@@ -1966,6 +2039,10 @@ class HarnessService:
                     self._start_or_queue_task(scope, goal, audience)
                 if review_request and not goal:
                     self.send_message(audience, self._start_work_review(scope, audience))
+                if memory_rebuild and not goal:
+                    self._offer_memory_rebuild(scope, audience)
+                elif memory_reorg and not goal:
+                    self.send_message(audience, self._start_memory_reorg(scope, audience))
                 if schedule_directive:
                     self._create_schedule(scope, audience, schedule_directive)
                 for action, payload in schedule_controls:
