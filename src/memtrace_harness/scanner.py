@@ -308,6 +308,49 @@ class UnattendedScanner:
                 gw.notify_operator(text)
             self._log_push(scope, text)
 
+    def _record_scan_snapshot(
+        self,
+        scope: ProjectScope,
+        open_issues: list[dict[str, Any]],
+        queued: list[dict[str, Any]],
+        recently_run: set[str],
+        declined: set[str],
+        dropped: set[str],
+    ) -> None:
+        """What this scan pass saw, kept for the status page so the operator can see how the backlog is
+        being held back (the page never calls GitHub itself). Best effort."""
+
+        def brief(items: list[dict[str, Any]]) -> list[dict[str, str]]:
+            return [{"id": str(c.get("id")), "title": str(c.get("title") or "")} for c in items]
+
+        queued_ids = {str(c.get("id")) for c in queued}
+        held: list[dict[str, str]] = []
+        for issue in open_issues:
+            issue_id = str(issue.get("id"))
+            if issue_id in queued_ids:
+                continue
+            why = (
+                "近期已跑過、issue 仍開啟" if issue_id in recently_run
+                else "你拒絕過" if issue_id in declined
+                else "Controller 判斷暫不處理" if issue_id in dropped
+                else "Controller 評估後暫緩"
+            )
+            held.append({"id": issue_id, "title": str(issue.get("title") or ""), "why": why})
+        try:
+            self.trace_store.set_scan_snapshot(
+                scope.name, {"open": len(open_issues), "queued": brief(queued), "held": held, "blocked": None}
+            )
+        except Exception:
+            logger.exception(f"recording the scan snapshot for {scope.name} failed")
+
+    def _note_scan_blocked(self, scope: ProjectScope, reason: str) -> None:
+        try:
+            previous = self.trace_store.get_scan_snapshot(scope.name) or {}
+            previous.pop("checked_at", None)
+            self.trace_store.set_scan_snapshot(scope.name, {**previous, "blocked": reason})
+        except Exception:
+            logger.exception(f"recording the blocked scan for {scope.name} failed")
+
     def run_scan_pass(self) -> dict[str, str]:
         results: dict[str, str] = {}
         for scope in self.projects:
@@ -316,6 +359,7 @@ class UnattendedScanner:
             if self.trace_store.get_workspace_lock(ws_id) is not None:
                 logger.info(f"Workspace {ws_id} is locked. Skipping scan.")
                 results[ws_id] = "skipped_locked"
+                self._note_scan_blocked(scope, "locked")
                 continue
 
             conv_id = f"scan_{uuid4().hex[:8]}"
@@ -323,6 +367,7 @@ class UnattendedScanner:
             if not locked:
                 logger.info(f"Failed to acquire lock for workspace {ws_id}. Skipping scan.")
                 results[ws_id] = "skipped_locked"
+                self._note_scan_blocked(scope, "locked")
                 continue
 
             candidates = self._find_ready_candidates(scope, run_id=conv_id)
@@ -339,11 +384,13 @@ class UnattendedScanner:
                 scope.name, kind="scanner_candidate", outcome=f"{CONTROLLER_OUTCOME_PREFIX}dropped",
                 since_iso=(datetime.now(timezone.utc) - self.DROPPED_COOLDOWN).isoformat(),
             )
+            open_issues = candidates
             candidates = [
                 c for c in candidates if str(c.get("id")) not in declined | recently_run | dropped
             ]
             self._notify_stalled(scope, stalled)
             candidates, review_reason = self._review_candidates(scope, candidates)
+            self._record_scan_snapshot(scope, open_issues, candidates, recently_run, declined, dropped)
 
             if not candidates:
                 self.trace_store.release_workspace_lock(ws_id)

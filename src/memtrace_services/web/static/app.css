@@ -195,6 +195,7 @@ header #search {
   background: #2b2412; border: 1px solid var(--warn); border-radius: 0.5rem;
   padding: 0.5rem 0.9rem; margin-bottom: 0.9rem; font-size: 0.85rem;
 }
+.banner-title { font-weight: 600; margin-bottom: 0.4rem; color: var(--warn); }
 .banner .goto { color: var(--warn); font-weight: 600; cursor: pointer; text-decoration: underline; }
 details.chain-edit { margin: 0.2rem 0 0.5rem; }
 details.chain-edit summary { cursor: pointer; color: var(--accent); font-size: 0.75rem; }
@@ -206,3 +207,10 @@ details.chain-edit summary { cursor: pointer; color: var(--accent); font-size: 0
 }
 .toast { position: fixed; right: 1rem; bottom: 1rem; max-width: 26rem; background: var(--card); border: 1px solid var(--accent); border-radius: 0.5rem; padding: 0.6rem 0.9rem; font-size: 0.82rem; display: none; z-index: 20; }
 .toast.err { border-color: #e05555; }
+
+.approval .tag { background: var(--warn); color: #16181d; border-radius: 0.25rem; padding: 0 0.35rem; font-size: 0.72rem; font-weight: 600; }
+.approval .muted { color: var(--muted, #8a93a6); font-size: 0.75rem; }
+.approval .wait-summary { margin: 0.15rem 0; }
+.approval-actions { flex-wrap: wrap; }
+.approval-btn.choice { background: var(--accent); color: #16181d; }
+.answer-box { width: 100%; box-sizing: border-box; margin: 0.25rem 0; background: transparent; color: inherit; border: 1px solid var(--warn); border-radius: 0.3rem; padding: 0.3rem; font: inherit; }

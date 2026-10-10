@@ -12,10 +12,12 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from memtrace_harness.approval import INFO_NEEDED_REASONS
 from memtrace_harness.config import HarnessConfig, _parse_chat_fallbacks
+from memtrace_harness.inflight import default_tracker
 from memtrace_harness.memory_digest import PREFERENCE_CATEGORY_LABELS
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.scope import ProjectScope
@@ -51,6 +53,67 @@ def merge_model_catalog(config: HarnessConfig, configured: dict[str, set[str]]) 
 STATUS_DIGEST_DAYS = 7
 # How many of the most recently retired preferences the status page lists (with a way back).
 STATUS_RETIRED_PREFERENCES = 10
+
+
+CONFIRMATION_LABELS = {
+    "job": "待確認重跑工作",
+    "scope_change": "待確認新增工具設定",
+    "external_action": "待確認 GitHub 操作",
+    "order": "待確認委託",
+}
+INTERRUPTED_LOOKBACK = timedelta(days=7)
+INTERRUPTED_AFTER = timedelta(minutes=10)
+
+
+def collect_waiting(trace_store: TraceStore, scope: ProjectScope, pending_approvals: list[dict], locks: list[dict]) -> dict:
+    """Everything of this project that waits on a person, so the status page can say how many and what.
+    Read-only; no network (the GitHub backlog comes from the last scan pass's snapshot)."""
+    now = datetime.now(timezone.utc)
+    items: list[dict] = []
+    for req in pending_approvals:
+        needs_answer = req["reason"] in INFO_NEEDED_REASONS
+        card = trace_store.get_approval_decision_card(req["id"]) if needs_answer else None
+        items.append(
+            {
+                "kind": "approval",
+                "id": req["id"],
+                "label": "待回答" if needs_answer else "待核准",
+                "summary": (req["proposed_action"] or "").strip().splitlines()[0][:140] if req["proposed_action"] else "",
+                "since": req["created_at"],
+                "needs_answer": needs_answer,
+                "options": [{"label": o["label"], "action": o["action"], "tradeoff": o.get("tradeoff", "")} for o in card["options"]] if card else [],
+                "recommended": card.get("recommended") if card else None,
+                "situation": card.get("situation") if card else None,
+            }
+        )
+    for conf in trace_store.list_open_confirmations(scope.name):
+        items.append(
+            {
+                "kind": "confirm", "id": conf["id"], "label": CONFIRMATION_LABELS.get(conf["kind"], "待確認"),
+                "summary": conf["summary"], "since": conf["since"], "expires_at": conf["expires_at"],
+            }
+        )
+    live = {entry["conversation_id"] for entry in default_tracker.snapshot()}
+    lock_ids = {lock["conversation_id"] for lock in locks}
+    for conv in trace_store.list_unfinished_conversations(scope.workspace_id, (now - INTERRUPTED_LOOKBACK).isoformat()):
+        if conv["id"] in live:
+            continue
+        try:
+            idle = now - datetime.fromisoformat(conv["updated_at"])
+        except ValueError:
+            continue
+        if idle < INTERRUPTED_AFTER:
+            continue
+        holds = conv["id"] in lock_ids
+        items.append(
+            {
+                "kind": "interrupted", "id": conv["id"],
+                "label": "疑似中斷的任務" + ("（鎖還被它佔著，會擋住新任務）" if holds else ""),
+                "summary": (conv["goal"] or "").strip().splitlines()[0][:140] if conv["goal"] else conv["id"],
+                "since": conv["updated_at"], "holds_lock": holds,
+            }
+        )
+    return {"total": len(items), "items": items, "backlog": trace_store.get_scan_snapshot(scope.name)}
 
 
 def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: str | None = None) -> dict:
@@ -263,6 +326,7 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                     }
                     for req in pending_approvals
                 ],
+                "waiting": collect_waiting(trace_store, scope, pending_approvals, locks),
                 "schedules": [
                     {
                         "id": s["id"],

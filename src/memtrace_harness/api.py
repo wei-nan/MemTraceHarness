@@ -278,6 +278,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif setting == "preference":
                 self._resolve_preference(body)
                 return
+            elif setting == "stuck":
+                self._resolve_stuck(body)
+                return
             else:
                 self._send(404, {"error": "not found"})
                 return
@@ -294,8 +297,8 @@ class _Handler(BaseHTTPRequestHandler):
         except (KeyError, TypeError):
             self._send(400, {"error": "malformed request body"})
             return
-        if action not in ("approve", "reject"):
-            self._send(400, {"error": f"unsupported action {action!r} (expected approve or reject)"})
+        if action not in ("approve", "reject", "clarify", "choose"):
+            self._send(400, {"error": f"unsupported action {action!r} (expected approve, reject, clarify or choose)"})
             return
         service = self.api.service
         if service.approval_manager.get_request(request_id) is None:
@@ -304,9 +307,41 @@ class _Handler(BaseHTTPRequestHandler):
         # Same code path a text command, a button or a reply goes through — one place resolves an
         # approval, this is just another door to it. A resulting Agent Loop resumption runs in a
         # background thread, so this returns at once.
-        msg = service.resolve_approval(request_id, action)
+        if action == "clarify":
+            answer = body.get("answer")
+            if not isinstance(answer, str) or not answer.strip():
+                self._send(400, {"error": "clarify needs the answer text"})
+                return
+            msg = service.resolve_approval(request_id, "clarify", answer=answer.strip())
+        elif action == "choose":
+            choice = body.get("choice")
+            if not isinstance(choice, int) or isinstance(choice, bool):
+                self._send(400, {"error": "choose needs the option number"})
+                return
+            msg = service.resolve_card_pick(request_id, choice)
+        else:
+            msg = service.resolve_approval(request_id, action)
         self.api.bus.publish()
         self._send(200, {"ok": True, "message": msg})
+
+    def _resolve_stuck(self, body: dict) -> None:
+        """Give up an interrupted task: mark it failed and free its workspace slot. The status page asks
+        the operator to confirm first; a task that is really running cannot be abandoned this way."""
+        from memtrace_harness.inflight import default_tracker
+
+        conversation_id = body.get("conversation_id")
+        if not isinstance(conversation_id, str) or body.get("action") != "abandon":
+            self._send(400, {"error": "malformed request body"})
+            return
+        if any(entry["conversation_id"] == conversation_id for entry in default_tracker.snapshot()):
+            self._send(400, {"error": "這個任務正在執行中，不能放棄"})
+            return
+        trace_store = self.api.service.approval_manager.trace_store
+        if not trace_store.abandon_conversation(self.api.scope.workspace_id, conversation_id):
+            self._send(400, {"error": "找不到這個未完成的任務"})
+            return
+        self.api.bus.publish()
+        self._send(200, {"ok": True, "message": f"已放棄 {conversation_id}，工作區已釋放。"})
 
     def _resolve_preference(self, body: dict) -> None:
         from memtrace_harness.memory_digest import resolve_preference, sync_operator_profile

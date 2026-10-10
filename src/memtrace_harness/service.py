@@ -526,6 +526,11 @@ class HarnessService:
         and the status page all go through."""
         return self._resolve_approval_action(request_id, action, audience, answer)
 
+    def resolve_card_pick(self, request_id: str, index: int) -> str:
+        """Answer a question-type approval with one option of its decision card (the status page's door;
+        the chat's own door is the option buttons)."""
+        return self._resolve_card_pick(request_id, index, None)
+
     def _resolve_approval_action(
         self,
         request_id: str,

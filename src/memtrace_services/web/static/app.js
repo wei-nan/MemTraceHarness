@@ -414,22 +414,40 @@ document.addEventListener("click", function (e) {
     });
 });
 
+var WAITING_ACTION_TEXT = { approve: "核准中…", reject: "處理中…", choose: "送出中…", clarify: "送出中…", abandon: "放棄中…" };
+
 document.addEventListener("click", function (e) {
   if (!e.target.classList.contains("approval-btn")) return;
   var btn = e.target;
   var project = btn.getAttribute("data-project");
-  var requestId = btn.getAttribute("data-request");
   var action = btn.getAttribute("data-action");
-  var group = btn.closest(".approval-actions");
-  var statusEl = group.querySelector(".approval-status");
-  var buttons = group.querySelectorAll(".approval-btn");
+  var item = btn.closest(".approval");
+  var statusEl = item.querySelector(".approval-status");
+  var buttons = item.querySelectorAll(".approval-btn");
+  var url = "/api/approval";
+  var body = { project: project, request_id: btn.getAttribute("data-request"), action: action };
+  if (action === "choose") {
+    body.choice = parseInt(btn.getAttribute("data-choice"), 10);
+  } else if (action === "clarify") {
+    var box = item.querySelector(".answer-box");
+    body.answer = box ? box.value.trim() : "";
+    if (!body.answer) {
+      statusEl.className = "approval-status err";
+      statusEl.textContent = "請先寫下答案";
+      return;
+    }
+  } else if (action === "abandon") {
+    if (!confirm("放棄這個任務？它會被標記為失敗，並釋放工作區。")) return;
+    url = "/api/stuck";
+    body = { project: project, conversation_id: btn.getAttribute("data-conversation"), action: "abandon" };
+  }
   statusEl.className = "approval-status";
-  statusEl.textContent = (action === "approve" ? "核准中…" : "拒絕中…");
+  statusEl.textContent = WAITING_ACTION_TEXT[action] || "處理中…";
   buttons.forEach(function (b) { b.disabled = true; });
-  fetch("/api/approval", {
+  fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: project, request_id: requestId, action: action })
+    body: JSON.stringify(body)
   })
     .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
     .then(function (res) {
@@ -472,18 +490,72 @@ function renderTurns(turns, q, projectName) {
   }).join("");
 }
 
-function renderApprovals(list, projectName) {
-  if (!list || !list.length) return "";
-  return '<div class="section-label">待核准 <span class="badge">' + list.length + "</span></div>" +
-    list.map(function (a) {
-      return '<div class="approval">' +
-        '<div><span class="id">' + esc(a.id) + "</span> — " + esc(a.reason) + " — " + esc(a.proposed_action) + "</div>" +
-        '<div class="approval-actions">' +
-        '<button class="approval-btn approve" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="approve">✅ 核准</button>' +
-        '<button class="approval-btn reject" data-project="' + esc(projectName) + '" data-request="' + esc(a.id) + '" data-action="reject">❌ 拒絕</button>' +
-        '<span class="approval-status"></span>' +
-        "</div></div>";
+function sinceText(iso) {
+  var t = Date.parse(iso || "");
+  if (isNaN(t)) return "";
+  var m = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (m < 60) return m + " 分鐘前";
+  if (m < 1440) return Math.round(m / 60) + " 小時前";
+  return Math.round(m / 1440) + " 天前";
+}
+
+function waitingButton(cls, project, id, action, text, extra) {
+  return '<button class="approval-btn ' + cls + '" data-project="' + esc(project) + '" data-request="' + esc(id) +
+    '" data-action="' + action + '"' + (extra || "") + ">" + text + "</button>";
+}
+
+function renderWaitingItem(it, projectName) {
+  var head = '<div><span class="tag">' + esc(it.label) + '</span> <span class="id">' + esc(it.id) + "</span>" +
+    (it.since ? ' <span class="muted">' + esc(sinceText(it.since)) + "</span>" : "") + "</div>" +
+    '<div class="wait-summary">' + esc(it.summary) + "</div>";
+  var actions = "";
+  if (it.kind === "approval" && it.needs_answer) {
+    var opts = (it.options || []).map(function (o, i) {
+      return waitingButton("choice", projectName, it.id, "choose",
+        (i === it.recommended ? "⭐ " : "") + esc(o.label), ' data-choice="' + i + '" title="' + esc(o.action + (o.tradeoff ? "（" + o.tradeoff + "）" : "")) + '"');
     }).join("");
+    var detail = (it.options || []).map(function (o, i) {
+      return '<div class="muted">' + String.fromCharCode(65 + i) + "．" + esc(o.label) + "：" + esc(o.action) + "</div>";
+    }).join("");
+    actions = (it.situation ? '<div class="muted">' + esc(it.situation) + "</div>" : "") + detail +
+      '<div class="approval-actions">' + opts + "</div>" +
+      '<textarea class="answer-box" rows="2" placeholder="或直接寫下具體答案…"></textarea>' +
+      '<div class="approval-actions">' +
+      waitingButton("approve", projectName, it.id, "clarify", "送出回答") +
+      waitingButton("reject", projectName, it.id, "reject", "❌ 放棄這個任務") +
+      '<span class="approval-status"></span></div>';
+  } else if (it.kind === "approval") {
+    actions = '<div class="approval-actions">' +
+      waitingButton("approve", projectName, it.id, "approve", "✅ 核准") +
+      waitingButton("reject", projectName, it.id, "reject", "❌ 拒絕") +
+      '<span class="approval-status"></span></div>';
+  } else if (it.kind === "confirm") {
+    actions = '<div class="muted">請到 Telegram 按確認（' + "到期 " + esc((it.expires_at || "").slice(11, 16)) + " UTC，逾時自動取消）</div>" +
+      '<div class="approval-actions"><span class="approval-status"></span></div>';
+  } else if (it.kind === "interrupted") {
+    actions = '<div class="approval-actions">' +
+      '<button class="approval-btn reject" data-project="' + esc(projectName) + '" data-conversation="' + esc(it.id) +
+      '" data-action="abandon">放棄這個任務</button><span class="approval-status"></span></div>' +
+      '<div class="muted">想繼續做的話，改在 Telegram 對該任務用 /clarify 回覆。</div>';
+  }
+  return '<div class="approval">' + head + actions + "</div>";
+}
+
+function renderBacklog(project) {
+  var w = project.waiting || {};
+  var b = w.backlog;
+  if (!b) return "";
+  var queued = b.queued || [], held = b.held || [];
+  var line = function (c, why) {
+    return '<div class="muted">' + esc(c.id) + " " + esc(c.title) + (why ? "（" + esc(why) + "）" : "") + "</div>";
+  };
+  return '<div class="section-label">Issue 清單 <span class="badge">開啟 ' + b.open + "</span> " +
+    '<span class="badge">排隊 ' + queued.length + '</span> <span class="badge">擱置 ' + held.length + "</span></div>" +
+    (b.blocked === "locked"
+      ? '<div class="approval-status err">掃描被工作區鎖擋住，現在不會提出新任務（上次檢查 ' + esc(sinceText(b.checked_at)) + "）</div>"
+      : '<div class="muted">上次檢查 ' + esc(sinceText(b.checked_at)) + "；一次只提一張，等你核准後才開工</div>") +
+    (queued.length ? '<div class="muted">排隊（最舊的先提）</div>' + queued.map(function (c) { return line(c); }).join("") : "") +
+    (held.length ? '<div class="muted">擱置</div>' + held.map(function (c) { return line(c, c.why); }).join("") : "");
 }
 
 var STAGE_LABELS = {
@@ -738,6 +810,7 @@ function renderProject(project, q) {
       pipelineSection = '<div class="section-label">Agent Loop 進度</div>' + pipelineHint + renderPipeline(project.pipeline, project.name);
     }
     content = (lock || pipelineSection ? lock + pipelineSection : '<div class="empty">目前沒有進行中的任務</div>') +
+      renderBacklog(project) +
       '<div class="section-label">對話記錄 (' + project.turn_count + ' 則，目標待處理 ' + project.pending_goal + ')</div>' +
       renderTurns(project.recent_turns, q, project.name);
   }
@@ -770,7 +843,7 @@ function renderTabs() {
   var projects = state.data.projects;
   var html = projects.map(function (p) {
     var running = (p.locks || []).length;
-    var approvals = (p.pending_approvals || []).length;
+    var approvals = ((p.waiting || {}).total) || 0;
     return '<button class="tab' + (state.project === p.name ? " active" : "") + (projectMatches(p) ? "" : " dim") +
       '" data-project="' + esc(p.name) + '">' + esc(p.name) +
       (running ? ' <span class="count live">▶ ' + running + "</span>" : "") +
@@ -785,13 +858,16 @@ function renderTabs() {
 // Everything waiting on a person, across all projects, above the tabs: the thing most worth seeing first.
 function renderApprovalsBanner() {
   var el = document.getElementById("approvals-banner");
-  var html = "";
+  var total = 0, html = "";
   state.data.projects.forEach(function (p) {
-    if (!(p.pending_approvals || []).length) return;
-    html += '<div class="banner-project"><a class="goto" data-project="' + esc(p.name) + '">' + esc(p.name) + "</a>" +
-      renderApprovals(p.pending_approvals, p.name) + "</div>";
+    var w = p.waiting || { total: 0, items: [] };
+    if (!w.total) return;
+    total += w.total;
+    html += '<div class="banner-project"><a class="goto" data-project="' + esc(p.name) + '">' + esc(p.name) + "</a> " +
+      '<span class="badge">' + w.total + " 項</span>" +
+      w.items.map(function (it) { return renderWaitingItem(it, p.name); }).join("") + "</div>";
   });
-  el.innerHTML = html ? '<div class="banner">' + html + "</div>" : "";
+  el.innerHTML = html ? '<div class="banner"><div class="banner-title">有 ' + total + " 項在等你處理</div>" + html + "</div>" : "";
 }
 
 function isEditingPreference() {
