@@ -1,9 +1,5 @@
 """Titles and bookkeeping for the hourly archive nodes ("drafts") in MemTrace.
 
-A draft is titled by its subject (a cheap model names it, see duties.make_topic_namer),
-followed by when and which turns; the opener of the conversation stands in when no model
-answers. The history below explains the earlier, content-blind titles.
-
 Every hourly draft used to be titled "Draft primary session consolidation: <project>":
 55 identical titles for one project, indistinguishable in the MemTrace UI and in search
 results, and the node id create_node returned was thrown away, so nothing could ever be
@@ -28,8 +24,6 @@ LEGACY_DRAFT_TITLE = "Draft primary session consolidation"
 _HEAD_CHARS = 24
 _QUOTE_SUFFIX = re.compile(r"\n?（回覆的訊息：「.*」）\s*$", re.DOTALL)
 _TURN_LINE = re.compile(r"^Turn #(\d+) \[", re.MULTILINE)
-# What follows "Draft: <project> " in a title that has no topic yet.
-_STAMP_TITLE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}（")
 
 # MemTrace rate-limits per API key, and the live Harness shares ours: bulk calls from a
 # command stay well under it (a burst of ~60 deletes drew an HTTP 429 once).
@@ -44,90 +38,17 @@ def _head(content: str) -> str:
     return text if len(text) <= _HEAD_CHARS else text[:_HEAD_CHARS] + "…"
 
 
-_TOPIC_MAX_CHARS = 30
-_TOPIC_LABEL = re.compile(r"^(?:主題|标题|標題|title|topic)\s*[:：]\s*", re.IGNORECASE)
-_TOPIC_JUNK = "`*#>-「」『』\"'“”（）()[]【】 "
-_TOPIC_TURNS = 14
-_TOPIC_TURN_CHARS = 220
-
-
-def clean_topic(raw: str | None) -> str:
-    """One short line out of whatever a model answered, or "" when nothing usable came
-    back (the caller then falls back to the opener-based title)."""
-    for line in (raw or "").splitlines():
-        text = re.sub(r"\s+", " ", line).strip().strip(_TOPIC_JUNK)
-        text = _TOPIC_LABEL.sub("", text).strip().strip(_TOPIC_JUNK)
-        if text:
-            return text if len(text) <= _TOPIC_MAX_CHARS else text[:_TOPIC_MAX_CHARS].rstrip() + "…"
-    return ""
-
-
-def topic_prompt(project: str, turns: Iterable[tuple[int, str, str, str]]) -> str:
-    ordered = sorted(turns, key=lambda t: t[0])
-    shown = ordered[:_TOPIC_TURNS]
-    lines = []
-    for seq, _, speaker, content in shown:
-        text = re.sub(r"\s+", " ", _QUOTE_SUFFIX.sub("", content or "")).strip()
-        if len(text) > _TOPIC_TURN_CHARS:
-            text = text[:_TOPIC_TURN_CHARS] + "…"
-        lines.append(f"#{seq} [{speaker}] {text}")
-    omitted = len(ordered) - len(shown)
-    if omitted > 0:
-        lines.append(f"（另有 {omitted} 則較後面的對話未列出）")
-    return (
-        f"以下是專案「{project}」對話紀錄的一段。請替這一段取一個之後用來搜尋與辨認的主題標題。\n"
-        "要求：繁體中文，8 到 25 個字，說出『談了什麼、決定了什麼』（例如：sendPhoto 圖表推送測試與驗收），"
-        "用具體的名詞與動作，不要寫日期、編號、專案名，也不要寫『討論』『對話』『紀錄』這類空泛字。\n"
-        "只回覆標題那一行，不要引號、不要說明。\n\n" + "\n".join(lines)
-    )
-
-
-def draft_title(
-    project: str,
-    turns: Iterable[tuple[int, str, str, str]],
-    tz: tzinfo,
-    topic: str | None = None,
-) -> str:
-    """turns: (turn_seq, created_at ISO, speaker, content) for the turns the draft holds.
-
-    With a topic: `Draft: Beri 修正登入逾時並補上重試（2026-09-30 14:05 · turns #412–#419）` —
-    the words a search or a link decision can use come first; the time and turn range
-    keep two drafts on the same subject apart. Without one (no model answered), the
-    opener of the conversation stands in:
-    `Draft: Beri 2026-09-30 14:05（turns #412–#419）· 請接續上次的任務`."""
+def draft_title(project: str, turns: Iterable[tuple[int, str, str, str]], tz: tzinfo) -> str:
+    """turns: (turn_seq, created_at ISO, speaker, content) for the turns the draft
+    holds. Reads like `Draft: Beri 2026-09-30 14:05（turns #412–#419）· 請接續上次的任務`."""
     ordered = sorted(turns, key=lambda t: t[0])
     first_seq, first_at, _, _ = ordered[0]
     last_seq = ordered[-1][0]
     stamp = datetime.fromisoformat(first_at).astimezone(tz).strftime("%Y-%m-%d %H:%M")
     span = f"turn #{first_seq}" if first_seq == last_seq else f"turns #{first_seq}–#{last_seq}"
-    subject = clean_topic(topic)
-    if subject:
-        return f"{DRAFT_TITLE_PREFIX} {project} {subject}（{stamp} · {span}）"
     opener = next((t for t in ordered if t[2] == "user"), ordered[0])
     head = _head(opener[3])
     return f"{DRAFT_TITLE_PREFIX} {project} {stamp}（{span}）" + (f"· {head}" if head else "")
-
-
-def name_topic(
-    project: str,
-    turns: list[tuple[int, str, str, str]],
-    topic_fn: Callable[[str], str] | None,
-) -> str | None:
-    """Ask the topic model about these turns; None on any failure (naming is a
-    convenience and must never stop a draft from being written or renamed)."""
-    if topic_fn is None or not turns:
-        return None
-    try:
-        return clean_topic(topic_fn(topic_prompt(project, turns))) or None
-    except Exception:
-        return None
-
-
-def has_topic_title(project: str, title: str) -> bool:
-    """True for a draft that was already given a topic title."""
-    return title.startswith(f"{DRAFT_TITLE_PREFIX} {project} ") and not _STAMP_TITLE.match(
-        title[len(f"{DRAFT_TITLE_PREFIX} {project} "):]
-    )
 
 
 def parse_turn_seqs(body: str) -> list[int]:
@@ -178,17 +99,11 @@ def plan_draft_retitle(
     project: str,
     workspace_id: str,
     tz: tzinfo,
-    topic_fn: Callable[[str], str] | None = None,
 ) -> tuple[list[RetitlePlan], list[SkippedDraft]]:
-    """Read-only (apart from the topic model calls): work out the new title of every
-    draft of this project in its memory workspace that has no topic title yet — the
-    identical legacy titles and the time-and-opener ones. The turn numbers come from the
-    node body and the timestamps and text from the local hot log (the node itself may be
-    a copy made later). A draft the topic model could not name keeps the opener-based
-    title; a node whose title would not change is left out, so a re-run only retries
-    those."""
+    """Read-only: work out the new title of every old-style draft of this project in
+    its memory workspace. The turn numbers come from the node body and the timestamps
+    from the local hot log (the node itself may be a copy made later)."""
     old_title = f"{LEGACY_DRAFT_TITLE}: {project}"
-    stamped_prefix = f"{DRAFT_TITLE_PREFIX} {project} "
     by_seq = {
         int(t["turn_seq"]): (int(t["turn_seq"]), t["created_at"], t["speaker"], t["content"])
         for t in trace_store.get_primary_session_turns(f"psess_{project}")
@@ -196,8 +111,7 @@ def plan_draft_retitle(
     plans: list[RetitlePlan] = []
     skipped: list[SkippedDraft] = []
     for node in _list_all_nodes(client, workspace_id):
-        title = str(node.get("title") or "")
-        if not (title == old_title or (title.startswith(stamped_prefix) and _STAMP_TITLE.match(title[len(stamped_prefix):]))):
+        if node.get("title") != old_title:
             continue
         seqs = parse_turn_seqs(str(node.get("body") or ""))
         if not seqs:
@@ -207,15 +121,11 @@ def plan_draft_retitle(
         if missing:
             skipped.append(SkippedDraft(str(node["id"]), f"turns not in the local log: {missing[:3]}"))
             continue
-        turns = [by_seq[s] for s in seqs]
-        new_title = draft_title(project, turns, tz, name_topic(project, turns, topic_fn))
-        if new_title == title:
-            continue
         plans.append(
             RetitlePlan(
                 node_id=str(node["id"]),
-                old_title=title,
-                new_title=new_title,
+                old_title=old_title,
+                new_title=draft_title(project, [by_seq[s] for s in seqs], tz),
                 first_turn_seq=seqs[0],
                 last_turn_seq=seqs[-1],
             )
