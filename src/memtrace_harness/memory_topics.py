@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 TOPIC_TAGS = ["harness", "draft", "topic"]
 MAX_TOPICS_PER_DAY = 20
+# The nightly pass archives every finished day that has no matters yet (a Harness that was down, or
+# history from before this existed), oldest first, but at most this many per project per night: each
+# day is one model call, so a long backlog is worked off over a few nights instead of one long run.
+MAX_DAYS_PER_PASS = 7
 EXISTING_TOPICS_SHOWN = 60
 TITLE_MAX_CHARS = 40
 STATE_MAX_CHARS = 300

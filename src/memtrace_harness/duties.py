@@ -34,6 +34,7 @@ from memtrace_harness.memory_digest import (
     sync_operator_profile,
 )
 from memtrace_harness.memory_topics import (
+    MAX_DAYS_PER_PASS,
     due_topic_dates,
     finish_archived_days,
     run_topics_for_date,
@@ -191,7 +192,7 @@ def run_memory_digests(
                 log(f"[{scope.name}] would digest {d}")
             for d in (
                 [only_date] if only_date is not None
-                else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
+                else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
             ):
                 log(f"[{scope.name}] would archive {d} into matters")
             continue
@@ -232,7 +233,8 @@ def run_memory_digests(
         if only_date is not None:
             topic_dates = [only_date]
         else:
-            topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
+            # Not limited to max_days_back: the matters have no catch-up window, only a per-night cap.
+            topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
         archive_topics(
             trace_store, memtrace_client, scope, workspace_id, tz, call_model, topic_dates,
             respect_retry_backoff=respect_retry_backoff, log=log,
