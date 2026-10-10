@@ -117,6 +117,7 @@ class GroupAndPromptTests(TestCase):
         for kw in (
             {"pinned": True}, {"ask_count": 2}, {"validity_confirmed_by": "me@x"},
             {"tags": ["daily-digest"]}, {"tags": ["task", "status:open"]}, {"tags": ["primary-session"]},
+            {"tags": ["harness", "draft", "topic"]},
         ):
             self.assertTrue(is_protected(node(1, **kw)), kw)
         self.assertTrue(is_protected(node(1), charter_node_id="mem_1"))

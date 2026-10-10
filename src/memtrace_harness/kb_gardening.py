@@ -52,10 +52,11 @@ MAX_TAGS_PER_OP = 5
 CHARTER_MAX_CHARS = 5000
 
 CHARTER_TAGS = ["harness", "controller", "charter"]
-# Nodes the harness itself manages (digests and consolidation notes it syncs, task nodes it
-# scans, the map): a model's tidying must not delete, retitle or retag them.
+# Nodes the harness itself manages (digests and matter notes it syncs, task nodes it scans, the
+# map): a model's tidying must not delete, retitle or retag them. A matter note's local row is
+# its source of truth and the next sync would overwrite such an edit anyway.
 PROTECTED_TAGS = frozenset(
-    {"daily-digest", "primary-session", "charter", "directions-index", "work-review-index", "task"}
+    {"daily-digest", "primary-session", "topic", "charter", "directions-index", "work-review-index", "task"}
 )
 DELETE_REASONS = ("hallucination", "wrong_direction", "duplicate", "pii", "orphaned", "other")
 RESOLUTIONS = ("open", "resolved", "superseded")
