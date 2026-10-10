@@ -20,6 +20,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 memtrace_harness = ["default-role-profiles.toml", "output_schemas/*.json"]
+memtrace_services = ["web/static/*"]
 
 [tool.ruff]
 line-length = 100
