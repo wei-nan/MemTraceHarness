@@ -605,7 +605,7 @@ def _print_loop_summary(summary, config: HarnessConfig) -> None:
 
 
 def memory_topics_command(args: argparse.Namespace) -> int:
-    from memtrace_harness.duties import archive_topics, make_digest_model_caller
+    from memtrace_harness.duties import archive_topics, make_archive_model_caller
     from memtrace_harness.memory_topics import due_topic_dates
 
     config, scope = _config_and_scope()
@@ -630,7 +630,7 @@ def memory_topics_command(args: argparse.Namespace) -> int:
     client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
     workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
     recorded = archive_topics(
-        trace_store, client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates
+        trace_store, client, scope, workspace_id, tz, make_archive_model_caller(config, scope.name), dates
     )
     for d in dates:
         trace_store.mark_digest_edges_unsynced(scope.name, d)
@@ -666,7 +666,7 @@ def _log_days(trace_store, project: str, tz):
 
 
 def memory_reorg_command(args: argparse.Namespace) -> int:
-    from memtrace_harness.duties import make_digest_model_caller
+    from memtrace_harness.duties import make_archive_model_caller
     from memtrace_harness.memory_reorg import describe_reorg, retire_covered_drafts, run_review_pass, undo_reorg_run
 
     config, scope = _config_and_scope()
@@ -690,7 +690,7 @@ def memory_reorg_command(args: argparse.Namespace) -> int:
             print(f"undo with: memory-reorg --undo {outcome.run_id}")
     if args.review:
         outcome = run_review_pass(
-            trace_store, client, scope.name, workspace_id, make_digest_model_caller(config, scope.name),
+            trace_store, client, scope.name, workspace_id, make_archive_model_caller(config, scope.name),
             force=True, plan_only=args.dry_run,
         )
         if outcome is None:

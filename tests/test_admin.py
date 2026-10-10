@@ -107,6 +107,25 @@ class ModelSettingTests(TestCase):
             self.assertEqual(config.digest_candidates_for()[0], ("claude", "sonnet"))
             self.assertEqual(config.recall_candidates_for()[0], ("claude", "claude-sonnet-5-5"))
 
+    def test_the_memory_archive_has_its_own_chain_that_defaults_to_the_digest_chain(self) -> None:
+        with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"}) as (root, config):
+            admin.update_digest_model(config, "claude", "sonnet")
+            self.assertEqual(config.archive_candidates_for()[0], ("claude", "sonnet"))  # nothing of its own yet
+
+            admin.update_model_chain(
+                config, "archive",
+                [{"provider": "claude", "model": "claude-opus-5-5"}, {"provider": "codex", "model": "gpt-5.6-sol"}],
+            )
+
+            saved = read_model_settings(models_file(root))
+            self.assertEqual(saved["HARNESS_ARCHIVE_MODEL"], "claude-opus-5-5")
+            self.assertEqual(saved["HARNESS_ARCHIVE_FALLBACKS"], "codex/gpt-5.6-sol")
+            self.assertEqual(config.archive_candidates_for(), (("claude", "claude-opus-5-5"), ("codex", "gpt-5.6-sol")))
+            self.assertEqual(config.digest_candidates_for()[0], ("claude", "sonnet"))  # the digest is untouched
+            self.assertEqual(config.chat_candidates_for()[0], ("claude", "haiku"))
+            with self.assertRaises(ValueError):
+                admin.update_model_chain(config, "memory", [{"provider": "claude", "model": "sonnet"}])
+
     def test_fallbacks_roundtrip_and_an_empty_string_clears_the_chain(self) -> None:
         with workspace({"HARNESS_DIGEST_PROVIDER": "claude", "HARNESS_DIGEST_MODEL": "sonnet"}) as (root, config):
             admin.update_digest_fallbacks(config, "codex/gpt-5.6-sol, claude/opus")
@@ -152,3 +171,6 @@ class StatusDataTests(TestCase):
         self.assertEqual([p["name"] for p in data["projects"]], ["ws"])  # the folder name
         self.assertEqual(data["harness"]["outbox_backlog"], 0)
         self.assertNotIn("bot", data["projects"][0]["dedicated"])  # nothing Telegram-shaped
+        project = data["projects"][0]
+        self.assertFalse(project["archive_is_own"])  # not set: it follows the digest chain
+        self.assertEqual(project["archive_candidates"], project["digest_candidates"])

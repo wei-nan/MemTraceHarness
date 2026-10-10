@@ -275,6 +275,8 @@ class PipelineTests(TestCase):
 
         with patch.object(duties, "archive_topics", archive), patch.object(
             duties, "make_digest_model_caller", return_value=lambda p: ("{}", None, None)
+        ), patch.object(
+            duties, "make_archive_model_caller", return_value=lambda p: ("{}", None, None)
         ), patch.object(duties, "due_digest_dates", return_value=[]):
             duties.run_memory_digests(config, self.store, None, [scope], max_days_back=2)
 

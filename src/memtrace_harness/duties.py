@@ -97,6 +97,31 @@ def make_digest_model_caller(config: HarnessConfig, project_name: str):
     return call
 
 
+ARCHIVE_TIMEOUT_SECONDS = 600
+
+
+def make_archive_model_caller(config: HarnessConfig, project_name: str):
+    """Like make_digest_model_caller(), through that project's archive chain (the memory
+    archive's own model; the digest's when none is configured): the nightly split into matters,
+    the weekly matter review, the rebuild. A day with many subjects is a long prompt, so the
+    timeout is longer than the digest's."""
+    candidates = config.archive_candidates_for(project_name)
+    sandbox = (config.trace_root / "digest-workspace").resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+
+    def call(prompt: str) -> tuple[str, str | None, str | None]:
+        errors = []
+        for provider, model in candidates:
+            cmd = config.chat_command(provider, model, prompt)
+            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=ARCHIVE_TIMEOUT_SECONDS)
+            if result.return_code == 0 and result.stdout.strip():
+                return result.stdout, provider, model
+            errors.append(f"{provider}/{model}: exit {result.return_code}")
+        raise DigestError("no archive candidate answered (" + "; ".join(errors) + ")")
+
+    return call
+
+
 def make_recall_model_caller(config: HarnessConfig, project_name: str):
     """One call through that project's recall candidates (its own stronger model, see
     HarnessConfig.recall_candidates_for), in order. Like the digest it runs in a neutral
@@ -193,7 +218,7 @@ def rebuild_matters(
         now = datetime.now(timezone.utc)
         dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)
         archive_topics(
-            trace_store, memtrace_client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates, log=log
+            trace_store, memtrace_client, scope, workspace_id, tz, make_archive_model_caller(config, scope.name), dates, log=log
         )
         remaining = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)
         if remaining or trace_store.topics_needing_sync(scope.name, workspace_id):
@@ -217,7 +242,7 @@ def reorganise_now(
     if retired and retired.count:
         outcomes.append(retired)
     reviewed = run_review_pass(
-        trace_store, memtrace_client, scope.name, workspace_id, make_digest_model_caller(config, scope.name), force=True
+        trace_store, memtrace_client, scope.name, workspace_id, make_archive_model_caller(config, scope.name), force=True
     )
     if reviewed and reviewed.count:
         outcomes.append(reviewed)
@@ -378,13 +403,14 @@ def run_memory_digests(
         else:
             # Not limited to max_days_back: the matters have no catch-up window, only a per-night cap.
             topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
+        call_archive = make_archive_model_caller(config, scope.name)
         archive_topics(
-            trace_store, memtrace_client, scope, workspace_id, tz, call_model, topic_dates,
+            trace_store, memtrace_client, scope, workspace_id, tz, call_archive, topic_dates,
             respect_retry_backoff=respect_retry_backoff, log=log,
         )
         if memtrace_client is not None and only_date is None:
             _reorganise(
-                trace_store, memtrace_client, scope, workspace_id, tz, call_model,
+                trace_store, memtrace_client, scope, workspace_id, tz, call_archive,
                 respect_retry_backoff=respect_retry_backoff, log=log, reorg_out=reorg_out,
             )
         if memtrace_client is not None:
