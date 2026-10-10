@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -88,10 +88,10 @@ def main(argv: list[str] | None = None) -> int:
             return doctor_command(args)
         if args.command == "repo":
             return repo_command(args)
+        if args.command == "memory-topics":
+            return memory_topics_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
-        if args.command == "memory-drafts":
-            return memory_drafts_command(args)
     except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -247,15 +247,6 @@ def build_parser() -> argparse.ArgumentParser:
         "ws_spec_plan/mem_c9c4affd).",
     )
     serve_parser.add_argument(
-        "--consolidation-interval-seconds",
-        type=int,
-        default=3600,
-        help=(
-            "Minimum seconds between cold-memory consolidation passes (hot primary-session "
-            "turns -> draft MemTrace nodes) (default 3600)."
-        ),
-    )
-    serve_parser.add_argument(
         "--schedule-check-interval-seconds",
         type=int,
         default=30,
@@ -342,21 +333,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="List the project-days that would be digested, without any model call",
     )
 
-    drafts_parser = subparsers.add_parser(
-        "memory-drafts",
+    topics_parser = subparsers.add_parser(
+        "memory-topics",
         help=(
-            "Rename the old hourly archive nodes in MemTrace (all titled "
-            "'Draft primary session consolidation: <project>') by date and turn range, and "
-            "record which node holds which turns. Dry run unless --apply."
+            "Split finished days of the conversation into matters and write one MemTrace note per "
+            "matter (the nightly archive; use this to catch up on older days). Oldest day first."
         ),
     )
-    drafts_parser.add_argument("--project", help="Only this project (default: every registered project)")
-    drafts_parser.add_argument(
-        "--apply", action="store_true", help="Actually rename the nodes (default: only print the plan)"
+    topics_parser.add_argument("--date", help="Only this local date (YYYY-MM-DD), even if already archived")
+    topics_parser.add_argument(
+        "--days", type=int, default=14, help="Catch up on the days not yet archived within this many days (default 14)"
     )
-    drafts_parser.add_argument(
-        "--plan-file", type=Path, help="Also write the full old -> new plan to this markdown file"
-    )
+    topics_parser.add_argument("--dry-run", action="store_true", help="Only list the days that would be archived")
 
     return parser
 
@@ -593,34 +581,35 @@ def _print_loop_summary(summary, config: HarnessConfig) -> None:
     print(f"trace_db: {config.trace_db_path}")
 
 
-def memory_drafts_command(args: argparse.Namespace) -> int:
-    from memtrace_harness.memory_drafts import apply_draft_retitle, plan_draft_retitle
+def memory_topics_command(args: argparse.Namespace) -> int:
+    from memtrace_harness.duties import archive_topics, make_digest_model_caller
+    from memtrace_harness.memory_topics import due_topic_dates
 
     config, scope = _config_and_scope()
+    trace_store = TraceStore(config.trace_db_path)
+    tz = ZoneInfo(config.schedule_timezone)
+    if args.date:
+        datetime.strptime(args.date, "%Y-%m-%d")
+        dates = [args.date]
+    else:
+        dates = due_topic_dates(
+            trace_store, scope.name, f"psess_{scope.name}", tz, datetime.now(timezone.utc), max_days_back=args.days
+        )
+    if args.dry_run:
+        for d in dates:
+            print(f"[{scope.name}] would archive {d} into matters")
+        print(f"dry run: {len(dates)} day(s), nothing was changed (drop --dry-run to run them)")
+        return 0
     if not config.memtrace_mcp_url:
         raise RuntimeError("MEMTRACE_MCP_URL is required")
-    trace_store = TraceStore(config.trace_db_path)
     client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
-    tz = ZoneInfo(config.schedule_timezone)
-    report: list[str] = []
-    total = 0
     workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-    plans, skipped = plan_draft_retitle(client, trace_store, scope.name, workspace_id, tz)
-    print(f"[{scope.name}] {workspace_id}: {len(plans)} draft(s) to rename, {len(skipped)} skipped")
-    report.append(f"## {scope.name} — `{workspace_id}` ({len(plans)} to rename, {len(skipped)} skipped)\n")
-    report += [f"- `{p.node_id}` → {p.new_title}" for p in plans]
-    report += [f"- `{k.node_id}` **skipped**: {k.reason}" for k in skipped]
-    report.append("")
-    for p in plans[:3] + plans[-1:]:
-        print(f"    {p.node_id}  →  {p.new_title}")
-    for k in skipped:
-        print(f"    skipped {k.node_id}: {k.reason}")
-    if args.apply and plans:
-        total += apply_draft_retitle(client, trace_store, scope.name, workspace_id, plans)
-    if args.plan_file:
-        args.plan_file.write_text("\n".join(report), encoding="utf-8")
-        print(f"full plan written to {args.plan_file}")
-    print(f"renamed {total} node(s)" if args.apply else "dry run: nothing was changed (use --apply)")
+    recorded = archive_topics(
+        trace_store, client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates
+    )
+    for d in dates:
+        trace_store.mark_digest_edges_unsynced(scope.name, d)
+    print(f"{recorded} matter(s) recorded for {len(dates)} day(s)")
     return 0
 
 
@@ -664,7 +653,6 @@ def serve_command(args: argparse.Namespace) -> int:
         config,
         scope,
         scan_interval=max(1, args.scan_interval_seconds),
-        consolidation_interval=max(1, args.consolidation_interval_seconds),
         schedule_check_interval=max(1, args.schedule_check_interval_seconds),
     )
 

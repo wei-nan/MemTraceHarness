@@ -1008,6 +1008,40 @@ class TraceStore:
                     UNIQUE(project, digest_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_topics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    entries_json TEXT NOT NULL,
+                    first_date TEXT NOT NULL,
+                    last_date TEXT NOT NULL,
+                    node_id TEXT,
+                    node_dirty INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_topics_project
+                    ON memory_topics(project, workspace_id, last_date);
+
+                CREATE TABLE IF NOT EXISTS memory_topic_days (
+                    topic_id INTEGER NOT NULL,
+                    project TEXT NOT NULL,
+                    digest_date TEXT NOT NULL,
+                    PRIMARY KEY (topic_id, digest_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_topic_runs (
+                    project TEXT NOT NULL,
+                    digest_date TEXT NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    topic_count INTEGER NOT NULL,
+                    ran_at TEXT NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (project, digest_date)
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project TEXT NOT NULL,
@@ -1599,7 +1633,167 @@ class TraceStore:
             ).fetchone()
         return self._digest_row_to_dict(row) if row else None
 
-    # --- Hourly archive nodes written to MemTrace (memory_drafts) ------------------
+    # --- Nightly topics (memory_topics.py): one row per matter, one MemTrace node each ---
+
+    _TOPIC_COLUMNS = (
+        "id, project, workspace_id, title, entries_json, first_date, last_date, node_id, node_dirty"
+    )
+
+    @staticmethod
+    def _topic_row_to_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "project": row[1],
+            "workspace_id": row[2],
+            "title": row[3],
+            "entries": json.loads(row[4]),
+            "first_date": row[5],
+            "last_date": row[6],
+            "node_id": row[7],
+            "node_dirty": bool(row[8]),
+        }
+
+    def list_memory_topics(self, project: str, workspace_id: str, limit: int | None = None) -> list[dict]:
+        """Newest-touched first."""
+        query = (
+            f"SELECT {self._TOPIC_COLUMNS} FROM memory_topics WHERE project = ? AND workspace_id = ? "
+            "ORDER BY last_date DESC, id DESC"
+        )
+        params: tuple = (project, workspace_id)
+        if limit is not None:
+            query += " LIMIT ?"
+            params += (limit,)
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._topic_row_to_dict(r) for r in rows]
+
+    def get_memory_topic(self, topic_id: int) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._TOPIC_COLUMNS} FROM memory_topics WHERE id = ?", (topic_id,)
+            ).fetchone()
+        return self._topic_row_to_dict(row) if row else None
+
+    def save_topic_day(
+        self, *, project: str, workspace_id: str, digest_date: str, topics: list[dict],
+        provider: str | None, model: str | None,
+    ) -> list[int]:
+        """Record one day's matters in a single transaction. Each item is
+        {"topic_id": existing id or None, "title": str, "entry": {...}}. An existing
+        matter gets that day's entry added (or replaced, when the day is re-run) and
+        is marked dirty so its node is updated in place; a new one gets a row. The
+        day's run is recorded last, so a day is never 'done' with its matters missing."""
+        now = utc_now_iso()
+        touched: list[int] = []
+        with self._connection() as conn:
+            for topic in topics:
+                entry = topic["entry"]
+                topic_id = topic.get("topic_id")
+                row = None
+                if topic_id is not None:
+                    row = conn.execute(
+                        "SELECT entries_json, first_date, last_date FROM memory_topics "
+                        "WHERE id = ? AND project = ? AND workspace_id = ?",
+                        (topic_id, project, workspace_id),
+                    ).fetchone()
+                if row is None:
+                    cur = conn.execute(
+                        "INSERT INTO memory_topics (project, workspace_id, title, entries_json, first_date, "
+                        "last_date, node_dirty, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                        (project, workspace_id, topic["title"], json.dumps([entry], ensure_ascii=False),
+                         digest_date, digest_date, now, now),
+                    )
+                    topic_id = int(cur.lastrowid)
+                else:
+                    entries = [e for e in json.loads(row[0]) if e.get("date") != digest_date] + [entry]
+                    entries.sort(key=lambda e: e.get("date", ""))
+                    conn.execute(
+                        "UPDATE memory_topics SET entries_json = ?, first_date = ?, last_date = ?, "
+                        "node_dirty = 1, updated_at = ? WHERE id = ?",
+                        (json.dumps(entries, ensure_ascii=False), entries[0]["date"], entries[-1]["date"],
+                         now, topic_id),
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO memory_topic_days (topic_id, project, digest_date) VALUES (?, ?, ?)",
+                    (topic_id, project, digest_date),
+                )
+                touched.append(int(topic_id))
+            conn.execute(
+                """
+                INSERT INTO memory_topic_runs (project, digest_date, provider, model, topic_count, ran_at, archived)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(project, digest_date) DO UPDATE SET
+                    provider = excluded.provider, model = excluded.model,
+                    topic_count = excluded.topic_count, ran_at = excluded.ran_at, archived = 0
+                """,
+                (project, digest_date, provider, model, len(touched), now),
+            )
+        return touched
+
+    def topic_run_dates(self, project: str) -> set[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT digest_date FROM memory_topic_runs WHERE project = ?", (project,)
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def topics_needing_sync(self, project: str, workspace_id: str) -> list[dict]:
+        """Matters with no node yet, or changed since their node was written. Oldest
+        first, so nodes appear in the order the matters began."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._TOPIC_COLUMNS} FROM memory_topics WHERE project = ? AND workspace_id = ? "
+                "AND (node_id IS NULL OR node_dirty = 1) ORDER BY first_date ASC, id ASC",
+                (project, workspace_id),
+            ).fetchall()
+        return [self._topic_row_to_dict(r) for r in rows]
+
+    def mark_topic_synced(self, topic_id: int, node_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_topics SET node_id = ?, node_dirty = 0 WHERE id = ?", (node_id, topic_id)
+            )
+
+    def topic_nodes_for_date(self, project: str, workspace_id: str, digest_date: str) -> list[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT t.node_id FROM memory_topic_days d JOIN memory_topics t ON t.id = d.topic_id "
+                "WHERE d.project = ? AND d.digest_date = ? AND t.workspace_id = ? AND t.node_id IS NOT NULL "
+                "ORDER BY t.id ASC",
+                (project, digest_date, workspace_id),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def unarchived_topic_days(self, project: str, workspace_id: str) -> list[str]:
+        """Days whose matters are all written to MemTrace but whose turns are not yet
+        marked archived."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT r.digest_date FROM memory_topic_runs r WHERE r.project = ? AND r.archived = 0 "
+                "AND NOT EXISTS (SELECT 1 FROM memory_topic_days d JOIN memory_topics t ON t.id = d.topic_id "
+                "WHERE d.project = r.project AND d.digest_date = r.digest_date "
+                "AND (t.node_id IS NULL OR t.node_dirty = 1 OR t.workspace_id != ?)) "
+                "ORDER BY r.digest_date ASC",
+                (project, workspace_id),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def mark_topic_day_archived(self, project: str, digest_date: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_topic_runs SET archived = 1 WHERE project = ? AND digest_date = ?",
+                (project, digest_date),
+            )
+
+    def mark_digest_edges_unsynced(self, project: str, digest_date: str) -> None:
+        """A day's matters were (re)written after its digest was linked: link again."""
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_digests SET edges_synced = 0 WHERE project = ? AND digest_date = ?",
+                (project, digest_date),
+            )
+
+    # --- Hourly archive nodes written to MemTrace (memory_drafts, until 2026-10-10) ---
 
     def record_memory_draft(
         self, *, project: str, workspace_id: str, node_id: str, first_turn_seq: int, last_turn_seq: int

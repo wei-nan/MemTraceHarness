@@ -1157,25 +1157,27 @@ class HarnessService:
         consolidated conversation note was effectively write-only for it."""
         memory_ws = self.config.memory_workspace_id_for(scope.name, scope.workspace_id)
         note_shape = (
-            f"draft nodes titled \"Draft: {scope.name} <YYYY-MM-DD HH:MM>（turns #a–#b）· "
-            "<how it opens>\" (content_type context, tags harness/draft/primary-session), "
-            "each holding a batch of past chat turns and decisions, plus one nightly digest "
-            f"per day titled \"{DIGEST_TITLE_PREFIX}: {scope.name} <YYYY-MM-DD>\" (tag "
-            "daily-digest) with that day's decisions, facts and open items. A digest is "
-            "linked by `extends` to the previous day's digest and by `extracted_from` to the "
-            "drafts it was made from, so traverse from a digest to reach its raw evidence"
+            "one node per matter (a rule, a bug, a decision, an open question), titled by the "
+            "matter itself (content_type context, tags harness/draft/topic): its body is the "
+            "matter's current state, then what is still open, the decisions and the facts "
+            "with the dates and chat-turn numbers they come from. Search by what the matter "
+            f"is about. A later day's discussion of the same matter updates its node. Each day "
+            f"also has a short \"{DIGEST_TITLE_PREFIX}: {scope.name} <YYYY-MM-DD>\" node (tag "
+            "daily-digest) linked by `extracted_from` to the matters of that day and by "
+            "`extends` to the previous day's digest. Conversation transcripts are never "
+            "in MemTrace; today's chat is in the prior-discussion context"
         )
         if memory_ws == scope.workspace_id:
             memory_line = (
                 f"- Cold memory (what was discussed/decided before): no dedicated memory "
-                f"workspace is configured, so the periodic background consolidation pass "
+                f"workspace is configured, so the nightly archive "
                 f"writes into the spec workspace `{memory_ws}` itself, as {note_shape}."
             )
         else:
             memory_line = (
                 f"- Cold memory (what was discussed/decided before): `{memory_ws}` "
-                f"(\"Harness Memory\" in MemTrace), separate from the spec workspace. A "
-                f"periodic background consolidation pass writes {note_shape}."
+                f"(\"Harness Memory\" in MemTrace), separate from the spec workspace. The "
+                f"nightly archive writes {note_shape}."
             )
         return "\n".join(
             [
@@ -1187,7 +1189,7 @@ class HarnessService:
                 "past conversation, task, or decision you need isn't in it, search the "
                 "cold-memory workspace with MemTrace's search_nodes (pass that "
                 "workspace_id explicitly). Cold-memory notes are unreviewed draft "
-                "evidence of what was said, not accepted spec: if one conflicts with "
+                "organised records of what was said, not accepted spec: if one conflicts with "
                 "the spec workspace, the spec wins and the conflict should be flagged.",
                 "A local Claude Code project-memory directory (e.g. under "
                 "~/.claude/projects/.../memory/) you may know of from your own tool "

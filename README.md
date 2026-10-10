@@ -322,11 +322,12 @@ without `HARNESS_API_TOKEN` refuses to serve its API.
   triggered twice while it's still running.
 - Every chat message and every Agent Loop outcome is appended to the project's own running
   transcript (its "primary session"), so a later question like "what happened with that last task"
-  is answerable from the same conversation, and a periodic consolidation pass can promote the
-  substantive parts back into MemTrace as draft evidence — never silently, never as canonical
-  knowledge. `git push` always requires a separate approval, even after a full Agent Loop pass.
+  is answerable from the same conversation. That transcript stays local, verbatim: nothing is
+  written to MemTrace by day, and a transcript never goes into MemTrace at all — the night pass
+  (below) writes organised notes, one per matter, as draft evidence, never as canonical knowledge.
+  `git push` always requires a separate approval, even after a full Agent Loop pass.
 - A scheduled run is logged as a `schedule_trigger` / `schedule_report` pair carrying the schedule's
-  id, kept out of the conversation window and the hourly MemTrace archive; chat and the Agent Loop
+  id, kept out of the conversation window and the nightly matter notes; chat and the Agent Loop
   instead get one line per schedule (latest result, firings in the last 24h). Replying to any
   message — including pushes from this bot's schedules or from external scripts using the same bot
   through the service's relay, which the Harness never otherwise sees — puts that message's text in
@@ -341,6 +342,15 @@ without `HARNESS_API_TOKEN` refuses to serve its API.
   operator corrects one by saying so in chat, or retires/restores it on the status page; the
   adopted rules reach the chat model numbered, newest 40 first. `memory-digest [--date YYYY-MM-DD] [--backfill] [--dry-run]` runs it
   by hand; the automatic pass only catches up the last 2 days.
+- **Nightly matter notes** (same window, right after the digest): the whole day is split by matter
+  *before* anything enters MemTrace — one memory node per matter (a rule, a bug, a decision, an open
+  question), however the day's messages interleaved. The node is titled by the matter itself and
+  holds the matter's current state, what is still open, and the decisions and facts with the dates
+  and chat-turn numbers they came from (items without a real turn are dropped; the words themselves
+  stay in the local log). A matter that already has a node is updated, not duplicated, so a
+  strategy discussed over ten days is one note with a history. The daily digest links to the
+  matters of its day. `memory-topics [--date YYYY-MM-DD] [--days N] [--dry-run]` runs it by hand and
+  catches up older days (oldest first); contract: "Memory archive" in `docs/operating-contract.md`.
 
 Full design rationale and the open decisions behind this feature are in
 [`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).

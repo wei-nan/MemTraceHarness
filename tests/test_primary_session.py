@@ -12,7 +12,7 @@ from memtrace_harness.trace_store import TraceStore
 
 
 class PrimarySessionTests(TestCase):
-    def test_primary_session_logging_and_consolidation(self) -> None:
+    def test_primary_session_logging_and_rehydration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             db_path = tmp_path / "test_psess.sqlite3"
@@ -38,83 +38,10 @@ class PrimarySessionTests(TestCase):
             self.assertIn("Agreed on architecture spec", rehydrated)
             self.assertIn("Loop finished with PASS", rehydrated)
 
-            # 3. Consolidate back to MemTrace
-            consolidated_ids = psess_mgr.consolidate_to_memtrace("proj_a", "ws_test")
-            self.assertEqual(len(consolidated_ids), 2)  # decision and dev_report are substantive
-            mock_client.create_node.assert_called_once()
-
-    def test_consolidation_without_memtrace_client_does_not_discard_substantive_turns(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            db_path = tmp_path / "test_psess_no_client.sqlite3"
-            trace_store = TraceStore(db_path)
-
-            # No memtrace_client configured — a legitimate, documented state (README:
-            # MemTrace MCP is optional). Nothing can be written yet, so a substantive
-            # turn must NOT be marked consolidated, or it would be silently lost forever
-            # once MemTrace does become reachable.
-            psess_mgr = PrimarySessionManager(trace_store, memtrace_client=None)
-            psess_mgr.record_turn(
-                project="proj_b", speaker="user", turn_type="chat", content="hi"
-            )
-            psess_mgr.record_turn(
-                project="proj_b", speaker="user", turn_type="decision", content="!ship the fix"
-            )
-
-            written = psess_mgr.consolidate_to_memtrace("proj_b", "ws_test")
-            self.assertEqual(written, [])
-
-            session_id = psess_mgr.primary_session_id_for_project("proj_b")
-            remaining = trace_store.get_unconsolidated_turns(session_id)
-            # The chat turn can be marked consolidated (nothing worth keeping), but the
-            # decision turn must still be pending so a later pass can actually write it.
-            self.assertEqual(len(remaining), 1)
-            self.assertEqual(remaining[0]["turn_type"], "decision")
-
-    def test_classify_chat_fn_can_promote_plain_chat_to_substantive(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            db_path = tmp_path / "test_psess_classify.sqlite3"
-            trace_store = TraceStore(db_path)
-            mock_client = MagicMock()
-            mock_client.create_node.return_value = "mem_draft_456"
-            psess_mgr = PrimarySessionManager(trace_store, mock_client)
-
-            psess_mgr.record_turn(project="proj_c", speaker="user", turn_type="chat", content="hi there")
-            psess_mgr.record_turn(
-                project="proj_c",
-                speaker="user",
-                turn_type="chat",
-                content="let's always fall back to Gemini before Sonnet from now on",
-            )
-
-            # A model classifier judges the second (unmarked "chat") turn as worth
-            # remembering even though nothing forced it via turn_type.
-            written = psess_mgr.consolidate_to_memtrace(
-                "proj_c", "ws_test", classify_chat_fn=lambda contents: [False, True]
-            )
-            self.assertEqual(len(written), 1)
-            mock_client.create_node.assert_called_once()
-            body = mock_client.create_node.call_args.kwargs["body"]
-            self.assertIn("fall back to Gemini", body)
-
-    def test_classify_chat_fn_mismatched_length_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            db_path = tmp_path / "test_psess_classify_mismatch.sqlite3"
-            trace_store = TraceStore(db_path)
-            mock_client = MagicMock()
-            psess_mgr = PrimarySessionManager(trace_store, mock_client)
-
-            psess_mgr.record_turn(project="proj_d", speaker="user", turn_type="chat", content="hi")
-
-            # A malformed/short classifier response must not be trusted enough to
-            # promote anything — better to miss a note than misattribute a verdict.
-            written = psess_mgr.consolidate_to_memtrace(
-                "proj_d", "ws_test", classify_chat_fn=lambda contents: []
-            )
-            self.assertEqual(written, [])
+            # 3. The hot log is never written to MemTrace on its own (2026-10-10: the night
+            # pass archives it as matters, memory_topics.py).
             mock_client.create_node.assert_not_called()
+
 
 
 def _stamp(store: TraceStore, turn_id: int, created_at: str) -> None:
@@ -207,29 +134,6 @@ class ScheduleNoiseTests(TestCase):
 
         self.assertIn("sched_a「追蹤 A」，近 24 小時觸發 1 次；這段期間沒有執行結果", text)
 
-    def test_hourly_archive_skips_schedule_turns_and_marks_them_done(self) -> None:
-        client = MagicMock()
-        mgr = PrimarySessionManager(self.store, client)
-        mgr.record_turn(project="p", speaker="user", turn_type="decision", content="真正的決策")
-        self._fire("sched_a", "追蹤 A", "不該進 MemTrace", "2026-10-01T05:00:00+00:00")
-
-        written = mgr.consolidate_to_memtrace("p", "ws_mem", classify_chat_fn=lambda c: [True] * len(c))
-
-        self.assertEqual(len(written), 1)
-        body = client.create_node.call_args.kwargs["body"]
-        self.assertIn("真正的決策", body)
-        self.assertNotIn("不該進 MemTrace", body)
-        self.assertEqual(self.store.get_unconsolidated_turns(mgr.primary_session_id_for_project("p")), [])
-
-    def test_a_pass_with_only_schedule_turns_writes_nothing_and_clears_them(self) -> None:
-        client = MagicMock()
-        mgr = PrimarySessionManager(self.store, client)
-        self._fire("sched_a", "g", "r", "2026-10-01T05:00:00+00:00")
-
-        self.assertEqual(mgr.consolidate_to_memtrace("p", "ws_mem"), [])
-
-        client.create_node.assert_not_called()
-        self.assertEqual(self.store.get_unconsolidated_turns(mgr.primary_session_id_for_project("p")), [])
 
 
 class LegacyScheduleRetagTests(TestCase):
