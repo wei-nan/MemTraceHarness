@@ -16,6 +16,7 @@ from pathlib import Path
 
 from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.model_override import describe as describe_model, resolve_model_override, with_developer_override
 from memtrace_harness.completion_claims import (
     CHAT_NOTE_MARKER,
     CHAT_NOTE_TAGS,
@@ -82,7 +83,7 @@ from memtrace_harness.github_actions import (
     summarize,
     validate_action,
 )
-from memtrace_harness.scope import ProjectScope, apply_scope_change, split_repo_goal, validate_scope_change
+from memtrace_harness.scope import ProjectScope, apply_scope_change, split_goal_directives, split_repo_goal, validate_scope_change
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
@@ -1091,9 +1092,13 @@ class HarnessService:
         """Start a governed task now if the project has a free worker slot, otherwise
         queue it. A schedule whose previous run is still running (or still queued) is
         skipped instead — it must never pile up behind itself."""
-        repo_name, _ = split_repo_goal(goal)
+        repo_name, model_spec, _ = split_goal_directives(goal)
         try:
             scope.resolve_repo(repo_name)
+            if model_spec:
+                resolve_model_override(
+                    model_spec, load_role_profiles(self.config.role_profiles_file_for(scope.name))["developer"], self.config
+                )
         except ValueError as exc:
             msg = f"⚠️ 任務沒有開始：{exc}"
             self.send_message(audience, msg)
@@ -1135,8 +1140,25 @@ class HarnessService:
         self._launch_task(scope, conv_id, goal, audience, schedule_id)
         return f"任務已在背景開始執行：{goal}"
 
+    def _with_model_override(
+        self, profiles: dict, model_spec: str | None, project: str | None
+    ) -> tuple[dict, frozenset[str]]:
+        """The profiles with this task's one-off Developer model in front (see model_override.py), and the
+        profiles it applies to. A spec that cannot be resolved is ignored: the task runs on the defaults."""
+        if not model_spec:
+            return profiles, frozenset()
+        try:
+            candidate = resolve_model_override(model_spec, profiles["developer"], self.config)
+        except ValueError as exc:
+            logger.warning(f"ignoring one-off model {model_spec!r} for project {project!r}: {exc}")
+            return profiles, frozenset()
+        return with_developer_override(profiles, candidate), frozenset({"developer"})
+
     @staticmethod
     def _task_started_text(scope: ProjectScope, goal: str, schedule_id: str | None) -> str:
+        _, model_spec, plain = split_goal_directives(goal)
+        if model_spec:
+            goal = f"{plain}（這次動手的模型：{model_spec}，失敗會改回預設）"
         if schedule_id:
             return f"⏰ 排程 {schedule_id} 開始執行：{goal}"
         return f"🔧 開始執行「{scope.name}」：{goal}"
@@ -1426,6 +1448,17 @@ class HarnessService:
             "要動手開發時，任務描述最前面加上「repo=<repo 名稱>::」指定在哪一個 repo 做（不加就是主要的那個），"
             f"例如「{self._TASK_START_MARKER}repo={next(iter(scope.repos))}::<任務>」；排程的任務內容也一樣。"
             "一件事要同時改兩個 repo 時，拆成各自在一個 repo 裡的兩個任務，先後順序在任務描述裡寫清楚。\n\n"
+        )
+
+    def _model_notice(self) -> str:
+        return (
+            "使用者可以只為「這一個任務」指定動手開發的模型，例如「請用 opus 5.5 來設計這個頁面」。這時在任務標記的"
+            f"任務描述最前面加上「model=<模型 id>::」（例如「{self._TASK_START_MARKER}model=claude-opus-5-5::<任務>」；"
+            "跟 repo= 可以並用）。模型 id 要寫成 CLI 認得的完整 id（Claude 如 claude-opus-5-5、claude-sonnet-5-5，"
+            "也可用 opus、sonnet、haiku；Codex 如 gpt-…；Antigravity 如 gemini-…）；沒把握屬於哪個供應商時寫成"
+            "「model=claude/<id>」。只有使用者明說要用某個模型時才加；沒說就不要加，任務照專案預設的模型跑。"
+            "這只影響這一個任務，失敗時系統會自動改回預設模型，不會改動專案設定。這個前綴只對開發任務有效，"
+            "對一般聊天回覆不適用。\n\n"
         )
 
     def _identity_context(self, scope: ProjectScope) -> str:
@@ -2171,6 +2204,7 @@ class HarnessService:
             f"{self.MAX_CHOICES} 個選項。Harness 會把它變成按鈕，而且會保留在狀態頁直到使用者回答，不會被聊天洗掉；"
             "正文仍要把情境與各選項的取捨說清楚。每則回覆最多一行；單純聊天、沒有要使用者決定時不要輸出。\n\n"
             f"{self._repos_notice(scope)}"
+            f"{self._model_notice()}"
             f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
             f"{self._schedule_control_notice(scope)}"
@@ -2731,7 +2765,7 @@ class HarnessService:
 
     def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str, schedule_id: str | None = None):
         # A task works in one repo of the project: the one its goal names, else the primary one.
-        repo_name, goal = split_repo_goal(goal)
+        repo_name, model_spec, goal = split_goal_directives(goal)
         scope = scope.for_repo(scope.resolve_repo(repo_name))
         self.approval_manager.trace_store.set_conversation_repo(conv_id, scope.repo)
         task = TaskEnvelope(
@@ -2745,6 +2779,7 @@ class HarnessService:
             source="chat",
         )
         profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
+        profiles, override_profiles = self._with_model_override(profiles, model_spec, scope.name)
         work_dir, worktree = self._provision_workdir(scope, conv_id)
         candidate_adapters = build_role_adapter_candidates(
             profiles=profiles,
@@ -2758,6 +2793,7 @@ class HarnessService:
             fallback_adapters={p_id: items[1:] for p_id, items in candidate_adapters.items()},
             role_profiles=profiles,
             trace_store=self.approval_manager.trace_store,
+            model_override_profiles=override_profiles,
             memtrace_client=self.memtrace_client,
             approval_manager=self.approval_manager,
             working_directory=work_dir,
@@ -2876,7 +2912,9 @@ class HarnessService:
         # summary of why it stopped) — approving must continue the actual task, not
         # re-run with the stop reason as the new goal. Older rows predating this field
         # fall back to the old behavior.
-        goal_repo, goal = split_repo_goal(req_data.resume_goal or req_data.proposed_action or req_data.reason)
+        goal_repo, model_spec, goal = split_goal_directives(
+            req_data.resume_goal or req_data.proposed_action or req_data.reason
+        )
         if answer:
             goal = f"{goal}\n\nHuman clarification: {answer}"
         if matching_scope is not None:
@@ -2931,6 +2969,9 @@ class HarnessService:
                     self.config.role_profiles_file_for(matching_scope.name) if matching_scope else None
                 )
                 profiles = load_role_profiles(profiles_file)
+                profiles, override_profiles = self._with_model_override(
+                    profiles, model_spec, matching_scope.name if matching_scope else None
+                )
                 worktree: TaskWorktree | None = None
                 run_dir = working_dir
                 if matching_scope is not None:
@@ -2951,6 +2992,7 @@ class HarnessService:
                     fallback_adapters={p_id: items[1:] for p_id, items in candidate_adapters.items()},
                     role_profiles=profiles,
                     trace_store=trace_store,
+                    model_override_profiles=override_profiles,
                     memtrace_client=self.memtrace_client,
                     approval_manager=self.approval_manager,
                     working_directory=run_dir,

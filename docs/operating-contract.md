@@ -250,6 +250,24 @@ not enforced:** that the model checks `list_jobs` first and only proposes what t
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
+**One-off model for a task (operator decision, 2026-10-11).** The operator can name a model for a single task in
+chat ("請用 opus 5.5 設計這個頁面"); the chat model writes `model=<model>::` (or `model=<provider>/<model>::`, alongside
+`repo=`) in front of the `HARNESS_TASK_START::` goal. **ENFORCED** (`tests/test_model_override.py`): the prefix is routing,
+not part of the goal; it applies to the Developer only, as its first candidate, with the project's own Developer chain
+behind it, so any failed call of the chosen model (not only capacity errors) continues on the defaults; nothing is
+written to `models.toml` or the role-profiles file, so the next task is back to the defaults; the permission and context
+shape of the Developer are unchanged; an unresolvable provider refuses the task before a slot is taken. It is
+carried by the goal text, so queued tasks, schedules and approval resumes keep it. **Prompt policy, not enforced:** that the chat
+model adds the prefix only when the operator names a model. **Not covered:** the chat reply itself and the
+other roles (Controller, Planner, Red Team) always use their configured models; a chosen model that succeeds with
+unparseable output does not fall back (the stage stops as for any invalid output).
+
+**Controller can end a task with nothing to do (2026-10-11).** At the start stage the Controller may choose
+`no_action_needed` (goal already met, or the operator said the current state is acceptable): the run ends `succeeded`
+and the reason is reported, with no new approval. `stop` and `ask_human` still end as `needs_human`; before this action
+existed, an operator answer of "already fine" came back as a new question each time (beri-android#140, four rounds).
+**Prompt policy, not enforced:** that the Controller picks it instead of `stop` in that situation.
+
 **Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
 with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
 30 characters, `text` the sentence the pick stands for). The Harness strips the line, sends the reply with the options as
@@ -270,7 +288,8 @@ in-flight tracker for 10 minutes, shown with whether it holds the workspace lock
 (`clarify` with text, or `choose` an option) and abandon an interrupted task (marks it failed and frees its slot;
 refused for a task the tracker says is running). The overview tab shows the **Issue list**: open / queued / held
 counts from the last scan pass's snapshot (`scan_snapshots`; the page itself never calls GitHub), each held issue
-with why, and a warning when the last pass was skipped because the workspace was locked. **Not enforced:** the
+with why. Whether the workspace is held is read live from the lock table (never stored): the page names the holder and, when
+the in-flight tracker shows no running thread for it, says scans are being skipped because of it. **Not enforced:** the
 10-minute and 7-day thresholds are display heuristics; a stale "interrupted" mark can still appear for work that
 ended without updating its conversation.
 

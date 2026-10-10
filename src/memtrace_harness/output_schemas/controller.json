@@ -8,6 +8,7 @@
         "run_operational_action",
         "ask_human",
         "stop",
+        "no_action_needed",
         "finish",
         "merge"
       ]

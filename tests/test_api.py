@@ -223,12 +223,17 @@ class StatusAndAdminTests(ApiTestCase):
             request_id="scope_w", project=self.scope.name, change={"kind": "probe_host", "value": "a.example.com"},
             summary="probe_host: a.example.com", expires_at="2999-01-01T00:00:00+00:00",
         )
-        store.set_scan_snapshot(self.scope.name, {"open": 3, "queued": [{"id": "gh:x/y#1", "title": "t"}], "held": [], "blocked": None})
+        store.set_scan_snapshot(self.scope.name, {"open": 3, "queued": [{"id": "gh:x/y#1", "title": "t"}], "held": []})
+        store.acquire_workspace_lock(self.scope.workspace_id, "conv_holder")
         waiting = self.client.status()["projects"][0]["waiting"]
         self.assertEqual([i["kind"] for i in waiting["items"]], ["approval", "confirm"])
         self.assertEqual(waiting["total"], 2)
         self.assertEqual(waiting["items"][0]["label"], "待核准")
         self.assertEqual(waiting["backlog"]["open"], 3)
+        # Who holds the workspace is read live, and a holder with no running thread is reported as not alive.
+        self.assertEqual(
+            [(h["conversation_id"], h["alive"]) for h in waiting["lock_holders"]], [("conv_holder", False)]
+        )
 
     def test_an_interrupted_task_can_be_abandoned_but_a_running_one_cannot(self) -> None:
         from datetime import datetime, timedelta, timezone

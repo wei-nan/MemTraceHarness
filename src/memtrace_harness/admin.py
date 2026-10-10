@@ -121,7 +121,13 @@ def collect_waiting(trace_store: TraceStore, scope: ProjectScope, pending_approv
                 "since": conv["updated_at"], "holds_lock": holds,
             }
         )
-    return {"total": len(items), "items": items, "backlog": trace_store.get_scan_snapshot(scope.name)}
+    # Who holds the workspace right now, read live: a scan pass is skipped while anyone does, and the page
+    # must say so (and who) only for as long as it is true.
+    holders = [
+        {"conversation_id": lock["conversation_id"], "locked_at": lock["locked_at"], "alive": lock["conversation_id"] in live}
+        for lock in locks
+    ]
+    return {"total": len(items), "items": items, "backlog": trace_store.get_scan_snapshot(scope.name), "lock_holders": holders}
 
 
 def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: str | None = None) -> dict:

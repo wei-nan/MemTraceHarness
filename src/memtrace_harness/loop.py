@@ -69,6 +69,7 @@ class AgentLoopRunner:
         edit_lock: tuple[Callable[[], bool], Callable[[], None]] | None = None,
         edit_lock_wait_seconds: float = 3600.0,
         edit_lock_poll_seconds: float = 5.0,
+        model_override_profiles: frozenset[str] = frozenset(),
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         # (acquire, release) for a project whose tasks share one folder (no worktree): the
@@ -80,6 +81,9 @@ class AgentLoopRunner:
         # An approval would let a later human reply resume the monitoring conversation with a
         # different goal (2026-10-05, chat_2e6f12ab), so none is opened.
         self.create_approvals = create_approvals
+        # Profiles whose first candidate is a model the operator picked for this task alone: if it
+        # fails for any reason the stage goes on to the profile's usual chain, not only on capacity errors.
+        self.model_override_profiles = model_override_profiles
         self.edit_lock_wait_seconds = edit_lock_wait_seconds
         self.edit_lock_poll_seconds = edit_lock_poll_seconds
         self._sleep = sleep
@@ -212,7 +216,7 @@ class AgentLoopRunner:
         if stopped:
             return self._persist(stopped, writeback=writeback)
         controller_artifact = controller.artifact or {}
-        start_actions = {"run_planner", "run_operational_action", "ask_human", "stop"}
+        start_actions = {"run_planner", "run_operational_action", "ask_human", "stop", "no_action_needed"}
         if not valid_controller(controller_artifact, start_actions):
             return self._persist(
                 self._summary(
@@ -247,6 +251,20 @@ class AgentLoopRunner:
         if action == "run_operational_action":
             return self._persist(
                 self._run_operational_action(task, trace_id, stages),
+                writeback=writeback,
+            )
+        if action == "no_action_needed":
+            # The goal is already met or needs nothing done (typically right after the operator answered
+            # "the current state is acceptable"). This ends the task; routing it through needs_human
+            # opened a fresh question every time and never finished (beri-android#140, four rounds).
+            return self._persist(
+                self._summary(
+                    task,
+                    trace_id,
+                    stages,
+                    "succeeded",
+                    "Controller 判斷不需要任何動作：" + str(controller_artifact.get("reason") or "(no reason given)"),
+                ),
                 writeback=writeback,
             )
         if action != "run_planner":
@@ -1180,6 +1198,8 @@ class AgentLoopRunner:
     ) -> bool:
         if attempt_index + 1 >= len(candidates):
             return False
+        if profile_id in self.model_override_profiles and attempt_index == 0:
+            return True
         profile = self.role_profiles.get(profile_id)
         # cli_unavailable and authentication bypass the profile's fallback_on: that list is
         # about capacity policy, whereas a CLI that cannot launch or whose login has expired
@@ -1419,7 +1439,7 @@ def controller_task(
         "token_spent": token_budget_units(stages),
     }
     if stage == "start":
-        allowed = ["run_operational_action", "ask_human", "stop"]
+        allowed = ["run_operational_action", "ask_human", "stop", "no_action_needed"]
         if agent_loop_enabled:
             allowed.insert(0, "run_planner")
     else:
@@ -1448,6 +1468,11 @@ def controller_task(
             "run_planner for a check-only request wastes a full review loop on "
             "nothing to plan; picking run_operational_action for a real code change "
             "skips the review that change would need — get this right.\n"
+            "no_action_needed ends the task as finished with nothing to do — choose it when "
+            "the goal is already met or the operator has said the current state is acceptable "
+            "and nothing should change. Do not use ask_human or stop for that: both open a new "
+            "question for the operator, so the same question would come back after they "
+            "answered. stop is for when a person has to act before this can go on.\n"
         )
         if not agent_loop_enabled:
             operational_action_notice += (

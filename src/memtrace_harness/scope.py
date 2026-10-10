@@ -16,10 +16,34 @@ REPO_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 REPO_GOAL_PREFIX = re.compile(r"^repo=([A-Za-z0-9_-]{1,40})::(.*)$", re.DOTALL)
 
 
+# A one-off model for this task only: `model=<model>::` or `model=<provider>/<model>::`.
+MODEL_GOAL_PREFIX = re.compile(r"^model=((?:[a-z]+/)?[A-Za-z0-9][A-Za-z0-9.\-]{0,79})::(.*)$", re.DOTALL)
+
+
+def split_goal_directives(goal: str) -> tuple[str | None, str | None, str]:
+    """(`repo` name, one-off `model` spec, the goal without its leading `repo=…::` / `model=…::`
+    prefixes — either, in either order). Missing ones are None."""
+    repo: str | None = None
+    model: str | None = None
+    rest = goal.strip()
+    while True:
+        if repo is None and (match := REPO_GOAL_PREFIX.match(rest)):
+            repo = match.group(1)
+        elif model is None and (match := MODEL_GOAL_PREFIX.match(rest)):
+            model = match.group(1)
+        else:
+            break
+        rest = match.group(2).strip()
+    if repo is None and model is None:
+        return None, None, goal
+    return repo, model, rest
+
+
 def split_repo_goal(goal: str) -> tuple[str | None, str]:
-    """(`repo` name or None, the goal without its `repo=<name>::` prefix)."""
-    match = REPO_GOAL_PREFIX.match(goal.strip())
-    return (match.group(1), match.group(2).strip()) if match else (None, goal)
+    """(`repo` name or None, the goal without its `repo=<name>::` prefix — and without a
+    `model=…::` prefix, which `split_goal_directives` reads)."""
+    repo, _, rest = split_goal_directives(goal)
+    return repo, rest
 
 
 @dataclass
