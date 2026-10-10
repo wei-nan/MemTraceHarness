@@ -86,7 +86,8 @@ advertise stream JSON are parsed conservatively as partial until their schema is
   from SQLite command metadata.
 - A timeout or unavailable executable still produces an auditable local trace record.
 - The harness does not mark Agent Loop gate state, approve a proposal, or call `submit_outcome`.
-- MemTrace writeback is optional and draft-labelled; raw provider transcripts remain local. The
+- MemTrace writeback is optional and draft-labelled; raw provider transcripts and conversation
+  transcripts remain local — the night pass writes organised, one-matter-per-node notes. The
   one exception is the operator's standing preferences, which the Harness adopts and retires
   itself under the safeguards in `docs/operating-contract.md`.
 

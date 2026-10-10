@@ -76,8 +76,9 @@ stable cross-run aggregates and may create proposals; it cannot adopt its own pr
 
 - raw provider output remains in the local trace directory;
 - local SQLite stores run, execution, turn, provider-session and checkpoint references;
-- MemTrace writeback is explicit; conversation archives and nightly digests are written as
-  draft-labelled notes (tags `harness`, `draft`);
+- MemTrace writeback is explicit; the nightly topic notes and daily digests are written as
+  draft-labelled notes (tags `harness`, `draft`), and **no conversation transcript is ever written to
+  MemTrace** — see "Memory archive" below;
 - a governed run's record stays in the local trace store and is **not** also written to the project's
   MemTrace workspace as a "Harness loop draft" node (explicit operator decision, 2026-10-07: those drafts had
   become 95% of one specification workspace); what a run teaches reaches the knowledge base through the
@@ -98,8 +99,36 @@ against the log; at most 5 rules are adopted per project-day (the rest wait for 
 only the newest 40 are put in front of the chat model; nothing is deleted, so a retired rule stays
 on record and can be restored. This does not extend to Agent Loop gates or Improvement Loop
 proposals, which the Harness still cannot approve for itself. **PLANNED, not implemented:** a
-"key-point" layer above the digests. Conversation archives, nightly digests and loop drafts are still
+"key-point" layer above the digests. Topic notes, nightly digests and loop drafts are still
 written draft-labelled; what the Controller writes is not (next paragraph).
+
+**Memory archive: hot by day, topics by night (explicit operator decision, 2026-10-10).** Applies to
+every Harness, because it is how the shared code works, not a per-project setting.
+
+- *By day* the conversation exists only in the local hot log (SQLite): verbatim, complete, and what
+  chat and the Agent Loop read as their recent context (`Prior discussion`, the recent daily digests).
+  Nothing is written to MemTrace on a timer, and **a transcript — raw or lightly trimmed — never
+  goes into MemTrace at all**. What cannot wait for the night is written at once as an already
+  organised note by the chat model (`HARNESS_KB_NOTE::`).
+- *By night* (the digest window) the Harness reads the whole day and splits it **by matter before
+  anything enters MemTrace**: one memory node is one matter (a strategy rule, a bug, a decision, an
+  open question), however the day's messages interleaved. A day with many subjects produces many
+  nodes, never one node holding the day.
+- A node's **title is the matter itself**, in the words someone would search for — no date, turn
+  number, project name or `Draft` prefix (the tags and the memory workspace say what and whose it is).
+  Its **body is organised, not quoted**: a one-line current state first, then decisions, facts and
+  open items, each with the turns it came from (`#687–#688`; the words are in the local log when the
+  source is needed).
+- A matter that already has a node is **updated, not duplicated**: the Harness keeps a local
+  `memory_topics` table (matter → node), shows the model the existing matters, and a later day's
+  discussion of the same matter revises that node (its current state replaced, older entries kept
+  dated below). The nightly digest is the day's index: it links to the matters it touched.
+- ENFORCED in code: every item cites turns that exist in that day's log, or it is dropped; a matter
+  the model says continues an existing one must name an existing one; a failed model call or
+  MemTrace write marks nothing archived and the next pass retries (days are caught up in order, so a
+  matter's history stays chronological); only after a day's matters are written are that day's turns
+  marked archived. Schedule firings are not matters; only each schedule's last result reaches the
+  digest.
 
 **Topic recall (explicit operator decision, 2026-10-03).** Behind chat, a slower background
 model (`HARNESS_RECALL_*`, default: the digest chain) judges each human message's topic
