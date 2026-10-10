@@ -349,8 +349,8 @@ without `HARNESS_API_TOKEN` refuses to serve its API.
   and chat-turn numbers they came from (items without a real turn are dropped; the words themselves
   stay in the local log). A matter that already has a node is updated, not duplicated, so a
   strategy discussed over ten days is one note with a history. The daily digest links to the
-  matters of its day. `memory-topics [--date YYYY-MM-DD] [--days N] [--dry-run]` runs it by hand and
-  catches up older days (oldest first); contract: "Memory archive" in `docs/operating-contract.md`.
+  matters of its day. The Harness works off any backlog of unarchived days itself, oldest first, at most 7 days
+  per project per night; `memory-topics [--date YYYY-MM-DD] [--days N] [--dry-run]` runs the same step by hand; contract: "Memory archive" in `docs/operating-contract.md`.
 
 Full design rationale and the open decisions behind this feature are in
 [`docs/remote-ops-plan.md`](docs/remote-ops-plan.md).

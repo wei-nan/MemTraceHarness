@@ -255,6 +255,33 @@ class PipelineTests(TestCase):
         run_topics_for_date(self.store, "proj", SESSION, "ws_mem", DAY1, TZ, call)
         self.assertEqual(due_topic_dates(self.store, "proj", SESSION, TZ, now, max_days_back=None), [])
 
+    def test_the_nightly_pass_works_off_the_whole_backlog_but_only_a_week_at_a_time(self) -> None:
+        from memtrace_harness import duties
+
+        for day in range(1, 11):  # ten older finished days, far beyond the 2-day digest catch-up
+            _add(self.store, "user", f"第{day}天的事", f"2026-09-{day:02d}T01:00:00+00:00")
+        config = MagicMock()
+        config.schedule_timezone = "Asia/Taipei"
+        config.memory_workspace_id_for.return_value = "ws_mem"
+        scope = MagicMock()
+        scope.name = "proj"
+        recorded: list[str] = []
+
+        def archive(trace_store, client, scope, ws, tz, call_model, dates, **kw):
+            recorded.extend(dates)
+            return 0
+
+        from unittest.mock import patch
+
+        with patch.object(duties, "archive_topics", archive), patch.object(
+            duties, "make_digest_model_caller", return_value=lambda p: ("{}", None, None)
+        ), patch.object(duties, "due_digest_dates", return_value=[]):
+            duties.run_memory_digests(config, self.store, None, [scope], max_days_back=2)
+
+        self.assertEqual(len(recorded), 7)
+        self.assertEqual(recorded, sorted(recorded))  # oldest first
+        self.assertEqual(recorded[0], "2026-09-01")
+
     def test_the_digest_links_to_the_matters_of_its_day(self) -> None:
         client = MagicMock()
         client.create_node.side_effect = ["mem_a", "mem_b"]
