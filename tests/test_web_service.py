@@ -62,7 +62,12 @@ class WebServiceTests(TestCase):
         with urllib.request.urlopen(base + "/", timeout=5) as resp:
             page = resp.read().decode("utf-8")
         self.assertIn('"alpha"', page)
-        self.assertNotIn("__INITIAL_DATA__", page)
+        self.assertNotIn("__INITIAL_JSON__", page)
+        for asset, marker in (("app.js", "function render"), ("app.css", ".tab")):
+            with urllib.request.urlopen(base + "/static/" + asset, timeout=5) as resp:
+                self.assertIn(marker, resp.read().decode("utf-8"))
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(base + "/static/../page.py", timeout=5)
 
     def test_a_setting_is_sent_to_the_harness_that_owns_the_project(self) -> None:
         root_a, _, a = self._harness("alpha", "ta")

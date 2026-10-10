@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from memtrace_services.client import HarnessError, HarnessUnavailable
 from memtrace_services.web.aggregate import HEARTBEAT_SECONDS, Aggregator
-from memtrace_services.web.page import PAGE_TEMPLATE
+from memtrace_services.web.page import STATIC_DIR, STATIC_TYPES, render_page
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +48,20 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (stdlib method name)
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path in ("/", ""):
-            page = PAGE_TEMPLATE.replace("__INITIAL_DATA__", json.dumps(self.aggregator.collect()))
+            page = render_page(json.dumps(self.aggregator.collect()))
             payload = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif parsed.path.startswith("/static/") and parsed.path[len("/static/"):] in STATIC_TYPES:
+            name = parsed.path[len("/static/"):]
+            payload = (STATIC_DIR / name).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", STATIC_TYPES[name])
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

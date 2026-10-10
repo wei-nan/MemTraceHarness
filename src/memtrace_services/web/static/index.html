@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MemTrace Harness Status</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>MemTrace Harness</h1>
+  <input id="search" type="text" placeholder="搜尋專案或對話內容…">
+  <div class="hint"><span id="dot"></span><span id="conn">連線中…</span> · 即時串流更新</div>
+</header>
+<div id="daemon" class="daemon-bar"></div>
+<div id="approvals-banner"></div>
+<div class="navrow"><nav id="project-tabs" class="tabs"></nav></div>
+<main id="projects"></main>
+<div id="stage-detail" class="stage-detail">
+  <div class="stage-detail-panel">
+    <div class="stage-detail-header">
+      <span>關卡詳情</span>
+      <span class="stage-detail-close" onclick="closeStageDetail()">✕</span>
+    </div>
+    <div id="stage-detail-body" class="stage-detail-body"></div>
+  </div>
+</div>
+<script>window.__INITIAL_DATA__ = __INITIAL_JSON__;</script>
+<script src="/static/app.js"></script>
+</body>
+</html>
