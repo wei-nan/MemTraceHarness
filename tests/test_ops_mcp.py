@@ -137,6 +137,20 @@ class ScopeAndSpecTests(unittest.TestCase):
         ctx = self._ctx(working_directory=tmp)
         self.assertEqual(ctx.tool_names(), {"propose_scope_change"})
 
+    def test_propose_github_issue_records_a_request_and_refuses_other_repos(self) -> None:
+        ctx = self._ctx(github_repos=["wei-nan/Beri"])
+        self.assertIn("propose_github_issue", ctx.tool_names())
+        self.assertNotIn("propose_github_issue", self._ctx().tool_names())  # no repos declared: no tool
+        text = call_tool(ctx, "propose_github_issue", {"repo": "wei-nan/Beri", "title": "T", "body": "B"})
+        self.assertIn("only after they tap", text)
+        call_tool(ctx, "propose_github_issue", {"repo": "wei-nan/Beri", "title": "T", "body": "B"})  # repeat
+        pending = ctx.store.claim_pending_job_requests(["P"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["kind"], "github_issue")
+        self.assertEqual(pending[0]["payload"], {"repo": "wei-nan/Beri", "title": "T", "body": "B"})
+        with self.assertRaises(OpsError):
+            call_tool(ctx, "propose_github_issue", {"repo": "evil/repo", "title": "T", "body": "B"})
+
 
 if __name__ == "__main__":
     unittest.main()

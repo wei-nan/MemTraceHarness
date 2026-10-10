@@ -17,6 +17,10 @@ Boundaries enforced here, from what the operator declared in the project's scope
   nothing: it records a request, and the Harness edits the scope file only after the human taps confirm
   in the chat. Always available, so a project that declares nothing yet can still be given tools.
 
+- ``propose_github_issue``: asks to open an issue in one of the project's own GitHub repos. It opens
+  nothing: it records a request, and the Harness runs ``gh issue create`` only after the human has seen
+  the full title and body and tapped confirm in the chat.
+
 Run: ``python -m memtrace_harness.ops_mcp`` (JSON-RPC over stdin/stdout).
 """
 
@@ -35,7 +39,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from memtrace_harness.scope import SCOPE_CHANGE_KINDS, describe_scope_change, validate_scope_change
+from memtrace_harness.scope import (
+    SCOPE_CHANGE_KINDS,
+    describe_scope_change,
+    github_issue_repos,
+    validate_github_issue,
+    validate_scope_change,
+)
 
 PROTOCOL_VERSION = "2024-11-05"
 PROBE_TIMEOUT_SECONDS = 45
@@ -118,6 +128,25 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "propose_github_issue",
+        "description": (
+            "Ask the user to open a GitHub issue (repo must be one of this project's repos; the tool says "
+            "which if you pass a wrong one). This does NOT open it: the user sees the full title and body "
+            "and a confirm button, and only a tap creates the issue, whose URL is then reported to them. "
+            "Say that a confirmation is waiting; do not say the issue exists."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": _string_param("owner/name of the repository"),
+                "title": _string_param("one-line issue title"),
+                "body": _string_param("issue body (markdown)"),
+            },
+            "required": ["repo", "title", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "run_job",
         "description": (
             "Ask to run one of the project's named jobs again. This does NOT run it: the user gets a "
@@ -144,6 +173,7 @@ class OpsContext:
         logs: list[str],
         jobs: dict[str, str],
         store: Any | None = None,
+        github_repos: list[str] | None = None,
     ) -> None:
         self.project = project
         self.working_directory = working_directory.resolve()
@@ -151,9 +181,12 @@ class OpsContext:
         self.logs = {Path(p).name: p for p in logs}
         self.jobs = jobs
         self.store = store
+        self.github_repos = list(github_repos or [])
 
     def tool_names(self) -> set[str]:
         names = {"propose_scope_change"} if self.store is not None else set()
+        if self.store is not None and self.github_repos:
+            names.add("propose_github_issue")
         if self.hosts:
             names.add("http_probe")
         if self.logs:
@@ -273,6 +306,26 @@ def propose_scope_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
+def propose_github_issue(ctx: OpsContext, arguments: dict[str, Any]) -> str:
+    if ctx.store is None:
+        raise OpsError("issue requests are not available here")
+    try:
+        issue = validate_github_issue(
+            ctx.github_repos, arguments.get("repo"), arguments.get("title"), arguments.get("body")
+        )
+    except ValueError as exc:
+        raise OpsError(str(exc)) from exc
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+    if not ctx.store.create_github_issue_request(
+        request_id=f"issue_{uuid.uuid4().hex[:10]}", project=ctx.project, issue=issue, expires_at=expires
+    ):
+        raise OpsError("could not record the request")
+    return (
+        f"Proposed issue in {issue['repo']}: {issue['title']}. The user now has a confirm button in the chat "
+        "(valid 10 minutes); the issue is created only after they tap it, and its URL is reported to them."
+    )
+
+
 def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
     if name not in ctx.tool_names():
         raise OpsError(f"unknown tool: {name}")
@@ -286,6 +339,8 @@ def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
         return "\n".join(f"{n}: {c}" for n, c in sorted(ctx.jobs.items()))
     if name == "propose_scope_change":
         return propose_scope_change(ctx, arguments)
+    if name == "propose_github_issue":
+        return propose_github_issue(ctx, arguments)
     return request_job(ctx, arguments)
 
 
@@ -336,6 +391,7 @@ def context_from_env(env: Any) -> OpsContext | None:
         logs=json.loads(env.get("HARNESS_OPS_LOGS") or "[]"),
         jobs=json.loads(env.get("HARNESS_OPS_JOBS") or "{}"),
         store=store,
+        github_repos=json.loads(env.get("HARNESS_OPS_GITHUB_REPOS") or "[]"),
     )
 
 
@@ -371,6 +427,7 @@ def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str
         "HARNESS_OPS_HOSTS": json.dumps(hosts),
         "HARNESS_OPS_LOGS": json.dumps(logs),
         "HARNESS_OPS_JOBS": json.dumps(jobs),
+        "HARNESS_OPS_GITHUB_REPOS": json.dumps(github_issue_repos(scope)),
     }
     if trace_db_path:
         env["HARNESS_TRACE_DB"] = str(Path(trace_db_path).resolve())
