@@ -8,6 +8,7 @@ to report through; none of them knows how a report reaches a person.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +41,13 @@ from memtrace_harness.memory_topics import (
     run_topics_for_date,
     sync_topics_to_memtrace,
 )
-from memtrace_harness.memory_reorg import ReorgOutcome, retire_covered_drafts, run_review_pass
+from memtrace_harness.memory_reorg import (
+    ReorgOutcome,
+    finish_rebuild,
+    retire_covered_drafts,
+    run_review_pass,
+    start_rebuild,
+)
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
@@ -160,6 +167,111 @@ def archive_topics(
         except Exception:
             logger.exception(f"[{scope.name}] syncing matter notes to MemTrace failed; will retry next pass")
     return recorded
+
+
+_rebuilding: set[str] = set()
+_rebuilding_lock = threading.Lock()
+
+
+def rebuild_matters(
+    config: HarnessConfig, trace_store: TraceStore, memtrace_client: MemTraceClient, scope, *, log=print
+) -> ReorgOutcome | None:
+    """Derive every matter of this project again from the whole local log (start, or resume an
+    interrupted rebuild), then trash the superseded notes. None when it did not finish (the
+    reason is logged; running it again resumes) or when one is already running."""
+    tz = ZoneInfo(config.schedule_timezone)
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    session_id = f"psess_{scope.name}"
+    with _rebuilding_lock:
+        if scope.name in _rebuilding:
+            log(f"[{scope.name}] a rebuild is already running")
+            return None
+        _rebuilding.add(scope.name)
+    try:
+        run_id, resumed = start_rebuild(trace_store, scope.name, workspace_id)
+        log(f"[{scope.name}] {'resuming' if resumed else 'started'} rebuild run {run_id}")
+        now = datetime.now(timezone.utc)
+        dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)
+        archive_topics(
+            trace_store, memtrace_client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates, log=log
+        )
+        remaining = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)
+        if remaining or trace_store.topics_needing_sync(scope.name, workspace_id):
+            log(f"[{scope.name}] rebuild not finished ({len(remaining)} day(s) left); run it again to resume")
+            return None
+        return finish_rebuild(trace_store, memtrace_client, scope.name, workspace_id, run_id)
+    finally:
+        with _rebuilding_lock:
+            _rebuilding.discard(scope.name)
+
+
+def reorganise_now(
+    config: HarnessConfig, trace_store: TraceStore, memtrace_client: MemTraceClient, scope, *, log=print
+) -> list[ReorgOutcome]:
+    """What the nightly pass would do for the matters, on request: retire the covered old drafts and
+    run the matter review now (ignoring the weekly schedule)."""
+    tz = ZoneInfo(config.schedule_timezone)
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    outcomes: list[ReorgOutcome] = []
+    retired = retire_covered_drafts(trace_store, memtrace_client, scope.name, workspace_id, tz)
+    if retired and retired.count:
+        outcomes.append(retired)
+    reviewed = run_review_pass(
+        trace_store, memtrace_client, scope.name, workspace_id, make_digest_model_caller(config, scope.name), force=True
+    )
+    if reviewed and reviewed.count:
+        outcomes.append(reviewed)
+    return outcomes
+
+
+def run_memory_rebuild(
+    config, trace_store, memtrace_client, projects, service, *, only_project=None, audience=None, force=True
+) -> int:
+    """Background body of the /rebuild command (and the chat model's request): rebuild, then tell
+    the operator how it ended."""
+    ran = 0
+    for scope in [p for p in projects if only_project is None or p.name == only_project]:
+        if memtrace_client is None:
+            service.send_message(audience, "沒有連上 MemTrace，無法重建記憶。")
+            continue
+        try:
+            outcome = rebuild_matters(config, trace_store, memtrace_client, scope)
+        except Exception as exc:
+            logger.exception(f"[{scope.name}] rebuilding memory failed")
+            service.send_message(audience, f"❌ 「{scope.name}」重建記憶失敗：{exc}。再說一次「重建記憶」會從中斷的地方接著做。")
+            continue
+        if outcome is None:
+            service.send_message(
+                audience, f"「{scope.name}」的重建還沒完成（或已經有一個在跑）。完成前舊的記憶節點都還在；再說一次「重建記憶」會接著做。"
+            )
+            continue
+        ran += 1
+        service.notify_reorg_outcome(outcome, audience)
+    return ran
+
+
+def run_memory_reorg(
+    config, trace_store, memtrace_client, projects, service, *, only_project=None, audience=None, force=True
+) -> int:
+    """Background body of the /reorganize command (and the chat model's request)."""
+    ran = 0
+    for scope in [p for p in projects if only_project is None or p.name == only_project]:
+        if memtrace_client is None:
+            service.send_message(audience, "沒有連上 MemTrace，無法整理記憶。")
+            continue
+        try:
+            outcomes = reorganise_now(config, trace_store, memtrace_client, scope)
+        except Exception as exc:
+            logger.exception(f"[{scope.name}] reorganising memory failed")
+            service.send_message(audience, f"❌ 「{scope.name}」整理記憶失敗：{exc}")
+            continue
+        if not outcomes:
+            service.send_message(audience, f"「{scope.name}」的記憶看過了，沒有需要調整的地方。")
+            continue
+        ran += 1
+        for outcome in outcomes:
+            service.notify_reorg_outcome(outcome, audience)
+    return ran
 
 
 def _reorganise(

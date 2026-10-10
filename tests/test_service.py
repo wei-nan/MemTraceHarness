@@ -371,7 +371,7 @@ class HarnessServiceTests(TestCase):
         names = {c["command"] for c in gateway.commands()}
         self.assertEqual(
             names,
-            {"status", "approve", "reject", "clarify", "schedules", "garden", "promote", "review", "schedule_cancel"},
+            {"status", "approve", "reject", "clarify", "schedules", "garden", "promote", "review", "reorganize", "rebuild", "schedule_cancel"},
         )
         self.assertTrue(all(c["description"] for c in gateway.commands()))
 

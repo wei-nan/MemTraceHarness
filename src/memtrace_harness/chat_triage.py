@@ -79,6 +79,18 @@ class ChatTriage:
                 matched = self.projects[0]
             return TriageResult(kind="promote", project_scope=matched)
 
+        if cleaned.startswith("/rebuild"):
+            matched = self._match_project_from_text(cleaned) or self._find_project(default_project)
+            if not matched and len(self.projects) == 1:
+                matched = self.projects[0]
+            return TriageResult(kind="memory_rebuild", project_scope=matched)
+
+        if cleaned.startswith("/reorganize"):
+            matched = self._match_project_from_text(cleaned) or self._find_project(default_project)
+            if not matched and len(self.projects) == 1:
+                matched = self.projects[0]
+            return TriageResult(kind="memory_reorg", project_scope=matched)
+
         if cleaned.startswith("/garden"):
             matched = self._match_project_from_text(cleaned) or self._find_project(default_project)
             if not matched and len(self.projects) == 1:

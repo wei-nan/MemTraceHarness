@@ -639,14 +639,11 @@ def memory_topics_command(args: argparse.Namespace) -> int:
 
 
 def _rebuild_matters(args, config, scope, trace_store, tz) -> int:
-    from memtrace_harness.duties import archive_topics, make_digest_model_caller
-    from memtrace_harness.memory_reorg import finish_rebuild, start_rebuild
-    from memtrace_harness.memory_topics import due_topic_dates
+    from memtrace_harness.duties import rebuild_matters
 
     workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-    session_id = f"psess_{scope.name}"
     if trace_store.running_reorg_run(scope.name, workspace_id, "rebuild") is None:
-        days = len({d for d in _log_days(trace_store, scope.name, tz)})
+        days = len(set(_log_days(trace_store, scope.name, tz)))
         print(f"[{scope.name}] a rebuild derives matters again for {days} day(s) of the local log (one model call each).")
     if args.dry_run:
         print("dry run: nothing was changed (drop --dry-run to rebuild)")
@@ -654,17 +651,11 @@ def _rebuild_matters(args, config, scope, trace_store, tz) -> int:
     if not config.memtrace_mcp_url:
         raise RuntimeError("MEMTRACE_MCP_URL is required")
     client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
-    run_id, resumed = start_rebuild(trace_store, scope.name, workspace_id)
-    print(f"{'resuming' if resumed else 'started'} rebuild run {run_id}")
-    dates = due_topic_dates(trace_store, scope.name, session_id, tz, datetime.now(timezone.utc), max_days_back=None)
-    archive_topics(trace_store, client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates)
-    remaining = due_topic_dates(trace_store, scope.name, session_id, tz, datetime.now(timezone.utc), max_days_back=None)
-    if remaining or trace_store.topics_needing_sync(scope.name, workspace_id):
-        print(f"rebuild not finished ({len(remaining)} day(s) left); run the same command again to resume")
+    outcome = rebuild_matters(config, trace_store, client, scope)
+    if outcome is None:
         return 1
-    outcome = finish_rebuild(trace_store, client, scope.name, workspace_id, run_id)
     print(outcome.lines[0] + (f"；{outcome.failed} 個舊節點移除失敗" if outcome.failed else ""))
-    print(f"undo with: memory-reorg --undo {run_id}")
+    print(f"undo with: memory-reorg --undo {outcome.run_id}")
     return 0
 
 

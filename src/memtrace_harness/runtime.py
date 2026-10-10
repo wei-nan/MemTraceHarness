@@ -27,6 +27,8 @@ from memtrace_harness.duties import (
     make_recall_model_caller,
     run_knowledge_gardening,
     run_knowledge_promotion,
+    run_memory_rebuild,
+    run_memory_reorg,
     run_work_reviews,
 )
 from memtrace_harness.memory_digest import in_digest_window
@@ -109,6 +111,8 @@ def build_harness(config: HarnessConfig, scope: ProjectScope) -> HarnessParts:
     service.garden_now = start(run_knowledge_gardening, "kb-garden")
     service.promote_now = start(run_knowledge_promotion, "kb-promote")
     service.work_review_now = start(run_work_reviews, "work-review")
+    service.memory_rebuild_now = start(run_memory_rebuild, "memory-rebuild")
+    service.memory_reorg_now = start(run_memory_reorg, "memory-reorg")
 
     scanner = UnattendedScanner(
         config,
