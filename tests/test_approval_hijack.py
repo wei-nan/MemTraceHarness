@@ -49,6 +49,18 @@ class ScheduleNeedsHumanIsOnlyANotificationTests(TestCase):
         self.assertEqual(summary.status, "needs_human")
         approvals.request_approval.assert_called_once()
 
+    def test_no_action_needed_ends_the_task_without_asking_anyone_again(self) -> None:
+        approvals = MagicMock()
+        summary = AgentLoopRunner(
+            adapters=_adapters([{"action": "no_action_needed", "reason": "人類確認目前已符合"}]),
+            trace_store=self.store,
+            approval_manager=approvals,
+        ).run(self.task)
+        self.assertEqual(summary.status, "succeeded")
+        self.assertIn("不需要任何動作", summary.recommendation or "")
+        self.assertIn("人類確認目前已符合", summary.recommendation or "")
+        approvals.request_approval.assert_not_called()
+
     def test_a_schedule_run_opens_no_approval(self) -> None:
         summary, approvals = self._stop(create_approvals=False)
         self.assertEqual(summary.status, "needs_human")

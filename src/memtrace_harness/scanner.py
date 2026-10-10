@@ -338,18 +338,10 @@ class UnattendedScanner:
             held.append({"id": issue_id, "title": str(issue.get("title") or ""), "why": why})
         try:
             self.trace_store.set_scan_snapshot(
-                scope.name, {"open": len(open_issues), "queued": brief(queued), "held": held, "blocked": None}
+                scope.name, {"open": len(open_issues), "queued": brief(queued), "held": held}
             )
         except Exception:
             logger.exception(f"recording the scan snapshot for {scope.name} failed")
-
-    def _note_scan_blocked(self, scope: ProjectScope, reason: str) -> None:
-        try:
-            previous = self.trace_store.get_scan_snapshot(scope.name) or {}
-            previous.pop("checked_at", None)
-            self.trace_store.set_scan_snapshot(scope.name, {**previous, "blocked": reason})
-        except Exception:
-            logger.exception(f"recording the blocked scan for {scope.name} failed")
 
     def run_scan_pass(self) -> dict[str, str]:
         results: dict[str, str] = {}
@@ -359,7 +351,6 @@ class UnattendedScanner:
             if self.trace_store.get_workspace_lock(ws_id) is not None:
                 logger.info(f"Workspace {ws_id} is locked. Skipping scan.")
                 results[ws_id] = "skipped_locked"
-                self._note_scan_blocked(scope, "locked")
                 continue
 
             conv_id = f"scan_{uuid4().hex[:8]}"
@@ -367,7 +358,6 @@ class UnattendedScanner:
             if not locked:
                 logger.info(f"Failed to acquire lock for workspace {ws_id}. Skipping scan.")
                 results[ws_id] = "skipped_locked"
-                self._note_scan_blocked(scope, "locked")
                 continue
 
             candidates = self._find_ready_candidates(scope, run_id=conv_id)

@@ -363,12 +363,10 @@ class ScannerTests(TestCase):
             self.assertEqual(snapshot["open"], 2)
             self.assertEqual([c["id"] for c in snapshot["queued"]], ["mem_2"])
             self.assertEqual([(c["id"], c["why"]) for c in snapshot["held"]], [("mem_1", "近期已跑過、issue 仍開啟")])
-            self.assertIsNone(snapshot["blocked"])
-            # While a task still holds the workspace, the pass is skipped and the page is told why.
+            # A skipped pass (workspace held) leaves the last real picture alone and invents no state: whether
+            # the workspace is held is read live by the status page.
             self.assertEqual(scanner.run_scan_pass().get("ws_scan"), "skipped_locked")
-            blocked = trace_store.get_scan_snapshot("proj_test")
-            self.assertEqual(blocked["blocked"], "locked")
-            self.assertEqual(blocked["open"], 2)  # the last real picture is kept
+            self.assertEqual(trace_store.get_scan_snapshot("proj_test")["open"], 2)
 
     def test_run_scan_pass_records_its_proposals_and_stalled_notices_in_the_chat_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -313,7 +313,7 @@ class ControllerTaskContextTests(TestCase):
         self.assertIn("run_operational_action", goal_text)
         self.assertIn("run_planner", goal_text)
         self.assertIn(
-            "['run_planner', 'run_operational_action', 'ask_human', 'stop']", goal_text
+            "['run_planner', 'run_operational_action', 'ask_human', 'stop', 'no_action_needed']", goal_text
         )
 
     def test_agent_loop_disabled_strips_run_planner_from_allowed_actions(self) -> None:
@@ -322,10 +322,10 @@ class ControllerTaskContextTests(TestCase):
             task, stage="start", stages=[], agent_loop_enabled=False
         ).goal
         self.assertIn(
-            "['run_operational_action', 'ask_human', 'stop']", goal_text
+            "['run_operational_action', 'ask_human', 'stop', 'no_action_needed']", goal_text
         )
         self.assertNotIn(
-            "['run_planner', 'run_operational_action', 'ask_human', 'stop']", goal_text
+            "['run_planner', 'run_operational_action', 'ask_human', 'stop', 'no_action_needed']", goal_text
         )
         self.assertIn("agent_loop is disabled", goal_text)
 

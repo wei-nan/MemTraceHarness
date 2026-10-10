@@ -558,19 +558,27 @@ function renderWaitingItem(it, projectName) {
 
 function renderBacklog(project) {
   var w = project.waiting || {};
-  var b = w.backlog;
-  if (!b) return "";
-  var queued = b.queued || [], held = b.held || [];
+  var b = w.backlog && w.backlog.open != null ? w.backlog : null;  // an old snapshot with no counts is no snapshot
+  var holders = w.lock_holders || [];
   var line = function (c, why) {
     return '<div class="muted">' + esc(c.id) + " " + esc(c.title) + (why ? "（" + esc(why) + "）" : "") + "</div>";
   };
+  var held = holders.map(function (h) {
+    return h.alive
+      ? '<div class="muted">工作區目前被 ' + esc(h.conversation_id) + " 使用中（正在執行，" + esc(sinceText(h.locked_at)) + "開始）；掃描會等它結束。</div>"
+      : '<div class="approval-status err">工作區被 ' + esc(h.conversation_id) + " 佔著（" + esc(sinceText(h.locked_at)) +
+        "），但它沒有在執行：掃描會一直略過，不會提出新任務。請在上方「等你處理」放棄這個任務。</div>";
+  }).join("");
+  if (!b) {
+    return '<div class="section-label">Issue 清單</div>' + held +
+      '<div class="muted">還沒有掃描結果（掃描每 30 分鐘一次，重啟後第一輪完成前是空的）。</div>';
+  }
+  var queued = b.queued || [], heldIssues = b.held || [];
   return '<div class="section-label">Issue 清單 <span class="badge">開啟 ' + b.open + "</span> " +
-    '<span class="badge">排隊 ' + queued.length + '</span> <span class="badge">擱置 ' + held.length + "</span></div>" +
-    (b.blocked === "locked"
-      ? '<div class="approval-status err">掃描被工作區鎖擋住，現在不會提出新任務（上次檢查 ' + esc(sinceText(b.checked_at)) + "）</div>"
-      : '<div class="muted">上次檢查 ' + esc(sinceText(b.checked_at)) + "；一次只提一張，等你核准後才開工</div>") +
+    '<span class="badge">排隊 ' + queued.length + '</span> <span class="badge">擱置 ' + heldIssues.length + "</span></div>" + held +
+    '<div class="muted">上次檢查 ' + esc(sinceText(b.checked_at)) + "；一次只提一張，等你核准後才開工</div>" +
     (queued.length ? '<div class="muted">排隊（最舊的先提）</div>' + queued.map(function (c) { return line(c); }).join("") : "") +
-    (held.length ? '<div class="muted">擱置</div>' + held.map(function (c) { return line(c, c.why); }).join("") : "");
+    (heldIssues.length ? '<div class="muted">擱置</div>' + heldIssues.map(function (c) { return line(c, c.why); }).join("") : "");
 }
 
 var STAGE_LABELS = {
