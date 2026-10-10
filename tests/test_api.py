@@ -178,6 +178,96 @@ class StatusAndAdminTests(ApiTestCase):
         with self.assertRaises(HarnessError):
             self.client.admin("approval", {"request_id": req.id, "action": "explode"})
 
+    def test_a_question_can_be_answered_from_the_page_by_text_or_by_option(self) -> None:
+        from unittest.mock import patch
+
+        card = {
+            "situation": "s", "recommended": 0, "reason": "r", "default_if_silent": "d", "basis": [],
+            "options": [
+                {"label": "A", "action": "do a", "tradeoff": "t"},
+                {"label": "B", "action": "do b", "tradeoff": "t"},
+            ],
+        }
+        manager = self.parts.approval_manager
+        first = manager.request_approval(
+            conversation_id="conv_q1", workspace=self.scope.workspace_id, working_directory=str(self.root),
+            reason="ambiguous_requirement", proposed_action="q", decision_card=card,
+        )
+        second = manager.request_approval(
+            conversation_id="conv_q2", workspace=self.scope.workspace_id, working_directory=str(self.root),
+            reason="ambiguous_requirement", proposed_action="q", decision_card=card,
+        )
+        with patch.object(self.service, "_resume_approved_conversation") as resume:
+            # A bare approve is still refused, and an empty answer is not an answer.
+            self.client.admin("approval", {"request_id": first.id, "action": "approve"})
+            self.assertEqual(manager.get_request(first.id).status, "pending")
+            with self.assertRaises(HarnessError):
+                self.client.admin("approval", {"request_id": first.id, "action": "clarify", "answer": "  "})
+            self.client.admin("approval", {"request_id": first.id, "action": "clarify", "answer": "只改 Dashboard"})
+            self.assertEqual(manager.get_request(first.id).status, "approved")
+            self.assertEqual(resume.call_args.args[1], "只改 Dashboard")
+            self.client.admin("approval", {"request_id": second.id, "action": "choose", "choice": 1})
+            self.assertEqual(manager.get_request(second.id).status, "approved")
+            self.assertIn("方案 B", resume.call_args.args[1])
+            with self.assertRaises(HarnessError):
+                self.client.admin("approval", {"request_id": second.id, "action": "choose", "choice": "x"})
+
+    def test_the_status_lists_everything_waiting_on_the_operator(self) -> None:
+        manager = self.parts.approval_manager
+        manager.request_approval(
+            conversation_id="conv_w", workspace=self.scope.workspace_id, working_directory=str(self.root),
+            reason="git_push", proposed_action="push it",
+        )
+        store = manager.trace_store
+        store.create_scope_change_request(
+            request_id="scope_w", project=self.scope.name, change={"kind": "probe_host", "value": "a.example.com"},
+            summary="probe_host: a.example.com", expires_at="2999-01-01T00:00:00+00:00",
+        )
+        store.set_scan_snapshot(self.scope.name, {"open": 3, "queued": [{"id": "gh:x/y#1", "title": "t"}], "held": [], "blocked": None})
+        waiting = self.client.status()["projects"][0]["waiting"]
+        self.assertEqual([i["kind"] for i in waiting["items"]], ["approval", "confirm"])
+        self.assertEqual(waiting["total"], 2)
+        self.assertEqual(waiting["items"][0]["label"], "待核准")
+        self.assertEqual(waiting["backlog"]["open"], 3)
+
+    def test_an_interrupted_task_can_be_abandoned_but_a_running_one_cannot(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from memtrace_harness.inflight import default_tracker
+
+        store = self.parts.approval_manager.trace_store
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        for conv in ("conv_dead", "conv_live"):
+            store.ensure_conversation(conv, "t", self.scope.workspace_id) if hasattr(store, "ensure_conversation") else None
+        with store._connection() as conn:
+            for conv in ("conv_dead", "conv_live"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO conversations (id, task_id, workspace_id, state, created_at, updated_at, last_activity_at) "
+                    "VALUES (?, ?, ?, 'active', ?, ?, ?)", (conv, conv, self.scope.workspace_id, old, old, old),
+                )
+        store.acquire_workspace_lock(self.scope.workspace_id, "conv_dead")
+        waiting = self.client.status()["projects"][0]["waiting"]["items"]
+        ids = {i["id"]: i for i in waiting if i["kind"] == "interrupted"}
+        self.assertEqual(set(ids), {"conv_dead", "conv_live"})
+        self.assertTrue(ids["conv_dead"]["holds_lock"])
+
+        class _Thread:
+            ident = 1
+
+        default_tracker.register(_Thread(), workspace_id=self.scope.workspace_id, conversation_id="conv_live", trace_store=store)
+        self.addCleanup(default_tracker.unregister, _Thread())
+        try:
+            with self.assertRaises(HarnessError):
+                self.client.admin("stuck", {"conversation_id": "conv_live", "action": "abandon"})
+            self.client.admin("stuck", {"conversation_id": "conv_dead", "action": "abandon"})
+        finally:
+            with default_tracker._lock:
+                default_tracker._entries.clear()
+        self.assertEqual(store.list_workspace_locks(self.scope.workspace_id), [])
+        self.assertEqual(
+            [c["id"] for c in store.list_unfinished_conversations(self.scope.workspace_id, "2000")], ["conv_live"]
+        )
+
     def test_an_unknown_turn_is_a_404(self) -> None:
         self.assertIsNone(self.client.turn(99999))
 

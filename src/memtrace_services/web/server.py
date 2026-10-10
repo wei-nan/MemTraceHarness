@@ -30,6 +30,7 @@ ADMIN_ROUTES = {
     "/api/digest-fallbacks": "digest-fallbacks",
     "/api/digest-model": "digest-model",
     "/api/approval": "approval",
+    "/api/stuck": "stuck",
     "/api/preference": "preference",
 }
 

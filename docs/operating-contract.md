@@ -250,6 +250,19 @@ not enforced:** that the model checks `list_jobs` first and only proposes what t
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
+**"Waiting on you" on the status page (operator decision, 2026-10-10).** Each project's status carries a `waiting`
+block, shown as one banner above the tabs with a total ("有 N 項在等你處理"): pending approvals (a question with a
+decision card shows its options and an answer box; a bare approve of a question stays refused, see
+`INFO_NEEDED_REASONS`), unexpired confirm-button requests (jobs, scope changes, GitHub actions, orders — to be tapped
+in the chat), and **interrupted tasks** (a conversation still marked active/running with no live thread in the
+in-flight tracker for 10 minutes, shown with whether it holds the workspace lock). The page can answer a question
+(`clarify` with text, or `choose` an option) and abandon an interrupted task (marks it failed and frees its slot;
+refused for a task the tracker says is running). The overview tab shows the **Issue list**: open / queued / held
+counts from the last scan pass's snapshot (`scan_snapshots`; the page itself never calls GitHub), each held issue
+with why, and a warning when the last pass was skipped because the workspace was locked. **Not enforced:** the
+10-minute and 7-day thresholds are display heuristics; a stale "interrupted" mark can still appear for work that
+ended without updating its conversation.
+
 **GitHub writes from the chat (operator decision, 2026-10-10).** A chat model's own GitHub connector cannot write:
 `codex exec` runs with approval `never`, so every write tool call is refused (an issue could be neither opened nor
 closed that way). The chat instead calls `propose_github_action`, which only records a `job_requests` row of kind

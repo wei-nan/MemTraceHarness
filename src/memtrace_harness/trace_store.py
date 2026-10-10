@@ -940,6 +940,12 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_order_intents_status
                     ON order_intents(status, project);
 
+                CREATE TABLE IF NOT EXISTS scan_snapshots (
+                    project TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS job_requests (
                     request_id TEXT PRIMARY KEY,
                     project TEXT NOT NULL,
@@ -3178,6 +3184,72 @@ class TraceStore:
         out["kind"] = row[8] or "job"
         out["payload"] = json.loads(row[9]) if row[9] else None
         return out
+
+    # ---- what is waiting on the human, for the status page (read-only views)
+    def list_open_confirmations(self, project: str) -> list[dict]:
+        """Requests shown (or about to be shown) in the chat with a confirm button: jobs, scope changes, GitHub
+        actions, and trading orders. They expire by themselves, so only the unexpired ones count."""
+        now = utc_now_iso()
+        items: list[dict] = []
+        with self._connection() as conn:
+            for row in conn.execute(
+                "SELECT request_id, kind, command, expires_at, created_at FROM job_requests "
+                "WHERE project = ? AND status IN ('pending', 'awaiting') AND expires_at > ? ORDER BY created_at",
+                (project, now),
+            ):
+                items.append({"id": row[0], "kind": row[1] or "job", "summary": row[2], "expires_at": row[3], "since": row[4]})
+            for row in conn.execute(
+                "SELECT intent_id, kind, action, symbol, quantity, price, expires_at, created_at FROM order_intents "
+                "WHERE project = ? AND status IN ('pending', 'awaiting') AND expires_at > ? ORDER BY created_at",
+                (project, now),
+            ):
+                label = "撤單" if row[1] == "cancel" else "委託"
+                items.append({
+                    "id": row[0], "kind": "order",
+                    "summary": f"{label} {row[2]} {row[3]} x{row[4]} @{row[5]}", "expires_at": row[6], "since": row[7],
+                })
+        return items
+
+    def list_unfinished_conversations(self, workspace_id: str, updated_after_iso: str) -> list[dict]:
+        """Conversations still marked active/running — whether one is really running is for the caller to
+        tell (the in-flight tracker), since a restart can leave the mark behind."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.state, c.updated_at, COALESCE(r.goal, '') FROM conversations c "
+                "LEFT JOIN runs r ON r.id = c.active_run_id "
+                "WHERE c.workspace_id = ? AND c.state IN ('active', 'running') AND c.updated_at > ? "
+                "ORDER BY c.updated_at DESC",
+                (workspace_id, updated_after_iso),
+            ).fetchall()
+        return [{"id": r[0], "state": r[1], "updated_at": r[2], "goal": r[3]} for r in rows]
+
+    def abandon_conversation(self, workspace_id: str, conversation_id: str) -> bool:
+        """Mark an interrupted conversation failed and free its workspace slot. False when it is not
+        one of this workspace's unfinished conversations."""
+        with self._connection() as conn:
+            changed = conn.execute(
+                "UPDATE conversations SET state = 'failed', updated_at = ? "
+                "WHERE id = ? AND workspace_id = ? AND state IN ('active', 'running')",
+                (utc_now_iso(), conversation_id, workspace_id),
+            ).rowcount > 0
+        if changed:
+            self.release_workspace_lock(workspace_id, conversation_id)
+        return changed
+
+    def set_scan_snapshot(self, project: str, payload: dict) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO scan_snapshots (project, updated_at, payload_json) VALUES (?, ?, ?) "
+                "ON CONFLICT(project) DO UPDATE SET updated_at = excluded.updated_at, payload_json = excluded.payload_json",
+                (project, utc_now_iso(), json.dumps(payload, ensure_ascii=False)),
+            )
+
+    def get_scan_snapshot(self, project: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT updated_at, payload_json FROM scan_snapshots WHERE project = ?", (project,)
+            ).fetchone()
+        return {**json.loads(row[1]), "checked_at": row[0]} if row else None
 
     def create_external_action_request(
         self, *, request_id: str, project: str, key: str, summary: str, payload: dict, expires_at: str

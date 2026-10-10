@@ -332,6 +332,44 @@ class ScannerTests(TestCase):
                 ).fetchone()[0]
             self.assertEqual(stage_ref, "mem_newer")
 
+    def test_scan_pass_leaves_a_snapshot_of_what_is_queued_held_and_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "test_scanner.sqlite3"
+            trace_store = TraceStore(db_path)
+            config = self._scanner_config(db_path, tmp_path)
+            scope = ProjectScope(
+                name="proj_test", workspace_id="ws_scan", working_directory=tmp_path,
+                scope_file_path=tmp_path / "harness-scope.md",
+            )
+            body = '{"checkpoint": "build", "current_stage": "dev", "gate_state": {"latest_verdict": "PASS"}}'
+            mock_memtrace = MagicMock()
+            mock_memtrace.search_nodes.return_value = [
+                {"id": f"mem_{n}", "title": f"任務{n}", "tags": ["task", "status:open"], "body": body,
+                 "created_at": f"2026-09-0{n}T00:00:00Z"}
+                for n in (1, 2)
+            ]
+            approval_mgr = ApprovalManager(trace_store)
+            scanner = UnattendedScanner(
+                config, trace_store, [scope], mock_memtrace, service=None, approval_mgr=approval_mgr
+            )
+            scanner.run_scan_pass()
+            with trace_store._connection() as conn:
+                first_id = conn.execute("SELECT id FROM approval_requests WHERE workspace = 'ws_scan'").fetchone()[0]
+            approval_mgr.trace_store.resolve_approval_request(first_id, "approved")
+            trace_store.release_workspace_lock("ws_scan")
+            scanner.run_scan_pass()  # the approved one is now held back, the other is queued
+            snapshot = trace_store.get_scan_snapshot("proj_test")
+            self.assertEqual(snapshot["open"], 2)
+            self.assertEqual([c["id"] for c in snapshot["queued"]], ["mem_2"])
+            self.assertEqual([(c["id"], c["why"]) for c in snapshot["held"]], [("mem_1", "近期已跑過、issue 仍開啟")])
+            self.assertIsNone(snapshot["blocked"])
+            # While a task still holds the workspace, the pass is skipped and the page is told why.
+            self.assertEqual(scanner.run_scan_pass().get("ws_scan"), "skipped_locked")
+            blocked = trace_store.get_scan_snapshot("proj_test")
+            self.assertEqual(blocked["blocked"], "locked")
+            self.assertEqual(blocked["open"], 2)  # the last real picture is kept
+
     def test_run_scan_pass_records_its_proposals_and_stalled_notices_in_the_chat_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
