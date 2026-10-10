@@ -28,6 +28,7 @@ from memtrace_harness.completion_claims import (
     kb_updates_from_artifact,
     reject_claim,
 )
+from memtrace_harness.memory_reorg import describe_reorg, undo_reorg_run
 from memtrace_harness.kb_gardening import (
     GardenOutcome,
     describe_outcome,
@@ -612,6 +613,8 @@ class HarnessService:
             return "無法辨識的按鈕"
         if action == "kb_undo":
             return self._resolve_garden_undo(request_id, audience, message_ref)[:200]
+        if action == "mem_undo":
+            return self._resolve_reorg_undo(request_id, audience, message_ref)[:200]
         if action in {CLAIM_OK, CLAIM_NO}:
             return self._resolve_claim(action, request_id, audience, message_ref)[:200]
         if action in {"sched_resume", "sched_cancel"}:
@@ -1554,6 +1557,33 @@ class HarnessService:
         self.primary_session_mgr.record_turn(
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
+
+    def notify_reorg_outcome(self, outcome, audience: str | None = None) -> None:
+        """Tell the operator what the Harness did to its own memory notes, with a one-tap undo."""
+        text = describe_reorg(outcome)
+        if outcome.count:
+            self.send_message_with_keyboard(
+                audience, text, [[{"label": "↩️ 還原這次整理", "id": f"mem_undo:{outcome.run_id}"}]]
+            )
+        else:
+            self.send_message(audience, text)
+        self.primary_session_mgr.record_turn(
+            project=outcome.project, speaker="assistant", turn_type="chat", content=text
+        )
+
+    def _resolve_reorg_undo(self, run_id_text: str, audience: str | None, message_ref: str | None) -> str:
+        if self.memtrace_client is None or not run_id_text.isdigit():
+            return "無法還原"
+        done, failed = undo_reorg_run(self.approval_manager.trace_store, self.memtrace_client, int(run_id_text))
+        self.clear_actions(message_ref)
+        if not done and not failed:
+            self.send_message(audience, "這次整理已經還原過了。")
+            return "已還原過"
+        text = f"↩️ 已還原這次整理（{done} 項）"
+        if failed:
+            text += f"；{failed} 項還原失敗，請看日誌"
+        self.send_message(audience, text + "。")
+        return "已還原" if not failed else "部分還原"
 
     def _resolve_garden_undo(self, run_id_text: str, audience: str | None, message_ref: str | None) -> str:
         if self.memtrace_client is None or not run_id_text.isdigit():

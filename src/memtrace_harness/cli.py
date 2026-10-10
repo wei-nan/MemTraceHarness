@@ -90,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
             return repo_command(args)
         if args.command == "memory-topics":
             return memory_topics_command(args)
+        if args.command == "memory-reorg":
+            return memory_reorg_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
     except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
@@ -345,6 +347,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--days", type=int, default=14, help="Catch up on the days not yet archived within this many days (default 14)"
     )
     topics_parser.add_argument("--dry-run", action="store_true", help="Only list the days that would be archived")
+    topics_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Derive ALL matters again from the first day of the local log (current prompts and models); "
+            "the old matters' notes go to the MemTrace trash only after the new set is written. "
+            "An interrupted rebuild resumes when you run this again."
+        ),
+    )
+
+    reorg_parser = subparsers.add_parser(
+        "memory-reorg",
+        help=(
+            "Reorganise the Harness's own memory notes by hand: --review (merge / retitle / resolve "
+            "matters), --retire-drafts (old hourly drafts now covered by matters), --undo RUN."
+        ),
+    )
+    reorg_parser.add_argument("--review", action="store_true", help="Run the matter review now (ignores the weekly schedule)")
+    reorg_parser.add_argument("--retire-drafts", action="store_true", help="Move covered old drafts to the MemTrace trash")
+    reorg_parser.add_argument("--undo", type=int, metavar="RUN", help="Undo a reorganisation run (see the run id in its report)")
+    reorg_parser.add_argument("--dry-run", action="store_true", help="With --review: only print the proposed changes")
 
     return parser
 
@@ -588,6 +611,8 @@ def memory_topics_command(args: argparse.Namespace) -> int:
     config, scope = _config_and_scope()
     trace_store = TraceStore(config.trace_db_path)
     tz = ZoneInfo(config.schedule_timezone)
+    if args.rebuild:
+        return _rebuild_matters(args, config, scope, trace_store, tz)
     if args.date:
         datetime.strptime(args.date, "%Y-%m-%d")
         dates = [args.date]
@@ -610,6 +635,81 @@ def memory_topics_command(args: argparse.Namespace) -> int:
     for d in dates:
         trace_store.mark_digest_edges_unsynced(scope.name, d)
     print(f"{recorded} matter(s) recorded for {len(dates)} day(s)")
+    return 0
+
+
+def _rebuild_matters(args, config, scope, trace_store, tz) -> int:
+    from memtrace_harness.duties import archive_topics, make_digest_model_caller
+    from memtrace_harness.memory_reorg import finish_rebuild, start_rebuild
+    from memtrace_harness.memory_topics import due_topic_dates
+
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    session_id = f"psess_{scope.name}"
+    if trace_store.running_reorg_run(scope.name, workspace_id, "rebuild") is None:
+        days = len({d for d in _log_days(trace_store, scope.name, tz)})
+        print(f"[{scope.name}] a rebuild derives matters again for {days} day(s) of the local log (one model call each).")
+    if args.dry_run:
+        print("dry run: nothing was changed (drop --dry-run to rebuild)")
+        return 0
+    if not config.memtrace_mcp_url:
+        raise RuntimeError("MEMTRACE_MCP_URL is required")
+    client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+    run_id, resumed = start_rebuild(trace_store, scope.name, workspace_id)
+    print(f"{'resuming' if resumed else 'started'} rebuild run {run_id}")
+    dates = due_topic_dates(trace_store, scope.name, session_id, tz, datetime.now(timezone.utc), max_days_back=None)
+    archive_topics(trace_store, client, scope, workspace_id, tz, make_digest_model_caller(config, scope.name), dates)
+    remaining = due_topic_dates(trace_store, scope.name, session_id, tz, datetime.now(timezone.utc), max_days_back=None)
+    if remaining or trace_store.topics_needing_sync(scope.name, workspace_id):
+        print(f"rebuild not finished ({len(remaining)} day(s) left); run the same command again to resume")
+        return 1
+    outcome = finish_rebuild(trace_store, client, scope.name, workspace_id, run_id)
+    print(outcome.lines[0] + (f"；{outcome.failed} 個舊節點移除失敗" if outcome.failed else ""))
+    print(f"undo with: memory-reorg --undo {run_id}")
+    return 0
+
+
+def _log_days(trace_store, project: str, tz):
+    from memtrace_harness.memory_digest import turns_by_local_date
+
+    return turns_by_local_date(trace_store.get_primary_session_turns(f"psess_{project}"), tz).keys()
+
+
+def memory_reorg_command(args: argparse.Namespace) -> int:
+    from memtrace_harness.duties import make_digest_model_caller
+    from memtrace_harness.memory_reorg import describe_reorg, retire_covered_drafts, run_review_pass, undo_reorg_run
+
+    config, scope = _config_and_scope()
+    if not (args.review or args.retire_drafts or args.undo):
+        print("choose --review, --retire-drafts or --undo RUN", file=sys.stderr)
+        return 2
+    if not config.memtrace_mcp_url:
+        raise RuntimeError("MEMTRACE_MCP_URL is required")
+    trace_store = TraceStore(config.trace_db_path)
+    client = MemTraceClient(config.memtrace_mcp_url, config.memtrace_api_token)
+    tz = ZoneInfo(config.schedule_timezone)
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    if args.undo:
+        done, failed = undo_reorg_run(trace_store, client, args.undo)
+        print(f"undone {done} op(s), {failed} failed")
+        return 1 if failed else 0
+    if args.retire_drafts:
+        outcome = retire_covered_drafts(trace_store, client, scope.name, workspace_id, tz)
+        print(describe_reorg(outcome) if outcome else "no old draft is fully covered by matters yet")
+        if outcome:
+            print(f"undo with: memory-reorg --undo {outcome.run_id}")
+    if args.review:
+        outcome = run_review_pass(
+            trace_store, client, scope.name, workspace_id, make_digest_model_caller(config, scope.name),
+            force=True, plan_only=args.dry_run,
+        )
+        if outcome is None:
+            print("too few matters to review")
+        else:
+            print(describe_reorg(outcome) if outcome.lines else "the model proposed no change")
+            if args.dry_run:
+                print("dry run: nothing was changed")
+            elif outcome.count:
+                print(f"undo with: memory-reorg --undo {outcome.run_id}")
     return 0
 
 
