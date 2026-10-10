@@ -110,7 +110,67 @@ function chainEditorInner(project, kind, chain, withEffort, profileId) {
     '<div class="chain-items">' + list.map(function (c, i) { return chainRowHtml(c, withEffort, i); }).join("") + "</div>" +
     '<div class="rp-row"><button class="chain-add">＋ 新增備援</button>' +
     '<button class="chain-save">儲存</button><button class="chain-reset">還原</button>' +
-    '<span class="rp-status"></span></div></div>';
+    (kind === "role" ? '<button class="chain-apply">套用備援到其他角色…</button>' : "") +
+    '<span class="rp-status"></span></div>' +
+    (kind === "role" ? applyPanelHtml(project, profileId) : "") + "</div>";
+}
+
+// "Apply to other roles": copies this editor's fallbacks (not its primary) onto the chosen roles,
+// each of which keeps its own primary model.
+function applyPanelHtml(project, profileId) {
+  var others = (project.role_profiles || []).filter(function (p) { return p.id !== profileId; });
+  return '<div class="rp-row chain-apply-panel" style="display:none"><span class="hint">把目前這份備援順序套用到（會取代它們原有的備援，主模型不變）：</span>' +
+    others.map(function (p) {
+      return '<label><input type="checkbox" class="apply-target" value="' + esc(p.id) + '"> ' + esc(p.id) + "</label>";
+    }).join(" ") +
+    '<button class="chain-apply-go">套用</button><span class="apply-status"></span></div>';
+}
+
+var toastTimer = null;
+function showToast(text, isError) {
+  var el = document.getElementById("toast");
+  el.textContent = text;
+  el.className = "toast" + (isError ? " err" : "");
+  el.style.display = "block";
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { el.style.display = "none"; }, 8000);
+}
+
+function applyFallbacksToRoles(chainEl, btn) {
+  var panel = chainEl.querySelector(".chain-apply-panel");
+  var targets = Array.prototype.map.call(panel.querySelectorAll(".apply-target:checked"), function (c) { return c.value; });
+  var statusEl = panel.querySelector(".apply-status");
+  var rows = Array.prototype.map.call(chainEl.querySelectorAll(".chain-item"), readChainRow);
+  var fallbacks = rows.slice(1);
+  statusEl.className = "apply-status rp-status err";
+  if (!targets.length) { statusEl.textContent = "請先勾選要套用的角色"; return; }
+  if (fallbacks.some(function (f) { return !f.model; })) { statusEl.textContent = "備援裡有未選擇的模型"; return; }
+  var projectName = chainEl.getAttribute("data-project");
+  var project = state.data.projects.filter(function (p) { return p.name === projectName; })[0];
+  btn.disabled = true;
+  statusEl.className = "apply-status rp-status";
+  statusEl.textContent = "套用中…";
+  var done = [], failed = [];
+  targets.reduce(function (chain, id) {
+    return chain.then(function () {
+      var role = project.role_profiles.filter(function (p) { return p.id === id; })[0];
+      var primary = { provider: role.provider, model: role.model, reasoning_effort: role.reasoning_effort };
+      return fetch("/api/role-profile-chain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: projectName, profile_id: id, chain: [primary].concat(fallbacks) })
+      }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+        .then(function (res) { (res.ok ? done : failed).push(res.ok ? id : id + "（" + (res.body.error || "失敗") + "）"); })
+        .catch(function () { failed.push(id + "（連線問題）"); });
+    });
+  }, Promise.resolve()).then(function () {
+    btn.disabled = false;
+    statusEl.className = "apply-status rp-status " + (failed.length ? "err" : "ok");
+    var message = (done.length ? "已套用備援到：" + done.join("、") + "，下次執行生效。" : "") +
+      (failed.length ? " 失敗：" + failed.join("、") : "");
+    statusEl.textContent = message;
+    showToast(message, failed.length > 0);
+  });
 }
 
 function onProviderSelectChange(providerSelect) {
@@ -258,6 +318,13 @@ document.addEventListener("click", function (e) {
     items.insertBefore(row, row.previousElementSibling); state.chainDirty = true;
   } else if (t.classList.contains("chain-down") && row && row.nextElementSibling) {
     items.insertBefore(row.nextElementSibling, row); state.chainDirty = true;
+  } else if (t.classList.contains("chain-apply")) {
+    var applyPanel = chainEl.querySelector(".chain-apply-panel");
+    applyPanel.style.display = applyPanel.style.display === "none" ? "flex" : "none";
+    return;
+  } else if (t.classList.contains("chain-apply-go")) {
+    applyFallbacksToRoles(chainEl, t);
+    return;
   } else if (t.classList.contains("chain-reset")) {
     state.chainDirty = false; render(); return;
   } else if (t.classList.contains("chain-save")) {
