@@ -1147,6 +1147,8 @@ class TraceStore:
             self._ensure_column(conn, "approval_requests", "message_ref", "TEXT")
             self._ensure_column(conn, "order_intents", "message_ref", "TEXT")
             self._ensure_column(conn, "job_requests", "message_ref", "TEXT")
+            self._ensure_column(conn, "job_requests", "kind", "TEXT NOT NULL DEFAULT 'job'")
+            self._ensure_column(conn, "job_requests", "payload_json", "TEXT")
             self._backfill_message_refs(conn)
             self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
             self._ensure_column(conn, "decision_records", "subject", "TEXT")
@@ -3163,7 +3165,7 @@ class TraceStore:
     # ---- jobs the chat model asked to re-run (ops_mcp.py): shown to the human, run only on a tap
     _JOB_COLUMNS = (
         "request_id, project, job_name, command, status, expires_at, "
-        "message_ref, result_json"
+        "message_ref, result_json, kind, payload_json"
     )
 
     @staticmethod
@@ -3173,7 +3175,31 @@ class TraceStore:
         )
         out = dict(zip(keys, row[:7]))
         out["result"] = json.loads(row[7]) if row[7] else None
+        out["kind"] = row[8] or "job"
+        out["payload"] = json.loads(row[9]) if row[9] else None
         return out
+
+    def create_scope_change_request(
+        self, *, request_id: str, project: str, change: dict, summary: str, expires_at: str
+    ) -> bool:
+        """A proposed change to the project's scope file, waiting for the human. A repeat of the
+        same pending proposal is accepted without a second row."""
+        now = utc_now_iso()
+        key = f"scope:{summary}"
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? AND kind = 'scope_change' "
+                "AND status IN ('pending', 'awaiting')",
+                (project, key),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at, kind, payload_json) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'scope_change', ?)",
+                (request_id, project, key, summary, expires_at, now, now,
+                 json.dumps(change, ensure_ascii=False)),
+            ).rowcount > 0
 
     def create_job_request(
         self, *, request_id: str, project: str, job_name: str, command: str, expires_at: str

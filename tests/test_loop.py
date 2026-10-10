@@ -1015,34 +1015,33 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.stages[-1].state, "quota_cooldown")
         self.assertEqual(summary.stages[-1].profile_id, "red-team")
 
-    def test_authentication_failure_does_not_use_fallback(self) -> None:
+    def test_authentication_failure_uses_fallback_and_alerts_the_operator(self) -> None:
         adapters = self._adapters()
+        failure = {"_status": "failed", "_error": "Failed to authenticate: OAuth session expired"}
         adapters["controller"] = QueueAdapter(
-            "controller",
-            "codex",
-            "gpt-5.6-luna",
-            [{"_status": "failed", "_error": "login required"}],
+            "controller", "claude", "sonnet", [failure, failure, failure, failure]
         )
         fallback = QueueAdapter(
             "controller-fallback-1",
-            "claude",
-            "sonnet",
-            [{"action": "run_planner", "reason": "should not run"}],
+            "codex",
+            "gpt-5.6-luna",
+            [{"action": "run_planner", "reason": "continued"}] * 4,
         )
+        alerts: list[str] = []
 
         summary = AgentLoopRunner(
             adapters=adapters,
             fallback_adapters={"controller": [fallback]},
             role_profiles=load_role_profiles(),
             trace_store=TraceStore(self.db_path),
+            alert_callback=alerts.append,
         ).run(self.task)
 
-        self.assertEqual(summary.status, "failed")
-        self.assertEqual(len(fallback.calls), 0)
-        self.assertEqual(
-            summary.stages[0].response.execution.failure_category,
-            "authentication",
-        )
+        first = summary.stages[0].response.execution
+        self.assertEqual(first.failure_category, "authentication")
+        self.assertGreaterEqual(len(fallback.calls), 1)
+        self.assertTrue(alerts)
+        self.assertIn("登入已失效", alerts[0])
 
     def test_agent_loop_disabled_stop_is_routed_to_config_change_required(self) -> None:
         adapters = self._adapters()

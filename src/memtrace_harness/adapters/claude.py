@@ -119,6 +119,7 @@ class ClaudeCliAdapter(CliModelAdapter):
             usage=usage,
             provider_run_id=provider_run_id,
             warnings=warnings,
+            error=_result_error(result),
         )
         resolved_model = _optional_str(result.get("model"))
         if resolved_model:
@@ -127,6 +128,16 @@ class ClaudeCliAdapter(CliModelAdapter):
                 execution=replace(response.execution, resolved_model=resolved_model),
             )
         return response
+
+
+def _result_error(result: dict[str, Any]) -> str | None:
+    """Claude reports a failed turn (e.g. an expired OAuth login) as a result event with
+    is_error=true on stdout while stderr stays empty; without this the only error recorded is
+    a generic "CLI exited with code 1", which cannot be classified or fallen back on."""
+    if result.get("is_error") is not True:
+        return None
+    text = _optional_str(result.get("result"))
+    return text[:500] if text else None
 
 
 def _last_text(events: list[dict[str, Any]]) -> str | None:

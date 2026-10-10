@@ -15,6 +15,7 @@ from memtrace_harness.adapters import (
     CodexCliAdapter,
 )
 from memtrace_harness.cli_process import ProcessResult
+from memtrace_harness.fallback import classify_execution_failure
 from memtrace_harness.output_contracts import output_schema_path
 from memtrace_harness.schemas import TaskEnvelope
 
@@ -388,6 +389,23 @@ class CliAdapterTests(TestCase):
         self.assertEqual(response.execution.usage.completeness, "unavailable")
         self.assertIn("not found", response.execution.error)
         self.assertTrue(Path(response.execution.raw_trace_ref).exists())
+
+    def test_claude_error_result_on_stdout_becomes_the_execution_error(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "is_error": True,
+                "result": "Failed to authenticate: OAuth session expired and could not be refreshed",
+            }
+        )
+        result = process_result(stdout, return_code=1)
+        adapter = self._adapter(ClaudeCliAdapter, StaticProcessRunner(result))
+
+        response = adapter.run(self.task, "run_auth_expired")
+
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("OAuth session expired", response.execution.error)
+        self.assertEqual(classify_execution_failure(response.execution), "authentication")
 
     def test_nonzero_exit_is_failed_and_preserves_stderr(self) -> None:
         result = process_result("", return_code=7, stderr="provider command failed")

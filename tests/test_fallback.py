@@ -31,6 +31,7 @@ class FailureClassifierTests(TestCase):
             "maximum context length exceeded": "context_limit",
             "Access denied": "permission",
             "login required": "authentication",
+            "Failed to authenticate: OAuth session expired and could not be refreshed": "authentication",
             "connection refused": "network",
             "codex-will: line 14: exec: /Applications/ChatGPT.app/Contents/Resources/codex: cannot execute: No such file or directory": "cli_unavailable",
             "CLI executable not found: codex": "cli_unavailable",
@@ -45,7 +46,13 @@ class FailureClassifierTests(TestCase):
                 self.assertEqual(
                     permits_cross_provider_fallback(category),
                     expected
-                    in {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable"},
+                    in {
+                        "quota_exhausted",
+                        "rate_limit",
+                        "provider_overloaded",
+                        "cli_unavailable",
+                        "authentication",
+                    },
                 )
 
     def test_timeout_is_not_a_model_fallback_signal(self) -> None:

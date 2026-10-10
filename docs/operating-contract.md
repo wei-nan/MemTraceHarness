@@ -236,6 +236,20 @@ starts a development task when the cause is in the project's code. Wired for Cod
 (Antigravity chat gets the notice but no tools). **Unverified against live models:** that a chat model calls these
 tools sensibly. A project that declares nothing is told to say it cannot verify from the chat sandbox.
 
+**Giving a project more ops tools without a code change (operator decision, 2026-10-10).** Which ops tools a
+chat reply has is whatever the scope file declares, and the chat model has no way to write that file. When it
+needs a capability that is not declared it calls `propose_scope_change` (kind `probe_host`, `log_file` or `job`),
+which only records a `job_requests` row of kind `scope_change`; the Harness shows the exact proposal in the chat
+with a "確認新增" button. **Enforced:** the proposal is validated when it is made and again at the tap (bare
+hostname; log path relative and inside the project; job name charset and a one-line command of at most 1000
+characters); nothing is written before the tap; a double tap applies it once; an unanswered request expires
+after 10 minutes; the edit keeps the rest of the scope file and is an atomic replace; the in-memory scope is
+reloaded so the next chat reply has the tool, with no restart. A newly added `job` still needs its own
+confirm tap before it runs. A project that declares nothing still gets `propose_scope_change`. **Prompt policy,
+not enforced:** that the model checks `list_jobs` first and only proposes what the user's request needs.
+**Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
+The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
+
 **Orders proposed by the chat model (explicit operator decision, 2026-10-05).** For a project
 listed in `HARNESS_TAIWANTRADE_ORDER_PROJECTS` the chat model may *propose* a limit order
 (`create_order_intent`); a human must confirm it. ENFORCED in code: the tool only creates a
@@ -522,8 +536,13 @@ Only these failure categories may cross provider boundaries:
   primary is retried on the next stage so a fixed install recovers immediately), and always sends
   the operator an alert (through the outbox) via `AgentLoopRunner.alert_callback` — even when no fallback
   exists — naming the failed and (if any) substitute provider/model.
+- `authentication` — the provider's login has expired (e.g. Claude's `Failed to authenticate: OAuth
+  session expired`). Like `cli_unavailable`, the request was never evaluated: it ignores a profile's
+  `fallback_on`, sets no cooldown (the primary is retried on the next stage, so a re-login recovers
+  at once) and always alerts the operator to log in again. The Claude adapter surfaces the
+  `is_error` result text as the execution error so this can be recognised.
 
-`context_limit`, timeout, network, authentication, permission, configuration, schema, safety and
+`context_limit`, timeout, network, permission, configuration, schema, safety and
 unknown failures do not trigger a cross-provider fallback. Error classification is conservative;
 unknown text fails closed.
 

@@ -111,6 +111,32 @@ class ScopeAndSpecTests(unittest.TestCase):
         (tmp / "harness-scope.md").write_text("- workspace_id: ws_x\n")
         self.assertIsNone(ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), None))
 
+    def _ctx(self, **kwargs) -> OpsContext:
+        tmp = Path(tempfile.mkdtemp())
+        defaults = dict(project="P", working_directory=tmp, hosts=[], logs=[], jobs={}, store=TraceStore(tmp / "t.db"))
+        return OpsContext(**{**defaults, **kwargs})
+
+    def test_propose_scope_change_only_records_a_request(self) -> None:
+        self.ctx = self._ctx(hosts=["www.twse.com.tw"])
+        self.store = self.ctx.store
+        text = call_tool(self.ctx, "propose_scope_change", {"kind": "probe_host", "value": "mac-mini.example.ts.net"})
+        self.assertIn("nothing changes until they tap", text)
+        self.assertIn("propose_scope_change", self.ctx.tool_names())
+        pending = self.store.claim_pending_job_requests(["P"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["kind"], "scope_change")
+        self.assertEqual(pending[0]["payload"], {"kind": "probe_host", "value": "mac-mini.example.ts.net"})
+        with self.assertRaises(OpsError):
+            call_tool(self.ctx, "propose_scope_change", {"kind": "log_file", "value": "../x.log"})
+
+    def test_a_project_with_nothing_declared_can_still_propose(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "harness-scope.md").write_text("- workspace_id: ws_x\n")
+        spec = ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), tmp / "t.db")
+        self.assertIsNotNone(spec)
+        ctx = self._ctx(working_directory=tmp)
+        self.assertEqual(ctx.tool_names(), {"propose_scope_change"})
+
 
 if __name__ == "__main__":
     unittest.main()
