@@ -124,6 +124,10 @@ PAGE_TEMPLATE = """<!doctype html>
     border-radius: 0.3rem; padding: 0.15rem 0.35rem; font-size: 0.75rem;
   }
   .rp-row input { width: 9rem; }
+  .chain { margin: 0.3rem 0 0.5rem; }
+  .chain-label { min-width: 3.2rem; }
+  .rp-row.chain-item button { background: var(--chip); color: var(--text); padding: 0.12rem 0.4rem; }
+  .catalog-refresh { background: var(--chip); color: var(--text); border: none; border-radius: 0.3rem; padding: 0.12rem 0.5rem; font-size: 0.72rem; cursor: pointer; }
   .rp-row button {
     background: var(--accent); color: #16181d; border: none; border-radius: 0.3rem;
     padding: 0.18rem 0.6rem; font-size: 0.75rem; cursor: pointer; font-weight: 600;
@@ -246,22 +250,52 @@ function modelOptions(provider, currentModel) {
   return html + '<option value="' + CUSTOM_MODEL_VALUE + '">— 自訂 —</option>';
 }
 
-// Shared by every "provider + model" edit row (role-profile rows, the chat-model
-// row): a model <select> populated from known_models for the currently-chosen
-// provider, plus a "自訂" option that reveals a free-text fallback — model catalogs
-// aren't tracked anywhere in this codebase (names change too often, see
-// profiles/beri.toml's own "verified against `agy models`" comments), so the
-// dropdown only ever offers what's already configured somewhere in this harness.
-function modelEditRowHtml(provider, model) {
-  return '<select class="rp-provider" onchange="onProviderSelectChange(this)">' + providerOptions(provider) + "</select>" +
-    '<select class="rp-model-select" onchange="onModelSelectChange(this)">' + modelOptions(provider, model) + "</select>" +
-    '<input class="rp-model-custom" type="text" value="' + esc(model || "") + '" placeholder="模型名稱" style="display:none">';
+// Every place a model is chosen is a "chain": the primary model plus any number of
+// fallbacks tried in order. One editor (provider + model [+ reasoning effort] per row,
+// add / remove / reorder) serves chat, digest, recall and each Agent Loop role.
+// The model <select> lists everything the provider CLIs offer plus models added by
+// hand; "— 自訂 —" takes any other name and remembers it for every dropdown.
+var EFFORTS = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+  antigravity: ["low", "medium", "high"]
+};
+
+function effortOptions(provider, selected) {
+  return (EFFORTS[provider] || []).map(function (e) {
+    return '<option value="' + e + '"' + (e === selected ? " selected" : "") + ">" + e + "</option>";
+  }).join("");
+}
+
+function chainRowHtml(c, withEffort, index) {
+  var label = index === 0 ? "主模型" : "備援 " + index;
+  return '<div class="rp-row chain-item">' +
+    '<span class="hint chain-label">' + label + "</span>" +
+    '<select class="rp-provider" onchange="onProviderSelectChange(this)">' + providerOptions(c.provider) + "</select>" +
+    '<select class="rp-model-select" onchange="onModelSelectChange(this)">' + modelOptions(c.provider, c.model) + "</select>" +
+    '<input class="rp-model-custom" type="text" value="' + esc(c.model || "") + '" placeholder="模型名稱" style="display:none">' +
+    (withEffort ? '<select class="rp-effort" title="reasoning effort">' + effortOptions(c.provider, c.reasoning_effort) + "</select>" : "") +
+    '<button class="chain-up" title="上移">↑</button><button class="chain-down" title="下移">↓</button>' +
+    '<button class="chain-del" title="移除">✕</button>' +
+    "</div>";
+}
+
+function chainEditorHtml(project, kind, chain, withEffort, profileId) {
+  var list = chain && chain.length ? chain : [{ provider: "claude", model: "", reasoning_effort: "medium" }];
+  return '<div class="chain" data-kind="' + kind + '" data-project="' + esc(project.name) + '"' +
+    (profileId ? ' data-profile="' + esc(profileId) + '"' : "") +
+    (withEffort ? ' data-effort="1"' : "") + ">" +
+    '<div class="chain-items">' + list.map(function (c, i) { return chainRowHtml(c, withEffort, i); }).join("") + "</div>" +
+    '<div class="rp-row"><button class="chain-add">＋ 新增備援</button>' +
+    '<button class="chain-save">儲存</button><button class="chain-reset">還原</button>' +
+    '<span class="rp-status"></span></div></div>';
 }
 
 function onProviderSelectChange(providerSelect) {
   var row = providerSelect.closest(".rp-row");
-  var modelSelect = row.querySelector(".rp-model-select");
-  modelSelect.innerHTML = modelOptions(providerSelect.value, "");
+  row.querySelector(".rp-model-select").innerHTML = modelOptions(providerSelect.value, "");
+  var effort = row.querySelector(".rp-effort");
+  if (effort) effort.innerHTML = effortOptions(providerSelect.value, "medium");
   syncCustomModelVisibility(row);
 }
 
@@ -275,54 +309,46 @@ function syncCustomModelVisibility(row) {
     modelSelect.value === CUSTOM_MODEL_VALUE ? "inline-block" : "none";
 }
 
-function readModelEditRow(row) {
-  var provider = row.querySelector(".rp-provider").value;
+function readChainRow(row) {
   var modelSelect = row.querySelector(".rp-model-select");
-  var model = modelSelect.value === CUSTOM_MODEL_VALUE
-    ? row.querySelector(".rp-model-custom").value
-    : modelSelect.value;
-  return { provider: provider, model: model };
+  var effort = row.querySelector(".rp-effort");
+  return {
+    provider: row.querySelector(".rp-provider").value,
+    model: (modelSelect.value === CUSTOM_MODEL_VALUE ? row.querySelector(".rp-model-custom").value : modelSelect.value).trim(),
+    reasoning_effort: effort ? effort.value : ""
+  };
 }
 
-function renderModelCandidates(project, list, saveClass, emptyText, note) {
-  var display = (!list || !list.length)
-    ? '<div class="empty">' + emptyText + "</div>"
-    : '<div class="chips">' + list.map(function (c) {
-        return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
-      }).join(" -> ") + "</div>";
-  var current = list && list.length ? list[0] : { provider: "claude", model: "" };
-  var editRow = '<div class="rp-row">' +
-    modelEditRowHtml(current.provider, current.model) +
-    '<button class="' + saveClass + '" data-project="' + esc(project.name) + '">儲存</button>' +
-    '<span class="rp-status"></span>' +
-    "</div>";
-  return display + (note ? '<div class="hint">' + note + "</div>" : "") + editRow;
+function relabelChain(chainEl) {
+  chainEl.querySelectorAll(".chain-item").forEach(function (row, i) {
+    row.querySelector(".chain-label").textContent = i === 0 ? "主模型" : "備援 " + i;
+  });
+}
+
+function chainCandidates(list) {
+  return (list || []).map(function (c) { return { provider: c.provider, model: c.model, reasoning_effort: c.reasoning_effort || "medium" }; });
+}
+
+function chainDisplay(list, emptyText) {
+  if (!list || !list.length) return '<div class="empty">' + emptyText + "</div>";
+  return '<div class="chips">' + list.map(function (c) {
+    return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
+  }).join(" → ") + "</div>";
+}
+
+function renderChain(project, kind, list, emptyText, note) {
+  return chainDisplay(list, emptyText) + (note ? '<div class="hint">' + note + "</div>" : "") +
+    chainEditorHtml(project, kind, chainCandidates(list), false);
 }
 
 function renderChatCandidates(project) {
-  return renderModelCandidates(project, project.chat_candidates, "chat-model-save",
-    "（未設定 HARNESS_CHAT_PROVIDER）", "");
-}
-
-function renderFallbackRow(project, candidates, inputClass, saveClass) {
-  var rest = (candidates || []).slice(1).map(function (c) {
-    return c.provider + "/" + (c.model || "");
-  }).join(",");
-  return '<div class="rp-row"><span class="hint">備援（provider/model，逗號分隔，留空＝無）</span> ' +
-    '<input class="fallbacks-input ' + inputClass + '" type="text" size="38" value="' + esc(rest) + '" placeholder="codex/gpt-5.6-sol">' +
-    '<button class="' + saveClass + '" data-project="' + esc(project.name) + '">儲存</button>' +
-    '<span class="rp-status"></span></div>';
-}
-
-function renderDigestFallbackRow(project) {
-  return renderFallbackRow(project, project.digest_candidates, "digest-fallbacks", "digest-fallbacks-save");
+  return renderChain(project, "chat", project.chat_candidates, "（未設定 HARNESS_CHAT_PROVIDER）", "");
 }
 
 function renderRecallCandidates(project) {
   var note = project.recall_enabled === false ? "背景回想已停用（HARNESS_RECALL_ENABLED=false）。"
     : (project.recall_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型。");
-  return renderModelCandidates(project, project.recall_candidates, "recall-model-save", "（未設定）", note) +
-    renderFallbackRow(project, project.recall_candidates, "recall-fallbacks", "recall-fallbacks-save");
+  return renderChain(project, "recall", project.recall_candidates, "（未設定）", note);
 }
 
 function renderTopicBriefs(project) {
@@ -346,10 +372,8 @@ function renderTopicBriefs(project) {
 }
 
 function renderDigestCandidates(project) {
-  return renderModelCandidates(project, project.digest_candidates, "digest-model-save",
-    "（未設定）",
-    project.digest_is_own ? "" : "尚未獨立設定，目前沿用聊天模型；儲存後摘要才會改用自己的模型。") +
-    renderDigestFallbackRow(project);
+  return renderChain(project, "digest", project.digest_candidates, "（未設定）",
+    project.digest_is_own ? "" : "尚未獨立設定，目前沿用聊天模型；儲存後摘要才會改用自己的模型。");
 }
 
 function renderRoleProfiles(project) {
@@ -362,17 +386,10 @@ function renderRoleProfiles(project) {
     '<div class="rp-row"><button class="rp-independent" data-project="' + esc(project.name) + '">獨立出去</button>' +
     '<span class="rp-status"></span></div></div>';
   var rows = (project.role_profiles || []).map(function (p) {
-    var fb = p.fallbacks.length ? p.fallbacks.map(function (f) { return f.provider + "/" + f.model; }).join(", ") : "";
-    var current = "<tr><td>" + esc(p.id) + "</td><td>" + esc(p.provider + "/" + p.model) +
-      (fb ? " <span class='chip'>fallback: " + esc(fb) + "</span>" : "");
-    if (editable) {
-      current += '<div class="rp-row">' +
-        modelEditRowHtml(p.provider, p.model) +
-        '<button class="rp-save" data-project="' + esc(project.name) + '" data-profile="' + esc(p.id) + '">儲存</button>' +
-        '<span class="rp-status"></span>' +
-        "</div>";
-    }
-    return current + "</td></tr>";
+    var chain = [{ provider: p.provider, model: p.model, reasoning_effort: p.reasoning_effort }].concat(p.fallbacks);
+    var cell = chainDisplay(chain, "") ;
+    if (editable) cell += chainEditorHtml(project, "role", chainCandidates(chain), true, p.id);
+    return "<tr><td>" + esc(p.id) + "</td><td>" + cell + "</td></tr>";
   }).join("");
   return note + "<table>" + rows + "</table>";
 }
@@ -391,96 +408,67 @@ function renderSchedules(project) {
   return '<div class="section-label">排程 <span class="badge">' + list.length + "</span></div>" + rows;
 }
 
+// A chain being edited must survive the live re-renders until it is saved or reset.
 document.addEventListener("click", function (e) {
-  if (!e.target.classList.contains("rp-save")) return;
-  var btn = e.target;
-  var row = btn.closest(".rp-row");
-  var project = btn.getAttribute("data-project");
-  var profileId = btn.getAttribute("data-profile");
-  var picked = readModelEditRow(row);
-  var statusEl = row.querySelector(".rp-status");
-  statusEl.className = "rp-status";
-  statusEl.textContent = "儲存中…";
-  btn.disabled = true;
-  fetch("/api/role-profile", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      project: project, profile_id: profileId, provider: picked.provider, model: picked.model
-    })
-  })
-    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
-    .then(function (res) {
-      btn.disabled = false;
-      if (res.ok) {
-        statusEl.className = "rp-status ok";
-        statusEl.textContent = "已儲存，下次執行生效";
-      } else {
-        statusEl.className = "rp-status err";
-        statusEl.textContent = res.body.error || "儲存失敗";
-      }
-    })
-    .catch(function () {
-      btn.disabled = false;
-      statusEl.className = "rp-status err";
-      statusEl.textContent = "儲存失敗（連線問題）";
-    });
+  var t = e.target;
+  var chainEl = t.closest && t.closest(".chain");
+  if (!chainEl || t.tagName !== "BUTTON") return;
+  var items = chainEl.querySelector(".chain-items");
+  var withEffort = !!chainEl.getAttribute("data-effort");
+  var row = t.closest(".chain-item");
+  if (t.classList.contains("chain-add")) {
+    var last = items.lastElementChild ? readChainRow(items.lastElementChild) : { provider: "claude", model: "", reasoning_effort: "medium" };
+    var holder = document.createElement("div");
+    holder.innerHTML = chainRowHtml({ provider: last.provider, model: "", reasoning_effort: last.reasoning_effort || "medium" }, withEffort, items.children.length);
+    var fresh = holder.firstChild;
+    items.appendChild(fresh);
+    fresh.querySelector(".rp-model-select").selectedIndex = 0;
+    syncCustomModelVisibility(fresh);
+    state.chainDirty = true;
+  } else if (t.classList.contains("chain-del") && row) {
+    if (items.children.length > 1) { row.remove(); state.chainDirty = true; }
+  } else if (t.classList.contains("chain-up") && row && row.previousElementSibling) {
+    items.insertBefore(row, row.previousElementSibling); state.chainDirty = true;
+  } else if (t.classList.contains("chain-down") && row && row.nextElementSibling) {
+    items.insertBefore(row.nextElementSibling, row); state.chainDirty = true;
+  } else if (t.classList.contains("chain-reset")) {
+    state.chainDirty = false; render(); return;
+  } else if (t.classList.contains("chain-save")) {
+    saveChain(chainEl, t);
+    return;
+  } else {
+    return;
+  }
+  relabelChain(chainEl);
 });
 
-document.addEventListener("click", function (e) {
-  var fbEndpoint = e.target.classList.contains("digest-fallbacks-save") ? "/api/digest-fallbacks"
-    : e.target.classList.contains("recall-fallbacks-save") ? "/api/recall-fallbacks" : null;
-  if (!fbEndpoint) return;
-  var btn = e.target;
-  var row = btn.closest(".rp-row");
-  var statusEl = row.querySelector(".rp-status");
+document.addEventListener("change", function (e) {
+  if (e.target.closest && e.target.closest(".chain")) state.chainDirty = true;
+});
+
+function saveChain(chainEl, btn) {
+  var kind = chainEl.getAttribute("data-kind");
+  var chain = Array.prototype.map.call(chainEl.querySelectorAll(".chain-item"), readChainRow);
+  var body = { project: chainEl.getAttribute("data-project"), chain: chain };
+  if (kind === "role") body.profile_id = chainEl.getAttribute("data-profile");
+  var statusEl = chainEl.querySelector(".rp-status");
   statusEl.className = "rp-status";
   statusEl.textContent = "儲存中…";
   btn.disabled = true;
-  fetch(fbEndpoint, {
+  fetch(kind === "role" ? "/api/role-profile-chain" : "/api/" + kind + "-chain", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: btn.getAttribute("data-project"), fallbacks: row.querySelector(".fallbacks-input").value })
+    body: JSON.stringify(body)
   })
     .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
     .then(function (res) {
       btn.disabled = false;
       statusEl.className = "rp-status " + (res.ok ? "ok" : "err");
-      statusEl.textContent = res.ok ? "已儲存，立即生效" : (res.body.error || "儲存失敗");
-    })
-    .catch(function () {
-      btn.disabled = false;
-      statusEl.className = "rp-status err";
-      statusEl.textContent = "儲存失敗（連線問題）";
-    });
-});
-
-document.addEventListener("click", function (e) {
-  var endpoint = e.target.classList.contains("chat-model-save") ? "/api/chat-model"
-    : e.target.classList.contains("digest-model-save") ? "/api/digest-model"
-    : e.target.classList.contains("recall-model-save") ? "/api/recall-model" : null;
-  if (!endpoint) return;
-  var btn = e.target;
-  var row = btn.closest(".rp-row");
-  var project = btn.getAttribute("data-project");
-  var picked = readModelEditRow(row);
-  var statusEl = row.querySelector(".rp-status");
-  statusEl.className = "rp-status";
-  statusEl.textContent = "儲存中…";
-  btn.disabled = true;
-  fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: project, provider: picked.provider, model: picked.model })
-  })
-    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
-    .then(function (res) {
-      btn.disabled = false;
       if (res.ok) {
-        statusEl.className = "rp-status ok";
-        statusEl.textContent = "已儲存，立即生效";
+        state.chainDirty = false;
+        if (state.renderDeferred) setTimeout(render, 1500);
+        statusEl.textContent = kind === "role" ? "已儲存，下次執行生效" : "已儲存，立即生效";
       } else {
-        statusEl.className = "rp-status err";
         statusEl.textContent = res.body.error || "儲存失敗";
       }
     })
@@ -489,7 +477,17 @@ document.addEventListener("click", function (e) {
       statusEl.className = "rp-status err";
       statusEl.textContent = "儲存失敗（連線問題）";
     });
-});
+}
+
+function refreshModelCatalog(btn) {
+  btn.disabled = true;
+  var first = state.data.projects[0];
+  fetch("/api/model-catalog-refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: first ? first.name : "" })
+  }).finally(function () { btn.disabled = false; });
+}
 
 document.addEventListener("click", function (e) {
   if (!e.target.classList.contains("rp-independent")) return;
@@ -813,6 +811,8 @@ function renderModelSettings(project) {
   var key = "models:" + project.name;
   return '<details class="models" data-key="' + esc(key) + '"' + detailsOpen(key) + ">" +
     "<summary>模型設定（聊天 / 每日摘要 / 背景回想 / Agent Loop 角色）</summary>" +
+    '<div class="hint">每一處都可設定主模型與任意數量的備援（依序嘗試）。清單包含各 CLI 目前提供的模型；'
+    + '沒列出的選「— 自訂 —」輸入名稱，之後所有選單都會記住。 <button class="catalog-refresh" onclick="refreshModelCatalog(this)">重新抓取模型清單</button></div>' +
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
     '<div class="section-label">背景回想模型</div>' + renderRecallCandidates(project) +
@@ -870,7 +870,7 @@ function render() {
   if (!state.data) return;
   // An SSE push re-renders everything; don't yank the textarea out from under
   // someone mid-edit — render once they leave it.
-  if (isEditingPreference()) { state.renderDeferred = true; return; }
+  if (isEditingPreference() || state.chainDirty) { state.renderDeferred = true; return; }
   state.renderDeferred = false;
   renderHarnesses(state.data.harnesses);
   renderMemory();

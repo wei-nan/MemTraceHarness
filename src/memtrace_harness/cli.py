@@ -771,13 +771,14 @@ def status_command(args: argparse.Namespace) -> int:
 def doctor_command(args: argparse.Namespace) -> int:
     """Check what keeps a Harness from working before it is started."""
     from memtrace_harness.chat_tools_check import check_chat_tools
-    from memtrace_harness.workspace import env_file_problems
+    from memtrace_harness.workspace import env_file_problems, global_secrets_problems
 
     config = HarnessConfig.from_env()
     problems: list[str] = []
     if config.workspace_root is None:
         raise ValueError("no workspace: run inside a folder that has a .harness.env, or pass -C <folder>")
     problems += env_file_problems(config.workspace_root)
+    problems += global_secrets_problems()
     if not config.api_token:
         problems.append("HARNESS_API_TOKEN is not set; the API (and so every service) cannot start")
     if not config.memtrace_mcp_url:

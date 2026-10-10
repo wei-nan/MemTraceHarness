@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 ADMIN_ROUTES = {
     "/api/role-profile": "role-profile",
     "/api/role-profile/independent": "role-profile-independent",
+    "/api/role-profile-chain": "role-profile-chain",
+    "/api/chat-chain": "chat-chain",
+    "/api/digest-chain": "digest-chain",
+    "/api/recall-chain": "recall-chain",
+    "/api/model-catalog-refresh": "model-catalog-refresh",
     "/api/chat-model": "chat-model",
     "/api/recall-model": "recall-model",
     "/api/recall-fallbacks": "recall-fallbacks",
