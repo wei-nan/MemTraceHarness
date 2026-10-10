@@ -72,7 +72,9 @@ def _existing_block(existing: list[dict]) -> str:
         latest = topic["entries"][-1]
         open_items = "；".join(i["text"] for i in latest.get("open_items", [])[:4])
         lines.append(
-            f"[{topic['id']}] {topic['title']}（最近 {topic['last_date']}）現況：{latest.get('state', '')}"
+            f"[{topic['id']}] {topic['title']}（最近 {topic['last_date']}"
+            + ("，已標記解決，若今天又談到就沿用它" if topic.get("status") == "resolved" else "")
+            + f"）現況：{latest.get('state', '')}"
             + (f" 未決：{open_items}" if open_items else "")
         )
     return "\n".join(lines)
@@ -202,6 +204,8 @@ def render_topic_markdown(topic: dict) -> str:
     entries = topic["entries"]
     latest = entries[-1]
     lines = [f"**現況（{latest['date']}）**：{latest['state']}", ""]
+    if topic.get("status") == "resolved":
+        lines.insert(0, f"**狀態：已解決**（{topic.get('resolved_reason') or '無待辦'}）\n")
     open_items = latest.get("open_items") or []
     if open_items:
         lines.append("## 未決")

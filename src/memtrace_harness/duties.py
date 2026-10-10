@@ -40,6 +40,7 @@ from memtrace_harness.memory_topics import (
     run_topics_for_date,
     sync_topics_to_memtrace,
 )
+from memtrace_harness.memory_reorg import ReorgOutcome, retire_covered_drafts, run_review_pass
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
@@ -161,6 +162,35 @@ def archive_topics(
     return recorded
 
 
+def _reorganise(
+    trace_store, memtrace_client, scope, workspace_id, tz, call_model, *, respect_retry_backoff, log, reorg_out
+) -> None:
+    """After the nightly archive: retire the old drafts the matters now cover, and (weekly)
+    let the model review the matters. Each part is best-effort and reported."""
+    try:
+        retired = retire_covered_drafts(trace_store, memtrace_client, scope.name, workspace_id, tz)
+        if retired:
+            log(f"[{scope.name}] {retired.lines[0]}")
+            if reorg_out is not None and retired.count:
+                reorg_out.append(retired)
+    except Exception:
+        logger.exception(f"[{scope.name}] retiring old drafts failed; will retry next pass")
+    key = ("review", scope.name)
+    if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
+        return
+    try:
+        reviewed = run_review_pass(trace_store, memtrace_client, scope.name, workspace_id, call_model)
+    except Exception:
+        _digest_failures[key] = time.monotonic()
+        logger.exception(f"[{scope.name}] reviewing the matters failed; will retry later")
+        return
+    _digest_failures.pop(key, None)
+    if reviewed:
+        log(f"[{scope.name}] matter review: {reviewed.count} change(s)")
+        if reorg_out is not None and reviewed.count:
+            reorg_out.append(reviewed)
+
+
 def run_memory_digests(
     config: HarnessConfig,
     trace_store: TraceStore,
@@ -173,6 +203,7 @@ def run_memory_digests(
     respect_retry_backoff: bool = False,
     log=print,
     triage_out: dict[str, list[dict]] | None = None,
+    reorg_out: list[ReorgOutcome] | None = None,
 ) -> dict[str, PreferenceChanges]:
     """Shared by the Harness's nightly trigger and the `memory-digest` command.
     Returns {project: the preferences the Harness adopted / retired / left waiting}. One
@@ -239,6 +270,11 @@ def run_memory_digests(
             trace_store, memtrace_client, scope, workspace_id, tz, call_model, topic_dates,
             respect_retry_backoff=respect_retry_backoff, log=log,
         )
+        if memtrace_client is not None and only_date is None:
+            _reorganise(
+                trace_store, memtrace_client, scope, workspace_id, tz, call_model,
+                respect_retry_backoff=respect_retry_backoff, log=log, reorg_out=reorg_out,
+            )
         if memtrace_client is not None:
             try:
                 synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)
@@ -457,6 +493,7 @@ def _run_nightly_digest_pass(
     on_change=None,
 ) -> None:
     triage: dict[str, list[dict]] = {}
+    reorg: list[ReorgOutcome] = []
     try:
         changed = run_memory_digests(
             config,
@@ -466,6 +503,7 @@ def _run_nightly_digest_pass(
             max_days_back=AUTO_CATCH_UP_DAYS,
             respect_retry_backoff=True,
             triage_out=triage,
+            reorg_out=reorg,
         )
     except Exception:
         logger.exception("nightly memory digest pass failed")
@@ -474,6 +512,11 @@ def _run_nightly_digest_pass(
         on_change()
     if service is None:
         return
+    for outcome in reorg:
+        try:
+            service.notify_reorg_outcome(outcome)
+        except Exception:
+            logger.exception(f"[{outcome.project}] reporting the memory reorganisation failed")
     for project, items in triage.items():
         text = _describe_open_item_triage(project, items)
         try:

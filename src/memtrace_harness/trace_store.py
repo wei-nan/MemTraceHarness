@@ -1024,6 +1024,26 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_memory_topics_project
                     ON memory_topics(project, workspace_id, last_date);
 
+                CREATE TABLE IF NOT EXISTS memory_reorg_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary TEXT,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    undone_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_reorg_ops (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    op TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_topic_days (
                     topic_id INTEGER NOT NULL,
                     project TEXT NOT NULL,
@@ -1108,6 +1128,10 @@ class TraceStore:
             )
             self._ensure_column(conn, "preference_rules", "adopted_by", "TEXT")
             self._ensure_column(conn, "preference_rules", "retire_reason", "TEXT")
+            self._ensure_column(conn, "memory_topics", "status", "TEXT NOT NULL DEFAULT 'active'")
+            self._ensure_column(conn, "memory_topics", "merged_into", "INTEGER")
+            self._ensure_column(conn, "memory_topics", "resolved_reason", "TEXT")
+            self._ensure_column(conn, "memory_drafts", "retired_at", "TEXT")
             self._ensure_column(conn, "memory_digests", "node_dirty", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "memory_digests", "edges_synced", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "order_intents", "kind", "TEXT NOT NULL DEFAULT 'order'")
@@ -1636,8 +1660,10 @@ class TraceStore:
     # --- Nightly topics (memory_topics.py): one row per matter, one MemTrace node each ---
 
     _TOPIC_COLUMNS = (
-        "id, project, workspace_id, title, entries_json, first_date, last_date, node_id, node_dirty"
+        "id, project, workspace_id, title, entries_json, first_date, last_date, node_id, node_dirty, "
+        "status, merged_into, resolved_reason"
     )
+    LIVE_TOPIC_STATUSES = ("active", "resolved")
 
     @staticmethod
     def _topic_row_to_dict(row) -> dict:
@@ -1651,15 +1677,22 @@ class TraceStore:
             "last_date": row[6],
             "node_id": row[7],
             "node_dirty": bool(row[8]),
+            "status": row[9],
+            "merged_into": row[10],
+            "resolved_reason": row[11],
         }
 
-    def list_memory_topics(self, project: str, workspace_id: str, limit: int | None = None) -> list[dict]:
-        """Newest-touched first."""
+    def list_memory_topics(
+        self, project: str, workspace_id: str, limit: int | None = None, statuses: tuple[str, ...] | None = None
+    ) -> list[dict]:
+        """Newest-touched first; live matters (active, resolved) unless told otherwise."""
+        statuses = statuses or self.LIVE_TOPIC_STATUSES
+        marks = ",".join("?" for _ in statuses)
         query = (
             f"SELECT {self._TOPIC_COLUMNS} FROM memory_topics WHERE project = ? AND workspace_id = ? "
-            "ORDER BY last_date DESC, id DESC"
+            f"AND status IN ({marks}) ORDER BY last_date DESC, id DESC"
         )
-        params: tuple = (project, workspace_id)
+        params: tuple = (project, workspace_id, *statuses)
         if limit is not None:
             query += " LIMIT ?"
             params += (limit,)
@@ -1693,7 +1726,8 @@ class TraceStore:
                 if topic_id is not None:
                     row = conn.execute(
                         "SELECT entries_json, first_date, last_date FROM memory_topics "
-                        "WHERE id = ? AND project = ? AND workspace_id = ?",
+                        "WHERE id = ? AND project = ? AND workspace_id = ? "
+                        "AND status IN ('active', 'resolved')",
                         (topic_id, project, workspace_id),
                     ).fetchone()
                 if row is None:
@@ -1709,7 +1743,10 @@ class TraceStore:
                     entries.sort(key=lambda e: e.get("date", ""))
                     conn.execute(
                         "UPDATE memory_topics SET entries_json = ?, first_date = ?, last_date = ?, "
-                        "node_dirty = 1, updated_at = ? WHERE id = ?",
+                        "node_dirty = 1, updated_at = ?, "
+                        "status = CASE WHEN status = 'resolved' THEN 'active' ELSE status END, "
+                        "resolved_reason = CASE WHEN status = 'resolved' THEN NULL ELSE resolved_reason END "
+                        "WHERE id = ?",
                         (json.dumps(entries, ensure_ascii=False), entries[0]["date"], entries[-1]["date"],
                          now, topic_id),
                     )
@@ -1743,7 +1780,8 @@ class TraceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 f"SELECT {self._TOPIC_COLUMNS} FROM memory_topics WHERE project = ? AND workspace_id = ? "
-                "AND (node_id IS NULL OR node_dirty = 1) ORDER BY first_date ASC, id ASC",
+                "AND status IN ('active', 'resolved') AND (node_id IS NULL OR node_dirty = 1) "
+                "ORDER BY first_date ASC, id ASC",
                 (project, workspace_id),
             ).fetchall()
         return [self._topic_row_to_dict(r) for r in rows]
@@ -1759,6 +1797,7 @@ class TraceStore:
             rows = conn.execute(
                 "SELECT t.node_id FROM memory_topic_days d JOIN memory_topics t ON t.id = d.topic_id "
                 "WHERE d.project = ? AND d.digest_date = ? AND t.workspace_id = ? AND t.node_id IS NOT NULL "
+                "AND t.status IN ('active', 'resolved') "
                 "ORDER BY t.id ASC",
                 (project, digest_date, workspace_id),
             ).fetchall()
@@ -1772,6 +1811,7 @@ class TraceStore:
                 "SELECT r.digest_date FROM memory_topic_runs r WHERE r.project = ? AND r.archived = 0 "
                 "AND NOT EXISTS (SELECT 1 FROM memory_topic_days d JOIN memory_topics t ON t.id = d.topic_id "
                 "WHERE d.project = r.project AND d.digest_date = r.digest_date "
+                "AND t.status IN ('active', 'resolved') "
                 "AND (t.node_id IS NULL OR t.node_dirty = 1 OR t.workspace_id != ?)) "
                 "ORDER BY r.digest_date ASC",
                 (project, workspace_id),
@@ -1791,6 +1831,130 @@ class TraceStore:
             conn.execute(
                 "UPDATE memory_digests SET edges_synced = 0 WHERE project = ? AND digest_date = ?",
                 (project, digest_date),
+            )
+
+    def update_memory_topic(self, topic_id: int, **fields) -> None:
+        """Change a matter row (title, entries, dates, status, ...). `entries` is stored as JSON;
+        any change to what the node shows marks it dirty so the next sync writes it."""
+        allowed = {"title", "entries", "first_date", "last_date", "status", "merged_into", "resolved_reason", "node_dirty", "node_id"}
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown memory_topics field(s): {sorted(unknown)}")
+        if "entries" in fields:
+            fields["entries_json"] = json.dumps(fields.pop("entries"), ensure_ascii=False)
+        if not fields:
+            return
+        fields["updated_at"] = utc_now_iso()
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connection() as conn:
+            conn.execute(f"UPDATE memory_topics SET {assignments} WHERE id = ?", (*fields.values(), topic_id))
+
+    def topic_day_dates(self, topic_id: int) -> list[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT digest_date FROM memory_topic_days WHERE topic_id = ? ORDER BY digest_date", (topic_id,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def add_topic_days(self, topic_id: int, project: str, dates: list[str]) -> None:
+        with self._connection() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO memory_topic_days (topic_id, project, digest_date) VALUES (?, ?, ?)",
+                [(topic_id, project, d) for d in dates],
+            )
+
+    def remove_topic_days(self, topic_id: int, dates: list[str]) -> None:
+        with self._connection() as conn:
+            conn.executemany(
+                "DELETE FROM memory_topic_days WHERE topic_id = ? AND digest_date = ?", [(topic_id, d) for d in dates]
+            )
+
+    def archived_topic_days(self, project: str) -> set[str]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT digest_date FROM memory_topic_runs WHERE project = ? AND archived = 1", (project,)
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def clear_topic_runs(self, project: str) -> None:
+        """Forget which days were archived, so every day is due again (a rebuild)."""
+        with self._connection() as conn:
+            conn.execute("DELETE FROM memory_topic_runs WHERE project = ?", (project,))
+
+    # --- Reorganisation runs and their undo log (memory_reorg.py) ------------------------
+
+    def create_reorg_run(self, *, project: str, workspace_id: str, kind: str, status: str = "done") -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO memory_reorg_runs (project, workspace_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                (project, workspace_id, kind, status, utc_now_iso()),
+            )
+        return int(cur.lastrowid)
+
+    def add_reorg_op(self, run_id: int, op: str, payload: dict) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO memory_reorg_ops (run_id, op, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (run_id, op, json.dumps(payload, ensure_ascii=False), utc_now_iso()),
+            )
+
+    def list_reorg_ops(self, run_id: int) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, op, payload_json FROM memory_reorg_ops WHERE run_id = ? ORDER BY id ASC", (run_id,)
+            ).fetchall()
+        return [{"id": r[0], "op": r[1], "payload": json.loads(r[2])} for r in rows]
+
+    def finish_reorg_run(self, run_id: int, *, status: str = "done", summary: str | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_reorg_runs SET status = ?, summary = COALESCE(?, summary), finished_at = ? WHERE id = ?",
+                (status, summary, utc_now_iso(), run_id),
+            )
+
+    def mark_reorg_run_undone(self, run_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE memory_reorg_runs SET undone_at = ? WHERE id = ?", (utc_now_iso(), run_id))
+
+    def get_reorg_run(self, run_id: int) -> dict | None:
+        with self._connection() as conn:
+            r = conn.execute(
+                "SELECT id, project, workspace_id, kind, status, summary, created_at, finished_at, undone_at "
+                "FROM memory_reorg_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+        keys = ("id", "project", "workspace_id", "kind", "status", "summary", "created_at", "finished_at", "undone_at")
+        return dict(zip(keys, r)) if r else None
+
+    def last_reorg_run(self, project: str, workspace_id: str, kind: str) -> dict | None:
+        with self._connection() as conn:
+            r = conn.execute(
+                "SELECT id FROM memory_reorg_runs WHERE project = ? AND workspace_id = ? AND kind = ? "
+                "AND undone_at IS NULL ORDER BY id DESC LIMIT 1", (project, workspace_id, kind),
+            ).fetchone()
+        return self.get_reorg_run(r[0]) if r else None
+
+    def running_reorg_run(self, project: str, workspace_id: str, kind: str) -> dict | None:
+        with self._connection() as conn:
+            r = conn.execute(
+                "SELECT id FROM memory_reorg_runs WHERE project = ? AND workspace_id = ? AND kind = ? "
+                "AND status = 'running' ORDER BY id DESC LIMIT 1", (project, workspace_id, kind),
+            ).fetchone()
+        return self.get_reorg_run(r[0]) if r else None
+
+    def list_unretired_drafts(self, project: str, workspace_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT node_id, first_turn_seq, last_turn_seq FROM memory_drafts "
+                "WHERE project = ? AND workspace_id = ? AND retired_at IS NULL ORDER BY first_turn_seq ASC",
+                (project, workspace_id),
+            ).fetchall()
+        return [{"node_id": r[0], "first_turn_seq": r[1], "last_turn_seq": r[2]} for r in rows]
+
+    def set_draft_retired(self, workspace_id: str, node_id: str, retired: bool) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_drafts SET retired_at = ? WHERE workspace_id = ? AND node_id = ?",
+                (utc_now_iso() if retired else None, workspace_id, node_id),
             )
 
     # --- Hourly archive nodes written to MemTrace (memory_drafts, until 2026-10-10) ---
@@ -1817,7 +1981,7 @@ class TraceStore:
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT node_id, first_turn_seq, last_turn_seq, created_at FROM memory_drafts "
-                "WHERE project = ? AND workspace_id = ? ORDER BY first_turn_seq ASC",
+                "WHERE project = ? AND workspace_id = ? AND retired_at IS NULL ORDER BY first_turn_seq ASC",
                 (project, workspace_id),
             ).fetchall()
         return [
