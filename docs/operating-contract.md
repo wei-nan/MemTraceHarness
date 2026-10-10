@@ -250,6 +250,17 @@ not enforced:** that the model checks `list_jobs` first and only proposes what t
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
+**Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
+with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
+30 characters, `text` the sentence the pick stands for). The Harness strips the line, sends the reply with the options as
+buttons plus a "略過" button, and **keeps the question in `chat_questions` until it is answered, dismissed or 7 days old**, so
+a chat that scrolled past it loses nothing; it is also listed on the status page ("待你選擇", with its option buttons and a
+dismiss button). **Enforced:** an unusable line (bad JSON, fewer than 2 options, no question) leaves the reply as plain
+text; a pick or dismissal applies once (a second tap says it was already answered); picking an option is processed exactly as
+if the operator had typed its `text` to the chat (so any confirm button that follows still needs its own tap), in the
+background. **Prompt policy, not enforced:** when the model chooses to offer choices. **Not implemented:** reminding the
+operator in the chat about a question still open.
+
 **"Waiting on you" on the status page (operator decision, 2026-10-10).** Each project's status carries a `waiting`
 block, shown as one banner above the tabs with a total ("有 N 項在等你處理"): pending approvals (a question with a
 decision card shows its options and an answer box; a bare approve of a question stays refused, see

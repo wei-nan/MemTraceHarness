@@ -281,6 +281,9 @@ class _Handler(BaseHTTPRequestHandler):
             elif setting == "stuck":
                 self._resolve_stuck(body)
                 return
+            elif setting == "chat-question":
+                self._resolve_chat_question(body)
+                return
             else:
                 self._send(404, {"error": "not found"})
                 return
@@ -321,6 +324,22 @@ class _Handler(BaseHTTPRequestHandler):
             msg = service.resolve_card_pick(request_id, choice)
         else:
             msg = service.resolve_approval(request_id, action)
+        self.api.bus.publish()
+        self._send(200, {"ok": True, "message": msg})
+
+    def _resolve_chat_question(self, body: dict) -> None:
+        question_id, choice = body.get("question_id"), body.get("choice")
+        dismiss = body.get("action") == "dismiss"
+        if not isinstance(question_id, str) or not (
+            dismiss or (isinstance(choice, int) and not isinstance(choice, bool))
+        ):
+            self._send(400, {"error": "malformed request body"})
+            return
+        service = self.api.service
+        if service.approval_manager.trace_store.get_chat_question(question_id) is None:
+            self._send(400, {"error": "找不到這個問題"})
+            return
+        msg = service.resolve_chat_question(question_id, None if dismiss else choice)
         self.api.bus.publish()
         self._send(200, {"ok": True, "message": msg})
 

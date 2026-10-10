@@ -388,6 +388,77 @@ class HarnessServiceTests(TestCase):
         button_texts = [btn["label"] for row in keyboard for btn in row]
         self.assertEqual(button_texts, ["🛑 放棄這個任務"])
 
+    def _chat_reply_with(self, stdout: str):
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli_process import ProcessResult
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        gateway.send_message_with_keyboard = MagicMock(return_value=81)
+        gateway.clear_message_keyboard = MagicMock()
+        scope = gateway.projects[0]
+        reply = ProcessResult(
+            command=[], return_code=0, stdout=stdout, stderr="",
+            started_at="2026-09-30T00:00:00+00:00", completed_at="2026-09-30T00:00:01+00:00", duration_ms=1,
+        )
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=reply):
+            gateway._chat_reply_and_maybe_start_task(scope, 12345, "要先做哪個？")
+        return gateway, scope, store
+
+    CHOICES_LINE = (
+        'HARNESS_CHOICES::{"question":"先做哪個？","options":[{"label":"先做 A","text":"先做 A"},'
+        '{"label":"先做 B","text":"我選 B，請開單"}]}'
+    )
+
+    def test_a_chat_reply_with_choices_goes_out_as_buttons_and_is_kept_until_answered(self) -> None:
+        gateway, scope, store = self._chat_reply_with(f"可以先做 A 或 B。\n{self.CHOICES_LINE}")
+        sent = gateway.send_message_with_keyboard.call_args
+        self.assertNotIn("HARNESS_CHOICES", sent.args[1])  # the marker never reaches the human
+        labels = [button["label"] for row in sent.args[2] for button in row]
+        self.assertEqual(labels, ["先做 A", "先做 B", "略過"])
+        open_questions = store.list_open_chat_questions(scope.name)
+        self.assertEqual(len(open_questions), 1)
+        self.assertEqual(open_questions[0]["question"], "先做哪個？")
+        gateway.send_message.assert_not_called()
+
+    def test_an_unusable_choices_line_leaves_the_reply_as_plain_text(self) -> None:
+        for bad in ("HARNESS_CHOICES::not json", 'HARNESS_CHOICES::{"question":"q","options":[{"label":"only one"}]}'):
+            with self.subTest(bad=bad):
+                gateway, scope, store = self._chat_reply_with(f"正文\n{bad}")
+                gateway.send_message_with_keyboard.assert_not_called()
+                self.assertIn("正文", gateway.send_message.call_args.args[1])
+                self.assertEqual(store.list_open_chat_questions(scope.name), [])
+
+    def test_picking_an_option_is_the_operator_saying_it_and_works_only_once(self) -> None:
+        from unittest.mock import patch
+
+        gateway, scope, store = self._chat_reply_with(f"正文\n{self.CHOICES_LINE}")
+        question = store.list_open_chat_questions(scope.name)[0]
+        said: list[str] = []
+        done = threading.Event()
+
+        def fake_handle(text, *, audience=None, **_):
+            said.append(text)
+            done.set()
+
+        with patch.object(gateway, "handle_message", side_effect=fake_handle):
+            result = gateway.handle_action(f"cq:{question['question_id']}:1", audience=12345, message_ref="tg:1:81")
+            self.assertTrue(done.wait(5))
+            self.assertIn("先做 B", result)
+            self.assertEqual(said, ["我選 B，請開單"])
+            self.assertEqual(store.list_open_chat_questions(scope.name), [])
+            again = gateway.handle_action(f"cq:{question['question_id']}:0", audience=12345)
+            self.assertIn("已經回答過", again)
+            self.assertEqual(said, ["我選 B，請開單"])  # a second tap does not say anything again
+
+    def test_a_dismissed_question_says_nothing_and_leaves_the_waiting_list(self) -> None:
+        gateway, scope, store = self._chat_reply_with(f"正文\n{self.CHOICES_LINE}")
+        question = store.list_open_chat_questions(scope.name)[0]
+        gateway.handle_action(f"cq:{question['question_id']}:x", audience=12345)
+        self.assertEqual(store.list_open_chat_questions(scope.name), [])
+        self.assertEqual(store.get_chat_question(question["question_id"])["status"], "dismissed")
+
     def test_chat_reply_preallowlists_memtrace_read_tools_for_claude_only(self) -> None:
         from unittest.mock import MagicMock, patch
         from memtrace_harness.cli_process import ProcessResult

@@ -414,7 +414,7 @@ document.addEventListener("click", function (e) {
     });
 });
 
-var WAITING_ACTION_TEXT = { approve: "核准中…", reject: "處理中…", choose: "送出中…", clarify: "送出中…", abandon: "放棄中…" };
+var WAITING_ACTION_TEXT = { pick: "送出中…", dismiss: "略過中…", approve: "核准中…", reject: "處理中…", choose: "送出中…", clarify: "送出中…", abandon: "放棄中…" };
 
 document.addEventListener("click", function (e) {
   if (!e.target.classList.contains("approval-btn")) return;
@@ -436,6 +436,10 @@ document.addEventListener("click", function (e) {
       statusEl.textContent = "請先寫下答案";
       return;
     }
+  } else if (action === "pick" || action === "dismiss") {
+    url = "/api/chat-question";
+    body = { project: project, question_id: btn.getAttribute("data-question"), action: action };
+    if (action === "pick") body.choice = parseInt(btn.getAttribute("data-choice"), 10);
   } else if (action === "abandon") {
     if (!confirm("放棄這個任務？它會被標記為失敗，並釋放工作區。")) return;
     url = "/api/stuck";
@@ -524,6 +528,17 @@ function renderWaitingItem(it, projectName) {
       waitingButton("approve", projectName, it.id, "clarify", "送出回答") +
       waitingButton("reject", projectName, it.id, "reject", "❌ 放棄這個任務") +
       '<span class="approval-status"></span></div>';
+  } else if (it.kind === "question") {
+    var qopts = (it.options || []).map(function (o, i) {
+      return '<button class="approval-btn choice" data-project="' + esc(projectName) + '" data-question="' + esc(it.id) +
+        '" data-action="pick" data-choice="' + i + '" title="' + esc(o.action) + '">' + esc(o.label) + "</button>";
+    }).join("");
+    var qdetail = (it.options || []).map(function (o) {
+      return '<div class="muted">・' + esc(o.label) + (o.action && o.action !== o.label ? "：" + esc(o.action) : "") + "</div>";
+    }).join("");
+    actions = qdetail + '<div class="approval-actions">' + qopts +
+      '<button class="approval-btn reject" data-project="' + esc(projectName) + '" data-question="' + esc(it.id) +
+      '" data-action="dismiss">略過</button><span class="approval-status"></span></div>';
   } else if (it.kind === "approval") {
     actions = '<div class="approval-actions">' +
       waitingButton("approve", projectName, it.id, "approve", "✅ 核准") +

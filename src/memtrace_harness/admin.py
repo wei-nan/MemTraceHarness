@@ -93,6 +93,14 @@ def collect_waiting(trace_store: TraceStore, scope: ProjectScope, pending_approv
                 "summary": conf["summary"], "since": conf["since"], "expires_at": conf["expires_at"],
             }
         )
+    for question in trace_store.list_open_chat_questions(scope.name):
+        items.append(
+            {
+                "kind": "question", "id": question["question_id"], "label": "待你選擇",
+                "summary": question["question"], "since": question["created_at"],
+                "options": [{"label": o["label"], "action": o["text"]} for o in question["options"]],
+            }
+        )
     live = {entry["conversation_id"] for entry in default_tracker.snapshot()}
     lock_ids = {lock["conversation_id"] for lock in locks}
     for conv in trace_store.list_unfinished_conversations(scope.workspace_id, (now - INTERRUPTED_LOOKBACK).isoformat()):
