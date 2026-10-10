@@ -17,9 +17,9 @@ Boundaries enforced here, from what the operator declared in the project's scope
   nothing: it records a request, and the Harness edits the scope file only after the human taps confirm
   in the chat. Always available, so a project that declares nothing yet can still be given tools.
 
-- ``propose_github_issue``: asks to open an issue in one of the project's own GitHub repos. It opens
-  nothing: it records a request, and the Harness runs ``gh issue create`` only after the human has seen
-  the full title and body and tapped confirm in the chat.
+- ``propose_github_action``: asks for one GitHub write (open / close / reopen / comment on an issue, adjust
+  its labels, comment on a PR; the table is in github_actions.py). It does nothing: it records a request, and
+  the Harness runs ``gh`` only after the human has seen the exact action and tapped confirm in the chat.
 
 Run: ``python -m memtrace_harness.ops_mcp`` (JSON-RPC over stdin/stdout).
 """
@@ -39,13 +39,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from memtrace_harness.scope import (
-    SCOPE_CHANGE_KINDS,
-    describe_scope_change,
-    github_issue_repos,
-    validate_github_issue,
-    validate_scope_change,
-)
+from memtrace_harness.github_actions import ACTIONS, github_issue_repos, summarize, validate_action
+from memtrace_harness.scope import SCOPE_CHANGE_KINDS, describe_scope_change, validate_scope_change
 
 PROTOCOL_VERSION = "2024-11-05"
 PROBE_TIMEOUT_SECONDS = 45
@@ -128,21 +123,28 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
-        "name": "propose_github_issue",
+        "name": "propose_github_action",
         "description": (
-            "Ask the user to open a GitHub issue (repo must be one of this project's repos; the tool says "
-            "which if you pass a wrong one). This does NOT open it: the user sees the full title and body "
-            "and a confirm button, and only a tap creates the issue, whose URL is then reported to them. "
-            "Say that a confirmation is waiting; do not say the issue exists."
+            "Ask the user to approve one GitHub write on this project's repos; your own GitHub connector cannot "
+            "write from here, so use this instead. action: issue_create (repo, title, body, labels?), "
+            "issue_close / issue_reopen (repo, number, comment?), issue_comment (repo, number, comment), "
+            "issue_label (repo, number, labels? to add, remove_labels? to remove), pr_comment (repo, number, "
+            "comment). This does NOT do it: the user sees the exact action and a confirm button, and only a "
+            "tap runs it. Say that a confirmation is waiting; never say it is done."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "action": {"type": "string", "enum": list(ACTIONS)},
                 "repo": _string_param("owner/name of the repository"),
-                "title": _string_param("one-line issue title"),
-                "body": _string_param("issue body (markdown)"),
+                "number": _string_param("issue or pull request number"),
+                "title": _string_param("one-line title (issue_create)"),
+                "body": _string_param("markdown body (issue_create)"),
+                "comment": _string_param("comment text"),
+                "labels": {"type": "array", "items": {"type": "string"}, "description": "labels to add"},
+                "remove_labels": {"type": "array", "items": {"type": "string"}, "description": "labels to remove"},
             },
-            "required": ["repo", "title", "body"],
+            "required": ["action", "repo"],
             "additionalProperties": False,
         },
     },
@@ -186,7 +188,7 @@ class OpsContext:
     def tool_names(self) -> set[str]:
         names = {"propose_scope_change"} if self.store is not None else set()
         if self.store is not None and self.github_repos:
-            names.add("propose_github_issue")
+            names.add("propose_github_action")
         if self.hosts:
             names.add("http_probe")
         if self.logs:
@@ -306,23 +308,23 @@ def propose_scope_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
-def propose_github_issue(ctx: OpsContext, arguments: dict[str, Any]) -> str:
+def propose_github_action(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     if ctx.store is None:
-        raise OpsError("issue requests are not available here")
+        raise OpsError("GitHub action requests are not available here")
     try:
-        issue = validate_github_issue(
-            ctx.github_repos, arguments.get("repo"), arguments.get("title"), arguments.get("body")
-        )
+        payload = validate_action(ctx.github_repos, arguments.get("action"), arguments)
     except ValueError as exc:
         raise OpsError(str(exc)) from exc
+    summary = summarize(payload)
     expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
-    if not ctx.store.create_github_issue_request(
-        request_id=f"issue_{uuid.uuid4().hex[:10]}", project=ctx.project, issue=issue, expires_at=expires
+    if not ctx.store.create_external_action_request(
+        request_id=f"act_{uuid.uuid4().hex[:10]}", project=ctx.project, key=f"github:{payload['action']}:{summary}",
+        summary=summary, payload=payload, expires_at=expires,
     ):
         raise OpsError("could not record the request")
     return (
-        f"Proposed issue in {issue['repo']}: {issue['title']}. The user now has a confirm button in the chat "
-        "(valid 10 minutes); the issue is created only after they tap it, and its URL is reported to them."
+        f"Proposed: {summary}. The user now has a confirm button in the chat (valid 10 minutes); it is done "
+        "only after they tap it, and the result is reported to them."
     )
 
 
@@ -339,8 +341,8 @@ def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
         return "\n".join(f"{n}: {c}" for n, c in sorted(ctx.jobs.items()))
     if name == "propose_scope_change":
         return propose_scope_change(ctx, arguments)
-    if name == "propose_github_issue":
-        return propose_github_issue(ctx, arguments)
+    if name == "propose_github_action":
+        return propose_github_action(ctx, arguments)
     return request_job(ctx, arguments)
 
 
