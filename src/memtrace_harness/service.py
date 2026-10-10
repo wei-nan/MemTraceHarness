@@ -287,6 +287,9 @@ class HarnessService:
             elif not delivered:
                 # Never reached the operator: put it back so the next tick shows it again.
                 store.transition_order_intent(ident, ("awaiting",), "pending")
+        elif kind == "chat_question":
+            if delivered and ref:
+                store.set_chat_question_message(ident, ref)
         elif kind == "job":
             if delivered and ref:
                 store.set_job_request_message(ident, ref)
@@ -526,6 +529,59 @@ class HarnessService:
         and the status page all go through."""
         return self._resolve_approval_action(request_id, action, audience, answer)
 
+    def _send_choices(self, scope: ProjectScope, audience: str | None, reply: str, choices: dict) -> None:
+        """Send a chat reply with its options as buttons, and keep the question until it is answered:
+        the status page lists it too, so it survives the chat scrolling past it."""
+        store = self.approval_manager.trace_store
+        question_id = f"cq_{uuid4().hex[:8]}"
+        store.create_chat_question(
+            question_id=question_id, project=scope.name, question=choices["question"], options=choices["options"]
+        )
+        keyboard = [
+            [{"label": option["label"], "id": f"{self.CHOICE_CALLBACK_PREFIX}:{question_id}:{index}"}]
+            for index, option in enumerate(choices["options"])
+        ]
+        keyboard.append([{"label": "略過", "id": f"{self.CHOICE_CALLBACK_PREFIX}:{question_id}:x"}])
+        self.send_message_with_keyboard(
+            audience, reply, keyboard, bind={"type": "chat_question", "id": question_id}
+        )
+
+    def resolve_chat_question(
+        self, question_id: str, choice: int | None, audience: str | None = None, message_ref: str | None = None
+    ) -> str:
+        """An option tapped in the chat or on the status page (choice=None dismisses it). Picking one is
+        exactly the operator saying that line to the chat, so it goes through the normal front door,
+        in the background because the model takes a while to answer."""
+        store = self.approval_manager.trace_store
+        question = store.get_chat_question(question_id)
+        if question is None:
+            return "找不到這個問題。"
+        self.clear_actions(message_ref or question["message_ref"])
+        if choice is None:
+            if not store.close_chat_question(question_id, "dismissed"):
+                return "這個問題已經處理過了。"
+            return "已略過這個問題。"
+        if not 0 <= choice < len(question["options"]):
+            return "無法辨識的選項。"
+        if not store.close_chat_question(question_id, "answered", choice):
+            return "這個問題已經回答過了。"
+        option = question["options"][choice]
+        text = option["text"]
+        self.primary_session_mgr.record_turn(
+            project=question["project"], speaker="user", turn_type="chat", content=f"（點選「{option['label']}」）{text}"
+        )
+        threading.Thread(
+            target=self._answer_chat_question, args=(text, audience), daemon=True, name=f"cq-{question_id}"
+        ).start()
+        return f"已選「{option['label']}」，處理中…"
+
+    def _answer_chat_question(self, text: str, audience: str | None) -> None:
+        try:
+            self.handle_message(text, audience=audience)
+        except Exception:
+            logger.exception("answering a chat question failed")
+            self.send_message(audience, "⚠️ 處理你選的選項時失敗了，請再說一次。")
+
     def resolve_card_pick(self, request_id: str, index: int) -> str:
         """Answer a question-type approval with one option of its decision card (the status page's door;
         the chat's own door is the option buttons)."""
@@ -635,6 +691,10 @@ class HarnessService:
         pick = parse_pick_action(action_id)
         if pick is not None:
             return self._resolve_card_pick(pick[0], pick[1], audience)[:200]
+        parts = action_id.split(":")
+        if len(parts) == 3 and parts[0] == self.CHOICE_CALLBACK_PREFIX:
+            choice = int(parts[2]) if parts[2].isdigit() else None
+            return self.resolve_chat_question(parts[1], choice, audience, message_ref)[:200]
         action, _, request_id = action_id.partition(":")
         if not action or not request_id:
             return "無法辨識的按鈕"
@@ -1909,6 +1969,9 @@ class HarnessService:
 
     _TASK_START_MARKER = "HARNESS_TASK_START::"
     _REVIEW_START_MARKER = "HARNESS_REVIEW_START::"
+    _CHOICES_MARKER = "HARNESS_CHOICES::"
+    CHOICE_CALLBACK_PREFIX = "cq"
+    MAX_CHOICES = 6
     _MEMORY_REORG_MARKER = "HARNESS_MEMORY_REORG::"
     _MEMORY_REBUILD_MARKER = "HARNESS_MEMORY_REBUILD::"
     _SCHEDULE_START_MARKER = "HARNESS_SCHEDULE_START::"
@@ -2101,6 +2164,12 @@ class HarnessService:
             "每一步都可以還原。使用者要你「整個重建」記憶（從完整對話紀錄重新分題、換掉現有的所有"
             f"記憶事項）時，改輸出「{self._MEMORY_REBUILD_MARKER}<一句話說明>」：系統會先請使用者按按鈕確認才開始，"
             "你不需要再問一次，也不要說已經開始了。\n\n"
+            "你需要使用者做決定、或要提供幾個可選的方向讓他挑時（例如「要先做 A 還是 B」「要不要開單」），"
+            "不要只在正文裡寫選項：在回覆最後另起一行，格式為「"
+            f"{self._CHOICES_MARKER}{{\"question\":\"<一句話的問題>\",\"options\":[{{\"label\":\"<按鈕上的短字，"
+            "30 字內>\",\"text\":\"<使用者點了之後，等同他對你說的那句話>\"}},...]}}」，整段 JSON 寫成一行、2 到 "
+            f"{self.MAX_CHOICES} 個選項。Harness 會把它變成按鈕，而且會保留在狀態頁直到使用者回答，不會被聊天洗掉；"
+            "正文仍要把情境與各選項的取捨說清楚。每則回覆最多一行；單純聊天、沒有要使用者決定時不要輸出。\n\n"
             f"{self._repos_notice(scope)}"
             f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
@@ -2146,6 +2215,8 @@ class HarnessService:
                 reply_text, review_request = self._extract_marker_line(reply_text, self._REVIEW_START_MARKER)
                 reply_text, memory_reorg = self._extract_marker_line(reply_text, self._MEMORY_REORG_MARKER)
                 reply_text, memory_rebuild = self._extract_marker_line(reply_text, self._MEMORY_REBUILD_MARKER)
+                reply_text, choices_payload = self._extract_marker_line(reply_text, self._CHOICES_MARKER)
+                choices = self._parse_choices(choices_payload) if not goal else None
                 if confirmations:
                     reply_text = "\n".join(filter(None, [reply_text, "", *confirmations])).strip()
                 attribution = f"🧩 {provider}/{model or '預設模型'}"
@@ -2153,7 +2224,10 @@ class HarnessService:
                 self.primary_session_mgr.record_turn(
                     project=scope.name, speaker="assistant", turn_type="chat", content=reply_text or reply
                 )
-                self.send_message(audience, reply)
+                if choices:
+                    self._send_choices(scope, audience, reply, choices)
+                else:
+                    self.send_message(audience, reply)
                 if approval_answer and pending_approval is not None and not goal:
                     # Only honored for the approval this very message replied to, and only
                     # while it is still pending (a double reply must not resume twice).
@@ -2186,6 +2260,33 @@ class HarnessService:
             project=scope.name, speaker="assistant", turn_type="chat", content=msg
         )
         return msg
+
+    @classmethod
+    def _parse_choices(cls, payload: str | None) -> dict | None:
+        """The question and options from a `HARNESS_CHOICES::` line, or None when it is not a usable one
+        (the reply then goes out as plain text, never lost)."""
+        if not payload:
+            return None
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("options"), list):
+            return None
+        question = str(data.get("question") or "").strip()[:300]
+        options: list[dict[str, str]] = []
+        for item in data["options"][: cls.MAX_CHOICES]:
+            if isinstance(item, str):
+                item = {"label": item}
+            if not isinstance(item, dict):
+                return None
+            label = str(item.get("label") or "").strip()[:30]
+            if not label:
+                return None
+            options.append({"label": label, "text": str(item.get("text") or label).strip()[:300]})
+        if len(options) < 2 or not question:
+            return None
+        return {"question": question, "options": options}
 
     @classmethod
     def _extract_marker_line(cls, raw: str, marker: str) -> tuple[str, str | None]:

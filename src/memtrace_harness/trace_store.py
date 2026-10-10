@@ -940,6 +940,18 @@ class TraceStore:
                 CREATE INDEX IF NOT EXISTS idx_order_intents_status
                     ON order_intents(status, project);
 
+                CREATE TABLE IF NOT EXISTS chat_questions (
+                    question_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    options_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message_ref TEXT,
+                    answered_index INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS scan_snapshots (
                     project TEXT PRIMARY KEY,
                     updated_at TEXT NOT NULL,
@@ -3184,6 +3196,58 @@ class TraceStore:
         out["kind"] = row[8] or "job"
         out["payload"] = json.loads(row[9]) if row[9] else None
         return out
+
+    # ---- questions the chat model put to the operator as choices (kept until answered, so a chat that
+    # scrolled past them cannot lose them)
+    CHAT_QUESTION_TTL = timedelta(days=7)
+
+    @staticmethod
+    def _chat_question_dict(row: tuple) -> dict:
+        return {
+            "question_id": row[0], "project": row[1], "question": row[2], "options": json.loads(row[3]),
+            "status": row[4], "message_ref": row[5], "answered_index": row[6], "created_at": row[7],
+        }
+
+    _CHAT_QUESTION_COLUMNS = "question_id, project, question, options_json, status, message_ref, answered_index, created_at"
+
+    def create_chat_question(self, *, question_id: str, project: str, question: str, options: list[dict]) -> None:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO chat_questions (question_id, project, question, options_json, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'open', ?, ?)",
+                (question_id, project, question, json.dumps(options, ensure_ascii=False), now, now),
+            )
+
+    def get_chat_question(self, question_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._CHAT_QUESTION_COLUMNS} FROM chat_questions WHERE question_id = ?", (question_id,)
+            ).fetchone()
+        return self._chat_question_dict(row) if row else None
+
+    def set_chat_question_message(self, question_id: str, message_ref: str) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE chat_questions SET message_ref = ? WHERE question_id = ?", (message_ref, question_id))
+
+    def close_chat_question(self, question_id: str, status: str, answered_index: int | None = None) -> bool:
+        """open -> answered|dismissed, once (a double tap cannot answer twice)."""
+        with self._connection() as conn:
+            return conn.execute(
+                "UPDATE chat_questions SET status = ?, answered_index = ?, updated_at = ? "
+                "WHERE question_id = ? AND status = 'open'",
+                (status, answered_index, utc_now_iso(), question_id),
+            ).rowcount > 0
+
+    def list_open_chat_questions(self, project: str) -> list[dict]:
+        cutoff = (datetime.now(timezone.utc) - self.CHAT_QUESTION_TTL).isoformat()
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._CHAT_QUESTION_COLUMNS} FROM chat_questions "
+                "WHERE project = ? AND status = 'open' AND created_at > ? ORDER BY created_at",
+                (project, cutoff),
+            ).fetchall()
+        return [self._chat_question_dict(r) for r in rows]
 
     # ---- what is waiting on the human, for the status page (read-only views)
     def list_open_confirmations(self, project: str) -> list[dict]:

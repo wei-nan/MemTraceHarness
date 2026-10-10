@@ -31,6 +31,7 @@ ADMIN_ROUTES = {
     "/api/digest-model": "digest-model",
     "/api/approval": "approval",
     "/api/stuck": "stuck",
+    "/api/chat-question": "chat-question",
     "/api/preference": "preference",
 }
 

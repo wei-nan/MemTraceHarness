@@ -268,6 +268,26 @@ class StatusAndAdminTests(ApiTestCase):
             [c["id"] for c in store.list_unfinished_conversations(self.scope.workspace_id, "2000")], ["conv_live"]
         )
 
+    def test_an_open_chat_question_is_listed_and_can_be_answered_from_the_page(self) -> None:
+        from unittest.mock import patch
+
+        store = self.parts.approval_manager.trace_store
+        store.create_chat_question(
+            question_id="cq_t1", project=self.scope.name, question="先做哪個？",
+            options=[{"label": "A", "text": "先做 A"}, {"label": "B", "text": "先做 B"}],
+        )
+        items = self.client.status()["projects"][0]["waiting"]["items"]
+        question = next(i for i in items if i["kind"] == "question")
+        self.assertEqual((question["label"], [o["label"] for o in question["options"]]), ("待你選擇", ["A", "B"]))
+        with patch.object(self.service, "handle_message") as handle:
+            self.client.admin("chat-question", {"question_id": "cq_t1", "choice": 0})
+            time.sleep(0.3)
+            handle.assert_called_once()
+            self.assertEqual(handle.call_args.args[0], "先做 A")
+        with self.assertRaises(HarnessError):
+            self.client.admin("chat-question", {"question_id": "cq_missing", "choice": 0})
+        self.assertFalse([i for i in self.client.status()["projects"][0]["waiting"]["items"] if i["kind"] == "question"])
+
     def test_an_unknown_turn_is_a_404(self) -> None:
         self.assertIsNone(self.client.turn(99999))
 
