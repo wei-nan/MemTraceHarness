@@ -33,6 +33,12 @@ from memtrace_harness.memory_digest import (
     sync_digests_to_memtrace,
     sync_operator_profile,
 )
+from memtrace_harness.memory_topics import (
+    due_topic_dates,
+    finish_archived_days,
+    run_topics_for_date,
+    sync_topics_to_memtrace,
+)
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
@@ -47,56 +53,6 @@ from memtrace_harness.work_review import (
 )
 
 logger = logging.getLogger(__name__)
-
-def _classify_via_model(
-    candidates: tuple[tuple[str, str], ...],
-    config: HarnessConfig,
-    working_directory: Path,
-    prompt: str,
-    contents: list[str],
-    positive_word: str,
-) -> list[bool]:
-    """Shared shape for both classifiers below: try each (provider, model) candidate in
-    order, ask for exactly one verdict line per input, and parse it. A provider outage
-    (not logged in, quota exhausted) falls through to the next candidate rather than
-    failing the whole classification pass."""
-    if not contents or not candidates:
-        return [False] * len(contents)
-    for provider, model in candidates:
-        cmd = config.chat_command(provider, model, prompt)
-        result = CliProcessRunner().run(cmd, cwd=working_directory, timeout_seconds=60)
-        if result.return_code != 0 or not result.stdout.strip():
-            continue
-        lines = [ln.strip().upper() for ln in result.stdout.strip().splitlines() if ln.strip()]
-        return [ln.startswith(positive_word) for ln in lines]
-    return [False] * len(contents)
-
-
-def _make_chat_classifier(config: HarnessConfig, project_name: str, working_directory: Path):
-    """Build the classify_chat_fn consolidate_to_memtrace() uses to judge plain chat
-    turns. Deliberately a cheap, low-stakes model call — that project's own chat model
-    (chat_candidates_for(), same resolution as the quick-chat-reply path) — since this
-    only decides whether to write a draft note, never whether to run real work; a model
-    verdict is an acceptable amount of risk here in a way it would not be for the
-    Agent Loop itself."""
-    candidates = config.chat_candidates_for(project_name)
-
-    def classify(contents: list[str]) -> list[bool]:
-        prompt = (
-            "Below are chat messages from a project's conversation log, numbered in "
-            "order. For each one, decide if it is substantive — a decision, "
-            "requirement, agreed plan, important fact, or something that should be "
-            "remembered later — versus just small talk, a greeting, or a status check "
-            "with no lasting value.\n\n"
-            f"Reply with EXACTLY {len(contents)} lines, one per message in the same "
-            "order, each line either the single word SUBSTANTIVE or the single word "
-            "CHAT and nothing else.\n\n"
-            + "\n".join(f"{i + 1}. {c}" for i, c in enumerate(contents))
-        )
-        return _classify_via_model(candidates, config, working_directory, prompt, contents, "SUBSTANTIVE")
-
-    return classify
-
 
 # How often the Harness loop checks whether a nightly memory digest is due. Cheap when
 # nothing is due (SQLite reads only); the digest itself runs in its own thread so a
@@ -162,6 +118,48 @@ def make_recall_model_caller(config: HarnessConfig, project_name: str):
     return call
 
 
+def archive_topics(
+    trace_store: TraceStore,
+    memtrace_client: MemTraceClient | None,
+    scope,
+    workspace_id: str,
+    tz: ZoneInfo,
+    call_model,
+    dates: list[str],
+    *,
+    respect_retry_backoff: bool = False,
+    log=print,
+) -> int:
+    """Split each of those days into matters (oldest first, stopping at the first failure so a
+    matter's history stays chronological), then write what MemTrace is missing. Returns the
+    number of matters recorded."""
+    recorded = 0
+    for d in dates:
+        key = ("topics", scope.name, d)
+        if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
+            break
+        session_id = f"psess_{scope.name}"
+        try:
+            count = run_topics_for_date(trace_store, scope.name, session_id, workspace_id, d, tz, call_model)
+        except Exception as exc:
+            _digest_failures[key] = time.monotonic()
+            logger.exception(f"[{scope.name}] topic archive for {d} failed; will retry later")
+            log(f"[{scope.name}] topic archive {d} failed: {exc}")
+            break
+        _digest_failures.pop(key, None)
+        recorded += count
+        log(f"[{scope.name}] archived {d}: {count} matter(s)")
+    if memtrace_client is not None:
+        try:
+            written = sync_topics_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id)
+            if written:
+                log(f"[{scope.name}] wrote {written} matter note(s) to MemTrace {workspace_id}")
+            finish_archived_days(trace_store, scope.name, workspace_id, tz)
+        except Exception:
+            logger.exception(f"[{scope.name}] syncing matter notes to MemTrace failed; will retry next pass")
+    return recorded
+
+
 def run_memory_digests(
     config: HarnessConfig,
     trace_store: TraceStore,
@@ -191,6 +189,11 @@ def run_memory_digests(
         if dry_run:
             for d in dates:
                 log(f"[{scope.name}] would digest {d}")
+            for d in (
+                [only_date] if only_date is not None
+                else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
+            ):
+                log(f"[{scope.name}] would archive {d} into matters")
             continue
         call_model = make_digest_model_caller(config, scope.name)
         for d in dates:
@@ -225,8 +228,16 @@ def run_memory_digests(
                 f"{outcome.digest['discarded_ungrounded']} ungrounded item(s) discarded "
                 f"({outcome.provider}/{outcome.model})"
             )
+        workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+        if only_date is not None:
+            topic_dates = [only_date]
+        else:
+            topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=max_days_back)
+        archive_topics(
+            trace_store, memtrace_client, scope, workspace_id, tz, call_model, topic_dates,
+            respect_retry_backoff=respect_retry_backoff, log=log,
+        )
         if memtrace_client is not None:
-            workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
             try:
                 synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)
                 if synced:

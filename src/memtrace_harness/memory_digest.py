@@ -806,6 +806,14 @@ def _link_digest(
             relation="extends",
             stage="daily_digest",
         )
+    for topic_node in trace_store.topic_nodes_for_date(project, workspace_id, row["digest_date"]):
+        memtrace_client.create_edge(
+            workspace_id=workspace_id,
+            from_id=node_id,
+            to_id=topic_node,
+            relation="extracted_from",
+            stage="daily_digest",
+        )
     day = _digest_turn_range(trace_store, project, row["digest_date"], tz)
     if day is None:
         return

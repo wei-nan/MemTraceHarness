@@ -30,7 +30,7 @@ def _config():
 
 
 def _serve(parts, config=None, **intervals):
-    kwargs = dict(scan_interval=9999, consolidation_interval=9999, schedule_check_interval=9999)
+    kwargs = dict(scan_interval=9999, schedule_check_interval=9999)
     kwargs.update(intervals)
     with patch("memtrace_harness.runtime.build_harness", return_value=parts), patch(
         "memtrace_harness.runtime.HarnessApi"
@@ -67,7 +67,7 @@ class ServeLoopTests(TestCase):
         ), patch("memtrace_harness.agy_mcp_check.check_antigravity_mcp", return_value=["agy is off"]), patch(
             "memtrace_harness.chat_tools_check.check_chat_tools", return_value=["no memtrace for codex"]
         ):
-            runtime.serve(_config(), parts.scope, scan_interval=9999, consolidation_interval=9999, schedule_check_interval=9999)
+            runtime.serve(_config(), parts.scope, scan_interval=9999, schedule_check_interval=9999)
         said = " ".join(c.args[0] for c in parts.service.notify_operator.call_args_list)
         self.assertIn("agy is off", said)
         self.assertIn("no memtrace for codex", said)

@@ -2,7 +2,7 @@
 
 `memtrace-harness serve` is this module. It owns what used to be the Harness's serve loop minus
 everything that talked to a chat: the timed duties (backlog scan, task-queue drain, orders and job
-requests, approval expiry, due schedules, cold-memory consolidation, the nightly digest and its
+requests, approval expiry, due schedules, the nightly digest and topic archive and their
 neighbours) plus the local HTTP API (api.py) that services use to reach it.
 """
 
@@ -23,7 +23,6 @@ from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.duties import (
     DIGEST_CHECK_SECONDS,
-    _make_chat_classifier,
     _run_nightly_digest_pass,
     make_recall_model_caller,
     run_knowledge_gardening,
@@ -160,7 +159,6 @@ def serve(
     scope: ProjectScope,
     *,
     scan_interval: int = 1800,
-    consolidation_interval: int = 3600,
     schedule_check_interval: int = 30,
 ) -> int:
     """Run until SIGINT/SIGTERM. A crash in one duty is logged and the loop continues rather than
@@ -176,7 +174,7 @@ def serve(
     print(
         f"Serving Harness '{scope.name}' (workspace {config.workspace_root}); API on "
         f"http://{config.api_host}:{config.api_port}; scan_interval={scan_interval}s "
-        f"consolidation_interval={consolidation_interval}s schedule_check_interval={schedule_check_interval}s. "
+        f"schedule_check_interval={schedule_check_interval}s. "
         "Ctrl-C to stop.",
         flush=True,
     )
@@ -206,7 +204,6 @@ def serve(
     _startup_checks(parts)
 
     last_scan = 0.0
-    last_consolidation = 0.0
     last_digest_check = 0.0
     last_schedule_check = 0.0
     last_approval_expiry = -APPROVAL_EXPIRY_CHECK_SECONDS  # run once right after startup
@@ -291,20 +288,6 @@ def serve(
             except Exception:
                 logger.exception("schedule check pass failed; continuing")
             last_schedule_check = now
-
-        if now - last_consolidation >= consolidation_interval:
-            try:
-                memory_workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-                classify_fn = _make_chat_classifier(config, scope.name, scope.working_directory)
-                written = primary_session_mgr.consolidate_to_memtrace(
-                    scope.name, memory_workspace_id, classify_fn, tz=schedule_tz
-                )
-                if written:
-                    print(f"[{scope.name}] consolidated {len(written)} turn(s) to MemTrace as draft evidence", flush=True)
-                    bus.publish()
-            except Exception:
-                logger.exception(f"[{scope.name}] cold-memory consolidation failed; will retry next cycle")
-            last_consolidation = now
 
         if now - last_digest_check >= DIGEST_CHECK_SECONDS:
             in_window = in_digest_window(datetime.now(schedule_tz))
