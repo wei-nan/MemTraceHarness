@@ -22,6 +22,7 @@ ADMIN_ROUTES = {
     "/api/chat-chain": "chat-chain",
     "/api/digest-chain": "digest-chain",
     "/api/archive-chain": "archive-chain",
+    "/api/audit-chain": "audit-chain",
     "/api/recall-chain": "recall-chain",
     "/api/model-catalog-refresh": "model-catalog-refresh",
     "/api/chat-model": "chat-model",

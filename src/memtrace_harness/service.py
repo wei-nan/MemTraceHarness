@@ -58,6 +58,8 @@ from memtrace_harness.trigger_review import (
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
+from memtrace_harness.calibration import calibration_block
+from memtrace_harness.memory_audit import describe_audit, undo_audit_run
 from memtrace_harness.memory_digest import (
     DIGEST_TITLE_PREFIX,
     PREFERENCE_CORRECT_MARKER,
@@ -751,6 +753,8 @@ class HarnessService:
             return self._resolve_garden_undo(request_id, audience, message_ref)[:200]
         if action in {"mem_rebuild_ok", "mem_rebuild_no"}:
             return self._resolve_memory_rebuild(action, request_id, audience, message_ref)[:200]
+        if action == "audit_undo":
+            return self._resolve_audit_undo(request_id, audience, message_ref)[:200]
         if action == "mem_undo":
             return self._resolve_reorg_undo(request_id, audience, message_ref)[:200]
         if action in {CLAIM_OK, CLAIM_NO}:
@@ -1656,8 +1660,9 @@ class HarnessService:
         automatic classifier appended raw turns to, with no evidence check, and a whole
         stock-analysis reply ended up injected into every chat as an instruction."""
         try:
-            return preference_context_for(
-                self.primary_session_mgr.trace_store, scope.name, with_ids=True
+            trace_store = self.primary_session_mgr.trace_store
+            return preference_context_for(trace_store, scope.name, with_ids=True) + calibration_block(
+                trace_store, scope.name, "chat"
             )
         except Exception:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
@@ -2000,6 +2005,32 @@ class HarnessService:
         self.primary_session_mgr.record_turn(
             project=outcome.project, speaker="assistant", turn_type="chat", content=text
         )
+
+    def notify_audit_outcome(self, outcome, audience: str | None = None) -> None:
+        """Tell the operator what the nightly audit found and changed, with a one-tap undo."""
+        text = describe_audit(outcome)
+        if not text:
+            return
+        if outcome.applied and outcome.run_id:
+            self.send_message_with_keyboard(
+                audience, text, [[{"label": "↩️ 撤銷這次校正", "id": f"audit_undo:{outcome.run_id}"}]]
+            )
+        else:
+            self.send_message(audience, text)
+        self.primary_session_mgr.record_turn(
+            project=outcome.project, speaker="assistant", turn_type="chat", content=text
+        )
+
+    def _resolve_audit_undo(self, run_id_text: str, audience: str | None, message_ref: str | None) -> str:
+        if not run_id_text.isdigit():
+            return "無法還原"
+        count = undo_audit_run(self.approval_manager.trace_store, int(run_id_text))
+        self.clear_actions(message_ref)
+        if not count:
+            self.send_message(audience, "這次校正已經撤銷過了。")
+            return "已撤銷過"
+        self.send_message(audience, f"↩️ 已撤銷這次的 {count} 條校正筆記。")
+        return "已撤銷"
 
     def _resolve_reorg_undo(self, run_id_text: str, audience: str | None, message_ref: str | None) -> str:
         if self.memtrace_client is None or not run_id_text.isdigit():

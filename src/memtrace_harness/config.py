@@ -45,6 +45,11 @@ class HarnessConfig:
     archive_provider: str | None = None
     archive_model: str | None = None
     archive_fallbacks: tuple[tuple[str, str], ...] = ()
+    # Nightly audit (memory_audit.py): an independent model that judges how the day went. Unset ->
+    # the digest chain; setting a different vendor makes the auditor more independent of what it audits.
+    audit_provider: str | None = None
+    audit_model: str | None = None
+    audit_fallbacks: tuple[tuple[str, str], ...] = ()
     # Topic recall (the slow path behind chat: topic judgement + cold-memory exploration
     # -> short-lived briefs, topic_recall.py). Unset -> the digest chain, so it gets the
     # stronger model without any extra setting.
@@ -224,6 +229,21 @@ class HarnessConfig:
         )
         return ((provider, model or ""), *fallbacks)
 
+    def audit_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
+        """Ordered (provider, model) list for the nightly audit; with none configured it uses the
+        digest chain. A configured chain is used as-is and never degrades into a weaker one."""
+        provider = os.getenv("HARNESS_AUDIT_PROVIDER") or self.audit_provider
+        if not provider:
+            return self.digest_candidates_for(project_name)
+        model = os.getenv("HARNESS_AUDIT_MODEL") or self.audit_model
+        fallbacks_override = os.getenv("HARNESS_AUDIT_FALLBACKS")
+        fallbacks = (
+            _parse_chat_fallbacks(fallbacks_override)
+            if fallbacks_override is not None
+            else self.audit_fallbacks
+        )
+        return ((provider, model or ""), *fallbacks)
+
     def recall_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for topic recall; with none configured it uses the
         digest chain (itself falling back to chat). A configured chain is used as-is and never
@@ -298,6 +318,9 @@ class HarnessConfig:
             archive_provider=os.getenv("HARNESS_ARCHIVE_PROVIDER") or None,
             archive_model=os.getenv("HARNESS_ARCHIVE_MODEL") or None,
             archive_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_ARCHIVE_FALLBACKS", "")),
+            audit_provider=os.getenv("HARNESS_AUDIT_PROVIDER") or None,
+            audit_model=os.getenv("HARNESS_AUDIT_MODEL") or None,
+            audit_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_AUDIT_FALLBACKS", "")),
             recall_enabled=os.getenv("HARNESS_RECALL_ENABLED", "true").lower()
             not in {"false", "0", "no"},
             recall_provider=os.getenv("HARNESS_RECALL_PROVIDER") or None,

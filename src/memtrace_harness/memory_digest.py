@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable
 
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
+from memtrace_harness.calibration import calibration_block
 from memtrace_harness.trace_store import TraceStore
 
 logger = logging.getLogger(__name__)
@@ -244,6 +245,7 @@ def build_digest_prompt(
     schedule_note: str = "",
     adopted_rules: list[dict] | None = None,
     state_snapshot: str = "",
+    calibration: str = "",
 ) -> str:
     adopted_text = (
         "\n".join(f"[{r['id']}] ({'global' if r['scope'] == 'global' else 'project'}) {r['text']}" for r in adopted_rules)
@@ -287,6 +289,7 @@ def build_digest_prompt(
             if state_snapshot
             else ""
         )
+        + (f"{calibration}\n" if calibration else "")
         +
         "Return ONLY one JSON object, no prose and no code fence, with exactly these keys:\n"
         "{\n"
@@ -658,7 +661,8 @@ def run_digest_for_date(
     if turns:
         stdout, provider, model = call_model(
             build_digest_prompt(
-                project, digest_date, turns, carried, schedule_note, adopted_rules, state_snapshot
+                project, digest_date, turns, carried, schedule_note, adopted_rules, state_snapshot,
+                calibration_block(trace_store, project, "digest"),
             )
         )
         raw = _extract_json_object(stdout)

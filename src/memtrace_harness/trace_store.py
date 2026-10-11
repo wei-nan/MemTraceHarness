@@ -1080,6 +1080,51 @@ class TraceStore:
                     PRIMARY KEY (project, digest_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_audit_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    audit_date TEXT NOT NULL,
+                    provider TEXT,
+                    model TEXT,
+                    metrics_json TEXT NOT NULL,
+                    assessment TEXT,
+                    created_at TEXT NOT NULL,
+                    undone_at TEXT,
+                    UNIQUE (project, audit_date)
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_audit_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL,
+                    project TEXT NOT NULL,
+                    audit_date TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    turns_json TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    note_id INTEGER,
+                    baseline REAL,
+                    status TEXT NOT NULL,
+                    verify_after TEXT,
+                    verified_at TEXT,
+                    outcome_json TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_audit_findings_project
+                    ON memory_audit_findings(project, status);
+
+                CREATE TABLE IF NOT EXISTS memory_calibration_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    finding_id INTEGER,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    retired_at TEXT,
+                    retired_reason TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS memory_drafts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project TEXT NOT NULL,
@@ -1896,6 +1941,149 @@ class TraceStore:
             ).fetchall()
         return {r[0] for r in rows}
 
+    def topic_days_between(self, project: str, start: str, end: str) -> list[tuple[int, str]]:
+        """(topic id, date) pairs for the days a matter was touched, start..end inclusive."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT topic_id, digest_date FROM memory_topic_days WHERE project = ? "
+                "AND digest_date >= ? AND digest_date <= ?", (project, start, end),
+            ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    # --- Nightly audit: runs, findings and calibration notes (memory_audit.py) ------------
+
+    _FINDING_COLUMNS = (
+        "id, run_id, project, audit_date, kind, text, turns_json, action, note_id, baseline, status, "
+        "verify_after, verified_at, outcome_json, created_at"
+    )
+
+    @staticmethod
+    def _finding_to_dict(row) -> dict:
+        keys = ("id", "run_id", "project", "audit_date", "kind", "text", "turns", "action", "note_id",
+                "baseline", "status", "verify_after", "verified_at", "outcome", "created_at")
+        item = dict(zip(keys, row))
+        item["turns"] = json.loads(item["turns"])
+        item["outcome"] = json.loads(item["outcome"]) if item["outcome"] else None
+        return item
+
+    def save_audit_run(
+        self, *, project: str, audit_date: str, provider: str | None, model: str | None,
+        metrics: dict, assessment: str,
+    ) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT OR REPLACE INTO memory_audit_runs "
+                "(project, audit_date, provider, model, metrics_json, assessment, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (project, audit_date, provider, model, json.dumps(metrics, ensure_ascii=False), assessment, utc_now_iso()),
+            )
+        return int(cur.lastrowid)
+
+    def audited_dates(self, project: str) -> set[str]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT audit_date FROM memory_audit_runs WHERE project = ?", (project,)).fetchall()
+        return {r[0] for r in rows}
+
+    def get_audit_run(self, run_id: int) -> dict | None:
+        with self._connection() as conn:
+            r = conn.execute(
+                "SELECT id, project, audit_date, provider, model, metrics_json, assessment, created_at, undone_at "
+                "FROM memory_audit_runs WHERE id = ?", (run_id,),
+            ).fetchone()
+        if not r:
+            return None
+        keys = ("id", "project", "audit_date", "provider", "model", "metrics", "assessment", "created_at", "undone_at")
+        item = dict(zip(keys, r))
+        item["metrics"] = json.loads(item["metrics"])
+        return item
+
+    def list_audit_runs(self, project: str, limit: int = 14) -> list[dict]:
+        with self._connection() as conn:
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM memory_audit_runs WHERE project = ? ORDER BY audit_date DESC LIMIT ?", (project, limit)
+            ).fetchall()]
+        return [self.get_audit_run(i) for i in ids]
+
+    def mark_audit_run_undone(self, run_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE memory_audit_runs SET undone_at = ? WHERE id = ?", (utc_now_iso(), run_id))
+
+    def add_audit_finding(
+        self, *, run_id: int, project: str, audit_date: str, kind: str, text: str, turns: list[int],
+        action: str, note_id: int | None, baseline: float | None, status: str, verify_after: str | None,
+    ) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO memory_audit_findings (run_id, project, audit_date, kind, text, turns_json, action, "
+                "note_id, baseline, status, verify_after, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, project, audit_date, kind, text, json.dumps(turns), action, note_id, baseline, status,
+                 verify_after, utc_now_iso()),
+            )
+        return int(cur.lastrowid)
+
+    def list_audit_findings(
+        self, project: str, *, statuses: tuple[str, ...] | None = None, run_id: int | None = None, limit: int = 50
+    ) -> list[dict]:
+        query = f"SELECT {self._FINDING_COLUMNS} FROM memory_audit_findings WHERE project = ?"
+        params: list = [project]
+        if statuses:
+            query += f" AND status IN ({','.join('?' for _ in statuses)})"
+            params += list(statuses)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._finding_to_dict(r) for r in rows]
+
+    def set_audit_finding_status(self, finding_id: int, status: str, outcome: dict | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_audit_findings SET status = ?, verified_at = ?, outcome_json = COALESCE(?, outcome_json) "
+                "WHERE id = ?",
+                (status, utc_now_iso(), json.dumps(outcome, ensure_ascii=False) if outcome else None, finding_id),
+            )
+
+    def add_calibration_note(self, *, project: str, target: str, text: str, finding_id: int | None = None) -> int:
+        with self._connection() as conn:
+            cur = conn.execute(
+                "INSERT INTO memory_calibration_notes (project, target, text, finding_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (project, target, text, finding_id, utc_now_iso()),
+            )
+        return int(cur.lastrowid)
+
+    def set_finding_note(self, finding_id: int, note_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE memory_audit_findings SET note_id = ? WHERE id = ?", (note_id, finding_id))
+            conn.execute("UPDATE memory_calibration_notes SET finding_id = ? WHERE id = ?", (finding_id, note_id))
+
+    def list_calibration_notes(
+        self, project: str, *, target: str | None = None, active_only: bool = True
+    ) -> list[dict]:
+        query = (
+            "SELECT id, project, target, text, finding_id, active, created_at, retired_at, retired_reason "
+            "FROM memory_calibration_notes WHERE project = ?"
+        )
+        params: list = [project]
+        if target:
+            query += " AND target = ?"
+            params.append(target)
+        if active_only:
+            query += " AND active = 1"
+        query += " ORDER BY id ASC"
+        with self._connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        keys = ("id", "project", "target", "text", "finding_id", "active", "created_at", "retired_at", "retired_reason")
+        return [dict(zip(keys, r)) | {"active": bool(r[5])} for r in rows]
+
+    def set_calibration_note_active(self, note_id: int, active: bool, reason: str | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE memory_calibration_notes SET active = ?, retired_at = ?, retired_reason = ? WHERE id = ?",
+                (1 if active else 0, None if active else utc_now_iso(), None if active else reason, note_id),
+            )
+
     def clear_topic_runs(self, project: str) -> None:
         """Forget which days were archived, so every day is due again (a rebuild)."""
         with self._connection() as conn:
@@ -1944,6 +2132,13 @@ class TraceStore:
             ).fetchone()
         keys = ("id", "project", "workspace_id", "kind", "status", "summary", "created_at", "finished_at", "undone_at")
         return dict(zip(keys, r)) if r else None
+
+    def list_undone_reorg_runs(self, project: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, undone_at FROM memory_reorg_runs WHERE project = ? AND undone_at IS NOT NULL", (project,)
+            ).fetchall()
+        return [{"id": r[0], "undone_at": r[1]} for r in rows]
 
     def last_reorg_run(self, project: str, workspace_id: str, kind: str) -> dict | None:
         with self._connection() as conn:

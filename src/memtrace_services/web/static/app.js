@@ -263,6 +263,29 @@ function renderArchiveCandidates(project) {
     project.archive_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型；儲存後記憶整理才會改用自己的模型。");
 }
 
+function renderAuditCandidates(project) {
+  return renderChain(project, "audit", project.audit_candidates, "（未設定）",
+    project.audit_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型；建議改用與摘要不同的供應商，稽核才更獨立。");
+}
+
+function renderAudit(project) {
+  var a = project.audit || {};
+  var head = '<div class="section-label">夜間稽核 · 北極星：' + esc(a.north_star || "") + "</div>";
+  var trend = (a.trend || []).map(function (t) {
+    return esc(t.date.slice(5)) + " " + (t.friction == null ? "–" : t.friction);
+  }).join(" · ");
+  var notes = (a.notes || []).map(function (n) {
+    return '<div class="evidence-item">[' + esc(n.target) + "] " + esc(n.text) + "</div>";
+  }).join("") || '<div class="empty">（目前沒有生效中的校正筆記）</div>';
+  var props = (a.open_proposals || []).map(function (p) {
+    return '<div class="evidence-item">💡 ' + esc(p.date) + " " + esc(p.text) + "</div>";
+  }).join("");
+  return head + (a.latest_assessment ? '<div class="hint">' + esc(a.latest_assessment) + "</div>" : "") +
+    '<div class="hint">摩擦指數（越低越好）：' + (trend || "尚無資料") + "</div>" +
+    '<div class="section-label">生效中的校正筆記</div>' + notes +
+    (props ? '<div class="section-label">等你決定的建議</div>' + props : "");
+}
+
 function renderRoleProfiles(project) {
   if (project.role_profiles_error) {
     return '<div class="warn">⚠️ role-profiles 讀取失敗：' + esc(project.role_profiles_error) + "</div>";
@@ -802,6 +825,7 @@ function renderModelSettings(project) {
     '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
     '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
     '<div class="section-label">記憶整理模型（夜間分題、每週審查、重建）</div>' + renderArchiveCandidates(project) +
+    '<div class="section-label">夜間稽核模型</div>' + renderAuditCandidates(project) +
     '<div class="section-label">背景回想模型</div>' + renderRecallCandidates(project) +
     '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project);
 }
@@ -814,7 +838,7 @@ function renderProject(project, q) {
     : "";
   var content = "";
   if (state.tab === "memory") {
-    content = renderTopicBriefs(project) + renderDigests(project);
+    content = renderAudit(project) + renderTopicBriefs(project) + renderDigests(project);
   } else if (state.tab === "schedules") {
     content = renderSchedules(project) || '<div class="empty">（沒有排程）</div>';
   } else if (state.tab === "settings") {

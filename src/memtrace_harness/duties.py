@@ -24,6 +24,7 @@ from memtrace_harness.kb_gardening import (
     workspaces_to_garden,
 )
 from memtrace_harness.kb_promotion import PROMOTION_TIMEOUT_SECONDS, run_promotion_pass
+from memtrace_harness.memory_audit import AuditOutcome, due_audit_dates, run_audit_pass
 from memtrace_harness.memory_digest import (
     AUTO_CATCH_UP_DAYS,
     DigestError,
@@ -122,6 +123,30 @@ def make_archive_model_caller(config: HarnessConfig, project_name: str):
     return call
 
 
+AUDIT_TIMEOUT_SECONDS = 600
+
+
+def make_audit_model_caller(config: HarnessConfig, project_name: str):
+    """Like make_digest_model_caller(), through that project's audit chain (the nightly audit's
+    own model; the digest's when none is configured). No tools: it is shown the day's log and the
+    numbers, and the Harness does every write."""
+    candidates = config.audit_candidates_for(project_name)
+    sandbox = (config.trace_root / "digest-workspace").resolve()
+    sandbox.mkdir(parents=True, exist_ok=True)
+
+    def call(prompt: str) -> tuple[str, str | None, str | None]:
+        errors = []
+        for provider, model in candidates:
+            cmd = config.chat_command(provider, model, prompt)
+            result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=AUDIT_TIMEOUT_SECONDS)
+            if result.return_code == 0 and result.stdout.strip():
+                return result.stdout, provider, model
+            errors.append(f"{provider}/{model}: exit {result.return_code}")
+        raise DigestError("no audit candidate answered (" + "; ".join(errors) + ")")
+
+    return call
+
+
 def make_recall_model_caller(config: HarnessConfig, project_name: str):
     """One call through that project's recall candidates (its own stronger model, see
     HarnessConfig.recall_candidates_for), in order. Like the digest it runs in a neutral
@@ -192,6 +217,42 @@ def archive_topics(
         except Exception:
             logger.exception(f"[{scope.name}] syncing matter notes to MemTrace failed; will retry next pass")
     return recorded
+
+
+def audit_night(
+    config: HarnessConfig,
+    trace_store: TraceStore,
+    scope,
+    workspace_id: str,
+    tz: ZoneInfo,
+    now: datetime,
+    *,
+    only_date: str | None = None,
+    respect_retry_backoff: bool = False,
+    log=print,
+) -> list[AuditOutcome]:
+    """The nightly audit for one project (memory_audit.py), after the digest and the archive have
+    filed the day. A failed model call records nothing, so the next pass retries that day."""
+    key = ("audit", scope.name)
+    if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
+        return []
+    try:
+        outcomes = run_audit_pass(
+            trace_store, scope.name, f"psess_{scope.name}", workspace_id, tz,
+            make_audit_model_caller(config, scope.name), now, only_date=only_date,
+        )
+    except Exception as exc:
+        _digest_failures[key] = time.monotonic()
+        logger.exception(f"[{scope.name}] nightly audit failed; will retry later")
+        log(f"[{scope.name}] audit failed: {exc}")
+        return []
+    _digest_failures.pop(key, None)
+    for outcome in outcomes:
+        log(
+            f"[{scope.name}] audited {outcome.audit_date or '(verification only)'}: "
+            f"{len(outcome.applied)} note(s), {len(outcome.proposals)} proposal(s), {len(outcome.verified)} verified"
+        )
+    return outcomes
 
 
 _rebuilding: set[str] = set()
@@ -341,6 +402,7 @@ def run_memory_digests(
     log=print,
     triage_out: dict[str, list[dict]] | None = None,
     reorg_out: list[ReorgOutcome] | None = None,
+    audit_out: list[AuditOutcome] | None = None,
 ) -> dict[str, PreferenceChanges]:
     """Shared by the Harness's nightly trigger and the `memory-digest` command.
     Returns {project: the preferences the Harness adopted / retired / left waiting}. One
@@ -363,6 +425,8 @@ def run_memory_digests(
                 else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
             ):
                 log(f"[{scope.name}] would archive {d} into matters")
+            for d in ([only_date] if only_date is not None else due_audit_dates(trace_store, scope.name, session_id, tz, now)):
+                log(f"[{scope.name}] would audit {d}")
             continue
         call_model = make_digest_model_caller(config, scope.name)
         for d in dates:
@@ -413,6 +477,12 @@ def run_memory_digests(
                 trace_store, memtrace_client, scope, workspace_id, tz, call_archive,
                 respect_retry_backoff=respect_retry_backoff, log=log, reorg_out=reorg_out,
             )
+        outcomes = audit_night(
+            config, trace_store, scope, workspace_id, tz, now,
+            only_date=only_date, respect_retry_backoff=respect_retry_backoff, log=log,
+        )
+        if audit_out is not None:
+            audit_out.extend(outcomes)
         if memtrace_client is not None:
             try:
                 synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)
@@ -632,6 +702,7 @@ def _run_nightly_digest_pass(
 ) -> None:
     triage: dict[str, list[dict]] = {}
     reorg: list[ReorgOutcome] = []
+    audits: list[AuditOutcome] = []
     try:
         changed = run_memory_digests(
             config,
@@ -642,6 +713,7 @@ def _run_nightly_digest_pass(
             respect_retry_backoff=True,
             triage_out=triage,
             reorg_out=reorg,
+            audit_out=audits,
         )
     except Exception:
         logger.exception("nightly memory digest pass failed")
@@ -655,6 +727,11 @@ def _run_nightly_digest_pass(
             service.notify_reorg_outcome(outcome)
         except Exception:
             logger.exception(f"[{outcome.project}] reporting the memory reorganisation failed")
+    for outcome in audits:
+        try:
+            service.notify_audit_outcome(outcome)
+        except Exception:
+            logger.exception(f"[{outcome.project}] reporting the nightly audit failed")
     for project, items in triage.items():
         text = _describe_open_item_triage(project, items)
         try:

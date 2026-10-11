@@ -25,6 +25,7 @@ from memtrace_harness.memory_digest import (
     split_schedule_activity,
     turns_by_local_date,
 )
+from memtrace_harness.calibration import calibration_block
 from memtrace_harness.trace_store import TraceStore
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,9 @@ def _existing_block(existing: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_topics_prompt(project: str, digest_date: str, turns: list[dict], existing: list[dict], schedule_note: str = "") -> str:
+def build_topics_prompt(
+    project: str, digest_date: str, turns: list[dict], existing: list[dict], schedule_note: str = "", calibration: str = ""
+) -> str:
     schedule_block = (
         f"\nScheduled runs that day (their firings are not matters; only the last result of each is in the log):\n{schedule_note}\n"
         if schedule_note
@@ -90,7 +93,7 @@ def build_topics_prompt(project: str, digest_date: str, turns: list[dict], exist
 
 Matters already in memory (id, title, last touched, current state, open items):
 {_existing_block(existing)}
-{schedule_block}
+{schedule_block}{calibration}
 Rules:
 1. One matter = one subject (a strategy rule, a bug, a decision, a question being worked out). Group all turns about it together, even when other subjects were discussed in between. Never put the whole day in one matter; a day with five subjects gives five matters. At most {MAX_TOPICS_PER_DAY}.
 2. If a matter continues one listed above, set "match" to its id and DO NOT invent a new matter; its "state" replaces the old one and its lists add to what is known. Otherwise "match" is null and you give a "title".
@@ -263,7 +266,7 @@ def run_topics_for_date(
     topics: list[dict] = []
     dropped = 0
     if conversation_turns:
-        stdout, provider, model = call_model(build_topics_prompt(project, digest_date, shown, existing, schedule_note))
+        stdout, provider, model = call_model(build_topics_prompt(project, digest_date, shown, existing, schedule_note, calibration_block(trace_store, project, "archive")))
         topics, dropped = ground_topics(
             _extract_json_object(stdout),
             digest_date=digest_date,
