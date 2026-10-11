@@ -26,7 +26,6 @@ from memtrace_harness.completion_claims import (
     accept_claim,
     apply_kb_updates,
     chat_notes_to_ops,
-    claim_keyboard,
     kb_updates_from_artifact,
     reject_claim,
 )
@@ -212,6 +211,7 @@ class HarnessService:
         self.memory_reorg_now: Callable[[ProjectScope, str | None], None] | None = None
         # Wakes a long-polling API call when something new goes into the outbox.
         self._outbox_signal = threading.Condition()
+        self._last_publish: dict[str, tuple[datetime, str, str]] = {}
 
     # ---- outbound: everything said to the operator goes through the outbox
 
@@ -1040,8 +1040,8 @@ class HarnessService:
         self._record_order_turn(job["project"], result)
         return result
 
-    def _run_job(self, scope: ProjectScope, job: dict, command: str, audience: str | None) -> None:
-        trace_store = self.approval_manager.trace_store
+    def _exec_job_command(self, scope: ProjectScope, command: str) -> tuple[str, int | None, str]:
+        """Run one declared job command in the project folder: (status, exit code, output tail)."""
         try:
             done = subprocess.run(
                 command, shell=True, cwd=scope.working_directory, capture_output=True, text=True,
@@ -1053,7 +1053,11 @@ class HarnessService:
             output, status, code = f"超過 {self.JOB_TIMEOUT_SECONDS} 秒，已中止。", "failed", None
         except Exception as exc:  # noqa: BLE001 — report any launch failure to the human
             output, status, code = f"無法啟動：{exc}", "failed", None
-        tail = output[-self.JOB_OUTPUT_CHARS:]
+        return status, code, output[-self.JOB_OUTPUT_CHARS:]
+
+    def _run_job(self, scope: ProjectScope, job: dict, command: str, audience: str | None) -> None:
+        trace_store = self.approval_manager.trace_store
+        status, code, tail = self._exec_job_command(scope, command)
         trace_store.finish_job_request(job["request_id"], status, {"exit_code": code, "output_tail": tail})
         head = "✅ 完成" if status == "done" else f"❌ 失敗（結束碼 {code}）"
         result = f"{head}：{job['job_name']}\n{tail}"
@@ -1355,9 +1359,40 @@ class HarnessService:
         if worktree is not None or self._slot_limit(scope) <= 1:
             return None
         ws_id = scope.lock_key
-        return (
-            lambda: trace_store.acquire_edit_lock(ws_id, conv_id),
-            lambda: trace_store.release_edit_lock(ws_id, conv_id),
+
+        def acquire() -> bool:
+            self._release_dead_edit_lock(trace_store, scope, ws_id, conv_id)
+            return trace_store.acquire_edit_lock(ws_id, conv_id)
+
+        return (acquire, lambda: trace_store.release_edit_lock(ws_id, conv_id))
+
+    DEAD_LOCK_GRACE_SECONDS = 120
+
+    def _release_dead_edit_lock(
+        self, trace_store: TraceStore, scope: ProjectScope, ws_id: str, conv_id: str
+    ) -> None:
+        """The edit lock is only ever held while a task's thread is running, so a holder that no
+        thread in this process is running for is dead (its thread stopped without releasing).
+        Abandon it and tell the operator, instead of letting every later task wait out the hour."""
+        holder = trace_store.get_edit_lock(ws_id)
+        if holder is None or holder["conversation_id"] == conv_id:
+            return
+        live = {entry["conversation_id"] for entry in default_tracker.snapshot()}
+        if holder["conversation_id"] in live:
+            return
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(holder["locked_at"])).total_seconds()
+        except (TypeError, ValueError):
+            age = float(self.DEAD_LOCK_GRACE_SECONDS)
+        if age < self.DEAD_LOCK_GRACE_SECONDS:
+            return
+        dead = holder["conversation_id"]
+        trace_store.release_edit_lock(ws_id, dead)
+        trace_store.abandon_conversation(scope.workspace_id, dead)
+        logger.warning(f"released the dead edit lock of {dead} in {scope.name}")
+        self.notify_operator(
+            f"⚠️ [{scope.name}] 任務 {dead} 已經停止運作卻還占著編輯權（{int(age // 60)} 分鐘），"
+            "我已自動中斷它並釋放，讓後面的任務能繼續。"
         )
 
     def _worktree_manager(self) -> WorktreeManager:
@@ -1768,14 +1803,55 @@ class HarnessService:
                 return
         claim = self._file_completion_claim(conv_id, summary)
         if claim is not None:
-            claim_id, extra_lines = claim
-            text = "\n".join([final_text, *extra_lines]) + "\n\n請驗收：完成了就按「驗收通過」，不是你要的就按「還沒完成」（沒有期限，沒按就一直維持待驗收）。"
-            self.send_message_with_keyboard(audience, text, claim_keyboard(claim_id))
+            # Operator decision 2026-10-11: a finished task is announced, not put up for acceptance.
+            # The Harness carries on without waiting; if the project declares a publish_job the
+            # result is already live, and its output (the preview address) goes with the message.
+            _, extra_lines = claim
+            lines = [final_text, *extra_lines]
+            published = self._publish_after_task(summary)
+            if published:
+                lines.append(published)
+            self.send_message(audience, "\n".join(lines))
             return
         if audience is not None:
             self.send_message(audience, final_text)
         else:
             self.notify_operator(final_text)
+
+    def _publish_after_task(self, summary) -> str | None:
+        """Run the project's declared `publish_job` for a task that just delivered. None when the
+        project declares none. Never raises; a failure is reported in the returned text."""
+        scope = next((p for p in self.projects if p.workspace_id == summary.task.workspace_id), None)
+        if scope is None or not scope.publish_job or not scope.jobs:
+            return None
+        command = scope.jobs.get(scope.publish_job)
+        if not command:
+            return None
+        status, code, tail = self._exec_job_command(scope, command)
+        self._last_publish[scope.name] = (datetime.now(timezone.utc), status, tail)
+        head = "🔗 已自動發佈" if status == "done" else f"⚠️ 自動發佈失敗（結束碼 {code}）"
+        return f"{head}：{scope.publish_job}\n{tail}".rstrip()
+
+    def _status_notice(self, scope: ProjectScope) -> str:
+        """What the Harness is doing for this project right now, for the chat model, which cannot see
+        it from its read-only sandbox: running tasks, and the last automatic publish with its address."""
+        running = [
+            e["conversation_id"] for e in default_tracker.snapshot() if e["workspace_id"] == scope.workspace_id
+        ]
+        lines = []
+        if running:
+            lines.append("目前正在跑的開發任務：" + "、".join(running) + "。")
+        else:
+            lines.append("目前沒有正在跑的開發任務。")
+        if scope.publish_job:
+            last = self._last_publish.get(scope.name)
+            lines.append(
+                f"這個專案設定了自動發佈 `{scope.publish_job}`：每個任務完成後 Harness 會自己執行，不需要使用者確認。"
+            )
+            if last is not None:
+                when = last[0].astimezone(ZoneInfo(self.config.schedule_timezone)).strftime("%m-%d %H:%M")
+                lines.append(f"最近一次自動發佈（{when}，{'成功' if last[1] == 'done' else '失敗'}）輸出：{last[2][-600:]}")
+        return "【Harness 目前狀態】" + " ".join(lines) + "\n\n"
 
     def notify_garden_outcome(self, outcome: GardenOutcome, audience: str | None = None) -> None:
         """Tell the operator what a tidying pass did, with a one-tap undo when it deleted
@@ -2275,6 +2351,7 @@ class HarnessService:
             f"{self._ops_notice(scope)}"
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
+            f"{self._status_notice(scope)}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"{self._pending_approval_notice(pending_approval)}"
             f"使用者訊息：{text}"

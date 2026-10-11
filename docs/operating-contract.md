@@ -433,10 +433,21 @@ refusal is reported, not worked around. A claim never edits the original node's 
 machine-read JSON): it creates a separate completion-claim node linked `extends` to the original and moves
 the original from `status:open` to `status:claimed-done`, rewriting tags only when the node's current tags
 could be read. Every governed run that reaches converge with `finish`/`merge` files a `completion_claims`
-row and is reported with 驗收通過/還沒完成 buttons; nothing is accepted by silence and a claim has no
-deadline. Accepting sets the node to `status:done` and `resolved`; sending it back reopens it, and the
-rejection is kept as a `task_claim` decision which the Controller's precedent lists with a warning ("宣告
-完成，被你退回") so it can calibrate what it declares finished. Operational and schedule runs never reach
+row and is announced to the operator — **without** an acceptance prompt (explicit operator decision,
+2026-10-11, superseding the earlier 驗收通過/還沒完成 buttons): the Harness does not wait for anyone to look at the
+result, and the node stays `status:claimed-done` (a claim, never an acceptance by the operator). If the
+operator is unhappy with a result they say so in chat and it is handled as a new task. The buttons on
+messages sent before this change still work, and past rejections are still kept as `task_claim` decisions
+in the Controller's precedent ("宣告完成，被你退回"). The converge prompt tells the Controller that a human
+looking at the result is not a condition for finishing; `ask_human` is for real decisions only.
+**Auto-publish (enforced):** a scope file may name one of its own declared jobs as `- publish_job: <name>`;
+after a task finishes through converge the Harness runs that job itself — no confirm tap, since the operator
+chose the command by declaring it — and appends its output (e.g. the preview address) to the announcement.
+A name that is not a declared job is ignored; a failing job is reported and never blocks the report.
+**Dead edit lock (enforced):** the edit lock is only held while a task's thread runs, so a holder that no
+thread in this process is running for (and that has held it over `DEAD_LOCK_GRACE_SECONDS`) is abandoned and
+its lock released when the next task asks, and the operator is told. The chat model is given the running
+tasks and the last auto-publish output as context. Operational and schedule runs never reach
 converge and carry no claim. **Not implemented:** promoting repeated rejections into a standing lesson,
 usage statistics for which precedents the Controller relied on (card `basis` is recorded only on the card),
 and Controller-maintained knowledge for tasks that have no node. **Unverified against live models:** that
