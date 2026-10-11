@@ -84,6 +84,7 @@ from memtrace_harness.github_actions import (
     validate_action,
 )
 from memtrace_harness.scope import ProjectScope, apply_scope_change, split_goal_directives, split_repo_goal, validate_scope_change
+from memtrace_harness.workspace import STATE_DIR_NAME
 from memtrace_harness.taiwantrade_mcp import (
     DEFAULT_BASE_URL as TAIWANTRADE_DEFAULT_URL,
     ProxyError,
@@ -582,6 +583,35 @@ class HarnessService:
         except Exception:
             logger.exception("answering a chat question failed")
             self.send_message(audience, "⚠️ 處理你選的選項時失敗了，請再說一次。")
+
+    CHAT_FAILURE_LOG = "chat-failures.log"
+    CHAT_FAILURE_LOG_MAX_BYTES = 1_000_000
+
+    def _log_chat_failure(self, provider: str, model: str | None, result: Any, detail: str) -> None:
+        """Keep what a failed chat call actually printed (never the prompt or the command, which hold the
+        conversation and connection details), so "exit code 0, nothing said" can be diagnosed afterwards.
+        One JSON line per failure in the workspace's `.harness/chat-failures.log`. Best effort."""
+        root = self.config.workspace_root
+        if root is None:
+            return
+        try:
+            path = root / STATE_DIR_NAME / self.CHAT_FAILURE_LOG
+            if path.is_file() and path.stat().st_size > self.CHAT_FAILURE_LOG_MAX_BYTES:
+                keep = path.read_text(encoding="utf-8", errors="replace").splitlines()[-100:]
+                path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            entry = {
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "provider": provider,
+                "model": model,
+                "return_code": result.return_code,
+                "detail": detail,
+                "stdout_tail": (result.stdout or "")[-2000:],
+                "stderr_tail": (result.stderr or "")[-1000:],
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("writing the chat failure log failed")
 
     def resolve_card_pick(self, request_id: str, index: int) -> str:
         """Answer a question-type approval with one option of its decision card (the status page's door;
@@ -2000,6 +2030,9 @@ class HarnessService:
             parts.append(entry)
         return "、".join(parts) if parts else "無"
 
+    # One chat reply, per candidate model. A reply that looks things up (MemTrace, TaiwanTrade, ops tools) can
+    # take minutes; 60 seconds made Antigravity and Codex time out and fall through to the next candidate.
+    CHAT_REPLY_TIMEOUT_SECONDS = 600
     _TASK_START_MARKER = "HARNESS_TASK_START::"
     _REVIEW_START_MARKER = "HARNESS_REVIEW_START::"
     _CHOICES_MARKER = "HARNESS_CHOICES::"
@@ -2227,7 +2260,9 @@ class HarnessService:
                 ops_server=ops_server_spec(scope, self.config.trace_db_path),
                 memtrace_read=True,
             )
-            result = CliProcessRunner().run(cmd, cwd=scope.working_directory, timeout_seconds=60)
+            result = CliProcessRunner().run(
+                cmd, cwd=scope.working_directory, timeout_seconds=self.CHAT_REPLY_TIMEOUT_SECONDS
+            )
             if result.return_code == 0 and result.stdout.strip():
                 if failures:
                     logger.warning(
@@ -2284,8 +2319,12 @@ class HarnessService:
                 for action, payload in schedule_controls:
                     self._apply_schedule_control(scope, audience, action, payload)
                 return reply
-            detail = result.error or result.stderr.strip() or f"exit code {result.return_code}"
+            empty_success = result.return_code == 0 and not result.stdout.strip()
+            detail = result.error or result.stderr.strip() or (
+                "結束碼 0 但沒有任何文字輸出" if empty_success else f"exit code {result.return_code}"
+            )
             failures.append(f"{provider}/{model or '預設模型'}：{detail}")
+            self._log_chat_failure(provider, model, result, detail)
 
         joined = "；".join(failures)
         msg = f"（回覆失敗：{joined}）"

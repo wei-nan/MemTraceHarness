@@ -422,6 +422,34 @@ class HarnessServiceTests(TestCase):
         self.assertEqual(open_questions[0]["question"], "先做哪個？")
         gateway.send_message.assert_not_called()
 
+    def test_a_failed_chat_call_leaves_what_it_printed_but_not_the_prompt(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli_process import ProcessResult
+
+        gateway, _mgr, _store = self._gateway_for_report_outcome_tests()
+        root = Path(tempfile.mkdtemp())
+        gateway.config = replace(gateway.config, workspace_root=root)
+        (root / ".harness").mkdir()
+        gateway.send_message = MagicMock()
+        scope = gateway.projects[0]
+        silent = ProcessResult(
+            command=["x"], return_code=0, stdout="  \n", stderr="warn: something",
+            started_at="2026-09-30T00:00:00+00:00", completed_at="2026-09-30T00:00:01+00:00", duration_ms=1,
+        )
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=silent):
+            reply = gateway._chat_reply_and_maybe_start_task(scope, 12345, "秘密對話內容")
+        lines = (root / ".harness" / "chat-failures.log").read_text().splitlines()
+        self.assertGreaterEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual((entry["return_code"], entry["stderr_tail"]), (0, "warn: something"))
+        self.assertNotIn("秘密對話內容", lines[0])  # the conversation never goes in the log
+        silent_ok = replace(silent, stderr="")
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", return_value=silent_ok):
+            reply = gateway._chat_reply_and_maybe_start_task(scope, 12345, "再問一次")
+        self.assertIn("結束碼 0 但沒有任何文字輸出", reply)
+
     def test_an_unusable_choices_line_leaves_the_reply_as_plain_text(self) -> None:
         for bad in ("HARNESS_CHOICES::not json", 'HARNESS_CHOICES::{"question":"q","options":[{"label":"only one"}]}'):
             with self.subTest(bad=bad):
