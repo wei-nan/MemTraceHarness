@@ -122,7 +122,7 @@ class ServeSmokeTests(TestCase):
                 },
             )
             # A clean environment: only a path with no `agy`, and nothing of this machine's secrets.
-            env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "PYTHONPATH": str(REPO / "src"), "HARNESS_MESSAGE_QUIET_SECONDS": "0"}
+            env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "PYTHONPATH": str(REPO / "src")}
             harness = subprocess.Popen(
                 [sys.executable, "-m", "memtrace_harness", "-C", str(root), "serve"],
                 env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=tmp,

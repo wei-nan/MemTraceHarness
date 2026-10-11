@@ -45,7 +45,6 @@ class EndToEndTests(TestCase):
         scope = ProjectScope.from_file(self.root / "harness-scope.md")
         self.parts = build_harness(self.config, scope)
         api = HarnessApi(self.parts.service, self.config, scope)
-        api.worker.COALESCE_QUIET_SECONDS = 0
         server = api.start()
         self.addCleanup(api.stop)
         self.addCleanup(server.server_close)

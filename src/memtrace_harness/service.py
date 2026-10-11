@@ -160,6 +160,11 @@ def _hydrate_github_issue_context(stage_ref: str, *, working_directory: Path) ->
     )
 
 
+class ChatInterrupted(Exception):
+    """A chat reply was thrown away because the person sent more before it went out. Raised before the
+    reply's markers (tasks, schedules, notes) are acted on, so nothing it said has happened."""
+
+
 class HarnessService:
     """One Harness: the model-based work of a single workspace, with no transport of its own.
 
@@ -212,6 +217,11 @@ class HarnessService:
         # Wakes a long-polling API call when something new goes into the outbox.
         self._outbox_signal = threading.Condition()
         self._last_publish: dict[str, tuple[datetime, str, str]] = {}
+        # Set by the API's message worker: whether the person sent more while a chat reply was being
+        # made (so it should be thrown away and redone with everything), and whether a chat model
+        # call is running right now (the only thing the worker may cancel).
+        self.chat_superseded: Callable[[], bool] = lambda: False
+        self.chat_generating = False
 
     # ---- outbound: everything said to the operator goes through the outbox
 
@@ -370,10 +380,13 @@ class HarnessService:
         audience: str | None,
         reply_to_ref: str | None = None,
         reply_to_text: str | None = None,
+        earlier_text: str = "",
     ) -> str | None:
         """What a person said, as a service relays it. Everything the Harness answers goes to the
         outbox; the returned string is only the gist, for tests and the API's synchronous echo.
-        `reply_to_ref`/`reply_to_text` carry the message being replied to, if any."""
+        `reply_to_ref`/`reply_to_text` carry the message being replied to, if any. `earlier_text` is
+        what the same person said just before, whose reply was thrown away (ChatInterrupted): it is
+        already in the transcript, so only `text` is recorded again, but the model sees both."""
         text = (text or "").strip()
         if not text:
             return None
@@ -498,7 +511,11 @@ class HarnessService:
                     pending_approval = candidate
 
             return self._chat_reply_and_maybe_start_task(
-                scope, audience, text, quoted_text=quoted, pending_approval=pending_approval
+                scope,
+                audience,
+                f"{earlier_text}\n\n{text}" if earlier_text else text,
+                quoted_text=quoted,
+                pending_approval=pending_approval,
             )
         return None
 
@@ -2357,6 +2374,7 @@ class HarnessService:
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
+        started_at = datetime.now(timezone.utc).isoformat()
         for provider, model in candidates:
             # Headless `claude --print` has nobody to approve a tool prompt, so an
             # un-allowlisted MCP call is just refused (and the model then made up a
@@ -2370,9 +2388,20 @@ class HarnessService:
                 ops_server=ops_server_spec(scope, self.config.trace_db_path),
                 memtrace_read=True,
             )
-            result = CliProcessRunner().run(
-                cmd, cwd=scope.working_directory, timeout_seconds=self.CHAT_REPLY_TIMEOUT_SECONDS
-            )
+            if self.chat_superseded():
+                raise ChatInterrupted()
+            self.chat_generating = True
+            try:
+                result = CliProcessRunner().run(
+                    cmd, cwd=scope.working_directory, timeout_seconds=self.CHAT_REPLY_TIMEOUT_SECONDS
+                )
+            finally:
+                self.chat_generating = False
+            if self.chat_superseded():
+                # More arrived while this was being made: drop the reply (nothing in it has been acted
+                # on) and any confirmation the model asked for meanwhile, and think again with it all.
+                self.approval_manager.trace_store.cancel_unshown_proposals(scope.name, started_at)
+                raise ChatInterrupted()
             if result.return_code == 0 and result.stdout.strip():
                 if failures:
                     logger.warning(
