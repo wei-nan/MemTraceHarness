@@ -131,6 +131,10 @@ class ProjectScope:
     probe_hosts: list[str] | None = None
     log_files: list[str] | None = None
     jobs: dict[str, str] | None = None
+    # Name of a declared job the Harness runs by itself after a task finishes with its work
+    # delivered (e.g. republishing a preview); "- publish_job: preview_start". No confirm tap:
+    # the operator already chose the command by declaring it, and it must exist in `jobs`.
+    publish_job: str | None = None
     # Other repos this Harness works in (see RepoScope); the scope above describes the primary one.
     repos: dict[str, RepoScope] = field(default_factory=dict)
     # Which repo this view of the scope is for: None = the primary one. See for_repo().
@@ -254,6 +258,10 @@ class ProjectScope:
             )
         }
 
+        publish_job = _extract_field(content, "publish_job")
+        if publish_job is not None and publish_job not in jobs:
+            publish_job = None
+
         return cls(
             name=name,
             workspace_id=workspace_id,
@@ -272,6 +280,7 @@ class ProjectScope:
             probe_hosts=[h.lower() for h in probe_hosts],
             log_files=log_files,
             jobs=jobs,
+            publish_job=publish_job,
         )
 
 

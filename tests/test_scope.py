@@ -47,6 +47,26 @@ class AgentLoopEnabledParsingTests(TestCase):
             self.assertTrue(scope.agent_loop_enabled)
 
 
+class PublishJobParsingTests(TestCase):
+    def _scope(self, extra: str) -> ProjectScope:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "harness-scope.md"
+        path.write_text(f"# s\n\n- workspace_id: ws_test\n{extra}", encoding="utf-8")
+        return ProjectScope.from_file(path)
+
+    def test_a_declared_job_can_be_the_publish_job(self) -> None:
+        scope = self._scope("- job: preview_start = echo hi\n- publish_job: preview_start\n")
+        self.assertEqual(scope.publish_job, "preview_start")
+
+    def test_a_publish_job_that_is_not_declared_is_ignored(self) -> None:
+        scope = self._scope("- publish_job: preview_start\n")
+        self.assertIsNone(scope.publish_job)
+
+    def test_no_publish_job_by_default(self) -> None:
+        self.assertIsNone(self._scope("- job: preview_start = echo hi\n").publish_job)
+
+
 class ScopeChangeTests(TestCase):
     def setUp(self) -> None:
         import tempfile

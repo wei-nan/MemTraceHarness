@@ -1512,6 +1512,13 @@ def controller_task(
     # completion_claims.py). The task's own node id, if there is one, is in the goal/context.
     write_permission = (
         f"\nThis is the converge stage (the loop finished, G2 already passed). {KB_UPDATES_INSTRUCTION}\n"
+        "A human looking at the result in a browser or on a device is NOT a condition for finishing: "
+        "the harness publishes the result and tells the operator, and the operator reviews it whenever "
+        "they like while the harness moves on. Choose \"finish\"/\"merge\" when the developer and G2 "
+        "outcomes support it, and list anything not independently confirmed in `reason`. Choose "
+        "\"ask_human\" only for a real decision the operator must make (a requirement that is "
+        "ambiguous, a safety or scope question, a merge that conflicts) — never merely to have "
+        "someone eyeball the result.\n"
         if stage != "start"
         else "\nkb_updates must be null at this stage.\n"
     )

@@ -232,21 +232,21 @@ class GatewayClaimTests(TestCase):
 
     def _file(self, gateway, summary=None):
         gateway._report_run_outcome(conv_id="chat_1", summary=summary or run_summary(), final_text="✅ 完成", audience=12345)
-        [call] = gateway.send_message_with_keyboard.call_args_list
-        text, keyboard = call.args[1], call.args[2]
-        claim_id = keyboard[0][0]["id"].split(":")[1]
+        gateway.send_message_with_keyboard.assert_not_called()
+        [call] = gateway.send_message.call_args_list
+        text = call.args[1]
+        with self.store._connection() as conn:
+            claim_id = conn.execute("SELECT id FROM completion_claims").fetchone()[0]
         return claim_id, text
 
-    def test_a_finished_run_is_reported_as_awaiting_acceptance_with_the_kb_update_applied(self) -> None:
+    def test_a_finished_run_is_announced_without_an_acceptance_prompt_and_the_kb_update_applied(self) -> None:
         gateway = self._gateway()
         claim_id, text = self._file(gateway)
-        self.assertIn("請驗收", text)
-        self.assertIn("沒有期限", text)
+        self.assertNotIn("請驗收", text)
         self.assertIn("完成宣告", text)
         claim = self.store.get_completion_claim(claim_id)
         self.assertEqual((claim["status"], claim["node_id"], claim["project"]), ("claimed", "mem_task", "test_proj"))
         self.assertIn(STATUS_CLAIMED, self.kb.nodes["mem_task"]["tags"])
-        gateway.send_message.assert_not_called()
 
     def test_accepting_marks_the_node_done_and_records_a_followed_decision(self) -> None:
         gateway = self._gateway()
@@ -283,6 +283,34 @@ class GatewayClaimTests(TestCase):
         self.assertEqual(self._tap(gateway, f"claim_no:{claim_id}"), "這項已經處理過了")
         self.assertEqual(self.store.get_completion_claim(claim_id)["status"], "accepted")
         self.assertEqual(len(self.store.list_decision_records("test_proj", kind="task_claim")), 1)
+
+    def test_a_declared_publish_job_runs_by_itself_and_its_output_joins_the_report(self) -> None:
+        gateway = self._gateway()
+        gateway.projects[0].jobs = {"preview_start": "echo https://example.test/preview"}
+        gateway.projects[0].publish_job = "preview_start"
+        _, text = self._file(gateway)
+        self.assertIn("已自動發佈", text)
+        self.assertIn("https://example.test/preview", text)
+        self.assertIn("https://example.test/preview", gateway._status_notice(gateway.projects[0]))
+
+    def test_a_failing_publish_job_is_reported_and_does_not_block_the_report(self) -> None:
+        gateway = self._gateway()
+        gateway.projects[0].jobs = {"preview_start": "echo boom; exit 3"}
+        gateway.projects[0].publish_job = "preview_start"
+        _, text = self._file(gateway)
+        self.assertIn("自動發佈失敗（結束碼 3）", text)
+
+    def test_a_dead_edit_lock_holder_is_released_and_the_operator_told(self) -> None:
+        gateway = self._gateway()
+        scope = gateway.projects[0]
+        gateway.notify_operator = MagicMock()
+        self.store.acquire_task_slot("ws_test", "chat_dead", max_slots=2)
+        self.store.acquire_edit_lock("ws_test", "chat_dead")
+        gateway.DEAD_LOCK_GRACE_SECONDS = 0
+        gateway._release_dead_edit_lock(self.store, scope, "ws_test", "chat_new")
+        self.assertIsNone(self.store.get_edit_lock("ws_test"))
+        gateway.notify_operator.assert_called_once()
+        self.assertIn("chat_dead", gateway.notify_operator.call_args.args[0])
 
     def test_a_run_that_did_not_finish_through_converge_files_no_claim(self) -> None:
         gateway = self._gateway()
