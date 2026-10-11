@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from memtrace_harness.memory_audit import audit_status
 from memtrace_harness.approval import INFO_NEEDED_REASONS
 from memtrace_harness.config import HarnessConfig, _parse_chat_fallbacks
 from memtrace_harness.inflight import default_tracker
@@ -192,6 +193,8 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         digest_is_own = bool(os.getenv("HARNESS_DIGEST_PROVIDER") or config.digest_provider)
         archive_candidates = config.archive_candidates_for(scope.name)
         archive_is_own = bool(os.getenv("HARNESS_ARCHIVE_PROVIDER") or config.archive_provider)
+        audit_candidates = config.audit_candidates_for(scope.name)
+        audit_is_own = bool(os.getenv("HARNESS_AUDIT_PROVIDER") or config.audit_provider)
         recall_candidates = config.recall_candidates_for(scope.name)
         recall_is_own = bool(os.getenv("HARNESS_RECALL_PROVIDER") or config.recall_provider)
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -259,6 +262,11 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                     {"provider": p, "model": m or None} for p, m in archive_candidates
                 ],
                 "archive_is_own": archive_is_own,
+                "audit_candidates": [
+                    {"provider": p, "model": m or None} for p, m in audit_candidates
+                ],
+                "audit_is_own": audit_is_own,
+                "audit": audit_status(trace_store, scope.name),
                 "recall_candidates": [
                     {"provider": p, "model": m or None} for p, m in recall_candidates
                 ],
@@ -509,8 +517,8 @@ def _remember(config: HarnessConfig, chain: list[dict]) -> None:
 
 def update_model_chain(config: HarnessConfig, target: str, chain: object) -> None:
     """Set the whole ordered chain (primary + any number of fallbacks) for `chat`, `digest`,
-    `archive` or `recall` in one go. Empty fallbacks are a real value: they clear the chain."""
-    if target not in ("chat", "digest", "archive", "recall"):
+    `archive`, `audit` or `recall` in one go. Empty fallbacks are a real value: they clear the chain."""
+    if target not in ("chat", "digest", "archive", "audit", "recall"):
         raise ValueError(f"unknown model target {target!r}")
     entries = _check_chain(chain)
     prefix = f"HARNESS_{target.upper()}"

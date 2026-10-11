@@ -92,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
             return memory_topics_command(args)
         if args.command == "memory-reorg":
             return memory_reorg_command(args)
+        if args.command == "memory-audit":
+            return memory_audit_command(args)
         if args.command == "memory-digest":
             return memory_digest_command(args)
     except (OSError, RuntimeError, ValueError, WorkspaceError) as exc:
@@ -356,6 +358,18 @@ def build_parser() -> argparse.ArgumentParser:
             "An interrupted rebuild resumes when you run this again."
         ),
     )
+
+    audit_parser = subparsers.add_parser(
+        "memory-audit",
+        help=(
+            "The nightly audit by hand: judge a day's conversation against the north star (least repetition "
+            "and round-tripping), adopt calibration notes, settle the ones whose week is up. --undo RUN retires a run's notes."
+        ),
+    )
+    audit_parser.add_argument("--date", help="Audit this local date (YYYY-MM-DD) even if already audited")
+    audit_parser.add_argument("--undo", type=int, metavar="RUN", help="Retire the calibration notes a run adopted")
+    audit_parser.add_argument("--status", action="store_true", help="Print the friction trend and the notes in force")
+    audit_parser.add_argument("--dry-run", action="store_true", help="Only print the mechanical metrics for the day; no model call")
 
     reorg_parser = subparsers.add_parser(
         "memory-reorg",
@@ -663,6 +677,55 @@ def _log_days(trace_store, project: str, tz):
     from memtrace_harness.memory_digest import turns_by_local_date
 
     return turns_by_local_date(trace_store.get_primary_session_turns(f"psess_{project}"), tz).keys()
+
+
+def memory_audit_command(args: argparse.Namespace) -> int:
+    from memtrace_harness.duties import audit_night
+    from memtrace_harness.memory_audit import (
+        audit_status,
+        build_metric_context,
+        compute_metrics,
+        describe_audit,
+        due_audit_dates,
+        undo_audit_run,
+    )
+
+    config, scope = _config_and_scope()
+    trace_store = TraceStore(config.trace_db_path)
+    if args.undo:
+        print(f"retired {undo_audit_run(trace_store, args.undo)} note(s)")
+        return 0
+    if args.status:
+        status = audit_status(trace_store, scope.name)
+        print(f"north star: {status['north_star']}")
+        print("friction: " + (", ".join(f"{t['date']} {t['friction']}" for t in status["trend"]) or "no audit yet"))
+        for n in status["notes"]:
+            print(f"note #{n['id']} [{n['target']}] {n['text']}")
+        for p in status["open_proposals"]:
+            print(f"proposal {p['date']}: {p['text']}")
+        return 0
+    tz = ZoneInfo(config.schedule_timezone)
+    now = datetime.now(timezone.utc)
+    workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
+    session_id = f"psess_{scope.name}"
+    if args.date:
+        datetime.strptime(args.date, "%Y-%m-%d")
+    dates = [args.date] if args.date else due_audit_dates(trace_store, scope.name, session_id, tz, now)
+    if args.dry_run:
+        for d in dates:
+            ctx = build_metric_context(trace_store, scope.name, session_id, workspace_id, tz, d, d)
+            print(f"{d}: {compute_metrics(ctx, d)}")
+        if not dates:
+            print("no day is due for an audit")
+        return 0
+    outcomes = audit_night(config, trace_store, scope, workspace_id, tz, now, only_date=args.date)
+    for outcome in outcomes:
+        print(describe_audit(outcome))
+        if outcome.applied:
+            print(f"undo with: memory-audit --undo {outcome.run_id}")
+    if not outcomes:
+        print("nothing to audit")
+    return 0
 
 
 def memory_reorg_command(args: argparse.Namespace) -> int:

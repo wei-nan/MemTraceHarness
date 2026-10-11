@@ -181,6 +181,46 @@ MemTrace's soft delete (restorable for 30 days) with the local row kept.
   operator with a one-tap undo (`memory-reorg --undo <run>` does the same by hand), and the matter notes are
   protected from the weekly knowledge-base tidying (`kb_gardening`).
 
+**Nightly audit and self-calibration (explicit operator decision, 2026-10-11).** The Harness starts it
+itself, in the digest window after the digest and the archive have filed the day (`memory_audit.py`,
+`duties.audit_night`; by hand: `memory-audit`). It works toward one **north star: the operator reaches
+what they want with the least repetition and round-tripping** — the Harness understands once and does
+the right thing.
+
+- *Metrics are mechanical, not the model's opinion* (`compute_metrics`, recomputable for any past day, per
+  ten operator messages): corrections ("我說的是…", "你誤會了"), restated messages, matters that came back on
+  3+ of the last 14 days, matters that took 12+ turns in one day and are still open, and flaws in the
+  Harness's own filing (digest items dropped as ungrounded, questions the digest could not settle,
+  undone reorganisations). Their sum is the *friction* index shown on the status page.
+- *The audit is an independent model call* (`[audit]` chain in `.harness/models.toml`, chosen on the status
+  page; with none configured it follows the digest chain). It has no tools and no chat persona; it is
+  shown the metrics, the operator's usual level, the day's log, the notes in force and what became of
+  earlier findings, and it may find nothing. ENFORCED in code: a finding must be one of four kinds, must cite
+  turns that exist in that day's log (except a `memory_quality` finding, which may rest on the numbers) or
+  it is dropped; at most 6 findings and 3 new notes a night.
+- *What it may change by itself*: a **calibration note** — one short rule (8–200 characters) added to the
+  prompt of the chat, digest or archive stage, labelled as learned from audits and stated never to override
+  that task's rules, evidence requirement or output format. ENFORCED: a note that tries to loosen those
+  rules (ignore/skip citing/approve/tool or write permission), duplicates an active note, or would be the 9th
+  active note for its stage is refused and becomes a proposal instead. The audit never edits code, models,
+  gates, role profiles or Improvement Loop proposals; those it can only *propose* to the operator (it still
+  cannot approve its own proposal).
+- *Every correction is checked afterwards.* Seven days after a note was adopted the Harness recomputes the
+  metric the note was meant to move (misunderstanding → corrections, repeat work → restatements and
+  recurring matters, round trips → long open matters, memory quality → filing flaws) against the seven-day
+  baseline before it. At least 20% lower keeps the note (`effective`); unchanged or worse retires it
+  (`ineffective`), and the operator is told; no baseline signal or too few active days is `inconclusive` and
+  keeps the note. Retired notes stay on record, and an earlier failed fix is shown to later audits so it is
+  not proposed again.
+- *Reversible and reported*: each night's findings, metrics, notes and verdicts are sent to the operator
+  with a one-tap "撤銷這次校正" (`memory-audit --undo RUN`); nothing is deleted. A failed model call records
+  nothing, so the day is audited on the next pass; only finished days that are already digested and archived
+  are audited, the latest 3 at most, 2 per night.
+- **Known limits.** The correction and restatement detectors are phrase and similarity heuristics, so they
+  miss a quiet misunderstanding and can flag a harmless repetition; the model audit reads the same log and
+  can be wrong in the same way as the stages it audits (hence the separate chain and the mechanical check
+  after a week). The verdict needs a week of data, so a note on a quiet project may stay `inconclusive`.
+
 **Topic recall (explicit operator decision, 2026-10-03).** Behind chat, a slower background
 model (`HARNESS_RECALL_*`, default: the digest chain) judges each human message's topic
 (continue an active topic / new topic / small talk), explores the cold-memory and spec
