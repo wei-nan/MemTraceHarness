@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
 from memtrace_harness import admin
+from memtrace_harness.cli_process import kill_process_for_thread
 
 if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
@@ -72,35 +73,41 @@ class MessageWorker:
     """Handles people's messages one after another, in the order they arrived: a chat reply can
     take a minute, and the API call that delivered the message must not wait for it.
 
-    Plain chat messages that arrive close together (someone typing a thought in several sends) are
-    answered once: after the first, the worker waits a short quiet window for more from the same
-    person and hands the model all of them as a single message. A command, a reply to a specific
-    message, or a message from someone else is never merged — it ends the batch and is handled on
-    its own, in order."""
+    A plain chat message is handled at once. If the same person sends another plain chat message
+    before the reply has gone out, the reply being made is cancelled (a model call in flight is
+    killed, a finished-but-unsent reply is dropped — nothing in either has been acted on) and the
+    model thinks again with everything said so far, so they get one answer. A command, a reply to a
+    specific message, or a message from someone else is never merged; it waits its turn. After
+    MAX_RESTARTS restarts for one burst the worker stops interrupting and lets the reply through."""
 
-    COALESCE_QUIET_SECONDS = 4.0
-    COALESCE_MAX_SECONDS = 20.0
-    _SEPARATOR = "\n\n"
+    MAX_RESTARTS = 3
 
     def __init__(self, service: HarnessService, bus: ChangeBus) -> None:
         self._service = service
         self._bus = bus
-        try:
-            self.COALESCE_QUIET_SECONDS = float(os.environ["HARNESS_MESSAGE_QUIET_SECONDS"])
-        except (KeyError, ValueError):
-            pass
-        self._queue: queue.Queue[tuple[str, dict] | None] = queue.Queue()
-        self._carry: list[tuple[str, dict] | None] = []
+        self._cond = threading.Condition()
+        self._inbox: list[dict] = []
+        self._stopped = False
+        self._current: dict | None = None  # the batch being answered, when it may still be redone
+        self._superseded = False
+        service.chat_superseded = lambda: self._superseded
         self._thread = threading.Thread(target=self._run, name="harness-messages", daemon=True)
         self._thread.start()
 
     def submit(self, payload: dict) -> None:
-        self._queue.put(("message", payload))
-
-    def _next(self, timeout: float | None = None) -> tuple[str, dict] | None:
-        if self._carry:
-            return self._carry.pop(0)
-        return self._queue.get(timeout=timeout)
+        with self._cond:
+            self._inbox.append(payload)
+            interrupt = (
+                self._current is not None
+                and not self._superseded
+                and payload.get("audience") == self._current.get("audience")
+                and self._is_mergeable(payload)
+            )
+            if interrupt:
+                self._superseded = True
+            self._cond.notify_all()
+        if interrupt and self._service.chat_generating:
+            kill_process_for_thread(self._thread.ident)
 
     def _is_mergeable(self, payload: dict) -> bool:
         if payload.get("reply_to_ref") or payload.get("reply_to_text"):
@@ -113,51 +120,67 @@ class MessageWorker:
         except Exception:
             return False
 
-    def _collect(self, first: dict) -> tuple[dict, bool]:
-        """`first`, plus any plain chat messages from the same audience that follow within the quiet
-        window. The bool is True when the worker was told to stop while waiting."""
-        if not self._is_mergeable(first) or self.COALESCE_QUIET_SECONDS <= 0:
-            return first, False
-        texts = [first["text"].strip()]
-        started = time.monotonic()
-        deadline = started + self.COALESCE_QUIET_SECONDS
-        hard = started + self.COALESCE_MAX_SECONDS
-        stop = False
+    def _take_mergeable(self, audience: object) -> list[dict]:
+        """Every plain chat message from `audience` that is waiting, in order; the rest stay queued."""
+        with self._cond:
+            taken = [p for p in self._inbox if p.get("audience") == audience and self._is_mergeable(p)]
+            for p in taken:
+                self._inbox.remove(p)
+            return taken
+
+    def _handle(self, payload: dict, earlier_text: str = "") -> None:
+        self._service.handle_message(
+            payload["text"],
+            audience=payload.get("audience"),
+            reply_to_ref=payload.get("reply_to_ref"),
+            reply_to_text=payload.get("reply_to_text"),
+            earlier_text=earlier_text,
+        )
+
+    def _answer(self, first: dict) -> None:
+        from memtrace_harness.service import ChatInterrupted
+
+        if not self._is_mergeable(first):
+            self._handle(first)
+            return
+        audience = first.get("audience")
+        earlier = ""
+        current = first
+        restarts = 0
         while True:
-            remaining = min(deadline, hard) - time.monotonic()
-            if remaining <= 0:
-                break
+            with self._cond:
+                self._superseded = False
+                self._current = current if restarts < self.MAX_RESTARTS else None
+            waiting = self._take_mergeable(audience)
+            if waiting:
+                current = {**waiting[-1], "text": "\n\n".join([current["text"].strip(), *(p["text"].strip() for p in waiting)])}
             try:
-                item = self._next(timeout=remaining)
-            except queue.Empty:
-                break
-            if item is None:
-                stop = True
-                break
-            payload = item[1]
-            if payload.get("audience") != first.get("audience") or not self._is_mergeable(payload):
-                self._carry.append(item)
-                break
-            texts.append(payload["text"].strip())
-            deadline = time.monotonic() + self.COALESCE_QUIET_SECONDS
-        if len(texts) == 1:
-            return first, stop
-        logger.info(f"answering {len(texts)} chat messages as one")
-        return {**first, "text": self._SEPARATOR.join(texts)}, stop
+                self._handle(current, earlier)
+                return
+            except ChatInterrupted:
+                more = self._take_mergeable(audience)
+                if not more:
+                    # The newcomer was claimed already or is gone: carry on with what we had.
+                    restarts = self.MAX_RESTARTS
+                    continue
+                restarts += 1
+                logger.info(f"answering {1 + len(more)} chat messages as one (restart {restarts})")
+                earlier = f"{earlier}\n\n{current['text'].strip()}".strip()
+                current = {**more[-1], "text": "\n\n".join(p["text"].strip() for p in more)}
+            finally:
+                with self._cond:
+                    self._current = None
 
     def _run(self) -> None:
         while True:
-            item = self._next()
-            if item is None:
-                return
-            payload, stop = self._collect(item[1])
+            with self._cond:
+                while not self._inbox and not self._stopped:
+                    self._cond.wait()
+                if self._stopped:
+                    return
+                payload = self._inbox.pop(0)
             try:
-                self._service.handle_message(
-                    payload["text"],
-                    audience=payload.get("audience"),
-                    reply_to_ref=payload.get("reply_to_ref"),
-                    reply_to_text=payload.get("reply_to_text"),
-                )
+                self._answer(payload)
             except Exception:
                 logger.exception("handling a message failed")
                 try:
@@ -165,11 +188,11 @@ class MessageWorker:
                 except Exception:
                     logger.exception("reporting the failure failed")
             self._bus.publish()
-            if stop:
-                return
 
     def stop(self) -> None:
-        self._queue.put(None)
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
 
 
 def _json_body(handler: BaseHTTPRequestHandler) -> dict | None:

@@ -422,6 +422,61 @@ class HarnessServiceTests(TestCase):
         self.assertEqual(open_questions[0]["question"], "先做哪個？")
         gateway.send_message.assert_not_called()
 
+    def test_a_superseded_chat_reply_is_dropped_with_its_proposals_and_nothing_is_acted_on(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli_process import ProcessResult
+        from memtrace_harness.service import ChatInterrupted
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        scope = gateway.projects[0]
+        reply = ProcessResult(
+            command=[], return_code=0, stdout="好，我來開發。\nHARNESS_TASK_START::做某事", stderr="",
+            started_at="2026-09-30T00:00:00+00:00", completed_at="2026-09-30T00:00:01+00:00", duration_ms=1,
+        )
+
+        def model_call(*_args, **_kwargs):
+            # The model asked for a confirmation while thinking; then the person sent more.
+            store.create_job_request(
+                request_id="job_1", project=scope.name, job_name="preview_start", command="x",
+                expires_at="2999-01-01T00:00:00+00:00",
+            )
+            gateway.chat_superseded = lambda: True
+            return reply
+
+        gateway._start_or_queue_task = MagicMock()
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", side_effect=model_call):
+            with self.assertRaises(ChatInterrupted):
+                gateway._chat_reply_and_maybe_start_task(scope, 12345, "第一句")
+        gateway.send_message.assert_not_called()
+        gateway._start_or_queue_task.assert_not_called()
+        self.assertEqual(store.get_job_request("job_1")["status"], "cancelled")
+
+    def test_the_redo_records_only_the_new_words_but_the_model_sees_both(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from memtrace_harness.cli_process import ProcessResult
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        seen = []
+        reply = ProcessResult(
+            command=[], return_code=0, stdout="一次回完", stderr="",
+            started_at="2026-09-30T00:00:00+00:00", completed_at="2026-09-30T00:00:01+00:00", duration_ms=1,
+        )
+
+        def model_call(self_runner, cmd, **_kw):
+            seen.append(" ".join(cmd))
+            return reply
+
+        with patch("memtrace_harness.cli_process.CliProcessRunner.run", new=model_call):
+            gateway.handle_message("還有第二句", audience=12345, earlier_text="第一句")
+        self.assertIn("第一句", seen[0])
+        self.assertIn("還有第二句", seen[0])
+        turns = [t["content"] for t in store.get_primary_session_turns("psess_test_proj") if t["speaker"] == "user"]
+        self.assertEqual(turns, ["還有第二句"])
+
     def test_a_failed_chat_call_leaves_what_it_printed_but_not_the_prompt(self) -> None:
         from dataclasses import replace
         from unittest.mock import MagicMock, patch

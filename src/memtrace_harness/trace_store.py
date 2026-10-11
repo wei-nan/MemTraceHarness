@@ -3414,6 +3414,24 @@ class TraceStore:
                 (to_status, utc_now_iso(), request_id, *from_statuses),
             ).rowcount > 0
 
+    def cancel_unshown_proposals(self, project: str, since_iso: str) -> int:
+        """Cancel what the chat model proposed (jobs, settings, orders) since `since_iso` that has not
+        yet been put in front of the operator: its reply was thrown away, so nobody should be asked
+        to confirm it. Returns how many were cancelled."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            jobs = conn.execute(
+                "UPDATE job_requests SET status = 'cancelled', updated_at = ? "
+                "WHERE project = ? AND status = 'pending' AND created_at >= ?",
+                (now, project, since_iso),
+            ).rowcount
+            orders = conn.execute(
+                "UPDATE order_intents SET status = 'cancelled', confirmation_token = NULL, updated_at = ? "
+                "WHERE project = ? AND status = 'pending' AND created_at >= ?",
+                (now, project, since_iso),
+            ).rowcount
+        return jobs + orders
+
     def claim_pending_job_requests(self, projects: list[str]) -> list[dict]:
         if not projects:
             return []
