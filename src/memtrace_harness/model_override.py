@@ -19,13 +19,15 @@ PROVIDERS = ("claude", "codex", "antigravity")
 _CLAUDE_ALIASES = {"opus", "sonnet", "haiku"}
 
 
-def _infer_provider(model: str, config: HarnessConfig) -> str | None:
+def infer_provider(model: str, config: HarnessConfig | None = None) -> str | None:
     if model in _CLAUDE_ALIASES or model.startswith("claude-"):
         return "claude"
     if model.startswith("gpt-"):
         return "codex"
     if model.startswith("gemini"):
         return "antigravity"
+    if config is None:
+        return None
     from memtrace_harness.model_catalog import extra_models, provider_models
 
     known = provider_models(config)
@@ -40,7 +42,7 @@ def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessCon
     """The candidate a `model=` spec names. Raises ValueError (with text for the operator)
     when the provider cannot be told."""
     provider, _, model = spec.rpartition("/")
-    provider = provider or (_infer_provider(model, config) or "")
+    provider = provider or (infer_provider(model, config) or "")
     if provider not in PROVIDERS:
         raise ValueError(
             f"認不出模型「{spec}」屬於哪個供應商；請寫成 claude/<模型>、codex/<模型> 或 antigravity/<模型>。"

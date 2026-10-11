@@ -16,6 +16,7 @@ from pathlib import Path
 
 from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
+from memtrace_harness.model_changes import apply_model_change
 from memtrace_harness.model_override import describe as describe_model, resolve_model_override, with_developer_override
 from memtrace_harness.completion_claims import (
     CHAT_NOTE_MARKER,
@@ -859,6 +860,15 @@ class HarnessService:
                     "不按、按取消、或時間到都不會改。新增的 job 之後仍要再按一次確認才會執行。"
                 )
                 confirm_label = "✅ 確認新增"
+            elif job["kind"] == "model_change":
+                text = (
+                    f"🔁 待確認永久變更模型（{job['project']}）\n"
+                    f"{job['command']}\n"
+                    f"有效至：{job['expires_at']}\n\n"
+                    "這是模型提出的要求，還沒有套用。按「確認變更」才會寫進設定並從下一次呼叫起生效；"
+                    "不按、按取消、或時間到都不會改。只改主要模型，備援不動。"
+                )
+                confirm_label = "✅ 確認變更"
             elif job["kind"] == "external_action":
                 payload = job["payload"] or {}
                 spec = ACTIONS.get(payload.get("action"))
@@ -895,6 +905,7 @@ class HarnessService:
             msg = {
                 "scope_change": f"⌛ 新增工具設定的要求已過期、沒有套用：{job['command']}",
                 "external_action": f"⌛ GitHub 操作的要求已過期、沒有執行：{job['command']}",
+                "model_change": f"⌛ 模型變更的要求已過期、沒有套用：{job['command']}",
             }.get(job["kind"], f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}")
             if job["message_ref"]:
                 self.notify_operator(msg)
@@ -916,6 +927,7 @@ class HarnessService:
             result = {
                 "scope_change": f"❌ 已取消，沒有套用：{job['command']}",
                 "external_action": f"❌ 已取消，沒有執行：{job['command']}",
+                "model_change": f"❌ 已取消，沒有變更：{job['command']}",
             }.get(job["kind"], f"❌ 已取消，沒有執行：{job['job_name']}")
             self.send_message(audience, result)
             self._record_order_turn(job["project"], result)
@@ -928,6 +940,8 @@ class HarnessService:
             return self._apply_scope_change(job, scope, audience)
         if job["kind"] == "external_action":
             return self._run_external_action(job, scope, audience)
+        if job["kind"] == "model_change":
+            return self._apply_model_change(job, audience)
         command = (scope.jobs or {}).get(job["job_name"])
         if command is None:
             trace_store.finish_job_request(request_id, "failed", {"error": "job no longer declared"})
@@ -966,6 +980,21 @@ class HarnessService:
                 if changed
                 else f"ℹ️ 設定裡本來就有：{job['command']}，沒有變動。"
             )
+        self.send_message(audience, result)
+        self._record_order_turn(job["project"], result)
+        return result
+
+    def _apply_model_change(self, job: dict, audience: str | None) -> str:
+        """The human confirmed: re-validate and write the new primary model (models.toml or the roles file)."""
+        trace_store = self.approval_manager.trace_store
+        try:
+            apply_model_change(self.config, job["payload"] or {})
+        except Exception as exc:  # noqa: BLE001 — report any failure to the human, change nothing more
+            trace_store.finish_job_request(job["request_id"], "failed", {"error": str(exc)})
+            result = f"⚠️ 沒能變更：{job['command']}（{exc}）"
+        else:
+            trace_store.finish_job_request(job["request_id"], "done", None)
+            result = f"✅ 已變更：{job['command']}。從下一次呼叫起生效。"
         self.send_message(audience, result)
         self._record_order_turn(job["project"], result)
         return result
@@ -2086,6 +2115,10 @@ class HarnessService:
             "`propose_github_action`；它只是提出，使用者看過完整內容按確認才會執行。說「已請你確認」，不要說"
             "已經做了；不要試著用其他 GitHub 工具直接寫入（沙盒沒有核准機制，一定會被拒絕）。開單的內文要寫清楚"
             "需求與驗收。\n"
+            "使用者要「永久」換模型（例如「以後 developer 都用 opus 5.5」「對話改用 sonnet」）時，用 "
+            "`propose_model_change`（target 是 chat、digest、archive、recall 或 controller、planner、"
+            "planner-escalation、red-team、developer）；它只是提出，使用者按確認才會寫進設定，只改主要模型、備援不動。"
+            "說「已請你確認」，不要說已經換了。只有這一個任務要用某模型時不要用它，改用任務標記的 model=。\n"
             "使用者要你做某件事（例如「開預覽」「讓我看頁面」「啟動服務」）而你的沙盒做不到時，先呼叫 "
             "`list_jobs` 看有沒有名稱或指令相符的 job（例如 preview_start），有就用 `run_job` 提出，"
             "並告訴使用者按「確認執行」後會收到網址；不要在沒查過 list_jobs 前就回答「做不到」或叫使用者自己"

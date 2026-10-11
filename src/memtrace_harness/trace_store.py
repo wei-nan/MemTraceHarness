@@ -3336,6 +3336,26 @@ class TraceStore:
                  json.dumps(payload, ensure_ascii=False)),
             ).rowcount > 0
 
+    def create_model_change_request(
+        self, *, request_id: str, project: str, key: str, summary: str, payload: dict, expires_at: str
+    ) -> bool:
+        """A permanent model change the chat model proposed (see model_changes.py), waiting for the human."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? AND kind = 'model_change' "
+                "AND status IN ('pending', 'awaiting')",
+                (project, key),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at, kind, payload_json) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'model_change', ?)",
+                (request_id, project, key, summary, expires_at, now, now,
+                 json.dumps(payload, ensure_ascii=False)),
+            ).rowcount > 0
+
     def create_scope_change_request(
         self, *, request_id: str, project: str, change: dict, summary: str, expires_at: str
     ) -> bool:
