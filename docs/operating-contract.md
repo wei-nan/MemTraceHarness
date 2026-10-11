@@ -275,6 +275,15 @@ refused. **ENFORCED** (`tests/test_cli.py`): every Claude chat call and the Clau
 **Unverified against a live model:** that the model then calls a skill; Codex needed no change (its skills come from
 `CODEX_HOME`) and whether its Controller/Red Team `--ignore-user-config` calls skip skills is not checked.
 
+**Chat reply limits and failure log (2026-10-11).** One chat reply may run up to 600 seconds per candidate model
+(`CHAT_REPLY_TIMEOUT_SECONDS`; it was 60, which cut off a reply that was still looking things up — an Antigravity
+MemTrace lookup measured 111 seconds). A failed chat call (timeout, non-zero exit, or exit 0 with no text — reported as
+"結束碼 0 但沒有任何文字輸出") appends one JSON line to the workspace's `.harness/chat-failures.log` with the provider,
+model, return code, and the tails of stdout (2000 characters) and stderr (1000). **Enforced:** neither the prompt nor the
+command is ever written there, the file is trimmed to its last 100 lines once past 1 MB, and a logging failure never
+affects the reply. **Not done:** the Claude chat call still has the whole Claude Code toolset and the Skill tool, so a
+small model may try to write files or use built-in scheduling instead of answering.
+
 **Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
 with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
 30 characters, `text` the sentence the pick stands for). The Harness strips the line, sends the reply with the options as
