@@ -66,6 +66,8 @@ settings (bot token, chat ids) are in neither — `doctor` flags them, and a pre
 | `GET /v1/status`, `GET /v1/changes?since=&wait=`, `GET /v1/turns/<id>` | what the status page shows |
 | `POST /v1/admin/<setting>` | model settings, role profiles, approve/reject, preferences |
 
+**Messages are answered once per burst (operator decision, 2026-10-11; enforced).** Plain chat messages from the same audience that arrive within `COALESCE_QUIET_SECONDS` (4 s, `HARNESS_MESSAGE_QUIET_SECONDS` overrides; each new message restarts the window, capped at 20 s) are joined with a blank line and handed to the model as one message, so they get one reply. A command, a reply to a specific message, or another audience's message is never merged and keeps its own turn, in order. **Not implemented:** messages that arrive while a reply is already being generated still get their own reply afterwards (the in-flight reply is not discarded and redone).
+
 Messages are handled one after another in arrival order by a worker thread, so a slow model reply
 never blocks the API.
 

@@ -25,6 +25,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,24 +70,87 @@ class ChangeBus:
 
 class MessageWorker:
     """Handles people's messages one after another, in the order they arrived: a chat reply can
-    take a minute, and the API call that delivered the message must not wait for it."""
+    take a minute, and the API call that delivered the message must not wait for it.
+
+    Plain chat messages that arrive close together (someone typing a thought in several sends) are
+    answered once: after the first, the worker waits a short quiet window for more from the same
+    person and hands the model all of them as a single message. A command, a reply to a specific
+    message, or a message from someone else is never merged — it ends the batch and is handled on
+    its own, in order."""
+
+    COALESCE_QUIET_SECONDS = 4.0
+    COALESCE_MAX_SECONDS = 20.0
+    _SEPARATOR = "\n\n"
 
     def __init__(self, service: HarnessService, bus: ChangeBus) -> None:
         self._service = service
         self._bus = bus
+        try:
+            self.COALESCE_QUIET_SECONDS = float(os.environ["HARNESS_MESSAGE_QUIET_SECONDS"])
+        except (KeyError, ValueError):
+            pass
         self._queue: queue.Queue[tuple[str, dict] | None] = queue.Queue()
+        self._carry: list[tuple[str, dict] | None] = []
         self._thread = threading.Thread(target=self._run, name="harness-messages", daemon=True)
         self._thread.start()
 
     def submit(self, payload: dict) -> None:
         self._queue.put(("message", payload))
 
+    def _next(self, timeout: float | None = None) -> tuple[str, dict] | None:
+        if self._carry:
+            return self._carry.pop(0)
+        return self._queue.get(timeout=timeout)
+
+    def _is_mergeable(self, payload: dict) -> bool:
+        if payload.get("reply_to_ref") or payload.get("reply_to_text"):
+            return False
+        text = (payload.get("text") or "").strip()
+        if not text or text.startswith("/"):
+            return False
+        try:
+            return self._service.triage.triage_message(text).kind == "chat"
+        except Exception:
+            return False
+
+    def _collect(self, first: dict) -> tuple[dict, bool]:
+        """`first`, plus any plain chat messages from the same audience that follow within the quiet
+        window. The bool is True when the worker was told to stop while waiting."""
+        if not self._is_mergeable(first) or self.COALESCE_QUIET_SECONDS <= 0:
+            return first, False
+        texts = [first["text"].strip()]
+        started = time.monotonic()
+        deadline = started + self.COALESCE_QUIET_SECONDS
+        hard = started + self.COALESCE_MAX_SECONDS
+        stop = False
+        while True:
+            remaining = min(deadline, hard) - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                item = self._next(timeout=remaining)
+            except queue.Empty:
+                break
+            if item is None:
+                stop = True
+                break
+            payload = item[1]
+            if payload.get("audience") != first.get("audience") or not self._is_mergeable(payload):
+                self._carry.append(item)
+                break
+            texts.append(payload["text"].strip())
+            deadline = time.monotonic() + self.COALESCE_QUIET_SECONDS
+        if len(texts) == 1:
+            return first, stop
+        logger.info(f"answering {len(texts)} chat messages as one")
+        return {**first, "text": self._SEPARATOR.join(texts)}, stop
+
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
+            item = self._next()
             if item is None:
                 return
-            _, payload = item
+            payload, stop = self._collect(item[1])
             try:
                 self._service.handle_message(
                     payload["text"],
@@ -101,6 +165,8 @@ class MessageWorker:
                 except Exception:
                     logger.exception("reporting the failure failed")
             self._bus.publish()
+            if stop:
+                return
 
     def stop(self) -> None:
         self._queue.put(None)
