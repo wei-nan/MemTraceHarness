@@ -59,6 +59,7 @@ CONFIRMATION_LABELS = {
     "job": "待確認重跑工作",
     "scope_change": "待確認新增工具設定",
     "external_action": "待確認 GitHub 操作",
+    "model_change": "待確認模型變更",
     "order": "待確認委託",
 }
 INTERRUPTED_LOOKBACK = timedelta(days=7)

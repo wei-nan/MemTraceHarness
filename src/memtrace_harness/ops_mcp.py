@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from memtrace_harness.github_actions import ACTIONS, github_issue_repos, summarize, validate_action
+from memtrace_harness.model_changes import TARGETS as MODEL_TARGETS, summarize as summarize_model_change, validate_model_change
 from memtrace_harness.scope import SCOPE_CHANGE_KINDS, describe_scope_change, validate_scope_change
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -149,6 +150,26 @@ TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "name": "propose_model_change",
+        "description": (
+            "Ask the user to PERMANENTLY change the primary model of the chat, a background job (digest, archive, "
+            "recall) or an Agent Loop role (controller, planner, planner-escalation, red-team, developer). Use it "
+            "only when the user wants the new model from now on, not for one task (for one task the task marker "
+            "carries model=). This does NOT change anything: the user sees the exact change and a confirm button, "
+            "and only a tap writes it. Say that a confirmation is waiting; never say it is changed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target": {"type": "string", "enum": list(MODEL_TARGETS)},
+                "model": _string_param("model id, e.g. claude-opus-5-5, or provider/model"),
+                "provider": {"type": "string", "enum": ["claude", "codex", "antigravity"]},
+            },
+            "required": ["target", "model"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "run_job",
         "description": (
             "Ask to run one of the project's named jobs again. This does NOT run it: the user gets a "
@@ -186,7 +207,7 @@ class OpsContext:
         self.github_repos = list(github_repos or [])
 
     def tool_names(self) -> set[str]:
-        names = {"propose_scope_change"} if self.store is not None else set()
+        names = {"propose_scope_change", "propose_model_change"} if self.store is not None else set()
         if self.store is not None and self.github_repos:
             names.add("propose_github_action")
         if self.hosts:
@@ -328,6 +349,26 @@ def propose_github_action(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
+def propose_model_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
+    if ctx.store is None:
+        raise OpsError("model change requests are not available here")
+    try:
+        payload = validate_model_change(arguments)
+    except ValueError as exc:
+        raise OpsError(str(exc)) from exc
+    summary = summarize_model_change(payload)
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+    if not ctx.store.create_model_change_request(
+        request_id=f"mdl_{uuid.uuid4().hex[:10]}", project=ctx.project, key=f"model:{summary}",
+        summary=summary, payload=payload, expires_at=expires,
+    ):
+        raise OpsError("could not record the request")
+    return (
+        f"Proposed: {summary}. The user now has a confirm button in the chat (valid 10 minutes); it changes "
+        "only after they tap it, and the result is reported to them."
+    )
+
+
 def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
     if name not in ctx.tool_names():
         raise OpsError(f"unknown tool: {name}")
@@ -343,6 +384,8 @@ def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
         return propose_scope_change(ctx, arguments)
     if name == "propose_github_action":
         return propose_github_action(ctx, arguments)
+    if name == "propose_model_change":
+        return propose_model_change(ctx, arguments)
     return request_job(ctx, arguments)
 
 

@@ -610,6 +610,25 @@ class HarnessServiceTests(TestCase):
             self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "act_1", 12345, 79))
             run.assert_not_called()  # a second tap does nothing
 
+    def test_a_model_change_is_written_only_after_the_human_confirms(self) -> None:
+        from unittest.mock import patch
+
+        gateway, scope, store = self._action_gateway()
+        store.create_model_change_request(
+            request_id="mdl_1", project=scope.name, key="k", summary="把「對話」的主要模型永久改成 claude/haiku",
+            payload={"target": "chat", "provider": "claude", "model": "haiku"}, expires_at="2999-01-01T00:00:00+00:00",
+        )
+        with patch("memtrace_harness.service.apply_model_change") as apply:
+            gateway.process_job_requests()
+            self.assertIn("確認變更", str(gateway.send_message_with_keyboard.call_args))
+            apply.assert_not_called()
+            result = gateway._resolve_job_action("job_confirm", "mdl_1", 12345, 79)
+            apply.assert_called_once()
+            self.assertIn("已變更", result)
+            self.assertEqual(store.get_job_request("mdl_1")["status"], "done")
+            self.assertIn("沒有再", gateway._resolve_job_action("job_confirm", "mdl_1", 12345, 79))
+            apply.assert_called_once()
+
     def test_closing_an_issue_shows_its_title_and_uses_the_right_command(self) -> None:
         from unittest.mock import MagicMock, patch
 

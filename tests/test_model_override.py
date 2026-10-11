@@ -63,3 +63,45 @@ class OverrideTests(TestCase):
         self.assertFalse(runner._may_fallback(category="unknown", attempt_index=1, **kwargs))
         runner.model_override_profiles = frozenset()
         self.assertFalse(runner._may_fallback(category="unknown", attempt_index=0, **kwargs))
+
+
+class PermanentChangeTests(TestCase):
+    def test_validation_infers_provider_and_refuses_unknown_targets(self) -> None:
+        from memtrace_harness.model_changes import validate_model_change
+
+        self.assertEqual(
+            validate_model_change({"target": "developer", "model": "claude-opus-5-5"}),
+            {"target": "developer", "provider": "claude", "model": "claude-opus-5-5"},
+        )
+        self.assertEqual(validate_model_change({"target": "chat", "model": "codex/x-1"})["provider"], "codex")
+        for bad in ({"target": "nope", "model": "opus"}, {"target": "chat", "model": "mystery"},
+                    {"target": "chat", "model": 'a"b', "provider": "claude"}):
+            with self.assertRaises(ValueError):
+                validate_model_change(bad)
+
+    def test_confirmed_change_rewrites_only_the_primary_model_and_a_bad_one_is_rolled_back(self) -> None:
+        import shutil
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from memtrace_harness.model_changes import apply_model_change
+
+        with TemporaryDirectory() as tmp:
+            roles = Path(tmp) / "roles.toml"
+            shutil.copy(Path(__file__).parents[1] / "src/memtrace_harness/default-role-profiles.toml", roles)
+            config = MagicMock(workspace_root=Path(tmp))
+            config.role_profiles_file_for.return_value = roles
+            before = load_role_profiles(roles)["developer"]
+            apply_model_change(config, {"target": "developer", "provider": "claude", "model": "claude-opus-5-5"})
+            after = load_role_profiles(roles)["developer"]
+            self.assertEqual((after.provider, after.model), ("claude", "claude-opus-5-5"))
+            self.assertEqual(after.fallbacks, before.fallbacks)
+            self.assertEqual(after.permission, "workspace-write")
+            # an effort the new provider does not accept: nothing changes
+            head, dev = roles.read_text(encoding="utf-8").split("[profiles.developer]")
+            text = head + "[profiles.developer]" + dev.replace('reasoning_effort = "high"', 'reasoning_effort = "max"', 1)
+            roles.write_text(text, encoding="utf-8")
+            snapshot = roles.read_text(encoding="utf-8")
+            with self.assertRaises(ValueError):
+                apply_model_change(config, {"target": "developer", "provider": "codex", "model": "gpt-6-sol"})
+            self.assertEqual(roles.read_text(encoding="utf-8"), snapshot)

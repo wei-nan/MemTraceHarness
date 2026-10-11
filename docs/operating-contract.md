@@ -284,6 +284,17 @@ command is ever written there, the file is trimmed to its last 100 lines once pa
 affects the reply. **Not done:** the Claude chat call still has the whole Claude Code toolset and the Skill tool, so a
 small model may try to write files or use built-in scheduling instead of answering.
 
+**Permanent model changes from the chat (operator decision, 2026-10-11).** The chat model can propose a lasting model
+change with the ops tool `propose_model_change` (target: `chat`, `digest`, `archive`, `recall`, or a role:
+`controller`, `planner`, `planner-escalation`, `red-team`, `developer`). **ENFORCED** (`tests/test_model_override.py`,
+`tests/test_service.py`): the tool only records a request (valid 10 minutes); nothing is written until the operator taps
+「確認變更」; only the target's *primary* provider/model changes (fallbacks, reasoning effort, permission and context
+policy stay), written to `models.toml` or the workspace's own roles file exactly as the status page does; a role change
+whose current settings the new provider does not accept is rolled back; a double tap applies once. A Harness without its
+own roles file cannot change a role (the packaged default is shared). **Prompt policy, not enforced:** that the chat model
+uses this tool only for a lasting change and `model=` for a single task. **Not implemented:** changing fallbacks or effort
+from chat.
+
 **Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
 with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
 30 characters, `text` the sentence the pick stands for). The Harness strips the line, sends the reply with the options as
