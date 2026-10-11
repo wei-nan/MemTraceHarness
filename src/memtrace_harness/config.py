@@ -151,6 +151,9 @@ class HarnessConfig:
             # --mcp-config may be given more than once; the taiwantrade one above is separate.
             command += ["--mcp-config", json.dumps({"mcpServers": {"ops": ops_server}})]
             claude_allowed_tools = ",".join(filter(None, [claude_allowed_tools, "mcp__ops"]))
+        if provider == "claude":
+            # Installed skills (~/.claude/skills) are loaded by the CLI but, headless, nobody can approve the Skill tool.
+            claude_allowed_tools = ",".join(filter(None, [claude_allowed_tools, "Skill"]))
         if provider == "claude" and claude_allowed_tools:
             command += ["--allowedTools", claude_allowed_tools]
         if model:

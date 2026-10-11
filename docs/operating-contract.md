@@ -268,6 +268,13 @@ and the reason is reported, with no new approval. `stop` and `ask_human` still e
 existed, an operator answer of "already fine" came back as a new question each time (beri-android#140, four rounds).
 **Prompt policy, not enforced:** that the Controller picks it instead of `stop` in that situation.
 
+**Skills for the chat and the Developer (operator decision, 2026-10-11).** Claude CLI loads installed skills
+(`~/.claude/skills`, the project's `.claude/skills`) but, headless, nobody can approve the `Skill` tool, so it was
+refused. **ENFORCED** (`tests/test_cli.py`): every Claude chat call and the Claude Developer (`acceptEdits`) pass
+`Skill` in `--allowedTools`. The read-only roles (Controller, Planner, Planner-escalation, Red Team) do not get it.
+**Unverified against a live model:** that the model then calls a skill; Codex needed no change (its skills come from
+`CODEX_HOME`) and whether its Controller/Red Team `--ignore-user-config` calls skip skills is not checked.
+
 **Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
 with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
 30 characters, `text` the sentence the pick stands for). The Harness strips the line, sends the reply with the options as
