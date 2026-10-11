@@ -196,7 +196,7 @@ class ChatCommandTests(TestCase):
         config = self._config()
         self.assertEqual(
             HarnessConfig.chat_command(config, "claude", "haiku", "p", claude_allowed_tools="mcp__x"),
-            ["/bin/claude", "--allowedTools", "mcp__x", "--model", "haiku", "--print", "p"],
+            ["/bin/claude", "--allowedTools", "mcp__x,Skill", "--model", "haiku", "--print", "p"],
         )
         self.assertEqual(
             HarnessConfig.chat_command(config, "antigravity", None, "p", claude_allowed_tools="mcp__x"),
@@ -222,7 +222,7 @@ class ChatCommandTests(TestCase):
         self.assertTrue(any("/keys/tw" in a for a in codex))  # a path, never the key itself
         # exec mode has approval=never: without this the MCP call is rejected outright.
         self.assertIn('mcp_servers.taiwantrade.default_tools_approval_mode="approve"', codex)
-        self.assertEqual(claude[claude.index("--allowedTools") + 1], "mcp__x,mcp__taiwantrade")
+        self.assertEqual(claude[claude.index("--allowedTools") + 1], "mcp__x,mcp__taiwantrade,Skill")
         self.assertIn("--mcp-config", claude)
         # No opt-in env var -> nothing attached even when asked for.
         with patch.dict("os.environ", {}, clear=True):

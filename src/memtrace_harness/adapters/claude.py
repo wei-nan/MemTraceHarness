@@ -80,7 +80,7 @@ class ClaudeCliAdapter(CliModelAdapter):
                 command.extend(["--add-dir", str(directory)])
         else:
             command.extend(
-                ["--permission-mode", "acceptEdits", "--allowedTools", read_tools + write_tools]
+                ["--permission-mode", "acceptEdits", "--allowedTools", read_tools + write_tools + ",Skill"]
             )
         return command
 
