@@ -292,8 +292,8 @@ change with the ops tool `propose_model_change` (target: `chat`, `digest`, `arch
 policy stay), written to `models.toml` or the workspace's own roles file exactly as the status page does; a role change
 whose current settings the new provider does not accept is rolled back; a double tap applies once. A Harness without its
 own roles file cannot change a role (the packaged default is shared). **Prompt policy, not enforced:** that the chat model
-uses this tool only for a lasting change and `model=` for a single task. **Not implemented:** changing fallbacks or effort
-from chat.
+uses this tool only for a lasting change and `model=` for a single task. **Not allowed (operator decision, 2026-10-11):** changing fallbacks or effort
+from chat; those stay on the status page.
 
 **Choices from the chat (operator decision, 2026-10-11).** When the chat model needs the operator to decide, it ends its reply
 with one `HARNESS_CHOICES::{"question":…,"options":[{"label":…,"text":…}]}` line (one line of JSON, 2–6 options, label up to
