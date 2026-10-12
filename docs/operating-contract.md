@@ -298,7 +298,7 @@ database or `~/.config/memtraceharness` is therefore something the reading Harne
 hold credentials (`.harness.env`, `*.env`, `web.toml`, keys, `.ssh`...) are refused by name even inside a declared root, and
 every returned text has tokens masked; `query_db` opens the file `mode=ro` with `query_only` and a SQLite authorizer that
 allows only SELECT (a write, `ATTACH`, `PRAGMA` or a second statement fails), at most 200 rows, 5 seconds;
-`system_status` is a fixed set of argv lists with no shell (`launchctl list/print`, `ps`, `git status/log/diff --stat/branch`).
+`system_status` is a fixed set of argv lists with no shell (`launchctl list/print`, `ps`, `git status/log/diff --stat/branch`), plus device errors: `simulator_log` / `mac_log` (`log show`, last hour, error+fault, validated process name) and `crash_reports` (DiagnosticReports and synced-iPhone MobileDevice crash files, fixed directories) and `device_crash_reports` (`xcrun devicectl` file copy of `systemCrashLogs` from a paired iPhone, including Xcode wireless; read-only; the phone must be unlocked).
 Changing anything still goes through a request and a confirm tap. **Never run for a model, whatever the allowlist says**
 (`command_policy.py`): `sudo`, deleting files or data (`rm`, `find -delete`, `git clean`, `git reset --hard`, forced push...),
 and changing system or security settings (`defaults write`, `launchctl bootout/load...`, `networksetup`, `pmset`...). Such a
