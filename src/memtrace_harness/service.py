@@ -337,12 +337,12 @@ class HarnessService:
     def notify_operator(self, text: str) -> None:
         self.send_message(None, text)
 
-    def fetch_events(self, *, limit: int = 20, wait_seconds: float = 0.0) -> list[dict]:
+    def fetch_events(self, *, limit: int = 20, wait_seconds: float = 0.0, consumer: str | None = None) -> list[dict]:
         """The undelivered outbox events (oldest first), waiting up to `wait_seconds` for one."""
         deadline = time.monotonic() + max(0.0, wait_seconds)
         store = self.approval_manager.trace_store
         while True:
-            events = store.claim_outbox(limit=limit)
+            events = store.claim_outbox(limit=limit, consumer=consumer)
             if events or time.monotonic() >= deadline:
                 return events
             with self._outbox_signal:

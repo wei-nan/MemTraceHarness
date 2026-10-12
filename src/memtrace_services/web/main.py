@@ -12,6 +12,7 @@ from pathlib import Path
 
 from memtrace_services.envfile import file_mode_problem
 from memtrace_services.web.aggregate import Aggregator, HarnessTarget
+from memtrace_services.web.chat import ChatHub
 from memtrace_services.web.server import start_server
 
 EXAMPLE = """\
@@ -52,13 +53,16 @@ def main(argv: list[str] | None = None) -> int:
 
     aggregator = Aggregator(targets)
     aggregator.start()
-    server = start_server(host, port, aggregator)
+    chat = ChatHub(targets)
+    chat.start()
+    server = start_server(host, port, aggregator, chat)
     print(f"Status page: http://{host}:{port} ({len(targets)} Harness(es))", flush=True)
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     stop.wait()
     aggregator.stop()
+    chat.stop()
     server.shutdown()
     return 0
 

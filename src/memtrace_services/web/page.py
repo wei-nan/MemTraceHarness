@@ -12,7 +12,12 @@ from __future__ import annotations
 from pathlib import Path
 
 STATIC_DIR = Path(__file__).with_name("static")
-STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8"}
+STATIC_TYPES = {
+    "app.css": "text/css; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+    "chat.css": "text/css; charset=utf-8",
+    "chat.js": "text/javascript; charset=utf-8",
+}
 
 PAGE_TEMPLATE = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 

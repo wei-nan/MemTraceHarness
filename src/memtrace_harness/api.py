@@ -282,7 +282,13 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/v1/events":
                 limit = int(self._float(query, "limit", 20, 100))
                 wait = self._float(query, "wait", 0, MAX_WAIT_SECONDS)
-                self._send(200, {"events": self.api.service.fetch_events(limit=limit, wait_seconds=wait)})
+                consumer = query.get("consumer")
+                self._send(
+                    200,
+                    {"events": self.api.service.fetch_events(
+                        limit=limit, wait_seconds=wait, consumer=consumer if consumer in {"web"} else None
+                    )},
+                )
             elif path == "/v1/status":
                 self._send(200, self.api.status())
             elif path == "/v1/changes":
