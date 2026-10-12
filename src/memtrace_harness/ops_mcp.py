@@ -25,6 +25,9 @@ Boundaries enforced here, from what the operator declared in the project's scope
   its labels, comment on a PR; the table is in github_actions.py). It does nothing: it records a request, and
   the Harness runs ``gh`` only after the human has seen the exact action and tapped confirm in the chat.
 
+- ``github_ci``: read-only GitHub Actions views (list / view / failed_log) through the host's ``gh`` for the
+  project's own repos (github_ci.py). Offered only when the project declares a ``github_repo``.
+
 Run: ``python -m memtrace_harness.ops_mcp`` (JSON-RPC over stdin/stdout).
 """
 
@@ -567,6 +570,7 @@ def _register_builtin_tools() -> None:
 
 _register_builtin_tools()
 from memtrace_harness import browser  # noqa: E402,F401  (registers `browse`)
+from memtrace_harness import github_ci  # noqa: E402,F401  (registers `github_ci`)
 
 
 def handle_message(message: dict[str, Any], ctx: OpsContext) -> dict[str, Any] | None:
