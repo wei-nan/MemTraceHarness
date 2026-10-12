@@ -66,7 +66,7 @@ def _git(path: str, *args: str) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
-def _worktree_state(row: dict[str, Any], git: Callable[..., str | None]) -> tuple[str | None, int, bool, str] | None:
+def worktree_state(row: dict[str, Any], git: Callable[..., str | None]) -> tuple[str | None, int, bool, str] | None:
     """(actual branch, commits not yet in the base branch, uncommitted edits, commit subjects), or None when the
     worktree is gone or cannot be read."""
     path = row.get("path")
@@ -103,7 +103,7 @@ def collect_other_work(
         if conv_id == exclude or live.get(conv_id) is True:
             continue
         goal = row.get("goal") or ""
-        state = _worktree_state(row, git)
+        state = worktree_state(row, git)
         branch, ahead, dirty, subjects = state if state else (row.get("branch"), 0, False, "")
         if conv_id in live:
             kind = RUNNING

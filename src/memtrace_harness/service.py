@@ -1705,6 +1705,84 @@ class HarnessService:
 
         return (acquire, lambda: trace_store.release_edit_lock(ws_id, conv_id))
 
+    INTERRUPTED_LOOKBACK = timedelta(days=14)
+
+    def recover_interrupted_tasks(self, scope: ProjectScope, started_at_iso: str) -> int:
+        """At startup, deal with the tasks the previous process left behind. A Harness killed instead of shut down
+        (a restart, a crash, a force-kill) leaves its tasks marked active, their slot locks held and — because a
+        provider CLI runs in its own session — the CLI itself still working, with nobody to receive its result and
+        no word to the operator (chat_be448f5b and chat_7efeada2, 2026-10-12). Nothing in this process runs a task
+        yet, so a conversation still marked active/running whose last activity predates this process, and which no
+        thread here is running, was interrupted. For each: stop the CLI left in its worktree, mark it failed,
+        free its slot, and tell the operator in one message what it had done (last finished stage, whether its
+        worktree holds commits or edits). Schedule runs are released quietly: the schedule fires again anyway.
+        Slot locks with no thread behind them are released too, since a stale schedule lock would skip that
+        schedule for good. The task is NOT resumed — what happens next is the operator's call. Returns how many
+        tasks were reported."""
+        store = self.approval_manager.trace_store
+        ws_id = scope.workspace_id
+        live = {e["conversation_id"] for e in default_tracker.snapshot()}
+        locks = {l["conversation_id"]: l for l in store.list_workspace_locks(ws_id)}
+        since = (datetime.now(timezone.utc) - self.INTERRUPTED_LOOKBACK).isoformat()
+        lines: list[str] = []
+        handled: set[str] = set()
+        for conv in store.list_unfinished_conversations(ws_id, since):
+            conv_id = conv["id"]
+            if conv_id in live or conv["updated_at"] >= started_at_iso:
+                continue
+            handled.add(conv_id)
+            worktree = store.get_conversation_worktree(conv_id)
+            stopped = 0
+            state = None
+            if worktree and worktree.get("path"):
+                try:
+                    stopped = len(kill_provider_clis_in_directory(worktree["path"]))
+                except Exception:
+                    logger.exception(f"stopping the leftover CLI of {conv_id} failed; continuing")
+                try:
+                    state = other_work.worktree_state(worktree, other_work._git)
+                except Exception:
+                    logger.exception(f"reading the worktree of {conv_id} failed; continuing")
+            store.abandon_conversation(ws_id, conv_id)
+            store.release_workspace_lock(ws_id, conv_id)
+            if (locks.get(conv_id) or {}).get("schedule_id"):
+                logger.info(f"released the interrupted run of schedule {locks[conv_id]['schedule_id']}")
+                continue
+            stages = store.get_conversation_pipeline(conv_id)
+            last = self._STAGE_LABELS.get(stages[-1]["stage"], stages[-1]["stage"]) if stages else None
+            if state is None:
+                work = "它沒有獨立的 worktree，或 worktree 已不存在。"
+            else:
+                branch, ahead, dirty, _ = state
+                bits = [f"分支 {branch}" if branch else "分支不明"]
+                if ahead:
+                    bits.append(f"有 {ahead} 個 commit 還不在主線")
+                if dirty:
+                    bits.append("有未提交的修改")
+                if not ahead and not dirty:
+                    bits.append("沒有任何 commit 或修改")
+                work = "worktree：" + "，".join(bits) + "。"
+            lines.append(
+                f"- {conv_id}：{' '.join((conv['goal'] or '').split())[:120] or '（沒有目標文字）'}\n"
+                f"  最後完成的階段：{last or '還沒有任何階段完成'}。{work}"
+                + (f"已終止它殘留的 {stopped} 個 CLI 程序。" if stopped else "")
+            )
+        for lock_id, lock in locks.items():
+            # Only locks taken before this process started: a task that just took its slot here has not
+            # registered its thread yet.
+            if lock_id not in live and lock_id not in handled and lock["locked_at"] < started_at_iso:
+                store.release_workspace_lock(ws_id, lock_id)
+                logger.info(f"released a stale slot lock of {lock_id}")
+        if not lines:
+            return 0
+        text = (
+            f"⚠️「{scope.name}」重新啟動時，發現上一個程序留下 {len(lines)} 個被中斷的任務，我已把它們標成中斷並釋放任務位"
+            "（沒有自動續跑）：\n" + "\n".join(lines) + "\n要接著做請直接告訴我；新任務會看到這些既有的工作。"
+        )
+        self.notify_operator(text)
+        self.primary_session_mgr.record_turn(project=scope.name, speaker="system", turn_type="dev_report", content=text)
+        return len(lines)
+
     OVERLAP_HOLD_SECONDS = 1800
 
     def _other_work(self, scope: ProjectScope, exclude: str | None = None) -> list[other_work.OtherWork]:
