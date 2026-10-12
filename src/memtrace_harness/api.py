@@ -90,6 +90,7 @@ class MessageWorker:
         self._stopped = False
         self._current: dict | None = None  # the batch being answered, when it may still be redone
         self._superseded = False
+        self._cancelled = False  # /cancel arrived while a chat reply was being made: drop it, do not redo it
         service.chat_superseded = lambda: self._superseded
         self._thread = threading.Thread(target=self._run, name="harness-messages", daemon=True)
         self._thread.start()
@@ -103,11 +104,18 @@ class MessageWorker:
                 and payload.get("audience") == self._current.get("audience")
                 and self._is_mergeable(payload)
             )
+            if not interrupt and self._current is not None and not self._superseded and self._is_cancel(payload):
+                interrupt = True
+                self._cancelled = True
             if interrupt:
                 self._superseded = True
             self._cond.notify_all()
         if interrupt and self._service.chat_generating:
             kill_process_for_thread(self._thread.ident)
+
+    @staticmethod
+    def _is_cancel(payload: dict) -> bool:
+        return (payload.get("text") or "").strip().lower().split("@")[0] in {"/cancel", "/stop"}
 
     def _is_mergeable(self, payload: dict) -> bool:
         if payload.get("reply_to_ref") or payload.get("reply_to_text"):
@@ -140,6 +148,9 @@ class MessageWorker:
     def _answer(self, first: dict) -> None:
         from memtrace_harness.service import ChatInterrupted
 
+        with self._cond:
+            self._cancelled = False
+            self._superseded = False
         if not self._is_mergeable(first):
             self._handle(first)
             return
@@ -158,6 +169,9 @@ class MessageWorker:
                 self._handle(current, earlier)
                 return
             except ChatInterrupted:
+                if self._cancelled:
+                    self._cancelled = False
+                    return  # the /cancel waiting in the inbox is handled next; this reply is not made
                 more = self._take_mergeable(audience)
                 if not more:
                     # The newcomer was claimed already or is gone: carry on with what we had.

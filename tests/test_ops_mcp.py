@@ -82,7 +82,8 @@ class OpsToolTests(unittest.TestCase):
     def test_only_declared_capabilities_are_listed(self) -> None:
         ctx = OpsContext(project="P", working_directory=self.tmp, hosts=[], logs=[], jobs={})
         reply = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, ctx)
-        self.assertEqual(reply["result"]["tools"], [])
+        # Only the read-only tools exist until the operator declares probe hosts, logs or jobs.
+        self.assertEqual({t["name"] for t in reply["result"]["tools"]}, {"read_file", "list_dir", "query_db", "system_status", "browse"})
         reply = handle_message(
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "run_job", "arguments": {"name": "x"}}},
             ctx,
@@ -106,10 +107,11 @@ class ScopeAndSpecTests(unittest.TestCase):
         spec = ops_server_spec(scope, tmp / "t.db")
         self.assertEqual(json.loads(spec["env"]["HARNESS_OPS_JOBS"])["other"], "echo x")
 
-    def test_a_scope_with_nothing_declared_has_no_ops_server(self) -> None:
+    def test_a_scope_with_nothing_declared_still_gets_the_read_only_tools(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         (tmp / "harness-scope.md").write_text("- workspace_id: ws_x\n")
-        self.assertIsNone(ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), None))
+        spec = ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), None)
+        self.assertEqual(json.loads(spec["env"]["HARNESS_OPS_READ_ROOTS"]), [])
 
     def _ctx(self, **kwargs) -> OpsContext:
         tmp = Path(tempfile.mkdtemp())
@@ -135,7 +137,7 @@ class ScopeAndSpecTests(unittest.TestCase):
         spec = ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), tmp / "t.db")
         self.assertIsNotNone(spec)
         ctx = self._ctx(working_directory=tmp)
-        self.assertEqual(ctx.tool_names(), {"propose_scope_change", "propose_model_change"})
+        self.assertEqual(ctx.tool_names(), {"propose_scope_change", "propose_model_change", "read_file", "list_dir", "query_db", "system_status", "browse"})
 
     def test_propose_github_action_records_a_request_and_refuses_other_repos(self) -> None:
         ctx = self._ctx(github_repos=["wei-nan/Beri"])

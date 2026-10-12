@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import tomllib
 
+from memtrace_harness.command_policy import REFUSAL_HINT, forbidden_reason
 from memtrace_harness.workspace import ENV_FILE_NAME, STATE_DIR_NAME
 
 
@@ -131,6 +132,10 @@ class ProjectScope:
     probe_hosts: list[str] | None = None
     log_files: list[str] | None = None
     jobs: dict[str, str] | None = None
+    # Extra folders the read-only ops tools (read_file / list_dir / query_db / system_status git) may look at, beyond
+    # the project's own folder: "- read_roots: ~/Workspace/Beri, ~/.config/memtraceharness". Declared by the operator;
+    # credential files stay unreadable inside them. Reading another Harness's workspace needs it declared here.
+    read_roots: list[str] | None = None
     # Name of a declared job the Harness runs by itself after a task finishes with its work
     # delivered (e.g. republishing a preview); "- publish_job: preview_start". No confirm tap:
     # the operator already chose the command by declaring it, and it must exist in `jobs`.
@@ -251,6 +256,7 @@ class ProjectScope:
 
         probe_hosts = _split_list(_extract_field(content, "probe_hosts"))
         log_files = _split_list(_extract_field(content, "log_files"))
+        read_roots = _split_list(_extract_field(content, "read_roots"))
         jobs = {
             match.group(1): match.group(2).strip()
             for match in re.finditer(
@@ -279,6 +285,7 @@ class ProjectScope:
             worktree_setup_command=worktree_setup_command,
             probe_hosts=[h.lower() for h in probe_hosts],
             log_files=log_files,
+            read_roots=read_roots,
             jobs=jobs,
             publish_job=publish_job,
         )
@@ -353,6 +360,9 @@ def validate_scope_change(
             raise ValueError("job command must be one non-empty line")
         if len(job_command) > MAX_JOB_COMMAND_CHARS:
             raise ValueError(f"job command is longer than {MAX_JOB_COMMAND_CHARS} characters")
+        reason = forbidden_reason(job_command)
+        if reason:
+            raise ValueError(f"{reason}：{REFUSAL_HINT}")
         return {"kind": kind, "name": job_name, "command": job_command}
     raise ValueError(f"unknown scope change kind {kind!r} (allowed: {', '.join(SCOPE_CHANGE_KINDS)})")
 

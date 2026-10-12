@@ -225,6 +225,17 @@ class TelegramService:
             if parsed:
                 self.bot.clear_keyboard(*parsed)
             return True, []
+        if kind == "edit":
+            parsed = parse_message_ref(event.get("ref"))
+            if parsed:
+                keyboard = [
+                    [{"text": button["label"], "callback_data": button["id"]} for button in row]
+                    for row in (event.get("actions") or [])
+                ] or None
+                # An edit that changes nothing is refused by Telegram ("message is not modified"); the state it
+                # would have shown is already there, so a failed edit is logged by the bot and not retried.
+                self.bot.edit_text(*parsed, event.get("text") or "", keyboard)
+            return True, []
         targets = self._targets(event.get("audience"))
         if kind == "typing":
             for chat in targets:

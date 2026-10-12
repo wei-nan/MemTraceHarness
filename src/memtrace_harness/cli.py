@@ -88,6 +88,8 @@ def main(argv: list[str] | None = None) -> int:
             return doctor_command(args)
         if args.command == "repo":
             return repo_command(args)
+        if args.command == "allowed":
+            return allowed_command(args)
         if args.command == "memory-topics":
             return memory_topics_command(args)
         if args.command == "memory-reorg":
@@ -295,6 +297,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "doctor", help="Check the workspace: env file, API token, scope file, tools the models need"
     )
+
+    allowed_parser = subparsers.add_parser(
+        "allowed", help="Jobs you told the Harness to always allow (.harness/allowed.json): list or revoke"
+    )
+    allowed_sub = allowed_parser.add_subparsers(dest="allowed_action", required=True)
+    allowed_sub.add_parser("list", help="Show the allowed jobs and when each was approved")
+    allowed_revoke = allowed_sub.add_parser("revoke", help="Ask again before running this job")
+    allowed_revoke.add_argument("job", help="A job name, or the label `allowed list` shows for a GitHub / settings / model entry")
 
     repo_parser = subparsers.add_parser(
         "repo", help="The other repos this Harness works in besides its primary one (.harness/repos.toml)"
@@ -865,6 +875,25 @@ def doctor_command(args: argparse.Namespace) -> int:
     if not problems:
         print("OK: nothing to fix")
     return 1 if problems else 0
+
+
+def allowed_command(args: argparse.Namespace) -> int:
+    """List or revoke the jobs the user said "always allow" (allowlist.py). Adding happens only from the chat's button."""
+    from memtrace_harness.allowlist import AllowList
+
+    config, scope = _config_and_scope()
+    allowlist = AllowList(workspace_paths(config.workspace_root)["state"] / "allowed.json")
+    if args.allowed_action == "list":
+        entries = allowlist.entries()
+        for entry in entries:
+            print(f"{entry.get('project')}: {entry.get('job') or entry.get('label')}  sha256={str(entry.get('sha256'))[:12]}  approved {entry.get('approved_at')}")
+        if not entries:
+            print("(nothing is always-allowed)")
+        return 0
+    if not allowlist.remove(scope.name, args.job):
+        raise ValueError(f"{args.job!r} is not in the allowed list")
+    print(f"revoked {args.job}: it will ask for a tap again")
+    return 0
 
 
 def repo_command(args: argparse.Namespace) -> int:
