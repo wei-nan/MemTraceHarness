@@ -99,8 +99,14 @@ The envelope separates runtime, project-spec, Agent Loop and optional Improvemen
 
 Passing `--conversation-id` to a later run injects the latest envelope into Controller context. This
 is cold-start continuation, not transfer of Claude thinking blocks, Codex reasoning traces or
-provider-specific tool-call state. The current implementation re-enters at Controller; exact
-logical-stage resume and semantic compaction remain planned.
+provider-specific tool-call state.
+
+Every resumed run starts again at Controller, which always re-routes. Settled work is then reused
+rather than re-executed: the latest valid plan, a G1 or G2 that already PASSed, and a development
+artifact that is not `INVALID` are rebuilt from the trace store (`_reconstruct_progress` in
+`loop.py`) and skipped. A REJECT or NEEDS_HUMAN gate is not reused, so a resume re-runs it with any
+new human clarification in context. Semantic compaction and provider-native thread continuation
+remain planned.
 
 ## Role-profile loop
 
@@ -115,7 +121,29 @@ developer           Antigravity Gemini        workspace-write
 ```
 
 The normal path is Luna control, Sonnet planning, Sol G1, Gemini development, Sol G2, and Luna
-convergence. High risk, cross-module scope, architecture change, and open questions do not select
+convergence. Each stage has a distinct job:
+
+- **Controller (start)** routes the request: plan it, run it as an operational action, ask a human,
+  stop, or report that no action is needed. It sees only the compact snapshot.
+- **Planner** produces the plan: affected files, acceptance criteria, scope exclusions, open
+  questions, and rollback. **G1** owns scope: it checks that the plan is concrete and bounded, and
+  rejects it when it is not. It is a model verdict.
+- **Developer** is the only role with write access. It implements the accepted plan and runs
+  tests. Its own "completed" status is not treated as final.
+- **G2** owns conformance: it checks that the development matches what the accepted plan
+  expected. If the project configures a `verify_command`, the Harness runs it first, and a failure
+  becomes a synthetic REJECT that skips the model and drives the same revision path.
+- **Converge (Controller)** runs after development and gates have passed, because a finished
+  development is not the same as finished work. It decides `finish`, `merge` (integrate the
+  task's isolated worktree back into the main line, reporting conflicts as `needs_human`), or
+  `ask_human`.
+- **Operate** handles requests that need no code change. Controller routes them to a direct action
+  and the loop ends without planning or development.
+
+Models remain in every gate: G1 and G2 judge scope and conformance, which a deterministic check
+cannot fully cover, while `verify_command` covers what it can.
+
+High risk, cross-module scope, architecture change, and open questions do not select
 Opus by themselves. Opus is allowed only after a first G1 `reasoning_gap`, an explicit custom
 policy/human decision, or a separate Improvement Loop replay; the built-in live loop implements
 only the first case.
@@ -129,8 +157,10 @@ One evidence-backed repair is allowed before human escalation:
 These are new stage invocations with the rejection artifact, not blind process retries. Provider
 fallbacks are never implicit. The packaged Controller candidate pool is Luna, then Sonnet, then
 Gemini 3.6; it is used only for classified quota, rate-limit or overloaded failures. The Role
-permission, output schema and context policy remain those of Controller. Planner and Developer have
-no packaged fallback yet. Opus escalation and Sol Red Team fail closed; an unavailable Sol run
+permission, output schema and context policy remain those of Controller. The packaged default
+profiles give Planner and Developer no fallback chain. A workspace's own `roles.toml` may declare
+one: Beri's Developer, for example, falls back to Antigravity Claude Sonnet and then Claude Sonnet,
+both on quota, rate-limit or overload failures. Opus escalation and Sol Red Team fail closed; an unavailable Sol run
 cannot produce a gate PASS.
 
 Quota buckets are explicit because multiple models can share one account limit. A failed bucket is
