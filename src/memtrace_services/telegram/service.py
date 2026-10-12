@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -13,6 +14,8 @@ from memtrace_services.client import HarnessClient, HarnessError, HarnessUnavail
 from memtrace_services.telegram.botapi import BotApi
 
 logger = logging.getLogger(__name__)
+
+MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # what Telegram lets a bot download
 
 AUDIENCE_PREFIX = "tg:"
 # A getUpdates call that comes back empty this fast failed rather than long-polled; back off.
@@ -131,9 +134,19 @@ class TelegramService:
         if chat_id is None or chat_id not in self.settings.allowed_chat_ids:
             # HARD REQUIREMENT: any chat not on the allowlist is ignored at the transport layer.
             return True
-        text = message.get("text") or ""
-        if not text:
+        text = message.get("text") or message.get("caption") or ""
+        media = self._media_of(message)
+        if not text and not media:
             return True
+        attachments: list[dict] = []
+        for item in media:
+            data, problem = self.bot.download_file(item["file_id"], MAX_DOWNLOAD_BYTES)
+            if data is None:
+                self.bot.send_text(chat_id, f"⚠️ 「{item['name']}」沒有收到：{problem}")
+                continue
+            attachments.append({"name": item["name"], "mime": item["mime"], "data_b64": base64.b64encode(data).decode("ascii")})
+        if media and not attachments and not text:
+            return True  # nothing arrived and nothing was said: the person has been told why
         reply_to = message.get("reply_to_message") or {}
         reply_text = reply_to.get("text") or reply_to.get("caption")
         reply_text = reply_text.strip() if isinstance(reply_text, str) else None
@@ -146,6 +159,7 @@ class TelegramService:
                 audience=audience_for(chat_id),
                 reply_to_ref=reply_ref,
                 reply_to_text=reply_text or None,
+                attachments=attachments or None,
             )
         except HarnessUnavailable as exc:
             logger.error(f"the Harness is unreachable: {exc}")
@@ -154,6 +168,29 @@ class TelegramService:
             logger.error(f"the Harness refused a message: {exc}")
             self.bot.send_text(chat_id, f"⚠️ Harness 拒絕了這則訊息：{exc.message}")
         return True
+
+    @staticmethod
+    def _media_of(message: dict) -> list[dict]:
+        """The files a message carries: photo (largest size), document, voice, audio, video, video note, animation."""
+        found: list[dict] = []
+        photo = message.get("photo")
+        if isinstance(photo, list) and photo:
+            best = max((p for p in photo if isinstance(p, dict) and p.get("file_id")), key=lambda p: p.get("file_size") or 0, default=None)
+            if best:
+                found.append({"file_id": best["file_id"], "name": "photo.jpg", "mime": "image/jpeg"})
+        for key, default_name, default_mime in (
+            ("document", "document", ""), ("voice", "voice.ogg", "audio/ogg"), ("audio", "audio.mp3", "audio/mpeg"),
+            ("video", "video.mp4", "video/mp4"), ("video_note", "video_note.mp4", "video/mp4"),
+            ("animation", "animation.mp4", "video/mp4"),
+        ):
+            item = message.get(key)
+            if isinstance(item, dict) and item.get("file_id"):
+                found.append({
+                    "file_id": item["file_id"],
+                    "name": item.get("file_name") or default_name,
+                    "mime": item.get("mime_type") or default_mime,
+                })
+        return found
 
     def _relay_callback(self, callback: dict) -> bool:
         callback_id = callback.get("id")

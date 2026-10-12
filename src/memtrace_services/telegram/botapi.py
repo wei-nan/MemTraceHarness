@@ -145,6 +145,24 @@ class BotApi:
             logger.error(f"Telegram sendPhoto failed: {exc}")
             return None
 
+    def download_file(self, file_id: str, max_bytes: int) -> tuple[bytes | None, str]:
+        """(bytes, "") or (None, reason). Bots can download files up to 20 MB; a bigger one is refused by Telegram."""
+        data = self._call("getFile", {"file_id": file_id})
+        info = (data or {}).get("result") if isinstance(data, dict) else None
+        if not isinstance(info, dict) or not info.get("file_path"):
+            return None, "Telegram 沒有給出檔案（可能超過 20 MB）"
+        if int(info.get("file_size") or 0) > max_bytes:
+            return None, f"檔案超過 {max_bytes // (1024 * 1024)} MB"
+        url = f"{self._base}/file/bot{self._token}/{info['file_path']}"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                body = resp.read(max_bytes + 1)
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return None, f"下載失敗：{exc}"  # a urllib error text never carries the URL (and so the token)
+        if len(body) > max_bytes:
+            return None, f"檔案超過 {max_bytes // (1024 * 1024)} MB"
+        return body, ""
+
     def edit_text(self, chat_id: int, message_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None) -> bool:
         """Replace a delivered message's text (and buttons) in place; only the first chunk of a long text is kept."""
         chunks = _split_telegram_text(text) or [text]

@@ -359,6 +359,20 @@ running:** a task, job or sub-agent that has started finishes by itself and is r
 running. A job or step that finishes after its plan was cancelled does not revive the plan. The plan's own "🛑 取消計畫" button
 cancels only that plan and its waiting requests. **Not implemented:** killing a running task or job.
 
+**Files sent in chat (operator decision, 2026-10-12; ENFORCED, `tests/test_attachments.py`, the media tests in
+`tests/test_telegram_service.py`, `tests/test_api.py`, `tests/test_chat_command_media.py`).** The Telegram service relays photos,
+documents, voice, audio, video, video notes and animations (up to Telegram's 20 MB bot limit; a file it cannot fetch is
+reported to the person, never silently dropped) as base64 in `POST /v1/messages`; a message with files and no words is still
+a message. The Harness (never a path named by a service) saves each file under `<workspace>/.harness/inbox/` — mode 0600, name
+sanitised so it cannot leave the folder, deleted after 7 days — at most 10 files and 40 MB per message. Files sent in one burst
+are answered together. For the chat model: images are looked at (Claude reads the path with a Read permission limited to the inbox; Antigravity reads
+the path from its working folder — verified 2026-10-12 for a PNG and a PDF; Codex gets `-i`); a video gives up to 4 frames plus its transcript; audio and voice are transcribed (`HARNESS_TRANSCRIBE_COMMAND`,
+default the `whisper` CLI **only when a model is already on disk — the Harness never starts a model download itself**; without a
+transcriber the model is told it could not hear it); text-like files and docx/rtf/doc (macOS `textutil`) are put in the prompt,
+clipped; a PDF is readable by Claude and Antigravity (they read the path themselves) but not by Codex; anything else is saved and acknowledged as unreadable. The
+prompt says file contents are untrusted data. **Not enforced:** that the model reports only what it actually saw or heard.
+**Not implemented:** PDF text extraction for Codex, xlsx/pptx, files in the status page.
+
 **One-off model for a task (operator decision, 2026-10-11).** The operator can name a model for a single task in
 chat ("請用 opus 5.5 設計這個頁面"); the chat model writes `model=<model>::` (or `model=<provider>/<model>::`, alongside
 `repo=`) in front of the `HARNESS_TASK_START::` goal. **ENFORCED** (`tests/test_model_override.py`): the prefix is routing,

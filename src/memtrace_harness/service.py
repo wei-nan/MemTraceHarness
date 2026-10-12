@@ -67,6 +67,7 @@ from memtrace_harness.memory_digest import (
     apply_chat_preference_correction,
     preference_context_for,
 )
+from memtrace_harness import attachments as attachments_mod
 from memtrace_harness import plans as plans_mod
 from memtrace_harness.allowlist import AllowList, rule_for
 from memtrace_harness.plan_runner import PlanRunner
@@ -305,6 +306,13 @@ class HarnessService:
         return text
 
     @property
+    def attachments(self) -> attachments_mod.AttachmentStore:
+        """Files people sent, next to the store: `.harness/inbox` (attachments.py)."""
+        if getattr(self, "_attachments", None) is None:
+            self._attachments = attachments_mod.AttachmentStore(Path(self.config.trace_db_path).parent / "inbox")
+        return self._attachments
+
+    @property
     def plan_runner(self) -> PlanRunner:
         if getattr(self, "_plan_runner", None) is None:
             self._plan_runner = PlanRunner(self)
@@ -445,6 +453,7 @@ class HarnessService:
         reply_to_ref: str | None = None,
         reply_to_text: str | None = None,
         earlier_text: str = "",
+        attachments: list[dict] | None = None,
     ) -> str | None:
         """What a person said, as a service relays it. Everything the Harness answers goes to the
         outbox; the returned string is only the gist, for tests and the API's synchronous echo.
@@ -558,11 +567,13 @@ class HarnessService:
             # scripts that use the same bot, neither of which the Harness would otherwise ever
             # see (a bot never receives its own messages).
             quoted = (reply_to_text or "").strip() or None
+            prepared = self._prepare_attachments(attachments)
+            stored_text = text if not prepared else f"{text}\n（附件：{'、'.join(p.name for p in prepared)}）"
             self.primary_session_mgr.record_turn(
                 project=scope.name,
                 speaker="user",
                 turn_type="chat",
-                content=text if not quoted else f"{text}\n{self._quote_marker(quoted)}",
+                content=stored_text if not quoted else f"{stored_text}\n{self._quote_marker(quoted)}",
             )
             self.send_typing(audience)
             if self.topic_recall is not None:
@@ -586,8 +597,25 @@ class HarnessService:
                 f"{earlier_text}\n\n{text}" if earlier_text else text,
                 quoted_text=quoted,
                 pending_approval=pending_approval,
+                attachments=prepared,
             )
         return None
+
+    def _prepare_attachments(self, saved: list[dict] | None) -> list[attachments_mod.Prepared]:
+        """Make what a person sent readable for the chat model (transcripts, frames, document text). One that fails to
+        prepare is still acknowledged, with a note, never silently dropped."""
+        prepared = []
+        command = getattr(self.config, "transcribe_command", None)
+        for item in saved or []:
+            try:
+                prepared.append(attachments_mod.prepare(item, transcribe_command=command))
+            except Exception as exc:  # noqa: BLE001 — report it to the model and the person, do not lose the message
+                logger.exception(f"preparing attachment {item.get('name')} failed")
+                prepared.append(attachments_mod.Prepared(
+                    name=str(item.get("name")), kind=str(item.get("kind")), path=Path(str(item.get("path"))),
+                    note=f"處理這個檔案時出錯：{exc}",
+                ))
+        return prepared
 
     # Stored with the user's turn so the transcript (and the nightly digest) still shows
     # what a short reply like "那檔怎麼了" was about. Kept after the user's own words so
@@ -2547,6 +2575,7 @@ class HarnessService:
         text: str,
         quoted_text: str | None = None,
         pending_approval: ApprovalRequestData | None = None,
+        attachments: list[attachments_mod.Prepared] | None = None,
     ) -> str:
         """The entire chat front door goes through one model call now: no more
         separate CHAT/QUESTION/LOOKUP/TASK classification pass, and no more
@@ -2641,6 +2670,7 @@ class HarnessService:
             f"{self._status_notice(scope)}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"{self._pending_approval_notice(pending_approval)}"
+            f"{attachments_mod.prompt_notice(attachments or [])}"
             f"使用者訊息：{text}"
         )
         failures: list[str] = []
@@ -2657,6 +2687,8 @@ class HarnessService:
                 order_project=scope.name,
                 ops_server=ops_server_spec(scope, self.config.trace_db_path),
                 memtrace_read=True,
+                images=[str(img) for item in attachments or [] for img in item.images] or None,
+                read_dirs=[str(self.attachments.inbox)] if attachments else None,
             )
             if self.chat_superseded():
                 raise ChatInterrupted()

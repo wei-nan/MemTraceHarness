@@ -77,6 +77,20 @@ class ConversationTests(ApiTestCase):
         self.assertEqual((events[0]["kind"], events[0]["audience"]), ("message", "tg:1"))
         self.assertIn("Harness 已上線", events[0]["text"])
 
+    def test_a_message_may_carry_files_that_are_saved_in_the_workspace_inbox(self) -> None:
+        import base64
+
+        data = base64.b64encode(b"hello file").decode()
+        status, _ = self._raw("POST", "/v1/messages", {"text": "", "audience": "tg:1", "attachments": [
+            {"name": "../note.txt", "mime": "text/plain", "data_b64": data}]})
+        self.assertEqual(status, 202)  # a file with no words is still a message
+        inbox = self.root / ".harness" / "inbox"
+        saved = list(inbox.iterdir())
+        self.assertEqual([p.read_bytes() for p in saved], [b"hello file"])
+        self.assertTrue(saved[0].name.endswith("_note.txt"))  # the name cannot leave the inbox
+        self.assertEqual(self._raw("POST", "/v1/messages", {"text": "x", "attachments": [{"name": "a", "data_b64": "!!"}]})[0], 400)
+        self.assertEqual(self._raw("POST", "/v1/messages", {"text": ""})[0], 400)  # no words and no file
+
     def test_messages_are_handled_in_the_order_they_arrived(self) -> None:
         for i in range(3):
             self.client.post_message("/schedules", audience=f"tg:{i}")

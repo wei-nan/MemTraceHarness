@@ -251,6 +251,7 @@ def serve(
         if now - last_approval_expiry >= APPROVAL_EXPIRY_CHECK_SECONDS:
             try:
                 service.expire_stale_approvals(config.approval_ttl_hours)
+                service.attachments.prune()
                 trace_store.prune_outbox(
                     (datetime.now(timezone.utc) - timedelta(hours=OUTBOX_RETENTION_HOURS)).isoformat()
                 )
