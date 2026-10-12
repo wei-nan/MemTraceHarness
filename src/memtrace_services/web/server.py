@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from memtrace_services.client import HarnessError, HarnessUnavailable
 from memtrace_services.web.aggregate import HEARTBEAT_SECONDS, Aggregator
+from memtrace_services.web.chat import ChatHub
 from memtrace_services.web.page import STATIC_DIR, STATIC_TYPES, render_page
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ ADMIN_ROUTES = {
 
 class _Handler(BaseHTTPRequestHandler):
     aggregator: Aggregator
+    chat: ChatHub
 
     def _json(self, status: int, data) -> None:
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -72,6 +74,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._events()
         elif parsed.path == "/api/turn":
             self._turn(urllib.parse.parse_qs(parsed.query))
+        elif parsed.path == "/api/chat":
+            self._chat_poll(urllib.parse.parse_qs(parsed.query))
         else:
             self.send_response(404)
             self.end_headers()
@@ -91,6 +95,26 @@ class _Handler(BaseHTTPRequestHandler):
                 last_seen = self.aggregator.changes.wait(last_seen, HEARTBEAT_SECONDS)
         except (BrokenPipeError, ConnectionResetError):
             pass  # client navigated away or closed the tab — not an error
+
+    def _chat_target(self, project: str) -> str | None:
+        target = self.aggregator.target_for(project)
+        return target.name if target is not None and self.chat.known(target.name) else None
+
+    def _chat_poll(self, query: dict[str, list[str]]) -> None:
+        harness = self._chat_target((query.get("project") or [""])[0])
+        if harness is None:
+            self._json(404, {"error": "no Harness serves this project"})
+            return
+        try:
+            since = int((query.get("since") or ["0"])[0])
+            wait = max(0.0, min(float((query.get("wait") or ["0"])[0]), 25.0))
+        except ValueError:
+            self._json(400, {"error": "malformed request"})
+            return
+        try:
+            self._json(200, self.chat.poll(harness, since, wait))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _turn(self, query: dict[str, list[str]]) -> None:
         # On-demand only: artifact/final_text bodies can be long and most stages are never clicked.
@@ -120,6 +144,9 @@ class _Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         except Exception:
             body = None
+        if path in ("/api/chat-send", "/api/chat-action"):
+            self._chat_post(path, body)
+            return
         setting = ADMIN_ROUTES.get(path)  # (body first: see api.py)
         if setting is None:
             self._json(404, {"error": "not found"})
@@ -142,12 +169,41 @@ class _Handler(BaseHTTPRequestHandler):
         self.aggregator.changes.publish()
         self._json(200, result)
 
+    def _chat_post(self, path: str, body) -> None:
+        if not isinstance(body, dict) or not isinstance(body.get("project"), str):
+            self._json(400, {"error": "malformed request body"})
+            return
+        harness = self._chat_target(body["project"])
+        if harness is None:
+            self._json(400, {"error": f"no Harness serves project {body['project']!r}"})
+            return
+        try:
+            if path == "/api/chat-send":
+                text = body.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    self._json(400, {"error": "text is required"})
+                    return
+                self.chat.send(harness, text.strip())
+                self._json(202, {"accepted": True})
+            else:
+                action_id, ref = body.get("id"), body.get("ref")
+                if not isinstance(action_id, str) or not action_id:
+                    self._json(400, {"error": "id is required"})
+                    return
+                toast = self.chat.act(harness, action_id, ref if isinstance(ref, str) else None)
+                self.aggregator.changes.publish()
+                self._json(200, {"toast": toast})
+        except HarnessError as exc:
+            self._json(400 if exc.status < 500 else 502, {"error": exc.message})
+        except HarnessUnavailable as exc:
+            self._json(502, {"error": f"Harness unreachable: {exc}"})
+
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         logger.debug("status web: " + format, *args)
 
 
-def start_server(host: str, port: int, aggregator: Aggregator) -> ThreadingHTTPServer:
-    handler = type("StatusHandler", (_Handler,), {"aggregator": aggregator})
+def start_server(host: str, port: int, aggregator: Aggregator, chat: ChatHub) -> ThreadingHTTPServer:
+    handler = type("StatusHandler", (_Handler,), {"aggregator": aggregator, "chat": chat})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True  # long-lived SSE connections must not keep the process alive
     threading.Thread(target=server.serve_forever, name="status-web", daemon=True).start()

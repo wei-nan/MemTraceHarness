@@ -1,6 +1,7 @@
 """The status web service in front of real Harness APIs."""
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -14,6 +15,7 @@ from memtrace_harness.scope import ProjectScope
 from memtrace_harness.workspace import models_file, read_model_settings
 from memtrace_services.web.aggregate import Aggregator, HarnessTarget
 from memtrace_services.web.main import load_config
+from memtrace_services.web.chat import ChatHub
 from memtrace_services.web.server import start_server
 from tests.workspace_support import workspace
 
@@ -34,7 +36,7 @@ class WebServiceTests(TestCase):
 
     def _web(self, targets):
         aggregator = Aggregator(targets)
-        server = start_server("127.0.0.1", 0, aggregator)
+        server = start_server("127.0.0.1", 0, aggregator, ChatHub([]))
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return aggregator, f"http://127.0.0.1:{server.server_address[1]}"
@@ -68,6 +70,30 @@ class WebServiceTests(TestCase):
                 self.assertIn(marker, resp.read().decode("utf-8"))
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(base + "/static/../page.py", timeout=5)
+
+    def test_a_message_typed_on_the_page_is_answered_on_the_page_and_never_reaches_telegram(self) -> None:
+        _, parts, target = self._harness("alpha", "ta")
+        hub = ChatHub([target])
+        hub.start()
+        self.addCleanup(hub.stop)
+        aggregator = Aggregator([target])
+        server = start_server("127.0.0.1", 0, aggregator, hub)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        self.assertEqual(self._post(base, "/api/chat-send", {"project": "alpha", "text": "status"})[0], 202)
+        self.assertEqual(self._post(base, "/api/chat-send", {"project": "alpha", "text": "  "})[0], 400)
+        seen: dict = {"messages": [], "version": 0}
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not any(m["role"] == "harness" for m in seen["messages"]):
+            with urllib.request.urlopen(f"{base}/api/chat?project=alpha&since=0&wait=2", timeout=10) as resp:
+                seen = json.loads(resp.read())
+        self.assertEqual([m["role"] for m in seen["messages"]][:1], ["user"])
+        reply = next(m for m in seen["messages"] if m["role"] == "harness")
+        self.assertIn("Harness 已上線", reply["text"])
+        self.assertTrue(reply["ref"].startswith("web:"))
+        # What the page already showed was delivered; Telegram's side of the outbox has nothing of it.
+        self.assertEqual(target.client().events(), [])
 
     def test_a_setting_is_sent_to_the_harness_that_owns_the_project(self) -> None:
         root_a, _, a = self._harness("alpha", "ta")

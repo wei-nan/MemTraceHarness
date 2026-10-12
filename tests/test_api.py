@@ -91,6 +91,13 @@ class ConversationTests(ApiTestCase):
         self.assertEqual(self._raw("POST", "/v1/messages", {"text": "x", "attachments": [{"name": "a", "data_b64": "!!"}]})[0], 400)
         self.assertEqual(self._raw("POST", "/v1/messages", {"text": ""})[0], 400)  # no words and no file
 
+    def test_events_for_the_web_page_and_for_telegram_are_kept_apart(self) -> None:
+        self.service.send_message("web:main", "to the page")
+        self.service.send_message("tg:1", "to telegram")
+        self.service.send_message(None, "to everyone")
+        self.assertEqual([e["text"] for e in self.client.events(consumer="web")], ["to the page"])
+        self.assertEqual([e["text"] for e in self.client.events()], ["to telegram", "to everyone"])
+
     def test_messages_are_handled_in_the_order_they_arrived(self) -> None:
         for i in range(3):
             self.client.post_message("/schedules", audience=f"tg:{i}")

@@ -4176,16 +4176,19 @@ class TraceStore:
 
     _OUTBOX_COLUMNS = "id, kind, audience, text, actions_json, bind_json, ref, created_at, attempts"
 
-    def claim_outbox(self, *, limit: int = 20) -> list[dict]:
+    def claim_outbox(self, *, limit: int = 20, consumer: str | None = None) -> list[dict]:
         """Events nobody has delivered, oldest first, leased to the caller for a minute so two
         fetches do not hand out the same event; an unacknowledged lease simply lapses and the
-        event is offered again."""
+        event is offered again. Events addressed to the web page (audience or ref "web:...") go only
+        to consumer="web"; every other consumer (Telegram) gets the rest."""
+        web = "(COALESCE(audience, '') LIKE 'web:%' OR COALESCE(ref, '') LIKE 'web:%')"
+        scope = web if consumer == "web" else f"NOT {web}"
         now = datetime.now(timezone.utc)
         lease_until = (now + timedelta(seconds=self.OUTBOX_LEASE_SECONDS)).isoformat()
         with self._connection() as conn:
             rows = conn.execute(
                 f"SELECT {self._OUTBOX_COLUMNS} FROM outbox WHERE delivered_at IS NULL "
-                "AND (leased_until IS NULL OR leased_until <= ?) ORDER BY id LIMIT ?",
+                f"AND (leased_until IS NULL OR leased_until <= ?) AND {scope} ORDER BY id LIMIT ?",
                 (now.isoformat(), limit),
             ).fetchall()
             for row in rows:

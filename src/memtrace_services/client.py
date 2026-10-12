@@ -75,8 +75,11 @@ class HarnessClient:
         return self._request("GET", "/v1/commands").get("commands", [])
 
     # ---- outbox
-    def events(self, *, limit: int = 20, wait: float = 0.0) -> list[dict]:
-        query = urllib.parse.urlencode({"limit": limit, "wait": wait})
+    def events(self, *, limit: int = 20, wait: float = 0.0, consumer: str | None = None) -> list[dict]:
+        params: dict[str, Any] = {"limit": limit, "wait": wait}
+        if consumer:
+            params["consumer"] = consumer
+        query = urllib.parse.urlencode(params)
         return self._request("GET", f"/v1/events?{query}", timeout=wait + self.timeout).get("events", [])
 
     def ack(self, event_id: int, *, ok: bool, message_refs: list[str] | None = None) -> str:
