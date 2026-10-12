@@ -296,7 +296,8 @@ class ScheduleReviewWiringTests(TestCase):
         self._seed_reports(2)
         self._run(gateway)
         pushed_texts = [c.args[1] for c in gateway.send_message.call_args_list]
-        self.assertTrue(any("任務已完成" in t for t in pushed_texts))
+        self.assertTrue(any("✅「test_proj」：持股無變化" in t for t in pushed_texts))
+        self.assertFalse(any("任務已完成" in t for t in pushed_texts))
         self.assertFalse(self._report_turns()[-1]["content"].startswith("【未推送"))
 
     def test_a_repeat_is_not_pushed_and_is_logged_tagged_for_the_digest(self) -> None:
@@ -305,6 +306,7 @@ class ScheduleReviewWiringTests(TestCase):
         self._run(gateway)
         pushed_texts = [c.args[1] for c in gateway.send_message.call_args_list]
         self.assertFalse(any("任務已完成" in t for t in pushed_texts))
+        self.assertFalse(any("持股無變化" in t for t in pushed_texts))
         last = self._report_turns()[-1]["content"]
         self.assertTrue(last.startswith("【未推送：持股與上輪相同】"))
         self.assertIn("持股無變化", last)
@@ -314,7 +316,8 @@ class ScheduleReviewWiringTests(TestCase):
         self._seed_reports(2)
         self._run(gateway)
         pushed_texts = [c.args[1] for c in gateway.send_message.call_args_list]
-        self.assertTrue(any("任務已完成" in t for t in pushed_texts))
+        self.assertTrue(any("✅「test_proj」：持股無變化" in t for t in pushed_texts))
+        self.assertFalse(any("任務已完成" in t for t in pushed_texts))
 
     def test_pausing_tells_the_operator_and_resuming_is_remembered_as_disagreement(self) -> None:
         gateway = self._gateway(reply(delivery="pause_and_notify", reason="部位已賣出", compared_to=None))
