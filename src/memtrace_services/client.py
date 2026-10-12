@@ -59,12 +59,12 @@ class HarnessClient:
         audience: str | None,
         reply_to_ref: str | None = None,
         reply_to_text: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> None:
-        self._request(
-            "POST",
-            "/v1/messages",
-            {"text": text, "audience": audience, "reply_to_ref": reply_to_ref, "reply_to_text": reply_to_text},
-        )
+        body = {"text": text, "audience": audience, "reply_to_ref": reply_to_ref, "reply_to_text": reply_to_text}
+        if attachments:
+            body["attachments"] = attachments  # [{name, mime, data_b64}]
+        self._request("POST", "/v1/messages", body, timeout=120 if attachments else None)
 
     def post_action(self, action_id: str, *, audience: str | None, message_ref: str | None = None) -> str | None:
         return self._request(

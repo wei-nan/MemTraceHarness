@@ -25,8 +25,10 @@ class FakeService:
             triage_message=lambda text: SimpleNamespace(kind="status" if text.startswith("/") else "chat")
         )
 
-    def handle_message(self, text, *, audience, reply_to_ref=None, reply_to_text=None, earlier_text=""):
+    def handle_message(self, text, *, audience, reply_to_ref=None, reply_to_text=None, earlier_text="", attachments=None):
         self.calls.append((text, audience, reply_to_ref, earlier_text))
+        self.attachments_seen = getattr(self, "attachments_seen", [])
+        self.attachments_seen.append(attachments)
         self.started.set()
         self.chat_generating = True
         try:
@@ -123,3 +125,12 @@ class MessageWorkerTests(TestCase):
         service.release.set()
         self.assertTrue(self._wait(lambda: service.finished == ["|/cancel"]))
         self.assertEqual([c[0] for c in service.calls], ["幫我做個很久的事", "/cancel"])  # the first was never answered
+
+    def test_files_sent_in_separate_messages_of_one_burst_all_reach_the_one_answer(self) -> None:
+        worker, service = self._worker()
+        worker.submit({"text": "（傳了附件）", "audience": "tg:1", "attachments": [{"name": "a.jpg"}]})
+        self.assertTrue(service.started.wait(2))
+        worker.submit({"text": "（傳了附件）", "audience": "tg:1", "attachments": [{"name": "b.jpg"}]})
+        service.release.set()
+        self.assertTrue(self._wait(lambda: service.finished))
+        self.assertEqual(service.attachments_seen[-1], [{"name": "a.jpg"}, {"name": "b.jpg"}])

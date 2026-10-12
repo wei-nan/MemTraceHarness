@@ -75,6 +75,9 @@ class HarnessConfig:
     # forgotten (2026-09-30: a day-old backtest approval was tapped thinking it was
     # something else). 0 disables.
     approval_ttl_hours: int = 12
+    # Command template that turns a voice / audio / video file into text (attachments.py); {input} and {outdir} are
+    # filled in. None -> the whisper CLI, when a model is already downloaded.
+    transcribe_command: str | None = None
 
     def chat_command(
         self,
@@ -87,6 +90,8 @@ class HarnessConfig:
         order_project: str | None = None,
         ops_server: dict | None = None,
         memtrace_read: bool = False,
+        images: list[str] | None = None,
+        read_dirs: list[str] | None = None,
     ) -> list[str]:
         """argv for one plain, non-interactive "answer this prompt" call — the quick
         chat reply, the chat classifiers, the nightly digest, JSON repair. Claude and
@@ -146,6 +151,9 @@ class HarnessConfig:
                 ]
             if model:
                 command += ["--model", model]
+            if images:
+                # `-i` takes any number of files, so `--` is what ends them and starts the prompt.
+                command += ["-i", *images, "--"]
             return command + [prompt]
         if provider == "claude" and proxy:
             command += ["--mcp-config", json.dumps({"mcpServers": {"taiwantrade": proxy}})]
@@ -159,6 +167,11 @@ class HarnessConfig:
         if provider == "claude":
             # Installed skills (~/.claude/skills) are loaded by the CLI but, headless, nobody can approve the Skill tool.
             claude_allowed_tools = ",".join(filter(None, [claude_allowed_tools, "Skill"]))
+        if provider == "claude" and read_dirs:
+            # Files a person sent (attachments.py) live in these folders; Claude reads them with its own Read tool.
+            claude_allowed_tools = ",".join(
+                filter(None, [claude_allowed_tools, *(f"Read(/{Path(d).resolve()}/**)" for d in read_dirs)])
+            )
         if provider == "claude" and claude_allowed_tools:
             command += ["--allowedTools", claude_allowed_tools]
         if model:
@@ -307,6 +320,7 @@ class HarnessConfig:
                 os.getenv("HARNESS_ANTIGRAVITY_OUTPUT_MODE", "auto")
             ),
             cli_timeout_seconds=_positive_int(os.getenv("HARNESS_CLI_TIMEOUT_SECONDS"), 900),
+            transcribe_command=os.getenv("HARNESS_TRANSCRIBE_COMMAND") or None,
             chat_provider=os.getenv("HARNESS_CHAT_PROVIDER", "claude"),
             chat_model=os.getenv("HARNESS_CHAT_MODEL", "haiku"),
             unattended_write_requires_approval=unattended_approval_str not in {"false", "0", "no"},

@@ -53,6 +53,13 @@ class FakeBot:
         self.cleared.append((chat_id, message_id))
         return True
 
+    def download_file(self, file_id, max_bytes):
+        self.downloads = getattr(self, "downloads", [])
+        self.downloads.append(file_id)
+        if file_id.startswith("big"):
+            return None, "檔案超過 20 MB"
+        return f"bytes-of-{file_id}".encode(), ""
+
     def edit_text(self, chat_id, message_id, text, keyboard=None):
         self.edited = getattr(self, "edited", [])
         self.edited.append((chat_id, message_id, text, keyboard))
@@ -79,13 +86,14 @@ class FakeClient:
         self.toast: str | None = "ok"
         self.error: HarnessError | None = None
 
-    def post_message(self, text, *, audience, reply_to_ref=None, reply_to_text=None):
+    def post_message(self, text, *, audience, reply_to_ref=None, reply_to_text=None, attachments=None):
         if self.down:
             raise HarnessUnavailable("refused")
         if self.error:
             raise self.error
         self.messages.append(
             {"text": text, "audience": audience, "reply_to_ref": reply_to_ref, "reply_to_text": reply_to_text}
+            | ({"attachments": attachments} if attachments else {})
         )
 
     def post_action(self, action_id, *, audience, message_ref=None):
@@ -120,6 +128,52 @@ def make_service(tmp: str, **overrides):
 
 def text_update(chat_id=ALLOWED, text="hello", update_id=1, **extra):
     return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text, **extra}}
+
+
+class MediaRelayTests(TestCase):
+    def _process(self, **message) -> tuple:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bot, client = make_service(tmp)
+            service.process_update({"update_id": 1, "message": {"chat": {"id": ALLOWED}, **message}})
+        return bot, client
+
+    def test_a_photo_with_a_caption_is_downloaded_and_relayed_with_its_words(self) -> None:
+        import base64
+
+        bot, client = self._process(
+            caption="這是什麼", photo=[{"file_id": "small", "file_size": 10}, {"file_id": "large", "file_size": 99}]
+        )
+        self.assertEqual(bot.downloads, ["large"])  # the biggest size
+        [message] = client.messages
+        self.assertEqual(message["text"], "這是什麼")
+        [attachment] = message["attachments"]
+        self.assertEqual((attachment["name"], attachment["mime"]), ("photo.jpg", "image/jpeg"))
+        self.assertEqual(base64.b64decode(attachment["data_b64"]), b"bytes-of-large")
+
+    def test_voice_video_audio_and_documents_are_all_relayed(self) -> None:
+        for key, payload in (
+            ("voice", {"file_id": "v1"}), ("video", {"file_id": "v2"}), ("audio", {"file_id": "a1", "file_name": "s.mp3"}),
+            ("document", {"file_id": "d1", "file_name": "r.pdf", "mime_type": "application/pdf"}),
+            ("video_note", {"file_id": "n1"}),
+        ):
+            with self.subTest(kind=key):
+                bot, client = self._process(**{key: payload})
+                [message] = client.messages
+                self.assertEqual(message["attachments"][0]["name"], payload.get("file_name") or {"voice": "voice.ogg", "video": "video.mp4", "video_note": "video_note.mp4"}[key])
+                self.assertEqual(message["text"], "")
+
+    def test_a_file_that_cannot_be_downloaded_is_reported_and_not_silently_dropped(self) -> None:
+        bot, client = self._process(document={"file_id": "big1", "file_name": "huge.zip"})
+        self.assertEqual(client.messages, [])
+        self.assertIn("huge.zip", bot.sent[0][1])
+        self.assertIn("20 MB", bot.sent[0][1])
+        bot, client = self._process(caption="看這個", document={"file_id": "big2", "file_name": "huge.zip"})
+        self.assertEqual(client.messages[0]["text"], "看這個")  # the words still go through
+        self.assertNotIn("attachments", client.messages[0])
+
+    def test_a_message_with_neither_words_nor_files_is_ignored(self) -> None:
+        bot, client = self._process(sticker={"file_id": "s"})
+        self.assertEqual((client.messages, bot.sent), ([], []))
 
 
 class EditDeliveryTests(TestCase):

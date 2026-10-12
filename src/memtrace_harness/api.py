@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
-from memtrace_harness import admin
+from memtrace_harness import admin, attachments
 from memtrace_harness.cli_process import kill_process_for_thread
 
 if TYPE_CHECKING:
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 1_000_000
+MAX_MESSAGE_BODY_BYTES = 60_000_000  # a message may carry files, base64 (attachments.py)
 MAX_WAIT_SECONDS = 55.0
 
 
@@ -143,6 +144,7 @@ class MessageWorker:
             reply_to_ref=payload.get("reply_to_ref"),
             reply_to_text=payload.get("reply_to_text"),
             earlier_text=earlier_text,
+            attachments=payload.get("attachments") or None,
         )
 
     def _answer(self, first: dict) -> None:
@@ -164,7 +166,11 @@ class MessageWorker:
                 self._current = current if restarts < self.MAX_RESTARTS else None
             waiting = self._take_mergeable(audience)
             if waiting:
-                current = {**waiting[-1], "text": "\n\n".join([current["text"].strip(), *(p["text"].strip() for p in waiting)])}
+                current = {
+                    **waiting[-1],
+                    "text": "\n\n".join([current["text"].strip(), *(p["text"].strip() for p in waiting)]),
+                    "attachments": [*(current.get("attachments") or []), *(a for p in waiting for a in p.get("attachments") or [])],
+                }
             try:
                 self._handle(current, earlier)
                 return
@@ -180,7 +186,12 @@ class MessageWorker:
                 restarts += 1
                 logger.info(f"answering {1 + len(more)} chat messages as one (restart {restarts})")
                 earlier = f"{earlier}\n\n{current['text'].strip()}".strip()
-                current = {**more[-1], "text": "\n\n".join(p["text"].strip() for p in more)}
+                current = {
+                    **more[-1],
+                    "text": "\n\n".join(p["text"].strip() for p in more),
+                    # files sent with the dropped reply's messages are still part of what was said
+                    "attachments": [*(current.get("attachments") or []), *(a for p in more for a in p.get("attachments") or [])],
+                }
             finally:
                 with self._cond:
                     self._current = None
@@ -209,12 +220,12 @@ class MessageWorker:
             self._cond.notify_all()
 
 
-def _json_body(handler: BaseHTTPRequestHandler) -> dict | None:
+def _json_body(handler: BaseHTTPRequestHandler, limit: int = MAX_BODY_BYTES) -> dict | None:
     try:
         length = int(handler.headers.get("Content-Length") or "0")
     except ValueError:
         return None
-    if length > MAX_BODY_BYTES:
+    if length > limit:
         return None
     raw = handler.rfile.read(length) if length else b""
     try:
@@ -296,7 +307,7 @@ class _Handler(BaseHTTPRequestHandler):
         path, _ = self._query()
         # The body is read before anything is refused: answering and closing with it unread resets
         # the client's connection instead of letting it see the 401/404.
-        body = _json_body(self)
+        body = _json_body(self, MAX_MESSAGE_BODY_BYTES if path == "/v1/messages" else MAX_BODY_BYTES)
         if not self._authorized():
             self._send(401, {"error": "unauthorized"})
             return
@@ -306,15 +317,23 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/messages":
                 text = body.get("text")
-                if not isinstance(text, str) or not text.strip():
+                try:
+                    uploads = attachments.decode_uploads(body.get("attachments"))
+                except attachments.AttachmentError as exc:
+                    self._send(400, {"error": str(exc)})
+                    return
+                if not isinstance(text, str) or not (text.strip() or uploads):
                     self._send(400, {"error": "text is required"})
                     return
+                # Saved here, so the bytes do not wait in memory behind a slow reply.
+                saved = [self.api.service.attachments.save(u["name"], u["mime"], u["data"]) for u in uploads]
                 self.api.worker.submit(
                     {
-                        "text": text,
+                        "text": text.strip() or "（傳了附件）",
                         "audience": _opt_str(body.get("audience")),
                         "reply_to_ref": _opt_str(body.get("reply_to_ref")),
                         "reply_to_text": _opt_str(body.get("reply_to_text")),
+                        "attachments": saved,
                     }
                 )
                 self._send(202, {"accepted": True})
