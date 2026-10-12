@@ -394,6 +394,19 @@ the remote but was merged locally is not listed, and a squash- or rebase-merged 
 queried. **Not implemented:** continuing from the other task's branch (a new task still starts from the base branch), and a
 force-refusal rather than a tap.
 
+**Interrupted tasks are recovered at startup, and a restart script refuses to kill a running task (operator request 2026-10-12, after a
+force-restart left chat_be448f5b's Developer CLI running with no thread, a held slot and no word to the operator). `recover_interrupted_tasks`,
+run once by `serve` right after the "已啟動" message; ENFORCED, `tests/test_startup_recovery.py`.** A conversation still marked
+active/running (last 14 days) whose last activity predates this process and which no thread here runs was interrupted: the Harness stops the
+provider CLI left in its worktree (same narrowing as abandoning), marks it failed, frees its slot, and sends one message per project with each
+task's goal, last finished stage and what its worktree holds (commits not yet in the base branch, uncommitted edits, or nothing). It is written
+to the chat log too. A schedule's interrupted run is released quietly, because a stale schedule lock would skip that schedule for good. Slot
+locks taken before this process started with no thread behind them are released; locks taken after it started are never touched. **The task is
+not resumed** — what happens next is the operator's call. `scripts/restart-harness.sh <Label|all> [--force]` checks `workspace_locks` and skips
+a Harness with a task running unless forced. **Not implemented:** a drain mode that stops taking tasks and waits for the running ones to
+finish before exiting (a normal stop still waits only the 119-second grace period, then kills the CLI), automatic resume of an interrupted task,
+and recovery for a Harness that is never started again.
+
 **Files sent in chat (operator decision, 2026-10-12; ENFORCED, `tests/test_attachments.py`, the media tests in
 `tests/test_telegram_service.py`, `tests/test_api.py`, `tests/test_chat_command_media.py`).** The Telegram service relays photos,
 documents, voice, audio, video, video notes and animations (up to Telegram's 20 MB bot limit; a file it cannot fetch is

@@ -205,6 +205,10 @@ def serve(
         threading.Thread(target=warm_model_catalog, name="model-catalog-warmup", daemon=True).start()
 
     service.notify_operator(f"✅ Harness 已啟動（{scope.name}）。")
+    try:
+        service.recover_interrupted_tasks(scope, started_at)
+    except Exception:
+        logger.exception("recovering interrupted tasks failed; continuing")
     _startup_checks(parts)
 
     last_scan = 0.0
