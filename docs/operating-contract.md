@@ -373,6 +373,25 @@ clipped; a PDF is readable by Claude and Antigravity (they read the path themsel
 prompt says file contents are untrusted data. **Not enforced:** that the model reports only what it actually saw or heard.
 **Not implemented:** PDF text extraction for Codex, xlsx/pptx, files in the status page.
 
+**Installing what is missing, only with the user's consent (operator decision, 2026-10-12; ENFORCED, `tests/test_capabilities.py`
+and the install test in `tests/test_service.py`).** The chat model's `request_install` (tier `propose`) only records a request; the
+user sees a confirm card with the source, the exact procedure, the reason and an honest warning, and nothing is installed until they
+tap "確認安裝". **Every install needs its own tap — no "always allow", and a forged always-allow tap is just a confirm.** Kinds, each a
+fixed procedure and never a shell string the model wrote: `pip` / `npm` into `.harness/capabilities/{python,node}` (isolated; names
+that are paths, URLs or options are refused), `brew` (global — the card says so), `model_file` (https URL plus a required SHA-256; a
+mismatch is deleted), `script` (an https script, i.e. "curl | sh", downloaded, hashed and run with `sh`), `git` (a clone into
+`.harness/capabilities/src/<name>` plus an optional one-line install command) and `skill` (a SKILL.md saved to `.harness/skills/`
+and offered to the chat model only, never the Developer; the card shows its content). Arbitrary https URLs and git sources are
+allowed **because the user confirms each one**. **Never, whatever the consent:** `sudo` / `doas` — a script that mentions them is
+not run, a git install command is checked with the command policy (no sudo, deletion or system settings), and a shim named `sudo`
+that fails is first on the PATH of everything an install runs; uninstalling is deletion and stays the user's own. **Honest limit:**
+a downloaded script or a package's own install step can still do whatever the user's account can; the card says so, and the SHA-256
+of what ran, its source and the reason are recorded in `.harness/capabilities.json`. Installed things are put on the PATH of jobs
+and of the transcriber, which is not permission to run them: use still goes through the usual tiers. The Harness never starts a
+model download by itself (the whisper model for voice and video is the first thing it will ask for). **Prompt policy, not
+enforced:** that the model asks instead of telling the user to install things. **Not implemented:** updating or removing installs,
+and installs in a plan step.
+
 **One-off model for a task (operator decision, 2026-10-11).** The operator can name a model for a single task in
 chat ("請用 opus 5.5 設計這個頁面"); the chat model writes `model=<model>::` (or `model=<provider>/<model>::`, alongside
 `repo=`) in front of the `HARNESS_TASK_START::` goal. **ENFORCED** (`tests/test_model_override.py`): the prefix is routing,

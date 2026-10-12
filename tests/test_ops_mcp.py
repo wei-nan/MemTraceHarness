@@ -137,7 +137,7 @@ class ScopeAndSpecTests(unittest.TestCase):
         spec = ops_server_spec(ProjectScope.from_file(tmp / "harness-scope.md"), tmp / "t.db")
         self.assertIsNotNone(spec)
         ctx = self._ctx(working_directory=tmp)
-        self.assertEqual(ctx.tool_names(), {"propose_scope_change", "propose_model_change", "read_file", "list_dir", "query_db", "system_status", "browse"})
+        self.assertEqual(ctx.tool_names(), {"propose_scope_change", "propose_model_change", "request_install", "read_file", "list_dir", "query_db", "system_status", "browse"})
 
     def test_propose_github_action_records_a_request_and_refuses_other_repos(self) -> None:
         ctx = self._ctx(github_repos=["wei-nan/Beri"])

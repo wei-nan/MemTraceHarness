@@ -149,22 +149,30 @@ def _run(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
     )
 
 
-def default_transcribe_command() -> str | None:
-    """The whisper CLI, only when a model is already on disk: starting a model download is the operator's call."""
+def default_transcribe_command(model_dirs: list[Path] | None = None) -> str | None:
+    """The whisper CLI, only when a model is already on disk (in `model_dirs`, where an approved install put it, or in
+    whisper's own cache): the Harness never starts a model download by itself — it asks, and the user taps."""
     if shutil.which("whisper", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin") is None:
         return None
-    for model in ("small", "medium", "base", "large-v3", "turbo"):
-        if (Path.home() / ".cache" / "whisper" / f"{model}.pt").exists():
-            return f"whisper {{input}} --model {model} --language zh --output_format txt --output_dir {{outdir}} --fp16 False"
+    for directory in [*(model_dirs or []), Path.home() / ".cache" / "whisper"]:
+        for model in ("small", "medium", "base", "large-v3", "turbo"):
+            if (Path(directory) / f"{model}.pt").exists():
+                where = f" --model_dir {shlex.quote(str(directory))}"
+                return f"whisper {{input}} --model {model}{where} --language zh --output_format txt --output_dir {{outdir}} --fp16 False"
     return None
 
 
-def transcribe(path: Path, command: str | None) -> tuple[str, str]:
+def transcribe(path: Path, command: str | None, model_dirs: list[Path] | None = None) -> tuple[str, str]:
     """(transcript, note). `command` is a template with {input} and {outdir}; the transcript is read from the .txt it writes
     or from stdout."""
-    command = command or default_transcribe_command()
+    command = command or default_transcribe_command(model_dirs)
     if not command:
-        return "", "這台機器還沒有可用的語音轉文字工具（設定 HARNESS_TRANSCRIBE_COMMAND，或先下載 whisper 模型），所以聽不到內容"
+        return "", (
+            "這台機器還沒有可用的語音轉文字工具，所以聽不到內容。可以用 request_install 向使用者提出安裝 whisper 模型"
+            "（kind=model_file，例如 small：url https://openaipublic.azureedge.net/main/whisper/models/"
+            "9ecf779972d90ba49c06d968637d720dd632c55bbf19d441fb42bf17a411e794/small.pt、filename small.pt、"
+            "sha256 就是網址裡那串），使用者同意才會下載"
+        )
     with tempfile.TemporaryDirectory(prefix="harness-transcribe-") as outdir:
         argv = [part.format(input=str(path), outdir=outdir) for part in shlex.split(command)]
         try:
@@ -222,18 +230,18 @@ def _document_text(path: Path, kind: str) -> tuple[str, str]:
     return (text if len(text) <= TEXT_CHARS else text[:TEXT_CHARS] + "…（文件已截斷）"), ""
 
 
-def prepare(saved: dict, *, transcribe_command: str | None = None) -> Prepared:
+def prepare(saved: dict, *, transcribe_command: str | None = None, model_dirs: list[Path] | None = None) -> Prepared:
     path, kind = Path(saved["path"]), saved["kind"]
     item = Prepared(name=saved["name"], kind=kind, path=path)
     if kind == IMAGE:
         item.images = [path]
     elif kind == VIDEO:
         item.images = video_frames(path)
-        item.text, item.note = transcribe(path, transcribe_command)
+        item.text, item.note = transcribe(path, transcribe_command, model_dirs)
         if not item.images:
             item.note = (item.note + "；" if item.note else "") + "沒能從影片取出畫面"
     elif kind == AUDIO:
-        item.text, item.note = transcribe(path, transcribe_command)
+        item.text, item.note = transcribe(path, transcribe_command, model_dirs)
     elif kind in {TEXT, OFFICE}:
         item.text, item.note = _document_text(path, kind)
     elif kind == PDF:

@@ -915,6 +915,30 @@ class HarnessServiceTests(TestCase):
         self.assertIn(saved[0]["path"], prompt)  # the picture, by path (Claude reads it; Codex gets -i)
         self.assertIn(f"Read(/{gateway.attachments.inbox.resolve()}/**)", " ".join(cmd))
 
+    def test_an_install_request_shows_its_source_cannot_be_always_allowed_and_runs_only_after_the_tap(self) -> None:
+        from unittest.mock import patch
+
+        gateway, scope, store = self._job_gateway("echo x")
+        from memtrace_harness import capabilities as cap
+
+        payload = cap.validate_install({"kind": "brew", "name": "ffmpeg", "reason": "轉影片格式"})
+        store.create_install_request(
+            request_id="inst_1", project=scope.name, summary=cap.summarize(payload), payload=payload,
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        text, keyboard = gateway.send_message_with_keyboard.call_args.args[1], gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertIn("待確認安裝", text)
+        self.assertIn("安裝到系統", text)
+        self.assertEqual([b["label"] for row in keyboard for b in row], ["✅ 確認安裝", "❌ 取消"])  # no always-allow
+        self.assertFalse(gateway.allowlist.is_rule_allowed(scope.name, "install", payload))
+        with patch("memtrace_harness.capabilities.run_install", return_value=(True, "ok", {})) as run:
+            gateway._resolve_job_action("job_confirm_always", "inst_1", 12345, 77)  # even a forged "always" tap is just a confirm
+            self._join_job("inst_1")
+        run.assert_called_once()
+        self.assertEqual(store.get_job_request("inst_1")["status"], "done")
+        self.assertEqual(gateway.allowlist.entries(), [])
+
     def test_a_forbidden_command_never_runs_and_never_gets_an_always_allow_button(self) -> None:
         gateway, scope, store = self._job_gateway("sudo rm -rf /tmp/x")
         store.create_job_request(

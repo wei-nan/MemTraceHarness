@@ -3699,6 +3699,27 @@ class TraceStore:
             ).fetchone()
         return self._job_row_to_dict(row) if row else None
 
+    def create_install_request(
+        self, *, request_id: str, project: str, summary: str, payload: dict, expires_at: str
+    ) -> bool:
+        """An install the chat model proposed (capabilities.py), waiting for the human. The same pending proposal is
+        accepted without a second row."""
+        now = utc_now_iso()
+        key = f"install:{summary}"
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? AND kind = 'install' "
+                "AND status IN ('pending', 'awaiting')",
+                (project, key),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at, kind, payload_json) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'install', ?)",
+                (request_id, project, key, summary, expires_at, now, now, json.dumps(payload, ensure_ascii=False)),
+            ).rowcount > 0
+
     def create_tool_call_request(
         self, *, request_id: str, project: str, tool: str, arguments: dict, summary: str, expires_at: str
     ) -> bool:
