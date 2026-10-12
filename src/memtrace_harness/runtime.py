@@ -241,6 +241,7 @@ def serve(
             (service.drain_task_queues, "draining the task queue"),
             (service.process_order_intents, "processing proposed orders"),
             (service.process_job_requests, "processing job requests"),
+            (service.plan_runner.tick, "advancing plans"),
         ):
             try:
                 duty()

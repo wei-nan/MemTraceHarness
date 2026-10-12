@@ -3,6 +3,7 @@
 import json
 import urllib.error
 import urllib.request
+import tempfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -50,6 +51,11 @@ class FakeBot:
 
     def clear_keyboard(self, chat_id, message_id):
         self.cleared.append((chat_id, message_id))
+        return True
+
+    def edit_text(self, chat_id, message_id, text, keyboard=None):
+        self.edited = getattr(self, "edited", [])
+        self.edited.append((chat_id, message_id, text, keyboard))
         return True
 
     def answer_callback(self, callback_id, text=None):
@@ -114,6 +120,19 @@ def make_service(tmp: str, **overrides):
 
 def text_update(chat_id=ALLOWED, text="hello", update_id=1, **extra):
     return {"update_id": update_id, "message": {"chat": {"id": chat_id}, "text": text, **extra}}
+
+
+class EditDeliveryTests(TestCase):
+    def test_an_edit_event_changes_the_delivered_message_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service, bot, _client = make_service(tmp)
+            ok, refs = service.deliver({
+                "id": 1, "kind": "edit", "ref": f"tg:{ALLOWED}:42", "text": "3/5",
+                "actions": [[{"label": "取消", "id": "plan_cancel:p"}]],
+            })
+        self.assertEqual((ok, refs), (True, []))
+        self.assertEqual(bot.edited, [(ALLOWED, 42, "3/5", [[{"text": "取消", "callback_data": "plan_cancel:p"}]])])
+        self.assertEqual(bot.sent, [])  # nothing new was sent
 
 
 class SettingsTests(TestCase):

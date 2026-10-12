@@ -290,6 +290,75 @@ not enforced:** that the model checks `list_jobs` first and only proposes what t
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
+**Read freely, ask before changing, never for some things (operator decision, 2026-10-12; ENFORCED, `tests/test_ops_read.py`).**
+The chat model's ops server always has four read-only tools that need no confirm tap: `read_file`, `list_dir`,
+`query_db` and `system_status`. **Enforced:** a path must resolve (symlinks followed) inside the project's own folder or a
+root the operator declared in the scope file (`- read_roots: ...`) — reading another Harness's workspace, its `.harness`
+database or `~/.config/memtraceharness` is therefore something the reading Harness must declare, never implied; files that
+hold credentials (`.harness.env`, `*.env`, `web.toml`, keys, `.ssh`...) are refused by name even inside a declared root, and
+every returned text has tokens masked; `query_db` opens the file `mode=ro` with `query_only` and a SQLite authorizer that
+allows only SELECT (a write, `ATTACH`, `PRAGMA` or a second statement fails), at most 200 rows, 5 seconds;
+`system_status` is a fixed set of argv lists with no shell (`launchctl list/print`, `ps`, `git status/log/diff --stat/branch`).
+Changing anything still goes through a request and a confirm tap. **Never run for a model, whatever the allowlist says**
+(`command_policy.py`): `sudo`, deleting files or data (`rm`, `find -delete`, `git clean`, `git reset --hard`, forced push...),
+and changing system or security settings (`defaults write`, `launchctl bootout/load...`, `networksetup`, `pmset`...). Such a
+command cannot be declared as a job, a declared one is refused at run time, and the chat model is told to hand the user the
+command to run in their own terminal; the check is fail-closed text matching, not a sandbox, so it can also refuse a harmless
+look-alike. **Allowed list:** the confirm card of a job has a second button, "確認並之後都允許"; the Harness then records the
+job name plus the SHA-256 of its exact command in `.harness/allowed.json` (written only by the Harness, mode 0600; the chat
+model has no tool for it and `.harness` is off-limits to the Developer). A request for that same job with that same command
+runs without a tap and says so in the chat; one changed character means it asks again; a forbidden command never matches.
+`memtrace-harness allowed list|revoke <job>` shows and removes entries. **Prompt policy, not enforced:** that the model reads
+and judges the result before answering instead of handing raw output over. **Not implemented:** a job's result is still sent to the chat as-is rather than being assessed by a model.
+**The allowed list also holds the other requests the chat model makes** (operator decision, 2026-10-12; ENFORCED): a GitHub
+action, a scope change and a model change each carry the same second button. What an entry is bound to: a GitHub action → its
+*type* in one repo (`issue_comment` on `owner/repo`; the text and number differ each time, so an exact match would never
+repeat, and `issue_close` is a separate entry); a scope change → the exact change, never a job command the command policy
+forbids; a model change → the exact target, provider and model. Each auto-run says so in the chat; `memtrace-harness allowed
+revoke <job or label>` removes one.
+
+**Tools declare a tier; new tools follow the same flow (operator decision, 2026-10-12; ENFORCED, `tests/test_tool_registry.py`).**
+Every tool the chat model can call is a `ToolSpec` in `tool_registry.py` with a tier: `read` (runs at once), `propose` (only
+records a request that has its own confirm card) or `change` (the call becomes a `tool_call` request; the handler runs only
+after a tap or an allowed-list match). **`change` is the default tier**, an unknown tier is refused at registration, and a tool
+that is not registered cannot be called. A `change` tool gets the confirm card, expiry, double-tap guard, "確認並之後都允許"
+(bound to the exact tool and arguments unless the tool declares a narrower `rule`) and the result message without any new
+code in `service.py`; a request kind the Harness has no handler for is refused rather than run. The command policy (sudo,
+deletion, system or security settings) sits outside the tiers and applies to every tool that runs a command. **`browse`**
+(`browser.py`, tier `read`): a fresh headless Chrome with a throw-away profile (no logins), JavaScript run, text and links
+returned; http/https only; loopback, private and link-local hosts refused unless listed in `probe_hosts`; the result is
+framed as untrusted data and tokens are masked. **Known gap:** a public page redirecting to an internal address is not caught.
+**Not implemented:** browser clicking, typing and submitting (they would be `change` tools); entering passwords, payment details
+or CAPTCHAs stays the user's own. **Prompt policy, not enforced:** that the model ignores instructions found inside a page —
+the enforced part is that nothing a page says can start a `change` action without a tap or an allowed rule.
+
+**Multi-step plans (operator decision, 2026-10-12; ENFORCED, `tests/test_plans.py` and the plan tests in `tests/test_service.py`).**
+When a request needs more than one action, the chat model ends its reply with `HARNESS_PLAN::<one-line JSON>` (goal, up to 10
+steps, each a title, a tool, its arguments and an expectation). The Harness runs the steps in order from its tick
+(`plan_runner.py`), keeps one progress message and edits it in place (new `edit` outbox kind; the Telegram service
+implements it), checks every step's result against its expectation, and ends with a verdict (達成 / 部分達成 / 未達成).
+**Enforced:** one unfinished plan per project; a step is a registered `read` or `change` tool or a declared job (`run_job`),
+never a `propose_*` tool and never a code change — **changing code always goes through the Agent Loop**
+(`HARNESS_TASK_START::`), never through a plan; a step keeps its tier's rules, so a job or `change` step waits for the user's tap
+or an allowed-list match, and a command the command policy forbids is refused at creation and at run time; the plan-wide
+"核准這個計畫的所有步驟" button only answers the confirm cards of steps created from the plan itself (the step list cannot change
+after creation); expectations are checked by rule first (`ok`, `contains`, `not_contains`, `regex`) and only `model`
+expectations use one fresh tool-less model call, and a result that call cannot judge clearly counts as not met; a failed or
+unmet step stops the plan and asks (重試 / 略過 / 取消 — at most 3 attempts per step), it is never retried or worked around on
+its own; a plan older than 24 hours is cancelled; state is persisted, so after a restart a read step that was running is run
+again, a step waiting on a confirm card keeps waiting and a result waiting to be judged is judged. **Prompt policy, not
+enforced:** when the model chooses a plan over a single action, and that it adds a status-check step after each action.
+**Not implemented:** the model revising the remaining steps mid-plan (the user decides after a failure instead), code-change
+steps, several plans at once, and plans for chats other than the operator's.
+
+**Cancelling what the Harness is doing (operator decision, 2026-10-12; ENFORCED, `tests/test_service.py`, `tests/test_message_worker.py`).**
+`/cancel` (or `/stop`) is deterministic, never goes through a model, and works while a chat reply is being made. It cancels:
+the chat reply being made (killed and not redone — unlike a follow-up message, which merges), the project's unfinished plan, every
+request still waiting for a tap (their buttons are removed) and the tasks waiting in the queue. **It does not stop what is already
+running:** a task, job or sub-agent that has started finishes by itself and is reported as usual; the reply lists which are still
+running. A job or step that finishes after its plan was cancelled does not revive the plan. The plan's own "🛑 取消計畫" button
+cancels only that plan and its waiting requests. **Not implemented:** killing a running task or job.
+
 **One-off model for a task (operator decision, 2026-10-11).** The operator can name a model for a single task in
 chat ("請用 opus 5.5 設計這個頁面"); the chat model writes `model=<model>::` (or `model=<provider>/<model>::`, alongside
 `repo=`) in front of the `HARNESS_TASK_START::` goal. **ENFORCED** (`tests/test_model_override.py`): the prefix is routing,

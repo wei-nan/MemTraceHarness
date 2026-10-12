@@ -13,6 +13,10 @@ Boundaries enforced here, from what the operator declared in the project's scope
   request and the human gets a confirm button in the chat; the Harness runs the command only after
   that tap. ``list_jobs`` shows what exists.
 
+- ``read_file`` / ``list_dir`` / ``query_db`` / ``system_status``: read-only, no confirm tap (ops_read.py): roots are the
+  project plus its scope file's ``read_roots``, credential files are never readable, output is redacted, SQLite is
+  opened read-only with a SELECT-only authorizer.
+
 - ``propose_scope_change``: asks to add a probe host, a log file or a job to the scope file. It changes
   nothing: it records a request, and the Harness edits the scope file only after the human taps confirm
   in the chat. Always available, so a project that declares nothing yet can still be given tools.
@@ -39,6 +43,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from memtrace_harness import ops_read, tool_registry
+from memtrace_harness.command_policy import REFUSAL_HINT, forbidden_reason
 from memtrace_harness.github_actions import ACTIONS, github_issue_repos, summarize, validate_action
 from memtrace_harness.model_changes import TARGETS as MODEL_TARGETS, summarize as summarize_model_change, validate_model_change
 from memtrace_harness.scope import SCOPE_CHANGE_KINDS, describe_scope_change, validate_scope_change
@@ -52,8 +58,7 @@ LOG_MAX_LINES = 300
 JOB_REQUEST_TTL_SECONDS = 600
 
 
-class OpsError(RuntimeError):
-    pass
+OpsError = tool_registry.OpsError
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -88,6 +93,67 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "type": "object",
             "properties": {"name": _string_param("log file name"), "lines": _string_param("default 80, max 300")},
             "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "Read a text file (a log, a config, source) without asking the user: the last lines by default "
+            "(from=head for the first lines). Paths must be inside this project or a root its scope file declares "
+            "in read_roots; files that hold credentials (.harness.env, *.env, web.toml, keys) are never readable "
+            "and tokens in the text are masked. Use list_dir to find files."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": _string_param("absolute, ~/..., or relative to the project"),
+                "lines": _string_param("default 120, max 600"),
+                "from": _string_param("tail (default) or head"),
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_dir",
+        "description": "List a directory (type, size, modified time, name) inside this project or a declared read root.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": _string_param("absolute, ~/..., or relative to the project")},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "query_db",
+        "description": (
+            "Run one read-only SELECT against a SQLite database (for example a Harness's .harness/harness.sqlite3: "
+            "turns, runs, job_requests, outbox, schedules, primary_sessions_hot_log...). Empty sql lists the tables "
+            "and columns. Nothing can be written. At most 200 rows, long cells are cut, tokens are masked; use LIMIT/WHERE."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"db": _string_param("path to the .sqlite3 file"), "sql": _string_param("a single SELECT; empty = list tables")},
+            "required": ["db"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "system_status",
+        "description": (
+            "Read-only system state, no shell: kind=launchd_list (argument = optional filter, shows pid/exit code per "
+            "service), launchd_print (argument = a launchd label), processes (argument = optional filter), or git "
+            "(argument = status | log | diff_stat | branches; root = a repository inside the readable roots)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": _string_param("launchd_list | launchd_print | processes | git"),
+                "argument": _string_param("filter, label, or git subcommand"),
+                "root": _string_param("repository path (git only)"),
+            },
+            "required": ["kind"],
             "additionalProperties": False,
         },
     },
@@ -197,9 +263,16 @@ class OpsContext:
         jobs: dict[str, str],
         store: Any | None = None,
         github_repos: list[str] | None = None,
+        read_roots: list[str] | None = None,
     ) -> None:
         self.project = project
         self.working_directory = working_directory.resolve()
+        # What the read-only tools may look at: this project, plus whatever the scope file declares.
+        self.read_roots = [self.working_directory]
+        for root in read_roots or []:
+            resolved = Path(os.path.expanduser(root)).resolve()
+            if resolved not in self.read_roots:
+                self.read_roots.append(resolved)
         self.hosts = {h.lower() for h in hosts}
         self.logs = {Path(p).name: p for p in logs}
         self.jobs = jobs
@@ -207,16 +280,9 @@ class OpsContext:
         self.github_repos = list(github_repos or [])
 
     def tool_names(self) -> set[str]:
-        names = {"propose_scope_change", "propose_model_change"} if self.store is not None else set()
-        if self.store is not None and self.github_repos:
-            names.add("propose_github_action")
-        if self.hosts:
-            names.add("http_probe")
-        if self.logs:
-            names |= {"read_log", "list_logs"}
-        if self.jobs:
-            names |= {"list_jobs", "run_job"}
-        return names
+        return {
+            spec.name for spec in tool_registry.all_specs() if spec.available is None or spec.available(self)
+        }
 
 
 def http_probe(
@@ -286,6 +352,9 @@ def request_job(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     name = str(arguments.get("name", ""))
     if name not in ctx.jobs:
         raise OpsError(f"unknown job {name!r} (allowed: {', '.join(sorted(ctx.jobs)) or 'none'})")
+    reason = forbidden_reason(ctx.jobs[name])
+    if reason:
+        raise OpsError(f"job {name} is never run for a model ({reason}). {REFUSAL_HINT} Give the user the command to run themselves.")
     if ctx.store is None:
         raise OpsError("job requests are not available here")
     expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
@@ -369,24 +438,87 @@ def propose_model_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
+def _read_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
+    try:
+        if name == "read_file":
+            return ops_read.read_file(ops_read.resolve_readable(arguments.get("path"), ctx.working_directory, ctx.read_roots), arguments)
+        if name == "list_dir":
+            return ops_read.list_dir(ops_read.resolve_readable(arguments.get("path"), ctx.working_directory, ctx.read_roots))
+        if name == "query_db":
+            return ops_read.query_db(ops_read.resolve_readable(arguments.get("db"), ctx.working_directory, ctx.read_roots), arguments.get("sql"))
+        root = None
+        if str(arguments.get("kind")) == "git":
+            root = ops_read.resolve_readable(arguments.get("root") or ".", ctx.working_directory, ctx.read_roots)
+        return ops_read.system_status(arguments.get("kind"), arguments.get("argument"), root)
+    except ops_read.ReadError as exc:
+        raise OpsError(str(exc)) from exc
+
+
+def _request_tool_call(ctx: OpsContext, spec: tool_registry.ToolSpec, arguments: dict[str, Any]) -> str:
+    """A `change`-tier tool: record the request; the handler runs only after the user's tap (service.py)."""
+    if ctx.store is None:
+        raise OpsError(f"{spec.name} needs the user's confirmation, which is not available here")
+    try:
+        args = spec.validate(ctx, arguments) if spec.validate else dict(arguments)
+    except ValueError as exc:
+        raise OpsError(str(exc)) from exc
+    summary = spec.summarize(args) if spec.summarize else f"{spec.name} {json.dumps(args, ensure_ascii=False, sort_keys=True)}"
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+    if not ctx.store.create_tool_call_request(
+        request_id=f"tool_{uuid.uuid4().hex[:10]}", project=ctx.project, tool=spec.name, arguments=args,
+        summary=summary, expires_at=expires,
+    ):
+        raise OpsError("could not record the request")
+    return (
+        f"Requested: {summary}. It changes something, so the user now has a confirm button in the chat "
+        "(valid 10 minutes); it runs only after they tap it and the result is reported to them. Say that a "
+        "confirmation is waiting; do not say it has been done."
+    )
+
+
 def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
-    if name not in ctx.tool_names():
+    spec = tool_registry.get(name)
+    if spec is None or name not in ctx.tool_names():
         raise OpsError(f"unknown tool: {name}")
-    if name == "http_probe":
-        return http_probe(ctx, arguments)
-    if name == "read_log":
-        return read_log(ctx, arguments)
-    if name == "list_logs":
-        return "\n".join(f"{n}: {p}" for n, p in sorted(ctx.logs.items()))
-    if name == "list_jobs":
-        return "\n".join(f"{n}: {c}" for n, c in sorted(ctx.jobs.items()))
-    if name == "propose_scope_change":
-        return propose_scope_change(ctx, arguments)
-    if name == "propose_github_action":
-        return propose_github_action(ctx, arguments)
-    if name == "propose_model_change":
-        return propose_model_change(ctx, arguments)
-    return request_job(ctx, arguments)
+    if spec.tier == tool_registry.CHANGE:
+        return _request_tool_call(ctx, spec, arguments)
+    return spec.handler(ctx, arguments)
+
+
+def run_confirmed_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
+    """Run a `change`-tier tool after the user's tap (or an allowed-list match). Only service.py calls this."""
+    spec = tool_registry.get(name)
+    if spec is None or spec.tier != tool_registry.CHANGE:
+        raise OpsError(f"{name} is not a tool that can be confirmed")
+    try:
+        args = spec.validate(ctx, arguments) if spec.validate else dict(arguments)
+    except ValueError as exc:
+        raise OpsError(str(exc)) from exc
+    return spec.handler(ctx, args)
+
+
+def _register_builtin_tools() -> None:
+    schemas = {t["name"]: t for t in TOOLS}
+    R, P = tool_registry.READ, tool_registry.PROPOSE
+    for name, tier, handler, available in (
+        ("http_probe", R, http_probe, lambda c: bool(c.hosts)),
+        ("read_log", R, read_log, lambda c: bool(c.logs)),
+        ("list_logs", R, lambda c, a: "\n".join(f"{n}: {p}" for n, p in sorted(c.logs.items())), lambda c: bool(c.logs)),
+        ("list_jobs", R, lambda c, a: "\n".join(f"{n}: {cmd}" for n, cmd in sorted(c.jobs.items())), lambda c: bool(c.jobs)),
+        ("read_file", R, lambda c, a: _read_tool(c, "read_file", a), None),
+        ("list_dir", R, lambda c, a: _read_tool(c, "list_dir", a), None),
+        ("query_db", R, lambda c, a: _read_tool(c, "query_db", a), None),
+        ("system_status", R, lambda c, a: _read_tool(c, "system_status", a), None),
+        ("run_job", P, request_job, lambda c: bool(c.jobs)),
+        ("propose_scope_change", P, propose_scope_change, lambda c: c.store is not None),
+        ("propose_model_change", P, propose_model_change, lambda c: c.store is not None),
+        ("propose_github_action", P, propose_github_action, lambda c: c.store is not None and bool(c.github_repos)),
+    ):
+        tool_registry.register(tool_registry.ToolSpec(name=name, schema=schemas[name], handler=handler, tier=tier, available=available))
+
+
+_register_builtin_tools()
+from memtrace_harness import browser  # noqa: E402,F401  (registers `browse`)
 
 
 def handle_message(message: dict[str, Any], ctx: OpsContext) -> dict[str, Any] | None:
@@ -409,7 +541,8 @@ def handle_message(message: dict[str, Any], ctx: OpsContext) -> dict[str, Any] |
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        return ok({"tools": [t for t in TOOLS if t["name"] in ctx.tool_names()]})
+        names = ctx.tool_names()
+        return ok({"tools": [spec.schema for spec in tool_registry.all_specs() if spec.name in names]})
     if method == "tools/call":
         params = message.get("params") or {}
         try:
@@ -437,6 +570,7 @@ def context_from_env(env: Any) -> OpsContext | None:
         jobs=json.loads(env.get("HARNESS_OPS_JOBS") or "{}"),
         store=store,
         github_repos=json.loads(env.get("HARNESS_OPS_GITHUB_REPOS") or "[]"),
+        read_roots=json.loads(env.get("HARNESS_OPS_READ_ROOTS") or "[]"),
     )
 
 
@@ -461,11 +595,9 @@ def serve(stdin=None, stdout=None) -> None:
 
 
 def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str | None = None) -> dict[str, Any] | None:
-    """Launch spec for this server for one project. With a store, even a project that declares nothing
-    gets propose_scope_change, the way to get its first capability."""
+    """Launch spec for this server for one project. The read-only tools are always there; with a store a project that
+    declares nothing also gets propose_scope_change, the way to get its first capability."""
     hosts, logs, jobs = scope.probe_hosts or [], scope.log_files or [], scope.jobs or {}
-    if not (hosts or logs or jobs or trace_db_path):
-        return None  # nothing declared and no store to record a proposal in: no tools at all
     env = {
         "HARNESS_OPS_PROJECT": scope.name,
         "HARNESS_OPS_CWD": str(scope.working_directory),
@@ -473,11 +605,22 @@ def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str
         "HARNESS_OPS_LOGS": json.dumps(logs),
         "HARNESS_OPS_JOBS": json.dumps(jobs),
         "HARNESS_OPS_GITHUB_REPOS": json.dumps(github_issue_repos(scope)),
+        "HARNESS_OPS_READ_ROOTS": json.dumps(getattr(scope, "read_roots", None) or []),
     }
     if trace_db_path:
         env["HARNESS_TRACE_DB"] = str(Path(trace_db_path).resolve())
     return {"command": python or sys.executable, "args": ["-m", "memtrace_harness.ops_mcp"], "env": env}
 
 
+def ops_context_for_scope(scope: Any, store: Any | None) -> OpsContext:
+    """The context a confirmed `change`-tier tool runs in, built from the project's scope the way the chat model's own is."""
+    return OpsContext(
+        project=scope.name, working_directory=scope.working_directory, hosts=scope.probe_hosts or [],
+        logs=scope.log_files or [], jobs=scope.jobs or {}, store=store, github_repos=github_issue_repos(scope),
+        read_roots=getattr(scope, "read_roots", None) or [],
+    )
+
+
 if __name__ == "__main__":
     serve()
+

@@ -145,6 +145,13 @@ class BotApi:
             logger.error(f"Telegram sendPhoto failed: {exc}")
             return None
 
+    def edit_text(self, chat_id: int, message_id: int, text: str, keyboard: list[list[dict[str, str]]] | None = None) -> bool:
+        """Replace a delivered message's text (and buttons) in place; only the first chunk of a long text is kept."""
+        chunks = _split_telegram_text(text) or [text]
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id, "text": chunks[0]}
+        payload["reply_markup"] = {"inline_keyboard": keyboard or []}
+        return self._call("editMessageText", payload) is not None
+
     def clear_keyboard(self, chat_id: int, message_id: int) -> bool:
         return (
             self._call(

@@ -113,3 +113,13 @@ class MessageWorkerTests(TestCase):
         service.release.set()
         self.assertTrue(self._wait(lambda: len(service.finished) == 2))
         self.assertEqual(service.calls[-1][0], "late")
+
+    def test_cancel_drops_the_reply_being_made_instead_of_redoing_it_and_is_then_handled(self) -> None:
+        worker, service = self._worker()
+        worker.submit({"text": "幫我做個很久的事", "audience": "tg:1"})
+        self.assertTrue(service.started.wait(2))
+        worker.submit({"text": "/cancel", "audience": "tg:1"})
+        self.assertTrue(self._wait(lambda: [c[0] for c in service.calls] == ["幫我做個很久的事", "/cancel"]))
+        service.release.set()
+        self.assertTrue(self._wait(lambda: service.finished == ["|/cancel"]))
+        self.assertEqual([c[0] for c in service.calls], ["幫我做個很久的事", "/cancel"])  # the first was never answered

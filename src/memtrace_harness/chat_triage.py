@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 @dataclass
 class TriageResult:
     kind: str  # "approval_response", "chat", "status", "out_of_scope", "unrecognized",
-    # "schedule_list", "schedule_cancel", "garden", "promote", "review"
+    # "schedule_list", "schedule_cancel", "garden", "promote", "review", "cancel"
     project_scope: ProjectScope | None
     approval_id: str | None = None
     approval_action: str | None = None  # "approve", "reject", "clarify"
@@ -51,6 +51,14 @@ class ChatTriage:
                 approval_action=cmd,
                 approval_reason=reason,
             )
+
+        # /cancel (or /stop): stop what the Harness is doing for the operator right now. Deterministic — it must work
+        # even when the model is the thing that is stuck.
+        if cleaned.lower().split("@")[0] in {"/cancel", "/stop"}:
+            matched = self._find_project(default_project)
+            if not matched and len(self.projects) == 1:
+                matched = self.projects[0]
+            return TriageResult(kind="cancel", project_scope=matched)
 
         # /schedules and /schedule_cancel are deterministic, structured operations
         # (list/cancel a row) — unlike starting a schedule, which needs the model to

@@ -969,6 +969,35 @@ class TraceStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS plans (
+                    plan_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    approve_all INTEGER NOT NULL DEFAULT 0,
+                    audience TEXT,
+                    message_ref TEXT,
+                    message_sent INTEGER NOT NULL DEFAULT 0,
+                    rendered_hash TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS plan_steps (
+                    plan_id TEXT NOT NULL,
+                    idx INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    args_json TEXT NOT NULL,
+                    expect_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_id TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result_text TEXT,
+                    note TEXT,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    PRIMARY KEY (plan_id, idx)
+                );
                 CREATE INDEX IF NOT EXISTS idx_workspace_locks_ws
                     ON workspace_locks(workspace_id);
                 CREATE INDEX IF NOT EXISTS idx_task_queue_ws
@@ -3529,6 +3558,167 @@ class TraceStore:
                 "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'external_action', ?)",
                 (request_id, project, key, summary, expires_at, now, now,
                  json.dumps(payload, ensure_ascii=False)),
+            ).rowcount > 0
+
+    # ---- multi-step plans (plans.py / plan_runner.py)
+    _PLAN_COLUMNS = (
+        "plan_id, project, goal, status, approve_all, audience, message_ref, message_sent, rendered_hash, created_at, updated_at"
+    )
+    _STEP_COLUMNS = (
+        "plan_id, idx, title, tool, args_json, expect_json, status, request_id, attempts, result_text, note, "
+        "started_at, finished_at"
+    )
+
+    @staticmethod
+    def _plan_dict(row: tuple) -> dict:
+        keys = ("plan_id", "project", "goal", "status", "approve_all", "audience", "message_ref", "message_sent",
+                "rendered_hash", "created_at", "updated_at")
+        out = dict(zip(keys, row))
+        out["approve_all"], out["message_sent"] = bool(out["approve_all"]), bool(out["message_sent"])
+        return out
+
+    @staticmethod
+    def _step_dict(row: tuple) -> dict:
+        keys = ("plan_id", "idx", "title", "tool", "args", "expect", "status", "request_id", "attempts", "result_text",
+                "note", "started_at", "finished_at")
+        out = dict(zip(keys, row))
+        out["args"], out["expect"] = json.loads(out["args"]), json.loads(out["expect"])
+        return out
+
+    def create_plan(self, *, plan_id: str, project: str, goal: str, steps: list[dict], audience: str | None) -> bool:
+        """False when the project already has a plan that is not finished (one at a time)."""
+        now = utc_now_iso()
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM plans WHERE project = ? AND status IN ('running', 'needs_attention')", (project,)
+            ).fetchone():
+                return False
+            conn.execute(
+                "INSERT INTO plans (plan_id, project, goal, status, audience, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+                (plan_id, project, goal, audience, now, now),
+            )
+            for index, step in enumerate(steps, 1):
+                conn.execute(
+                    "INSERT INTO plan_steps (plan_id, idx, title, tool, args_json, expect_json, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                    (plan_id, index, step["title"], step["tool"],
+                     json.dumps(step["args"], ensure_ascii=False), json.dumps(step["expect"], ensure_ascii=False)),
+                )
+        return True
+
+    def get_plan(self, plan_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(f"SELECT {self._PLAN_COLUMNS} FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        return self._plan_dict(row) if row else None
+
+    def list_active_plans(self) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._PLAN_COLUMNS} FROM plans WHERE status IN ('running', 'needs_attention') ORDER BY created_at"
+            ).fetchall()
+        return [self._plan_dict(r) for r in rows]
+
+    def list_plans_to_show(self) -> list[dict]:
+        """Plans whose current view may not have reached the chat yet (running, or just finished)."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._PLAN_COLUMNS} FROM plans WHERE status IN ('running', 'needs_attention') "
+                "OR (updated_at > ? AND status IN ('done', 'cancelled')) ORDER BY created_at",
+                ((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),),
+            ).fetchall()
+        return [self._plan_dict(r) for r in rows]
+
+    def list_plan_steps(self, plan_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._STEP_COLUMNS} FROM plan_steps WHERE plan_id = ? ORDER BY idx", (plan_id,)
+            ).fetchall()
+        return [self._step_dict(r) for r in rows]
+
+    def update_plan(self, plan_id: str, **fields: object) -> None:
+        allowed = {"status", "approve_all", "message_ref", "message_sent", "rendered_hash", "audience"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"cannot update plan fields {sorted(bad)}")
+        assignments = ", ".join(f"{k} = ?" for k in fields) + (", " if fields else "") + "updated_at = ?"
+        with self._connection() as conn:
+            conn.execute(
+                f"UPDATE plans SET {assignments} WHERE plan_id = ?",
+                (*[int(v) if isinstance(v, bool) else v for v in fields.values()], utc_now_iso(), plan_id),
+            )
+
+    def transition_plan_step(self, plan_id: str, idx: int, from_statuses: tuple[str, ...], to_status: str, **fields: object) -> bool:
+        """Compare-and-set a step's status (so two ticks cannot start the same step), setting any other columns."""
+        allowed = {"request_id", "attempts", "result_text", "note", "started_at", "finished_at"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"cannot update plan step fields {sorted(bad)}")
+        marks = ",".join("?" for _ in from_statuses)
+        assignments = "status = ?" + "".join(f", {k} = ?" for k in fields)
+        with self._connection() as conn:
+            return conn.execute(
+                f"UPDATE plan_steps SET {assignments} WHERE plan_id = ? AND idx = ? AND status IN ({marks})",
+                (to_status, *fields.values(), plan_id, idx, *from_statuses),
+            ).rowcount > 0
+
+    def plan_for_request(self, request_id: str) -> dict | None:
+        """The plan whose step created this job request, if any."""
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {', '.join('p.' + c.strip() for c in self._PLAN_COLUMNS.split(','))} FROM plans p "
+                "JOIN plan_steps s ON s.plan_id = p.plan_id WHERE s.request_id = ?",
+                (request_id,),
+            ).fetchone()
+        return self._plan_dict(row) if row else None
+
+    def cancel_open_job_requests(self, project: str) -> list[dict]:
+        """Every request of the project still waiting for the user (pending or shown), cancelled; the rows, so the
+        caller can remove their buttons. A request that is already running is not touched."""
+        with self._connection() as conn:
+            ids = [
+                r[0] for r in conn.execute(
+                    "SELECT request_id FROM job_requests WHERE project = ? AND status IN ('pending', 'awaiting')",
+                    (project,),
+                )
+            ]
+        rows = []
+        for request_id in ids:
+            row = self.get_job_request(request_id)
+            if row and self.transition_job_request(request_id, ("pending", "awaiting"), "cancelled"):
+                self.finish_job_request(request_id, "cancelled")
+                rows.append(row)
+        return rows
+
+    def find_active_job_request(self, project: str, job_name: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._JOB_COLUMNS} FROM job_requests WHERE project = ? AND job_name = ? "
+                "AND status IN ('pending', 'awaiting', 'running') ORDER BY created_at DESC LIMIT 1",
+                (project, job_name),
+            ).fetchone()
+        return self._job_row_to_dict(row) if row else None
+
+    def create_tool_call_request(
+        self, *, request_id: str, project: str, tool: str, arguments: dict, summary: str, expires_at: str
+    ) -> bool:
+        """A `change`-tier tool call the chat model made (tool_registry.py), waiting for the human. The same pending
+        call (same tool and arguments) is accepted without a second row."""
+        now = utc_now_iso()
+        key = f"tool:{tool}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
+        with self._connection() as conn:
+            if conn.execute(
+                "SELECT 1 FROM job_requests WHERE project = ? AND job_name = ? AND kind = 'tool_call' "
+                "AND status IN ('pending', 'awaiting')",
+                (project, key),
+            ).fetchone():
+                return True
+            return conn.execute(
+                "INSERT OR IGNORE INTO job_requests (request_id, project, job_name, command, status, "
+                "expires_at, created_at, updated_at, kind, payload_json) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, 'tool_call', ?)",
+                (request_id, project, key, summary, expires_at, now, now,
+                 json.dumps({"tool": tool, "arguments": arguments}, ensure_ascii=False)),
             ).rowcount > 0
 
     def create_model_change_request(

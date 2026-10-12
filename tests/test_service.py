@@ -11,6 +11,7 @@ from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.primary_session import PrimarySessionManager
+from memtrace_harness.plans import verdict as plans_verdict
 from memtrace_harness.scope import ProjectScope
 from memtrace_harness.service import HarnessService
 from memtrace_harness.trace_store import TraceStore
@@ -371,7 +372,7 @@ class HarnessServiceTests(TestCase):
         names = {c["command"] for c in gateway.commands()}
         self.assertEqual(
             names,
-            {"status", "approve", "reject", "clarify", "schedules", "garden", "promote", "review", "reorganize", "rebuild", "schedule_cancel"},
+            {"status", "approve", "reject", "clarify", "cancel", "schedules", "garden", "promote", "review", "reorganize", "rebuild", "schedule_cancel"},
         )
         self.assertTrue(all(c["description"] for c in gateway.commands()))
 
@@ -594,6 +595,324 @@ class HarnessServiceTests(TestCase):
         self.assertIn("ran-it", store.get_job_request("job_1")["result"]["output_tail"])
         # A second tap cannot run it again.
         self.assertIn("沒有再執行", gateway._resolve_job_action("job_confirm", "job_1", 12345, 77))
+
+    def _job_gateway(self, command: str):
+        from unittest.mock import MagicMock
+
+        gateway, _mgr, store = self._gateway_for_report_outcome_tests()
+        scope = gateway.projects[0]
+        scope.jobs = {"hello": command}
+        gateway.config = type("C", (), {"trace_db_path": Path(tempfile.mkdtemp()) / "h.sqlite3"})()
+        gateway.send_message = MagicMock()
+        gateway.send_message_with_keyboard = MagicMock(return_value=77)
+        gateway.clear_message_keyboard = MagicMock()
+        return gateway, scope, store
+
+    def _join_job(self, request_id: str) -> None:
+        for thread in [t for t in threading.enumerate() if t.name == f"job-{request_id}"]:
+            thread.join(10)
+
+    def test_always_allow_runs_the_same_command_without_asking_but_not_a_changed_one(self) -> None:
+        gateway, scope, store = self._job_gateway("echo ran-it")
+        store.create_job_request(
+            request_id="job_1", project=scope.name, job_name="hello", command="echo ran-it",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        labels = [b["label"] for row in gateway.send_message_with_keyboard.call_args.args[2] for b in row]
+        self.assertTrue(any("之後都允許" in label for label in labels))
+        gateway._resolve_job_action("job_confirm_always", "job_1", 12345, 77)
+        self._join_job("job_1")
+        self.assertTrue(gateway.allowlist.is_allowed(scope.name, "hello", "echo ran-it"))
+
+        gateway.send_message_with_keyboard.reset_mock()
+        store.create_job_request(
+            request_id="job_2", project=scope.name, job_name="hello", command="echo ran-it",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self._join_job("job_2")
+        gateway.send_message_with_keyboard.assert_not_called()  # no tap needed
+        self.assertEqual(store.get_job_request("job_2")["status"], "done")
+
+        scope.jobs = {"hello": "echo something-else"}  # the command changed: ask again
+        store.create_job_request(
+            request_id="job_3", project=scope.name, job_name="hello", command="echo something-else",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
+        self.assertEqual(store.get_job_request("job_3")["status"], "awaiting")
+
+    def test_github_scope_and_model_requests_can_be_always_allowed_too(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, scope, store = self._job_gateway("echo x")
+        gateway._resolve_job_action = MagicMock(return_value="ok")
+        payload = {"action": "issue_comment", "repo": "o/r", "number": 3, "comment": "hi"}
+        store.create_external_action_request(
+            request_id="act_1", project=scope.name, key="k1", summary="comment", payload=payload,
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        keyboard = gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertTrue(any("同一 repo 的同類操作" in b["label"] for row in keyboard for b in row))
+        gateway._resolve_job_action.assert_not_called()  # first time: asks
+
+        gateway.allowlist.add_rule(scope.name, "external_action", payload)
+        gateway.send_message_with_keyboard.reset_mock()
+        store.create_external_action_request(
+            request_id="act_2", project=scope.name, key="k2", summary="comment",
+            payload={**payload, "number": 8, "comment": "another"}, expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        gateway.send_message_with_keyboard.assert_not_called()
+        gateway._resolve_job_action.assert_called_once_with("job_confirm", "act_2", None, None)
+
+    def test_a_change_tool_call_asks_then_can_be_always_allowed_and_an_unknown_kind_fails_closed(self) -> None:
+        from memtrace_harness import tool_registry
+
+        ran: list[dict] = []
+        tool_registry.register(tool_registry.ToolSpec(
+            name="t_click", schema={"name": "t_click", "description": "x", "inputSchema": {"type": "object"}},
+            handler=lambda ctx, args: ran.append(args) or "clicked", tier=tool_registry.CHANGE,
+        ))
+        self.addCleanup(tool_registry.unregister, "t_click")
+        gateway, scope, store = self._job_gateway("echo x")
+        store.create_tool_call_request(
+            request_id="tool_1", project=scope.name, tool="t_click", arguments={"a": 1}, summary="click a",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        keyboard = gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertTrue(any("同一個工具" in b["label"] for row in keyboard for b in row))
+        self.assertEqual(ran, [])  # nothing ran before the tap
+        gateway._resolve_job_action("job_confirm_always", "tool_1", 12345, 77)
+        self._join_job("tool_1")
+        self.assertEqual(ran, [{"a": 1}])
+
+        gateway.send_message_with_keyboard.reset_mock()
+        store.create_tool_call_request(
+            request_id="tool_2", project=scope.name, tool="t_click", arguments={"a": 1}, summary="click a",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self._join_job("tool_2")
+        gateway.send_message_with_keyboard.assert_not_called()
+        self.assertEqual(ran, [{"a": 1}, {"a": 1}])
+        # different arguments: asks again
+        store.create_tool_call_request(
+            request_id="tool_3", project=scope.name, tool="t_click", arguments={"a": 2}, summary="click b",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
+
+        # a request kind nothing handles is never run
+        store.create_tool_call_request(
+            request_id="tool_4", project=scope.name, tool="gone", arguments={}, summary="x",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        gateway._resolve_job_action("job_confirm", "tool_4", 12345, 77)
+        self._join_job("tool_4")
+        self.assertEqual(store.get_job_request("tool_4")["status"], "failed")
+
+    # ---- multi-step plans (plans.py / plan_runner.py)
+    def _plan_gateway(self):
+        from unittest.mock import MagicMock
+        from memtrace_harness import tool_registry
+
+        calls: list[dict] = []
+        outputs = {"text": "pid=123 exit=0 com.memtraceharness.Beri"}
+        tool_registry.register(tool_registry.ToolSpec(
+            name="t_status", schema={"name": "t_status", "description": "x", "inputSchema": {"type": "object"}},
+            handler=lambda ctx, args: calls.append(args) or outputs["text"], tier=tool_registry.READ,
+        ))
+        self.addCleanup(tool_registry.unregister, "t_status")
+        gateway, scope, store = self._job_gateway("echo restarted")
+        gateway.edit_message = MagicMock()
+        return gateway, scope, store, calls, outputs
+
+    def _drive(self, gateway, store, rounds: int = 6, confirm: bool = False) -> None:
+        for _ in range(rounds):
+            gateway.plan_runner.tick()
+            gateway.process_job_requests()
+            if confirm:
+                for row in self._open_requests(store):
+                    gateway._resolve_job_action("job_confirm", row, 12345, 77)
+            for thread in [t for t in threading.enumerate() if t.name.startswith(("job-", "plan-"))]:
+                thread.join(10)
+
+    @staticmethod
+    def _open_requests(store) -> list[str]:
+        with store._connection() as conn:
+            return [r[0] for r in conn.execute("SELECT request_id FROM job_requests WHERE status = 'awaiting'")]
+
+    PLAN = json.dumps({
+        "goal": "重啟 Beri 並確認它在跑",
+        "steps": [
+            {"title": "重啟 Beri", "tool": "run_job", "args": {"name": "hello"}, "expect": {"kind": "contains", "value": "restarted"}},
+            {"title": "確認 Beri 在跑", "tool": "t_status", "args": {"x": "1"}, "expect": {"kind": "regex", "value": r"pid=\d+ exit=0"}},
+        ],
+    }, ensure_ascii=False)
+
+    def test_plan_runs_in_order_asks_for_the_change_step_checks_each_result_and_reports(self) -> None:
+        gateway, scope, store, calls, _out = self._plan_gateway()
+        self.assertIsNone(gateway.plan_runner.create(scope, 12345, self.PLAN))
+        self._drive(gateway, store, 2)
+        plan = store.list_active_plans()[0]
+        steps = store.list_plan_steps(plan["plan_id"])
+        self.assertEqual([s["status"] for s in steps], ["awaiting", "pending"])  # waiting for the tap, nothing past it
+        self.assertEqual(calls, [])
+        self.assertEqual(gateway.send_message_with_keyboard.call_count, 2)  # the progress view + the confirm card
+        self._drive(gateway, store, 5, confirm=True)
+        steps = store.list_plan_steps(plan["plan_id"])
+        self.assertEqual([s["status"] for s in steps], ["done", "done"])
+        self.assertEqual(store.get_plan(plan["plan_id"])["status"], "done")
+        self.assertEqual(calls, [{"x": "1"}])
+        final = [c.args[1] for c in gateway.send_message.call_args_list if "計畫結束：達成" in str(c.args[1:])]
+        self.assertTrue(final)
+
+    def test_plan_wide_approval_answers_the_confirm_cards_of_its_own_steps(self) -> None:
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
+        self._drive(gateway, store, 6)  # no taps at all
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        cards = [c for c in gateway.send_message_with_keyboard.call_args_list if "待確認重跑工作" in c.args[1]]
+        self.assertEqual(cards, [])
+
+    def test_a_step_that_misses_its_expectation_stops_the_plan_and_the_user_can_retry_skip_or_cancel(self) -> None:
+        gateway, scope, store, calls, out = self._plan_gateway()
+        out["text"] = "not running"
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
+        self._drive(gateway, store, 6)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+        failed = store.list_plan_steps(plan_id)[1]
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("沒達到預期", failed["note"])
+        self.assertEqual(len(calls), 1)  # it did not carry on or retry by itself
+        out["text"] = "pid=9 exit=0"
+        gateway.plan_runner.handle_action("plan_retry", plan_id)
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+
+    def test_skip_and_cancel_end_a_stuck_plan(self) -> None:
+        gateway, scope, store, _calls, out = self._plan_gateway()
+        out["text"] = "nope"
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
+        self._drive(gateway, store, 6)
+        gateway.plan_runner.handle_action("plan_skip", plan_id)
+        self._drive(gateway, store, 3)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        self.assertIn("部分達成", plans_verdict(store.list_plan_steps(plan_id)))
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        second = [p for p in store.list_active_plans()][0]["plan_id"]
+        gateway.plan_runner.handle_action("plan_cancel", second)
+        self.assertEqual(store.get_plan(second)["status"], "cancelled")
+        self.assertEqual(self._open_requests(store), [])
+
+    def test_a_plan_is_refused_when_one_is_running_or_a_step_is_not_allowed(self) -> None:
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        self.assertIsNone(gateway.plan_runner.create(scope, 12345, self.PLAN))
+        self.assertIn("已經有一個進行中的計畫", gateway.plan_runner.create(scope, 12345, self.PLAN))
+        bad_tool = '{"goal": "g", "steps": [{"title": "改程式", "tool": "edit_code", "args": {}}]}'
+        store.update_plan(store.list_active_plans()[0]["plan_id"], status="cancelled")
+        self.assertIn("不能放進計畫", gateway.plan_runner.create(scope, 12345, bad_tool))
+        propose = '{"goal": "g", "steps": [{"title": "x", "tool": "propose_model_change", "args": {}}]}'
+        self.assertIn("不能放進計畫", gateway.plan_runner.create(scope, 12345, propose))
+        scope.jobs = {"hello": "sudo reboot"}
+        self.assertIn("沒有建立", gateway.plan_runner.create(scope, 12345, self.PLAN))
+        self.assertIn("不是有效的 JSON", gateway.plan_runner.create(scope, 12345, "not json"))
+
+    def test_a_model_judged_step_uses_the_judge_and_unclear_means_not_met(self) -> None:
+        from unittest.mock import MagicMock
+
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        plan = '{"goal": "g", "steps": [{"title": "看狀態", "tool": "t_status", "args": {}, "expect": "服務看起來正常"}]}'
+        gateway.judge_plan_step = MagicMock(return_value=(True, "正常"))
+        gateway.plan_runner.create(scope, 12345, plan)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        gateway.judge_plan_step = MagicMock(side_effect=RuntimeError("no model"))
+        gateway.plan_runner.create(scope, 12345, plan)
+        plan_id = [p for p in store.list_active_plans()][0]["plan_id"]
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+        self.assertIn("無法自動判斷", store.list_plan_steps(plan_id)[0]["note"])
+
+    def test_after_a_restart_a_read_step_that_was_running_is_run_again(self) -> None:
+        from memtrace_harness.plan_runner import PlanRunner
+
+        gateway, scope, store, calls, _out = self._plan_gateway()
+        plan = '{"goal": "g", "steps": [{"title": "看狀態", "tool": "t_status", "args": {}}]}'
+        gateway.plan_runner.create(scope, 12345, plan)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        store.transition_plan_step(plan_id, 1, ("pending",), "running")  # was in flight when the Harness stopped
+        gateway._plan_runner = PlanRunner(gateway)  # a fresh process knows nothing live
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        self.assertEqual(len(calls), 1)
+
+    def test_cancel_stops_the_plan_waiting_requests_and_queued_tasks_but_not_what_is_already_running(self) -> None:
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        self._drive(gateway, store, 2)  # step 1 is now waiting for a tap
+        store.create_job_request(
+            request_id="job_x", project=scope.name, job_name="other", command="echo other",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        store.enqueue_task(workspace_id=scope.workspace_id, kind="task", payload={"goal": "排隊的任務"}) if hasattr(store, "enqueue_task") else None
+        message = gateway._cancel_current(scope, 12345)
+        self.assertIn("已取消", message)
+        self.assertIn("計畫", message)
+        self.assertEqual(store.list_active_plans(), [])
+        self.assertEqual(self._open_requests(store), [])
+        self.assertEqual(store.get_job_request("job_x")["status"], "cancelled")
+        self.assertIn("沒有可以取消", gateway._cancel_current(scope, 12345))
+        self.assertEqual(gateway.handle_message("/cancel", audience=12345), gateway._cancel_current(scope, 12345))
+
+    def test_a_job_that_finishes_after_the_plan_was_cancelled_does_not_revive_it(self) -> None:
+        gateway, scope, store, calls, _out = self._plan_gateway()
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
+        self._drive(gateway, store, 1)
+        gateway._cancel_current(scope, 12345)
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "cancelled")
+        self.assertEqual(calls, [])  # the second step never started
+
+    def test_a_forbidden_command_never_runs_and_never_gets_an_always_allow_button(self) -> None:
+        gateway, scope, store = self._job_gateway("sudo rm -rf /tmp/x")
+        store.create_job_request(
+            request_id="job_1", project=scope.name, job_name="hello", command="sudo rm -rf /tmp/x",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        keyboard = gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertEqual(len(keyboard), 1)  # confirm / cancel only
+        gateway._resolve_job_action("job_confirm", "job_1", 12345, 77)
+        self._join_job("job_1")
+        self.assertEqual(store.get_job_request("job_1")["status"], "failed")
+        self.assertIn("不執行", store.get_job_request("job_1")["result"]["output_tail"])
+        with self.assertRaises(ValueError):
+            gateway.allowlist.add(scope.name, "hello", "sudo rm -rf /tmp/x")
+
+    def test_long_job_output_keeps_its_beginning(self) -> None:
+        service = object.__new__(HarnessService)
+        scope = type("S", (), {"working_directory": "."})()
+        status, _code, out = service._exec_job_command(scope, "echo FIRST; yes x | head -c 5000")
+        self.assertEqual(status, "done")
+        self.assertTrue(out.startswith("FIRST"))
+        self.assertIn("只保留開頭", out)
 
     def test_a_scope_change_is_written_only_after_the_human_confirms(self) -> None:
         from unittest.mock import MagicMock
