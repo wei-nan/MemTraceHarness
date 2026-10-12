@@ -57,6 +57,7 @@ from memtrace_harness.trigger_review import (
     silent_tag,
 )
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
+from memtrace_harness import other_work
 from memtrace_harness.inflight import default_tracker
 from memtrace_harness.loop import AgentLoopRunner
 from memtrace_harness.calibration import calibration_block
@@ -225,6 +226,7 @@ class HarnessService:
         # records the result) to the thread that reports it.
         self._schedule_deliveries: dict[str, ScheduleDelivery] = {}
         self._long_run_notes: dict[str, float] = {}
+        self._pending_overlap: dict[str, dict] = {}
         # Starts a tidying pass over a project's knowledge-base workspaces now (the /garden
         # command); wired in by the serve command, None means the feature is not running here.
         self.garden_now: Callable[[ProjectScope, str | None], None] | None = None
@@ -872,6 +874,8 @@ class HarnessService:
             return self._resolve_schedule_button(
                 action.removeprefix("sched_"), request_id, audience, message_ref
             )[:200]
+        if action in {"dup_start", "dup_cancel"}:
+            return self._resolve_overlap(action, request_id, audience, message_ref)[:200]
         if action in {"job_confirm", "job_confirm_always", "job_cancel"}:
             return self._resolve_job_action(action, request_id, audience, message_ref)[:200]
         if action in {"order_confirm", "order_cancel"}:
@@ -1701,6 +1705,62 @@ class HarnessService:
 
         return (acquire, lambda: trace_store.release_edit_lock(ws_id, conv_id))
 
+    OVERLAP_HOLD_SECONDS = 1800
+
+    def _other_work(self, scope: ProjectScope, exclude: str | None = None) -> list[other_work.OtherWork]:
+        """The project's other unfinished work (see other_work.py). Best effort: a failure here must never stop a
+        task from starting, so it logs and returns nothing."""
+        store = self.approval_manager.trace_store
+        try:
+            schedule_runs = {l["conversation_id"] for l in store.list_workspace_locks(scope.workspace_id) if l["schedule_id"]}
+            live = {
+                e["conversation_id"]: e["conversation_id"] in schedule_runs
+                for e in default_tracker.snapshot()
+                if e["workspace_id"] == scope.workspace_id
+            }
+            return other_work.collect_other_work(store, scope.workspace_id, exclude=exclude, live=live)
+        except Exception:
+            logger.exception("listing the project's other unfinished work failed; continuing without it")
+            return []
+
+    def _hold_for_overlap(self, scope: ProjectScope, goal: str, audience: str | None) -> bool:
+        """A task the chat model asked to start that names an issue another unfinished task already covers is
+        not started straight away: the operator is asked first (start anyway / cancel). ENFORCED, and only
+        by issue number — see other_work.overlapping. Returns True when the task was held. Only chat-started
+        tasks come through here; schedules and the unattended scanner have their own duplicate handling."""
+        matches = other_work.overlapping(self._other_work(scope), goal)
+        if not matches:
+            return False
+        now = time.time()
+        pending = self._pending_overlap
+        for token in [t for t, v in pending.items() if now - v["at"] > self.OVERLAP_HOLD_SECONDS]:
+            pending.pop(token, None)
+        token = uuid4().hex[:8]
+        pending[token] = {"scope": scope, "goal": goal, "at": now}
+        text = (
+            "⚠️ 這個任務提到的 issue，已經有尚未收尾的工作，我先沒有開始：\n- "
+            + "\n- ".join(other_work.describe(m) for m in matches[:5])
+            + "\n\n要照常開始嗎？（開始後，新任務會在上下文裡看到這些既有工作，被要求先檢視再接續或避開。）"
+            f"\n這個確認 {self.OVERLAP_HOLD_SECONDS // 60} 分鐘內有效，過期或 Harness 重啟後請重新說一次。"
+        )
+        self.send_message_with_keyboard(
+            audience, text,
+            [[{"label": "照常開始", "id": f"dup_start:{token}"}, {"label": "取消", "id": f"dup_cancel:{token}"}]],
+        )
+        self.primary_session_mgr.record_turn(project=scope.name, speaker="system", turn_type="dev_report", content=text)
+        return True
+
+    def _resolve_overlap(self, action: str, token: str, audience: str | None, message_ref: str | None) -> str:
+        held = self._pending_overlap.pop(token, None)
+        self.clear_actions(message_ref)
+        if held is None or time.time() - held["at"] > self.OVERLAP_HOLD_SECONDS:
+            return "這個確認已經處理過或過期了，請重新說一次。"
+        if action == "dup_cancel":
+            self.send_message(audience, "已取消，沒有開始這個任務。")
+            return "已取消。"
+        self._start_or_queue_task(held["scope"], held["goal"], audience)
+        return "照常開始。"
+
     LONG_RUN_FIRST_SECONDS = 600
     LONG_RUN_REPEAT_SECONDS = 1200
     _STAGE_LABELS = {
@@ -2086,7 +2146,7 @@ class HarnessService:
             logger.exception("Failed to build operator precedent; continuing without it")
             return ""
 
-    def _project_context_items(self, scope: ProjectScope) -> list[ContextItem]:
+    def _project_context_items(self, scope: ProjectScope, exclude_conversation: str | None = None) -> list[ContextItem]:
         """What the Agent Loop actually needs to do its job, carried through the
         TaskEnvelope's structured context_items (respecting each role's
         context_policy — see adapter_factory.py/loop.py's per-stage filtering) instead
@@ -2116,6 +2176,17 @@ class HarnessService:
                 source="harness",
             ),
         ]
+        others = self._other_work(scope, exclude=exclude_conversation)
+        if others:
+            items.append(
+                ContextItem(
+                    ref=f"harness:other-work:{scope.name}",
+                    title="Other unfinished work in this project",
+                    body=other_work.render_for_task(others),
+                    content_type="context",
+                    source="harness",
+                )
+            )
         if scope.repos:
             items.append(
                 ContextItem(
@@ -2880,7 +2951,8 @@ class HarnessService:
                     self.primary_session_mgr.record_turn(
                         project=scope.name, speaker="user", turn_type="decision", content=goal
                     )
-                    self._start_or_queue_task(scope, goal, audience)
+                    if not self._hold_for_overlap(scope, goal, audience):
+                        self._start_or_queue_task(scope, goal, audience)
                 if review_request and not goal:
                     self.send_message(audience, self._start_work_review(scope, audience))
                 if memory_rebuild and not goal:
@@ -3393,7 +3465,7 @@ class HarnessService:
             workspace_id=scope.workspace_id,
             goal=goal,
             context_refs=[],
-            context_items=self._project_context_items(scope),
+            context_items=self._project_context_items(scope, exclude_conversation=conv_id),
             constraints=list(scope.off_limits or []),
             risk_level=scope.default_risk_level,
             source="chat",
@@ -3550,7 +3622,11 @@ class HarnessService:
             # instance being touched concurrently.
             trace_store = TraceStore(self.config.trace_db_path)
             try:
-                context_items = self._project_context_items(matching_scope) if matching_scope else []
+                context_items = (
+                    self._project_context_items(matching_scope, exclude_conversation=req_data.conversation_id)
+                    if matching_scope
+                    else []
+                )
                 # An unattended-scan approval's stage_ref is the actual backlog item
                 # id the operator just discussed and approved — hydrate its real
                 # content (intent/constraints/acceptance_criteria, or the GitHub

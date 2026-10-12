@@ -3511,6 +3511,25 @@ class TraceStore:
             ).fetchall()
         return [{"id": r[0], "state": r[1], "updated_at": r[2], "goal": r[3]} for r in rows]
 
+    def list_conversations_for_overview(self, workspace_id: str, updated_after_iso: str, limit: int) -> list[dict]:
+        """Recent conversations with their goal and worktree record (if any), newest first — the raw material for
+        other_work.py's list of what else is going on in a project."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.state, c.updated_at, COALESCE(r.goal, ''), w.path, w.branch, w.base_branch, w.base_commit "
+                "FROM conversations c LEFT JOIN runs r ON r.id = c.active_run_id "
+                "LEFT JOIN conversation_worktrees w ON w.conversation_id = c.id "
+                "WHERE c.workspace_id = ? AND c.updated_at > ? ORDER BY c.updated_at DESC LIMIT ?",
+                (workspace_id, updated_after_iso, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r[0], "state": r[1], "updated_at": r[2], "goal": r[3],
+                "path": r[4], "branch": r[5], "base_branch": r[6], "base_commit": r[7],
+            }
+            for r in rows
+        ]
+
     def abandon_conversation(self, workspace_id: str, conversation_id: str) -> bool:
         """Mark an interrupted conversation failed and free its workspace slot. False when it is not
         one of this workspace's unfinished conversations."""
