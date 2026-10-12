@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 from pathlib import Path
 
-from memtrace_harness.cli_process import child_env
+from memtrace_harness.cli_process import child_env, kill_provider_clis_in_directory
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.model_changes import apply_model_change
 from memtrace_harness.model_override import describe as describe_model, resolve_model_override, with_developer_override
@@ -224,6 +224,7 @@ class HarnessService:
         # conversation_id -> the delivery chosen for a schedule run, handed from the run (which
         # records the result) to the thread that reports it.
         self._schedule_deliveries: dict[str, ScheduleDelivery] = {}
+        self._long_run_notes: dict[str, float] = {}
         # Starts a tidying pass over a project's knowledge-base workspaces now (the /garden
         # command); wired in by the serve command, None means the feature is not running here.
         self.garden_now: Callable[[ProjectScope, str | None], None] | None = None
@@ -1700,7 +1701,75 @@ class HarnessService:
 
         return (acquire, lambda: trace_store.release_edit_lock(ws_id, conv_id))
 
+    LONG_RUN_FIRST_SECONDS = 600
+    LONG_RUN_REPEAT_SECONDS = 1200
+    _STAGE_LABELS = {
+        "control-start": "Controller", "plan": "Planner", "plan-revision": "Planner（修訂）", "g1": "G1",
+        "g1-recheck": "G1（複查）", "develop": "Developer", "develop-revision": "Developer（修訂）",
+        "g2": "G2", "g2-recheck": "G2（複查）", "converge": "收尾", "operate": "執行",
+    }
+
+    def report_long_running(self, now: float | None = None) -> int:
+        """Tell the operator, in the chat, that a task is still running when no stage has finished for a while.
+        A Developer stage can legitimately take close to an hour and says nothing until it ends; with no word the
+        operator cannot tell it from a dead task and sends the instruction again (chat_7fe66edf and chat_dfc8a7eb,
+        2026-10-12, both finished within four minutes of each other). First note after LONG_RUN_FIRST_SECONDS
+        without a finished stage, then at most one more every LONG_RUN_REPEAT_SECONDS. Schedule runs are skipped.
+        State is in memory, so a restart may repeat a note once. Returns how many notes were sent."""
+        now = time.time() if now is None else now
+        trace_store = self.approval_manager.trace_store
+        notes = self._long_run_notes
+        live = default_tracker.snapshot()
+        live_ids = {e["conversation_id"] for e in live}
+        for gone in [c for c in notes if c not in live_ids]:
+            notes.pop(gone, None)
+        sent = 0
+        for entry in live:
+            conv_id, ws_id = entry["conversation_id"], entry["workspace_id"]
+            if any(l["conversation_id"] == conv_id and l["schedule_id"] for l in trace_store.list_workspace_locks(ws_id)):
+                continue
+            pipeline = trace_store.get_conversation_pipeline(conv_id)
+            quiet_since = entry["started_at"]
+            last_stage = None
+            if pipeline:
+                last = pipeline[-1]
+                last_stage = self._STAGE_LABELS.get(last["stage"], last["stage"])
+                try:
+                    quiet_since = max(quiet_since, datetime.fromisoformat(last["created_at"]).timestamp())
+                except (TypeError, ValueError):
+                    pass
+            quiet = now - quiet_since
+            previous = notes.get(conv_id)
+            if quiet < self.LONG_RUN_FIRST_SECONDS:
+                continue
+            if previous is not None and now - previous < self.LONG_RUN_REPEAT_SECONDS:
+                continue
+            notes[conv_id] = now
+            where = f"最近完成的階段是 {last_stage}，" if last_stage else "還沒有任何階段完成，"
+            self.notify_operator(
+                f"⏳ 任務 {conv_id} 仍在執行：{where}之後已經 {int(quiet // 60)} 分鐘沒有新階段完成。"
+                "Developer 階段可能要跑很久，這不代表卡住，請先不要重新下同樣的指令；"
+                "真的要放棄它，到狀態頁按「放棄」（會一併終止它的 CLI）。"
+            )
+            sent += 1
+        return sent
+
     DEAD_LOCK_GRACE_SECONDS = 120
+
+    def abandon_task(self, workspace_id: str, conversation_id: str) -> tuple[bool, int]:
+        """Give up an unfinished task: stop any provider CLI still working in its worktree, then mark it failed and
+        free its slot. Marking it failed alone left the CLI running — it went on to commit, push and open a PR
+        with nobody waiting for the result (chat_7efeada2, 2026-10-12). Returns (abandoned, CLI groups stopped).
+        A task without its own worktree is never swept by directory: its folder is the project itself."""
+        trace_store = self.approval_manager.trace_store
+        worktree = trace_store.get_conversation_worktree(conversation_id)
+        stopped = 0
+        if worktree and worktree.get("path"):
+            try:
+                stopped = len(kill_provider_clis_in_directory(worktree["path"]))
+            except Exception:
+                logger.exception(f"stopping the CLI of {conversation_id} failed; abandoning it anyway")
+        return trace_store.abandon_conversation(workspace_id, conversation_id), stopped
 
     def _release_dead_edit_lock(
         self, trace_store: TraceStore, scope: ProjectScope, ws_id: str, conv_id: str
@@ -1722,11 +1791,12 @@ class HarnessService:
             return
         dead = holder["conversation_id"]
         trace_store.release_edit_lock(ws_id, dead)
-        trace_store.abandon_conversation(scope.workspace_id, dead)
+        _, stopped = self.abandon_task(scope.workspace_id, dead)
         logger.warning(f"released the dead edit lock of {dead} in {scope.name}")
         self.notify_operator(
             f"⚠️ [{scope.name}] 任務 {dead} 已經停止運作卻還占著編輯權（{int(age // 60)} 分鐘），"
             "我已自動中斷它並釋放，讓後面的任務能繼續。"
+            + (f"它還在跑的 {stopped} 個 CLI 程序也已終止。" if stopped else "")
         )
 
     def _worktree_manager(self) -> WorktreeManager:

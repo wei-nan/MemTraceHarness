@@ -365,6 +365,19 @@ running:** a task, job or sub-agent that has started finishes by itself and is r
 running. A job or step that finishes after its plan was cancelled does not revive the plan. The plan's own "🛑 取消計畫" button
 cancels only that plan and its waiting requests. **Not implemented:** killing a running task or job.
 
+**Abandoning a task stops its CLI, and a long run is announced (operator request 2026-10-12, after chat_7efeada2's Developer CLI
+went on to commit, push and open PR #197 nine minutes after the task had been marked failed, and chat_7fe66edf's 49-minute Developer
+stage made the operator send the same instruction again). ENFORCED, `tests/test_task_abandon_and_heartbeat.py`:**
+`HarnessService.abandon_task` (the status page's 放棄 button and the dead-edit-lock sweep both use it) first terminates provider CLI
+process groups working inside the task's own worktree, then marks it failed. Only a group whose *leader* is a provider CLI
+(codex / claude / agy / antigravity / gemini) with its working directory inside the worktree is signalled; this process, its group
+and a person's own shell in that folder are not. A task without a worktree (in-place project) is never swept by directory. The
+provider CLIs run in their own session, so they can outlive a Harness that was killed rather than shut down; the sweep finds them by
+directory, not by a pid the Harness no longer has. `report_long_running` (a serve-loop duty) sends one chat note when a live
+non-schedule task has had no stage finish for 10 minutes, then at most one more every 20; it says the task is still running and not to
+re-send the instruction. **Not implemented:** stopping a *running* task that still has a live Harness thread (the button refuses it,
+and `/cancel` does not touch it), sweeping orphan CLIs automatically at startup, and the note's state surviving a restart.
+
 **Files sent in chat (operator decision, 2026-10-12; ENFORCED, `tests/test_attachments.py`, the media tests in
 `tests/test_telegram_service.py`, `tests/test_api.py`, `tests/test_chat_command_media.py`).** The Telegram service relays photos,
 documents, voice, audio, video, video notes and animations (up to Telegram's 20 MB bot limit; a file it cannot fetch is

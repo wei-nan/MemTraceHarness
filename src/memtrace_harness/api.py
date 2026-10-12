@@ -483,12 +483,13 @@ class _Handler(BaseHTTPRequestHandler):
         if any(entry["conversation_id"] == conversation_id for entry in default_tracker.snapshot()):
             self._send(400, {"error": "這個任務正在執行中，不能放棄"})
             return
-        trace_store = self.api.service.approval_manager.trace_store
-        if not trace_store.abandon_conversation(self.api.scope.workspace_id, conversation_id):
+        abandoned, stopped = self.api.service.abandon_task(self.api.scope.workspace_id, conversation_id)
+        if not abandoned:
             self._send(400, {"error": "找不到這個未完成的任務"})
             return
         self.api.bus.publish()
-        self._send(200, {"ok": True, "message": f"已放棄 {conversation_id}，工作區已釋放。"})
+        extra = f"，並終止了它還在跑的 {stopped} 個 CLI 程序" if stopped else ""
+        self._send(200, {"ok": True, "message": f"已放棄 {conversation_id}{extra}，工作區已釋放。"})
 
     def _resolve_preference(self, body: dict) -> None:
         from memtrace_harness.memory_digest import resolve_preference, sync_operator_profile

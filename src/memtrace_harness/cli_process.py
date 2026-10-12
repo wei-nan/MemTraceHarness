@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
 import threading
+import time
 from time import monotonic
 
 
@@ -129,6 +131,86 @@ def kill_process_for_thread(thread_ident: int) -> bool:
             os.killpg(pgid, signal.SIGKILL)
         except OSError:
             pass
+    return True
+
+
+# A provider CLI is started with start_new_session=True, so it is its own process-group leader and can outlive the
+# Harness process (a restart that is not a clean shutdown). The command a group leader runs names the provider.
+_PROVIDER_CLI = re.compile(r"(^|[/\s])(codex(-will)?|claude|agy|antigravity|gemini)(\s|$)")
+
+
+def _lsof_cwds() -> list[tuple[int, str]]:
+    try:
+        done = subprocess.run(
+            ["lsof", "-a", "-d", "cwd", "-Fpn"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    rows: list[tuple[int, str]] = []
+    pid: int | None = None
+    for line in done.stdout.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            rows.append((pid, line[1:]))
+    return rows
+
+
+def _command_of(pid: int) -> str:
+    try:
+        done = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout.strip()
+
+
+def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
+    """Terminate provider CLI process groups working inside `directory`, whether or not this process started them.
+
+    For abandoning a task: its worktree is the only handle left on a CLI that outlived the Harness thread that
+    was waiting for it. **Enforced narrowing:** only a process group whose *leader* is a provider CLI
+    (codex / claude / agy / antigravity / gemini) and has its working directory inside `directory` is signalled,
+    never this process or its group, so a person's own shell sitting in the folder is left alone.
+    Returns the group ids signalled."""
+    root = os.path.realpath(str(directory))
+    own_pgid = os.getpgid(0)
+    groups: dict[int, None] = {}
+    for pid, cwd in _lsof_cwds():
+        real = os.path.realpath(cwd)
+        if real != root and not real.startswith(root + os.sep):
+            continue
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            continue
+        if pgid in (0, 1, own_pgid) or pgid in groups:
+            continue
+        if _PROVIDER_CLI.search(_command_of(pgid)):
+            groups[pgid] = None
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = monotonic() + 5
+    while monotonic() < deadline and any(_group_alive(g) for g in groups):
+        time.sleep(0.2)
+    for pgid in groups:
+        if _group_alive(pgid):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+    return list(groups)
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except OSError:
+        return False
     return True
 
 
