@@ -162,6 +162,17 @@ def _hydrate_github_issue_context(stage_ref: str, *, working_directory: Path) ->
     )
 
 
+def normalize_literal_newlines(text: str) -> str:
+    """Normalize literal newline escape sequences in text into actual newlines for display.
+
+    Converts literal '\\r\\n', '\\n', and standalone '\\r' into actual newline characters
+    while preserving already-unescaped newlines.
+    """
+    if not text:
+        return text
+    return text.replace("\r\n", "\n").replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+
 class ChatInterrupted(Exception):
     """A chat reply was thrown away because the person sent more before it went out. Raised before the
     reply's markers (tasks, schedules, notes) are acted on, so nothing it said has happened."""
@@ -1269,17 +1280,23 @@ class HarnessService:
                 if delivery is not None and delivery.action == "pause_and_notify":
                     self._pause_and_notify(scope, schedule_id, summary, delivery, audience)
                     return
+                rec = normalize_literal_newlines(summary.recommendation)
                 if schedule_id and summary.status == "needs_human":
                     # A notification, not a question: no approval is open, so a later reply
                     # can't resume this monitoring run with some other goal.
                     msg = (
-                        f"⏰ 排程 {schedule_id} 有事需要你留意：{summary.recommendation}\n\n"
+                        f"⏰ 排程 {schedule_id} 有事需要你留意：{rec}\n\n"
                         "這只是通知，沒有待核准的問題；要處理的話直接在聊天告訴我。\n\n"
+                        f"🧩 {self._model_summary(summary)}"
+                    )
+                elif schedule_id and summary.status == "succeeded":
+                    msg = (
+                        f"✅「{scope.name}」：{rec}\n\n"
                         f"🧩 {self._model_summary(summary)}"
                     )
                 else:
                     msg = (
-                        f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{summary.recommendation}\n\n"
+                        f"✅「{scope.name}」的任務已完成。狀態：{summary.status}。{rec}\n\n"
                         f"🧩 {self._model_summary(summary)}"
                     )
                 self._report_run_outcome(
@@ -2756,9 +2773,10 @@ class HarnessService:
             outcome=f"{CONTROLLER_OUTCOME_PREFIX}paused",
             subject=schedule_id,
         )
+        rec = normalize_literal_newlines(summary.recommendation)
         text = (
             f"⏸ 排程 {schedule_id} 我先暫停了：{delivery.reason}\n"
-            f"任務：{row['goal']}\n最近一輪結果：{summary.recommendation[:300]}\n\n"
+            f"任務：{row['goal']}\n最近一輪結果：{rec[:300]}\n\n"
             "要繼續就按「繼續排程」；不按的話它會維持暫停。"
         )
         keyboard = [
@@ -3243,12 +3261,13 @@ class HarnessService:
                     content=f"Resumed loop {summary.conversation_id} completed with status {summary.status}: {summary.recommendation}",
                     source_work_conversation_id=summary.conversation_id,
                 )
+                rec = normalize_literal_newlines(summary.recommendation)
                 self._report_run_outcome(
                     conv_id=req_data.conversation_id,
                     summary=summary,
                     final_text=(
                         f"🔄 對話 {req_data.conversation_id} 已繼續執行。結果：{summary.status}"
-                        f"（{summary.recommendation}）\n\n🧩 {self._model_summary(summary)}"
+                        f"（{rec}）\n\n🧩 {self._model_summary(summary)}"
                     ),
                 )
             except Exception:

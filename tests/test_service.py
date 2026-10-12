@@ -1550,3 +1550,142 @@ class StatusAndCommandTests(TestCase):
             self.assertIsNone(event["audience"])
             self.assertEqual(set(event["actions"][0][0]), {"label", "id"})
             self.assertEqual(event["bind"], {"type": "approval", "id": req.id})
+
+
+class NotificationFormatAndLiteralNewlineTests(TestCase):
+    def setUp(self) -> None:
+        from unittest.mock import MagicMock
+        self._tmp = tempfile.TemporaryDirectory()
+        self.gateway, self.store, self.scope = _build_schedule_gateway(Path(self._tmp.name))
+        self.gateway.send_message = MagicMock()
+        self.gateway.send_message_with_keyboard = MagicMock()
+        self.gateway.notify_operator = MagicMock()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_task(self, *, schedule_id: str | None, status: str, recommendation: str):
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        summary = MagicMock(
+            conversation_id="conv_test",
+            status=status,
+            recommendation=recommendation,
+            stages=[],
+            task=MagicMock(workspace_id=self.scope.workspace_id),
+        )
+        with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+            "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+        ), patch("memtrace_harness.service.AgentLoopRunner") as runner:
+            runner.return_value.run.return_value = summary
+            self.gateway._start_or_queue_task(self.scope, "測試目標", 12345, schedule_id=schedule_id)
+            for t in threading.enumerate():
+                if t.name.startswith("agent-loop-"):
+                    t.join(timeout=5)
+        return summary
+
+    def test_normalize_literal_newlines_helper(self) -> None:
+        from memtrace_harness.service import normalize_literal_newlines
+
+        self.assertEqual(normalize_literal_newlines(r"第一行\n第二行\n第三行"), "第一行\n第二行\n第三行")
+        self.assertEqual(normalize_literal_newlines(r"第一行\r\n第二行"), "第一行\n第二行")
+        self.assertEqual(normalize_literal_newlines(r"第一行\r第二行"), "第一行\n第二行")
+        self.assertEqual(normalize_literal_newlines("第一行\n第二行"), "第一行\n第二行")
+        self.assertEqual(normalize_literal_newlines("第一行\r\n第二行"), "第一行\n第二行")
+        self.assertEqual(normalize_literal_newlines(r"第一行\n第二行" + "\n第三行"), "第一行\n第二行\n第三行")
+        self.assertEqual(normalize_literal_newlines(""), "")
+        self.assertIsNone(normalize_literal_newlines(None))
+
+    def test_scheduled_success_notification_omits_prefix_and_unescapes_newlines(self) -> None:
+        rec = r"已完成 09:20 狀態檢查：\n1. 未成交委託：無\n2. 實際持股：2 檔"
+        self._run_task(schedule_id="sched_1", status="succeeded", recommendation=rec)
+
+        sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
+        self.assertTrue(any(t.startswith("✅「test_proj」：已完成 09:20 狀態檢查：\n1. 未成交委託：無\n2. 實際持股：2 檔") for t in sent_messages))
+        self.assertFalse(any("任務已完成" in t for t in sent_messages))
+        self.assertFalse(any("狀態：succeeded" in t for t in sent_messages))
+        self.assertFalse(any(r"\n" in t for t in sent_messages))
+
+    def test_scheduled_failure_notification_preserves_prefix(self) -> None:
+        rec = r"檢查失敗：\n連線逾時"
+        self._run_task(schedule_id="sched_fail", status="failed", recommendation=rec)
+
+        sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
+        self.assertTrue(any("✅「test_proj」的任務已完成。狀態：failed。檢查失敗：\n連線逾時" in t for t in sent_messages))
+
+    def test_nonscheduled_task_preserves_prefix(self) -> None:
+        rec = r"完成新功能實作：\n已更新 2 個檔案"
+        self._run_task(schedule_id=None, status="succeeded", recommendation=rec)
+
+        sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
+        self.assertTrue(any("✅「test_proj」的任務已完成。狀態：succeeded。完成新功能實作：\n已更新 2 個檔案" in t for t in sent_messages))
+
+    def test_scheduled_needs_human_notification_unescapes_newlines(self) -> None:
+        rec = r"請確認：\n1. 停損門檻觸發"
+        self._run_task(schedule_id="sched_attn", status="needs_human", recommendation=rec)
+
+        sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
+        self.assertTrue(any(t.startswith("⏰ 排程 sched_attn 有事需要你留意：請確認：\n1. 停損門檻觸發") for t in sent_messages))
+        self.assertFalse(any(r"\n" in t for t in sent_messages))
+
+    def test_pause_and_notify_unescapes_newlines(self) -> None:
+        from memtrace_harness.trigger_review import ScheduleDelivery
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock
+
+        sched_id = self.store.create_schedule(
+            project="test_proj", workspace_id="ws_test", goal="追蹤持股", kind="interval",
+            interval_seconds=600, audience=12345, next_run_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        delivery = ScheduleDelivery(action="pause_and_notify", reason="條件已滿足")
+        summary = MagicMock(
+            conversation_id="conv_p",
+            status="succeeded",
+            recommendation=r"前情提要：\n部位已結清\n無需繼續追蹤",
+            stages=[],
+        )
+        self.gateway._pause_and_notify(self.scope, sched_id, summary, delivery, 12345)
+        text = self.gateway.send_message_with_keyboard.call_args.args[1]
+        self.assertIn("前情提要：\n部位已結清", text)
+        self.assertNotIn(r"\n", text)
+
+    def test_resume_approved_conversation_unescapes_newlines(self) -> None:
+        import threading
+        from unittest.mock import MagicMock, patch
+        from memtrace_harness.approval import ApprovalRequestData
+
+        req_data = ApprovalRequestData(
+            id="req_1",
+            conversation_id="conv_resume",
+            workspace=self.scope.workspace_id,
+            working_directory=str(self.scope.working_directory),
+            stage_ref=None,
+            reason="git_push",
+            proposed_action="git push",
+            status="approved",
+            created_at="2026-10-12T00:00:00Z",
+        )
+        summary = MagicMock(
+            conversation_id="conv_resume",
+            status="succeeded",
+            recommendation=r"已合併變更：\n1. 修正問題\n2. 推送分支",
+            stages=[],
+            task=MagicMock(workspace_id=self.scope.workspace_id),
+        )
+
+        with patch("memtrace_harness.service.load_role_profiles", return_value={}), patch(
+            "memtrace_harness.service.build_role_adapter_candidates", return_value={}
+        ), patch("memtrace_harness.service.AgentLoopRunner") as runner, patch.object(
+            self.gateway, "_report_run_outcome"
+        ) as mock_report:
+            runner.return_value.run.return_value = summary
+            self.gateway._resume_approved_conversation(req_data)
+            for t in threading.enumerate():
+                if t.name.startswith("agent-loop-resume-"):
+                    t.join(timeout=5)
+            mock_report.assert_called_once()
+            final_text = mock_report.call_args.kwargs["final_text"]
+            self.assertIn("已合併變更：\n1. 修正問題\n2. 推送分支", final_text)
+            self.assertNotIn(r"\n", final_text)
+
