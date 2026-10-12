@@ -147,13 +147,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "description": (
             "Read-only system state, no shell: kind=launchd_list (argument = optional filter, shows pid/exit code per "
             "service), launchd_print (argument = a launchd label), processes (argument = optional filter), or git "
-            "(argument = status | log | diff_stat | branches; root = a repository inside the readable roots)."
+            "(argument = status | log | diff_stat | branches; root = a repository inside the readable roots); device errors: "
+            "simulator_log (booted iOS Simulator) and mac_log (argument = process name; last hour of error/fault lines), "
+            "crash_reports (argument = app name; Mac, simulator and synced iPhone crash reports), device_crash_reports "
+            "(argument = app@device, e.g. Beri@William; pulls crash logs from a paired iPhone via devicectl, device must be unlocked)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "kind": _string_param("launchd_list | launchd_print | processes | git"),
-                "argument": _string_param("filter, label, or git subcommand"),
+                "kind": _string_param("launchd_list | launchd_print | processes | git | simulator_log | mac_log | crash_reports | device_crash_reports"),
+                "argument": _string_param("filter, label, git subcommand, or process/app name"),
                 "root": _string_param("repository path (git only)"),
             },
             "required": ["kind"],

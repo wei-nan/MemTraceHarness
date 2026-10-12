@@ -251,4 +251,96 @@ def system_status(kind: object, argument: object, root: Path | None) -> str:
         if sub is None:
             raise ReadError(f"git argument must be one of: {', '.join(_GIT_SUB)}")
         return _clip(redact(_run(["git", "-C", str(root), *sub])))
-    raise ReadError("kind must be one of: launchd_list, launchd_print, processes, git")
+    if kind in ("simulator_log", "mac_log"):
+        if not _PROCESS.match(text):
+            raise ReadError("argument must be a process name such as Beri")
+        predicate = f'process == "{text}" AND (messageType == error OR messageType == fault)'
+        argv = ["log", "show", "--last", "1h", "--style", "compact", "--predicate", predicate]
+        if kind == "simulator_log":
+            argv = ["xcrun", "simctl", "spawn", "booted", *argv]
+        lines = _run(argv).splitlines()
+        if len(lines) > TAIL_LINES:
+            lines = [f"…（只顯示最後 {TAIL_LINES} 行）", *lines[-TAIL_LINES:]]
+        return _clip(redact("\n".join(lines) or f"過去 1 小時沒有 {text} 的 error／fault 紀錄"))
+    if kind == "crash_reports":
+        if not _PROCESS.match(text):
+            raise ReadError("argument must be a process or app name such as Beri")
+        return _clip(redact(_crash_reports(text)))
+    if kind == "device_crash_reports":
+        app, _, device = text.partition("@")
+        app, device = app.strip(), device.strip()
+        if not _PROCESS.match(app) or (device and not _DEVICE.match(device)):
+            raise ReadError("argument must be an app name, optionally followed by @device name, such as Beri@William")
+        return _clip(redact(_device_crash_reports(app, device)))
+    raise ReadError("kind must be one of: launchd_list, launchd_print, processes, git, simulator_log, mac_log, crash_reports, device_crash_reports")
+
+
+_PROCESS = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+TAIL_LINES = 200
+# Mac and simulator crashes land in DiagnosticReports; a physical iPhone's crash logs appear under
+# CrashReporter/MobileDevice/<device> after the device syncs with this Mac (Finder / Xcode).
+_CRASH_DIRS = ("~/Library/Logs/DiagnosticReports", "~/Library/Logs/CrashReporter/MobileDevice")
+
+
+_DEVICE = re.compile(r"^[A-Za-z0-9._ -]{1,60}$")
+
+
+def _devicectl(args: list[str]) -> tuple[str, dict]:
+    """Run ``xcrun devicectl <args>`` (paired devices, including Xcode's wireless ones) and return (output, json)."""
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="harness-devicectl-") as tmp:
+        out = Path(tmp) / "out.json"
+        try:
+            done = subprocess.run(
+                ["xcrun", "devicectl", *args, "--timeout", "30", "--json-output", str(out)], capture_output=True,
+                text=True, timeout=60, stdin=subprocess.DEVNULL,
+                env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(Path.home()), "LC_ALL": "C"},
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise ReadError(f"devicectl failed: {exc}") from exc
+        data = json.loads(out.read_text()) if out.exists() and out.stat().st_size else {}
+    return ((done.stdout or "") + (done.stderr or "")).strip(), data
+
+
+def _device_crash_reports(name: str, device: str) -> str:
+    """Pull the newest matching system crash log straight from a paired iPhone (read-only file copy)."""
+    if not device:
+        _, listing = _devicectl(["list", "devices"])
+        paired = [d for d in listing.get("result", {}).get("devices", []) if d.get("connectionProperties", {}).get("pairingState") == "paired"]
+        if len(paired) != 1:
+            names = ", ".join(d.get("deviceProperties", {}).get("name", "?") for d in paired) or "none"
+            raise ReadError(f"specify the device as app@device; paired devices: {names}")
+        device = paired[0]["deviceProperties"]["name"]
+    text, data = _devicectl(["device", "info", "files", "--device", device, "--domain-type", "systemCrashLogs"])
+    if data.get("info", {}).get("outcome") != "success":
+        hint = "（手機可能鎖定中——請解鎖後再試）" if "locked" in text.lower() else ""
+        raise ReadError(f"無法讀取 {device} 的 crash 紀錄{hint}：{text[-400:]}")
+    files = [f for f in data.get("result", {}).get("files", []) if not f["resources"]["isDirectory"] and name.lower() in f["name"].lower()]
+    files.sort(key=lambda f: f["metadata"]["lastModDate"], reverse=True)
+    if not files:
+        return f"{device} 上沒有 {name} 的 crash 報告。"
+    import tempfile
+
+    rows = [f"{f['metadata']['lastModDate']}  {f['relativePath']}" for f in files[:20]]
+    with tempfile.TemporaryDirectory(prefix="harness-devicectl-") as tmp:
+        copied = Path(tmp) / "report"
+        _devicectl(["device", "copy", "from", "--device", device, "--domain-type", "systemCrashLogs",
+                    "--source", files[0]["relativePath"], "--destination", str(copied)])
+        head = copied.read_text(errors="replace").splitlines()[:80] if copied.exists() else ["（複製失敗）"]
+    return f"{device} 最近的報告：\n" + "\n".join(rows) + f"\n\n最新一份前 80 行：\n" + "\n".join(head)
+
+
+def _crash_reports(name: str) -> str:
+    found: list[Path] = []
+    for raw in _CRASH_DIRS:
+        base = Path(raw).expanduser()
+        if base.is_dir():
+            found += [f for f in base.rglob("*") if f.is_file() and f.suffix in (".ips", ".crash") and name.lower() in f.name.lower()]
+    found.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    if not found:
+        return f"沒有找到 {name} 的 crash 報告（找過 {', '.join(_CRASH_DIRS)}）。實體 iPhone 的報告要先和這台 Mac 同步才會出現。"
+    rows = [f"{datetime.fromtimestamp(f.stat().st_mtime):%Y-%m-%d %H:%M}  {f}" for f in found[:20]]
+    head = found[0].read_text(errors="replace").splitlines()[:80]
+    return "最近的報告：\n" + "\n".join(rows) + f"\n\n最新一份（{found[0].name}）前 80 行：\n" + "\n".join(head)
