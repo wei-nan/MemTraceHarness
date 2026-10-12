@@ -332,6 +332,12 @@ framed as untrusted data and tokens are masked. **Known gap:** a public page red
 or CAPTCHAs stays the user's own. **Prompt policy, not enforced:** that the model ignores instructions found inside a page —
 the enforced part is that nothing a page says can start a `change` action without a tap or an allowed rule.
 
+**`github_ci`** (`github_ci.py`, tier `read`; operator request 2026-10-12, after a chat could not read a private repo's failing Actions
+run through `browse`): `list` recent runs, `view` one run's jobs and steps, `failed_log` the failing steps' log (the end is kept), through
+the host's own logged-in `gh`. **Enforced** (`tests/test_github_ci.py`): offered only when the scope declares a `github_repo`; the repo must
+be one of the project's own; fixed sub-commands in an argv list, numeric run id only; output token-masked and clipped; nothing is written to
+GitHub. **Not implemented:** re-running a workflow or any other write (they would be `change` tools).
+
 **Multi-step plans (operator decision, 2026-10-12; ENFORCED, `tests/test_plans.py` and the plan tests in `tests/test_service.py`).**
 When a request needs more than one action, the chat model ends its reply with `HARNESS_PLAN::<one-line JSON>` (goal, up to 10
 steps, each a title, a tool, its arguments and an expectation). The Harness runs the steps in order from its tick
