@@ -378,6 +378,22 @@ non-schedule task has had no stage finish for 10 minutes, then at most one more 
 re-send the instruction. **Not implemented:** stopping a *running* task that still has a live Harness thread (the button refuses it,
 and `/cancel` does not touch it), sweeping orphan CLIs automatically at startup, and the note's state surviving a restart.
 
+**Other unfinished work is shown to a new task, and a chat task on a covered issue waits for a tap (operator request 2026-10-12, after
+three tasks on Beri#194 each started blind to the others and produced two pull requests for one issue). `other_work.py`; ENFORCED in
+`tests/test_other_work.py`.** Every task the Harness starts or resumes gets an `other-work` context item (content type `context`, so the
+Controller reads it too) listing the project's other unfinished work from the last 7 days: tasks running now (schedule runs excluded),
+tasks waiting in the queue, and tasks whose own worktree has commits not yet in its base branch or uncommitted edits (stopped, failed,
+waiting for a human, or finished but unmerged). It reads the worktree's real `HEAD` and `git status`, not the branch name the Harness
+recorded, because a CLI can switch branches (chat_7efeada2 did). **Prompt policy, not enforced:** that a model that sees the list
+inspects the other branch and continues or avoids it instead of redoing it. **Enforced:** when the chat model asks to start a task whose
+goal names an issue number (`#194`, `issue-194`, `gh:owner/repo#194`, `/issues/194`) that another listed task also names, the task is
+not started; a card offers 照常開始 / 取消. A goal without an issue number is never held (it only gets the list). The hold lasts 30
+minutes and lives in memory, so a restart drops it and the request has to be made again. Schedules, the unattended scanner and approval
+resumes are never held. **Known limits:** "merged" means merged into the local base branch, so work whose pull request is still open on
+the remote but was merged locally is not listed, and a squash- or rebase-merged branch still looks unmerged; remote pull requests are not
+queried. **Not implemented:** continuing from the other task's branch (a new task still starts from the base branch), and a
+force-refusal rather than a tap.
+
 **Files sent in chat (operator decision, 2026-10-12; ENFORCED, `tests/test_attachments.py`, the media tests in
 `tests/test_telegram_service.py`, `tests/test_api.py`, `tests/test_chat_command_media.py`).** The Telegram service relays photos,
 documents, voice, audio, video, video notes and animations (up to Telegram's 20 MB bot limit; a file it cannot fetch is
