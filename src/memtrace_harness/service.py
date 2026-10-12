@@ -68,6 +68,7 @@ from memtrace_harness.memory_digest import (
     preference_context_for,
 )
 from memtrace_harness import attachments as attachments_mod
+from memtrace_harness import capabilities as capabilities_mod
 from memtrace_harness import plans as plans_mod
 from memtrace_harness.allowlist import AllowList, rule_for
 from memtrace_harness.plan_runner import PlanRunner
@@ -304,6 +305,11 @@ class HarnessService:
                 (c["goal"] or c["id"])[:60] for c in running
             )
         return text
+
+    def _state_dir(self) -> Path | None:
+        """Where this Harness keeps its own state (`.harness`), when it has a store."""
+        path = getattr(getattr(self, "config", None), "trace_db_path", None)
+        return Path(path).parent if path else None
 
     @property
     def attachments(self) -> attachments_mod.AttachmentStore:
@@ -608,7 +614,11 @@ class HarnessService:
         command = getattr(self.config, "transcribe_command", None)
         for item in saved or []:
             try:
-                prepared.append(attachments_mod.prepare(item, transcribe_command=command))
+                state_dir = self._state_dir()
+                prepared.append(attachments_mod.prepare(
+                    item, transcribe_command=command,
+                    model_dirs=[capabilities_mod.caps_dir(state_dir) / "models"] if state_dir else None,
+                ))
             except Exception as exc:  # noqa: BLE001 — report it to the model and the person, do not lose the message
                 logger.exception(f"preparing attachment {item.get('name')} failed")
                 prepared.append(attachments_mod.Prepared(
@@ -1046,6 +1056,19 @@ class HarnessService:
                     "不按、按取消、或時間到都不會改。只改主要模型，備援不動。"
                 )
                 confirm_label = "✅ 確認變更"
+            elif job["kind"] == "install":
+                payload = job["payload"] or {}
+                details = "\n".join(capabilities_mod.card_lines(payload))
+                if len(details) > 3200:
+                    details = details[:3200] + f"\n…（共 {len(details)} 字，這裡只顯示前 3200 字）"
+                text = (
+                    f"📦 待確認安裝（{job['project']}）\n"
+                    f"{job['command']}\n{details}\n\n"
+                    f"有效至：{job['expires_at']}\n"
+                    "這是模型提出的要求，還沒有安裝。按「確認安裝」才會裝；不按、按取消、或時間到都不會裝。"
+                    "安裝每次都要你確認，沒有「之後都允許」；sudo 一律不執行。"
+                )
+                confirm_label = "✅ 確認安裝"
             elif job["kind"] == "tool_call":
                 text = (
                     f"🛠 待確認工具操作（{job['project']}）\n"
@@ -1114,6 +1137,7 @@ class HarnessService:
                 "external_action": f"⌛ GitHub 操作的要求已過期、沒有執行：{job['command']}",
                 "model_change": f"⌛ 模型變更的要求已過期、沒有套用：{job['command']}",
                 "tool_call": f"⌛ 工具操作的要求已過期、沒有執行：{job['command']}",
+                "install": f"⌛ 安裝的要求已過期、沒有安裝：{job['command']}",
             }.get(job["kind"], f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}")
             if job["message_ref"]:
                 self.notify_operator(msg)
@@ -1137,6 +1161,7 @@ class HarnessService:
                 "external_action": f"❌ 已取消，沒有執行：{job['command']}",
                 "model_change": f"❌ 已取消，沒有變更：{job['command']}",
                 "tool_call": f"❌ 已取消，沒有執行：{job['command']}",
+                "install": f"❌ 已取消，沒有安裝：{job['command']}",
             }.get(job["kind"], f"❌ 已取消，沒有執行：{job['job_name']}")
             self.send_message(audience, result)
             self._record_order_turn(job["project"], result)
@@ -1170,6 +1195,8 @@ class HarnessService:
                 self.send_message(audience, f"⚠️ 沒有加入允許清單：{exc}。這一次仍會照你的確認執行。")
         if job["kind"] == "tool_call":
             return self._run_tool_call(job, scope, audience)
+        if job["kind"] == "install":
+            return self._run_install(job, audience)
         if job["kind"] not in {"job", "scope_change", "external_action", "model_change"}:
             trace_store.finish_job_request(request_id, "failed", {"error": f"unknown request kind {job['kind']}"})
             return f"不認得的要求類型（{job['kind']}），沒有執行。"
@@ -1188,6 +1215,33 @@ class HarnessService:
             name=f"job-{request_id}",
         ).start()
         started = f"▶️ 開始執行 {job['job_name']}，完成後會回報。"
+        self.send_message(audience, started)
+        return started
+
+    def _run_install(self, job: dict, audience: str | None) -> str:
+        """The user tapped "確認安裝": validate the request again and run the fixed procedure for its kind (capabilities.py)
+        off the poll thread. Installs are never put on the allowed list."""
+        trace_store = self.approval_manager.trace_store
+        state_dir = self._state_dir()
+
+        def run() -> None:
+            try:
+                if state_dir is None:
+                    raise capabilities_mod.InstallError("這個 Harness 沒有狀態資料夾")
+                payload = capabilities_mod.validate_install(job["payload"] or {})
+                env = child_env()
+                env["PATH"] = ":".join(["/opt/homebrew/bin", "/usr/local/bin", env.get("PATH") or "/usr/bin:/bin"])
+                ok, text, _meta = capabilities_mod.run_install(payload, state_dir, base_env=env)
+            except Exception as exc:  # noqa: BLE001 — report any failure to the human
+                ok, text = False, str(exc)
+            clipped = text if len(text) <= 1500 else text[:1500] + "…"
+            trace_store.finish_job_request(job["request_id"], "done" if ok else "failed", {"output_tail": clipped})
+            result = f"✅ 已安裝：{job['command']}\n{clipped}" if ok else f"⚠️ 沒有裝成功：{job['command']}\n{clipped}"
+            self.send_message(audience, result)
+            self._record_order_turn(job["project"], result)
+
+        threading.Thread(target=run, daemon=True, name=f"job-{job['request_id']}").start()
+        started = f"▶️ 開始安裝：{job['command']}（可能要一點時間，完成會回報）"
         self.send_message(audience, started)
         return started
 
@@ -1303,6 +1357,12 @@ class HarnessService:
         self._record_order_turn(job["project"], result)
         return result
 
+    def _job_env(self) -> dict[str, str]:
+        """What a job's shell sees: the allowlisted environment, plus whatever was installed here on its PATH."""
+        env = child_env()
+        state_dir = self._state_dir()
+        return capabilities_mod.capabilities_env(env, state_dir) if state_dir else env
+
     def _exec_job_command(self, scope: ProjectScope, command: str) -> tuple[str, int | None, str]:
         """Run one declared job command in the project folder: (status, exit code, output head)."""
         reason = forbidden_reason(command)
@@ -1311,7 +1371,7 @@ class HarnessService:
         try:
             done = subprocess.run(
                 command, shell=True, cwd=scope.working_directory, capture_output=True, text=True,
-                timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=child_env(),
+                timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=self._job_env(),
             )
             output = ((done.stdout or "") + (done.stderr or "")).strip()
             status, code = ("done" if done.returncode == 0 else "failed"), done.returncode
@@ -2665,6 +2725,7 @@ class HarnessService:
             f"{self._model_notice()}"
             f"{self._memtrace_notice()}"
             f"{self._ops_notice(scope)}"
+            f"{capabilities_mod.prompt_notice(self._state_dir()) if self._state_dir() else ''}"
             f"{self._schedule_control_notice(scope)}"
             f"{self._taiwantrade_notice(scope.name)}"
             f"{self._status_notice(scope)}"

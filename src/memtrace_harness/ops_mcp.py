@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from memtrace_harness import ops_read, tool_registry
+from memtrace_harness import capabilities, ops_read, tool_registry
 from memtrace_harness.command_policy import REFUSAL_HINT, forbidden_reason
 from memtrace_harness.github_actions import ACTIONS, github_issue_repos, summarize, validate_action
 from memtrace_harness.model_changes import TARGETS as MODEL_TARGETS, summarize as summarize_model_change, validate_model_change
@@ -166,6 +166,33 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "list_jobs",
         "description": "The named jobs this project allows run_job to run, with their commands.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "request_install",
+        "description": (
+            "Ask the user to install something the Harness is missing. Only a request: the user sees the source, the exact "
+            "command and your reason, and only a tap installs it (every time; no always-allow). kind: pip, npm, brew (name, "
+            "optional version), model_file (url, filename, sha256 — required), script (url of a shell script, downloaded "
+            "and run with sh), git (url, name, optional ref and one-line install_command), skill (name, and content or url "
+            "of a SKILL.md). Never for sudo — give the user that command to run themselves."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": _string_param("pip | npm | brew | model_file | script | git | skill"),
+                "reason": _string_param("why it is needed (shown to the user)"),
+                "name": _string_param("package / folder / skill name"),
+                "version": _string_param("optional version"),
+                "url": _string_param("https URL (model_file, script, git, skill)"),
+                "filename": _string_param("model_file: file name to save as"),
+                "sha256": _string_param("model_file: required SHA-256 (hex)"),
+                "ref": _string_param("git: optional branch or tag"),
+                "install_command": _string_param("git: optional one-line command run in the clone"),
+                "content": _string_param("skill: the SKILL.md text"),
+            },
+            "required": ["kind", "reason"],
+            "additionalProperties": False,
+        },
     },
     {
         "name": "propose_scope_change",
@@ -454,6 +481,26 @@ def _read_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
         raise OpsError(str(exc)) from exc
 
 
+def request_install(ctx: OpsContext, arguments: dict[str, Any]) -> str:
+    if ctx.store is None:
+        raise OpsError("install requests are not available here")
+    try:
+        payload = capabilities.validate_install(arguments)
+    except capabilities.InstallError as exc:
+        raise OpsError(str(exc)) from exc
+    summary = capabilities.summarize(payload)
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+    if not ctx.store.create_install_request(
+        request_id=f"inst_{uuid.uuid4().hex[:10]}", project=ctx.project, summary=summary, payload=payload, expires_at=expires
+    ):
+        raise OpsError("could not record the request")
+    return (
+        f"Proposed: {summary}. The user now has a confirm button in the chat (valid 10 minutes) showing the source, what "
+        "will run and why; nothing is installed until they tap it. Say that a confirmation is waiting; do not say it is "
+        "installed. Using it afterwards still goes through the usual confirmations."
+    )
+
+
 def _request_tool_call(ctx: OpsContext, spec: tool_registry.ToolSpec, arguments: dict[str, Any]) -> str:
     """A `change`-tier tool: record the request; the handler runs only after the user's tap (service.py)."""
     if ctx.store is None:
@@ -510,6 +557,7 @@ def _register_builtin_tools() -> None:
         ("query_db", R, lambda c, a: _read_tool(c, "query_db", a), None),
         ("system_status", R, lambda c, a: _read_tool(c, "system_status", a), None),
         ("run_job", P, request_job, lambda c: bool(c.jobs)),
+        ("request_install", P, request_install, lambda c: c.store is not None),
         ("propose_scope_change", P, propose_scope_change, lambda c: c.store is not None),
         ("propose_model_change", P, propose_model_change, lambda c: c.store is not None),
         ("propose_github_action", P, propose_github_action, lambda c: c.store is not None and bool(c.github_repos)),
