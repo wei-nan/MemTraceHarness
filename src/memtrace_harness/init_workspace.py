@@ -33,8 +33,8 @@ DEFAULT_API_PORT = 8800
 DEFAULT_SERVICES_DIR = Path.home() / ".config" / "memtraceharness"
 
 CHAT_PRESETS = {
-    "1": ("antigravity", "gemini-3.6-flash-high", "claude/haiku"),
-    "2": ("claude", "haiku", "antigravity/gemini-3.6-flash-high"),
+    "1": ("antigravity", "gemini-3.8-flash-high", "claude/haiku"),
+    "2": ("claude", "haiku", "antigravity/gemini-3.8-flash-high"),
     "3": ("codex", "", ""),
 }
 

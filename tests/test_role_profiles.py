@@ -18,7 +18,7 @@ class RoleProfileTests(TestCase):
             [(item.provider, item.model) for item in profiles["controller"].fallbacks],
             [
                 ("claude", "sonnet"),
-                ("antigravity", "gemini-3.6-flash-high"),
+                ("antigravity", "gemini-3.8-flash-high"),
             ],
         )
         self.assertEqual(profiles["red-team"].fallbacks, ())
@@ -76,7 +76,7 @@ class RoleProfileTests(TestCase):
             text = original.read_text(encoding="utf-8").replace(
                 '[profiles.red-team]\nrole = "Red Team"\nprovider = "codex"\nmodel = "gpt-5.6-sol"',
                 '[profiles.red-team]\nrole = "Red Team"\nprovider = "antigravity"\n'
-                'model = "gemini-3.1-pro-high"',
+                'model = "gemini-3.8-flash-high"',
                 1,
             )
             path.write_text(text, encoding="utf-8")
@@ -84,7 +84,7 @@ class RoleProfileTests(TestCase):
             profiles = load_role_profiles(path)
 
         self.assertEqual(profiles["red-team"].provider, "antigravity")
-        self.assertEqual(profiles["red-team"].model, "gemini-3.1-pro-high")
+        self.assertEqual(profiles["red-team"].model, "gemini-3.8-flash-high")
         self.assertEqual(profiles["red-team"].permission, "read-only")
 
     def test_custom_profile_cannot_grant_red_team_write_access(self) -> None:
@@ -126,12 +126,12 @@ class RoleProfileTests(TestCase):
                 .replace(
                     '[profiles.controller]\nrole = "Controller"\nprovider = "codex"\nmodel = "gpt-5.6-luna"',
                     '[profiles.controller]\nrole = "Controller"\nprovider = "antigravity"\n'
-                    'model = "gemini-3.6-flash-high"',
+                    'model = "gemini-3.8-flash-high"',
                     1,
                 )
                 .replace(
                     '[profiles.developer]\nrole = "Developer"\nprovider = "antigravity"\n'
-                    'model = "gemini-3.1-pro-high"',
+                    'model = "gemini-3.8-flash-high"',
                     '[profiles.developer]\nrole = "Developer"\nprovider = "claude"\n'
                     'model = "sonnet"',
                     1,
@@ -180,7 +180,7 @@ class RoleProfileTests(TestCase):
                 'fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]\n'
                 'max_fallback_hops = 1\n\n'
                 '[[profiles.red-team.fallbacks]]\nprovider = "antigravity"\n'
-                'model = "gemini-3.6-flash-high"\nreasoning_effort = "high"\n'
+                'model = "gemini-3.8-flash-high"\nreasoning_effort = "high"\n'
                 'quota_bucket = "antigravity-account"\n'
             )
             path.write_text(text, encoding="utf-8")
@@ -189,7 +189,7 @@ class RoleProfileTests(TestCase):
 
         self.assertEqual(profiles["red-team"].provider, "antigravity")
         self.assertEqual(len(profiles["red-team"].fallbacks), 1)
-        self.assertEqual(profiles["red-team"].fallbacks[0].model, "gemini-3.6-flash-high")
+        self.assertEqual(profiles["red-team"].fallbacks[0].model, "gemini-3.8-flash-high")
 
     def test_custom_profile_can_pin_a_full_sonnet_model_id(self) -> None:
         with TemporaryDirectory() as directory:
