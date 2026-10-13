@@ -105,3 +105,46 @@ class PermanentChangeTests(TestCase):
             with self.assertRaises(ValueError):
                 apply_model_change(config, {"target": "develop", "provider": "codex", "model": "gpt-6-sol"})
             self.assertEqual(roles.read_text(encoding="utf-8"), snapshot)
+
+
+class PerSkillOverrideTests(TestCase):
+    def setUp(self) -> None:
+        self.profiles = load_role_profiles()
+        self.config = MagicMock(workspace_root=None)
+
+    def test_skill_prefixes_come_off_with_the_model_and_repo_ones_in_any_order(self) -> None:
+        self.assertEqual(
+            split_goal_directives("review=gpt-5.6-sol::develop=opus::repo=android::設計頁面"),
+            ("android", "develop=opus,review=gpt-5.6-sol", "設計頁面"),
+        )
+        self.assertEqual(
+            split_goal_directives("model=opus::review=codex/gpt-5.6-sol::設計頁面"),
+            (None, "develop=opus,review=codex/gpt-5.6-sol", "設計頁面"),
+        )
+        # `develop=` alone is the same as `model=`, and reads back as the plain spec
+        self.assertEqual(split_goal_directives("develop=opus::設計頁面"), (None, "opus", "設計頁面"))
+        self.assertEqual(split_goal_directives("plan=opus::設計頁面"), (None, "plan=opus", "設計頁面"))
+
+    def test_a_directive_spec_reads_back_as_models_per_skill(self) -> None:
+        from memtrace_harness.model_override import parse_skill_models
+
+        self.assertEqual(parse_skill_models("opus"), {"develop": "opus"})
+        self.assertEqual(
+            parse_skill_models("develop=opus,review=codex/gpt-5.6-sol"),
+            {"develop": "opus", "review": "codex/gpt-5.6-sol"},
+        )
+        with self.assertRaises(ValueError):
+            parse_skill_models("controller=opus")
+
+    def test_each_named_skill_gets_the_chosen_model_first_and_the_others_are_untouched(self) -> None:
+        from memtrace_harness.model_override import with_skill_override
+
+        review = self.profiles["review"]
+        candidate = resolve_model_override("claude-opus-5-5", review, self.config)
+        changed = with_skill_override(self.profiles, "review", candidate)
+
+        self.assertEqual((changed["review"].provider, changed["review"].model), ("claude", "claude-opus-5-5"))
+        self.assertEqual((changed["review"].fallbacks[0].provider, changed["review"].fallbacks[0].model), (review.provider, review.model))
+        self.assertEqual(changed["review"].permission, "read-only")
+        self.assertEqual(changed["develop"], self.profiles["develop"])
+        self.assertEqual(changed["plan"], self.profiles["plan"])

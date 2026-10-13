@@ -26,15 +26,19 @@ Hard project boundaries:
   preferences in `.harness/models.toml` — never read or print the former, and never put a secret in a command line or a log.
 - Harness output remains draft evidence; it cannot approve its own Agent Loop gate or Improvement
   Loop proposal.
-- Role identity is the job in the pipeline (route, plan, escalate, verify, implement), not a vendor
-  pin: every role's provider/model — Controller, Planner, Planner-escalation, Red Team, and
-  Developer alike — is project-configurable via a custom role-profiles file
-  (`HARNESS_ROLE_PROFILES_FILE` in the workspace's `.harness.env`). What must stay enforced regardless of vendor choice:
-  only the `developer` profile may hold `workspace-write` (every other role stays `read-only`);
-  each role's `context_policy` shape (Controller only gets a loop snapshot, Red Team only
-  gate-scoped evidence, etc.); and Red Team / Planner-escalation both fail closed with no fallback
-  chain. The "independent reviewer" and "consistent behavior" guarantees come from every role stage
-  already being a fresh, separately-invoked CLI call — never a continued conversation — and from
-  those permission/context boundaries, not from forcing any role onto a specific vendor.
+- The Controller is the only role; plan, review and develop are skills it runs (`stage_skills.py`,
+  `skills/<name>/SKILL.md`). A skill's identity is its job, not a vendor pin: every profile's
+  provider/model — the Controller and the `plan`, `plan-escalation`, `review` and `develop` skills —
+  is project-configurable via a custom role-profiles file (`HARNESS_ROLE_PROFILES_FILE` in the
+  workspace's `.harness.env`; the pre-skill names `planner`/`red-team`/`developer` still load). What
+  must stay enforced regardless of vendor choice: only the `develop` profile may hold
+  `workspace-write` (every other profile stays `read-only`); each profile's `context_policy` shape
+  (Controller only gets a loop snapshot, `review` only gate-scoped evidence, etc.). The "independent
+  reviewer" guarantee comes from every skill being a fresh, separately-invoked CLI call that is
+  handed artifacts, never another skill's conversation, and from those permission/context
+  boundaries, not from forcing any skill onto a specific vendor.
+- A task is reported done only when the Controller's goal check answers every success criterion it
+  wrote for the user's whole request (`goal_plan.py`); never mark it `succeeded` on the strength of
+  one phase.
 - A local loop status never proves that MemTrace changed gate, blocked, rejected, reject-count, or
   completed state.

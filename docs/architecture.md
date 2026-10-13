@@ -108,35 +108,60 @@ artifact that is not `INVALID` are rebuilt from the trace store (`_reconstruct_p
 new human clarification in context. Semantic compaction and provider-native thread continuation
 remain planned.
 
-## Role-profile loop
+## One Controller, stage skills
 
-The packaged v0.4 policy is:
+The Controller is the only role. Plan, review and develop are *skills* it runs: packaged
+`skills/<name>/SKILL.md` files (`stage_skills.py`) whose front matter names the profile (model,
+permission, fallback chain) and output schema, and whose sections hold the stable prompt policy. The
+Harness runs each skill as a fresh CLI call and hands back its artifact; the Controller decides which
+skill runs next, the Harness decides what is allowed.
 
 ```text
-controller          Codex gpt-5.6-luna        read-only
-planner             Claude sonnet             read-only
-planner-escalation  Claude opus               read-only
-red-team            Codex gpt-5.6-sol         read-only
-developer           Antigravity Gemini        workspace-write
+controller          Codex gpt-5.6-luna        read-only        (the only role)
+plan                Claude sonnet             read-only        skill
+plan-escalation     Claude opus               read-only        the plan skill's stronger-model mode
+review              Codex gpt-5.6-sol         read-only        skill (G1 on a plan, G2 on a development)
+develop             Antigravity Gemini        workspace-write  skill
 ```
 
-The normal path is Luna control, Sonnet planning, Sol G1, Gemini development, Sol G2, and Luna
+Profile ids are the skill names. The pre-skill names (`planner`, `planner-escalation`, `red-team`,
+`developer`) still load from an older roles file, and a `[profiles.plan.escalation]` sub-table is read as
+the `plan-escalation` profile.
+
+**Goal plan.** At the start the Controller writes a goal plan for the user's *whole* request: the
+restated goal, observable `success_criteria`, and ordered `phases`. Each phase names the skills it needs
+(`["plan"]`, `["develop"]` or `["plan","develop"]`) and its own acceptance conditions; `review` is never
+chosen, it follows every plan (G1) and every development (build/test then G2) automatically. The
+Controller is given the user's own words (`user_request`), not only the chat model's one-line goal.
+
+**Goal check.** After each phase the Controller looks at what was produced against the success criteria
+(`progress`: next_phase, revise_phases, finish, ask_human) and, when the last phase is done, `converge`
+reports a per-criterion `goal_check`. The Harness refuses to finish while the check is missing, skips a
+criterion, or lists anything unmet: the task stops as `needs_human` and says it is only partly done. The
+Controller can instead choose `revise_phases` to add more work (at most six phases in all). The final
+message carries the criterion-by-criterion report. Stages of phase N>1 are recorded as `pN-…`; a resumed
+run reuses a settled phase only while it and every phase before it keep the same title and skills.
+
+## Role-profile loop
+
+The packaged v0.4 policy is the table above. The default one-phase plan runs the original pipeline:
+Luna control, Sonnet planning, Sol G1, Gemini development, Sol G2, and Luna
 convergence. Each stage has a distinct job:
 
 - **Controller (start)** routes the request: plan it, run it as an operational action, ask a human,
   stop, or report that no action is needed. It sees only the compact snapshot.
-- **Planner** produces the plan: affected files, acceptance criteria, scope exclusions, open
+- **Plan** produces the plan: affected files, acceptance criteria, scope exclusions, open
   questions, and rollback. **G1** owns scope: it checks that the plan is concrete and bounded, and
   rejects it when it is not. It is a model verdict.
-- **Developer** is the only role with write access. It implements the accepted plan and runs
+- **Develop** is the only skill with write access. It implements the accepted plan and runs
   tests. Its own "completed" status is not treated as final.
-- **G2** owns conformance: it checks that the development matches what the accepted plan
+- **Review (G2)** owns conformance: it checks that the development matches what the accepted plan
   expected. If the project configures a `verify_command`, the Harness runs it first, and a failure
   becomes a synthetic REJECT that skips the model and drives the same revision path.
 - **Converge (Controller)** runs after development and gates have passed, because a finished
   development is not the same as finished work. It decides `finish`, `merge` (integrate the
-  task's isolated worktree back into the main line, reporting conflicts as `needs_human`), or
-  `ask_human`.
+  task's isolated worktree back into the main line, reporting conflicts as `needs_human`),
+  `revise_phases` (the goal is not reached yet) or `ask_human`, and reports the goal check.
 - **Operate** handles requests that need no code change. Controller routes them to a direct action
   and the loop ends without planning or development.
 

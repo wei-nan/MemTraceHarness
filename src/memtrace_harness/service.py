@@ -18,7 +18,12 @@ from pathlib import Path
 from memtrace_harness.cli_process import child_env, kill_provider_clis_in_directory
 from memtrace_harness.adapter_factory import build_role_adapter_candidates
 from memtrace_harness.model_changes import apply_model_change
-from memtrace_harness.model_override import describe as describe_model, resolve_model_override, with_developer_override
+from memtrace_harness.model_override import (
+    describe as describe_model,
+    parse_skill_models,
+    resolve_model_override,
+    with_skill_override,
+)
 from memtrace_harness.completion_claims import (
     CHAT_NOTE_MARKER,
     CHAT_NOTE_TAGS,
@@ -59,7 +64,7 @@ from memtrace_harness.trigger_review import (
 from memtrace_harness.approval import INFO_NEEDED_REASONS, ApprovalRequestData
 from memtrace_harness import other_work
 from memtrace_harness.inflight import default_tracker
-from memtrace_harness.loop import AgentLoopRunner
+from memtrace_harness.loop import AgentLoopRunner, split_stage_name, user_request_item
 from memtrace_harness.calibration import calibration_block
 from memtrace_harness.memory_audit import describe_audit, undo_audit_run
 from memtrace_harness.memory_digest import (
@@ -1560,7 +1565,12 @@ class HarnessService:
         )
 
     def _start_or_queue_task(
-        self, scope: ProjectScope, goal: str, audience: str | None, schedule_id: str | None = None
+        self,
+        scope: ProjectScope,
+        goal: str,
+        audience: str | None,
+        schedule_id: str | None = None,
+        request: str | None = None,
     ) -> str:
         """Start a governed task now if the project has a free worker slot, otherwise
         queue it. A schedule whose previous run is still running (or still queued) is
@@ -1569,9 +1579,9 @@ class HarnessService:
         try:
             scope.resolve_repo(repo_name)
             if model_spec:
-                resolve_model_override(
-                    model_spec, load_role_profiles(self.config.role_profiles_file_for(scope.name))["develop"], self.config
-                )
+                skill_profiles = load_role_profiles(self.config.role_profiles_file_for(scope.name))
+                for skill, spec in parse_skill_models(model_spec).items():
+                    resolve_model_override(spec, skill_profiles[skill], self.config)
         except ValueError as exc:
             msg = f"⚠️ 任務沒有開始：{exc}"
             self.send_message(audience, msg)
@@ -1590,7 +1600,7 @@ class HarnessService:
             queue_id = trace_store.enqueue_task(
                 workspace_id=ws_id,
                 kind="new",
-                payload={"goal": goal},
+                payload={"goal": goal, "request": request},
                 conversation_id=None,
                 schedule_id=schedule_id,
                 audience=audience,
@@ -1610,34 +1620,50 @@ class HarnessService:
         # Say WHICH task started: with several schedules (and chat tasks) running, a bare
         # "a task started" can't be told apart.
         self.send_message(audience, self._task_started_text(scope, goal, schedule_id))
-        self._launch_task(scope, conv_id, goal, audience, schedule_id)
+        self._launch_task(scope, conv_id, goal, audience, schedule_id, request)
         return f"任務已在背景開始執行：{goal}"
 
     def _with_model_override(
         self, profiles: dict, model_spec: str | None, project: str | None
     ) -> tuple[dict, frozenset[str]]:
-        """The profiles with this task's one-off Developer model in front (see model_override.py), and the
-        profiles it applies to. A spec that cannot be resolved is ignored: the task runs on the defaults."""
+        """The profiles with this task's one-off skill models in front (see model_override.py), and the
+        profiles they apply to. A spec that cannot be resolved is ignored: that skill runs on the defaults."""
         if not model_spec:
             return profiles, frozenset()
         try:
-            candidate = resolve_model_override(model_spec, profiles["develop"], self.config)
+            chosen = parse_skill_models(model_spec)
         except ValueError as exc:
             logger.warning(f"ignoring one-off model {model_spec!r} for project {project!r}: {exc}")
             return profiles, frozenset()
-        return with_developer_override(profiles, candidate), frozenset({"develop"})
+        applied: set[str] = set()
+        for skill, spec in chosen.items():
+            try:
+                candidate = resolve_model_override(spec, profiles[skill], self.config)
+            except ValueError as exc:
+                logger.warning(f"ignoring one-off model {spec!r} for {skill} in project {project!r}: {exc}")
+                continue
+            profiles = with_skill_override(profiles, skill, candidate)
+            applied.add(skill)
+        return profiles, frozenset(applied)
 
     @staticmethod
     def _task_started_text(scope: ProjectScope, goal: str, schedule_id: str | None) -> str:
         _, model_spec, plain = split_goal_directives(goal)
         if model_spec:
-            goal = f"{plain}（這次動手的模型：{model_spec}，失敗會改回預設）"
+            shown = model_spec if "=" in model_spec else f"develop={model_spec}"
+            goal = f"{plain}（這次指定的模型：{shown.replace(',', '、')}，失敗會改回預設）"
         if schedule_id:
             return f"⏰ 排程 {schedule_id} 開始執行：{goal}"
         return f"🔧 開始執行「{scope.name}」：{goal}"
 
     def _launch_task(
-        self, scope: ProjectScope, conv_id: str, goal: str, audience: str | None, schedule_id: str | None
+        self,
+        scope: ProjectScope,
+        conv_id: str,
+        goal: str,
+        audience: str | None,
+        schedule_id: str | None,
+        request: str | None = None,
     ) -> None:
         """Run an already-slotted task in a background thread so this bot's poll loop —
         and therefore ordinary chat on it — isn't blocked for the minutes a governed loop
@@ -1649,7 +1675,8 @@ class HarnessService:
 
         def _run() -> None:
             try:
-                summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id)
+                extra = {"request": request} if request else {}
+                summary = self._run_new_task(scope, conv_id, goal, schedule_id=schedule_id, **extra)
                 delivery = self._schedule_deliveries.pop(conv_id, None) if schedule_id else None
                 if delivery is not None and delivery.action == "digest_only":
                     # Recorded in the chat log (tagged) for the nightly digest; not pushed.
@@ -1756,7 +1783,7 @@ class HarnessService:
             self.send_message(
                 audience, f"▶️ 輪到排隊中的任務了，開始執行「{scope.name}」：{goal[:80]}"
             )
-        self._launch_task(scope, conv_id, goal, audience, item["schedule_id"])
+        self._launch_task(scope, conv_id, goal, audience, item["schedule_id"], item["payload"].get("request"))
 
     # ---- per-task git worktrees (see worktrees.py)
 
@@ -1826,7 +1853,7 @@ class HarnessService:
                 logger.info(f"released the interrupted run of schedule {locks[conv_id]['schedule_id']}")
                 continue
             stages = store.get_conversation_pipeline(conv_id)
-            last = self._STAGE_LABELS.get(stages[-1]["stage"], stages[-1]["stage"]) if stages else None
+            last = self._stage_label(stages[-1]["stage"]) if stages else None
             if state is None:
                 work = "它沒有獨立的 worktree，或 worktree 已不存在。"
             else:
@@ -1878,7 +1905,9 @@ class HarnessService:
             logger.exception("listing the project's other unfinished work failed; continuing without it")
             return []
 
-    def _hold_for_overlap(self, scope: ProjectScope, goal: str, audience: str | None) -> bool:
+    def _hold_for_overlap(
+        self, scope: ProjectScope, goal: str, audience: str | None, request: str | None = None
+    ) -> bool:
         """A task the chat model asked to start that names an issue another unfinished task already covers is
         not started straight away: the operator is asked first (start anyway / cancel). ENFORCED, and only
         by issue number — see other_work.overlapping. Returns True when the task was held. Only chat-started
@@ -1891,7 +1920,7 @@ class HarnessService:
         for token in [t for t, v in pending.items() if now - v["at"] > self.OVERLAP_HOLD_SECONDS]:
             pending.pop(token, None)
         token = uuid4().hex[:8]
-        pending[token] = {"scope": scope, "goal": goal, "at": now}
+        pending[token] = {"scope": scope, "goal": goal, "at": now, "request": request}
         text = (
             "⚠️ 這個任務提到的 issue，已經有尚未收尾的工作，我先沒有開始：\n- "
             + "\n- ".join(other_work.describe(m) for m in matches[:5])
@@ -1913,16 +1942,30 @@ class HarnessService:
         if action == "dup_cancel":
             self.send_message(audience, "已取消，沒有開始這個任務。")
             return "已取消。"
-        self._start_or_queue_task(held["scope"], held["goal"], audience)
+        extra = {"request": held["request"]} if held.get("request") else {}
+        self._start_or_queue_task(held["scope"], held["goal"], audience, **extra)
         return "照常開始。"
 
     LONG_RUN_FIRST_SECONDS = 600
     LONG_RUN_REPEAT_SECONDS = 1200
     _STAGE_LABELS = {
-        "control-start": "Controller", "plan": "Planner", "plan-revision": "Planner（修訂）", "g1": "G1",
-        "g1-recheck": "G1（複查）", "develop": "Developer", "develop-revision": "Developer（修訂）",
-        "g2": "G2", "g2-recheck": "G2（複查）", "converge": "收尾", "operate": "執行",
+        "control-start": "Controller", "plan": "plan", "plan-revision": "plan（修訂）",
+        "plan-escalation": "plan（升級）", "g1": "review G1", "g1-rescope": "review G1（重審）",
+        "g1-recheck": "review G1（複查）", "develop": "develop", "develop-revision": "develop（修訂）",
+        "g2": "review G2", "g2-recheck": "review G2（複查）", "progress": "階段檢查", "converge": "收尾",
+        "operate": "執行",
     }
+
+    @classmethod
+    def _stage_label(cls, stage: str) -> str:
+        """The label of a recorded stage name; a later phase's stages (``p2-develop``, ``progress-1``,
+        ``converge-2``) read as the plain stage with its phase."""
+        phase, base = split_stage_name(stage)
+        numbered = re.match(r"^(progress|converge)-(\d+)$", base)
+        if numbered:
+            return f"{cls._STAGE_LABELS[numbered.group(1)]} {numbered.group(2)}"
+        label = cls._STAGE_LABELS.get(base, base)
+        return label if phase == 1 else f"{label}（第 {phase} 階段）"
 
     def report_long_running(self, now: float | None = None) -> int:
         """Tell the operator, in the chat, that a task is still running when no stage has finished for a while.
@@ -1948,7 +1991,7 @@ class HarnessService:
             last_stage = None
             if pipeline:
                 last = pipeline[-1]
-                last_stage = self._STAGE_LABELS.get(last["stage"], last["stage"])
+                last_stage = self._stage_label(last["stage"])
                 try:
                     quiet_since = max(quiet_since, datetime.fromisoformat(last["created_at"]).timestamp())
                 except (TypeError, ValueError):
@@ -2700,7 +2743,7 @@ class HarnessService:
             converge = next(
                 (
                     s for s in reversed(summary.stages)
-                    if s.stage == "converge" and (s.artifact or {}).get("action") in {"finish", "merge"}
+                    if s.stage.startswith("converge") and (s.artifact or {}).get("action") in {"finish", "merge"}
                 ),
                 None,
             )
@@ -2959,7 +3002,7 @@ class HarnessService:
         human wants real development work started now, it should end its reply
         with a line "HARNESS_TASK_START::<goal>"; the harness strips that line
         out of what the human sees and uses it to kick off the governed
-        Controller/Planner/RedTeam/Developer loop in the background, same as the
+        Controller loop (plan, review and develop skills) in the background, same as the
         old "!" trigger did — except the decision now comes from the model
         judging the conversation, not a mechanical prefix, and there is no
         separate approval step in between: reaching this marker together with
@@ -3005,9 +3048,11 @@ class HarnessService:
             "原因，不要假裝在等待。\n\n"
             "如果，而且只有在，根據這則訊息（以及前面的對話），你確信使用者現在真的是要你"
             "動手進行開發——修改這個 repo 的程式碼、實際落地某個具體改動——才在回覆的最後"
-            f"另起一行，格式為「{self._TASK_START_MARKER}<一句話描述要做的具體任務>」，交給"
-            "受控的 Controller/Planner/RedTeam/Developer 流程去執行。單純聊天、討論、還在"
-            "釐清需求、或只是在問問題時，絕對不要輸出這一行——不確定就不要輸出。\n\n"
+            f"另起一行，格式為「{self._TASK_START_MARKER}<任務描述>」，交給"
+            "受控的 Controller 流程去執行（它會自己擬計畫、分階段、決定要不要規劃與開發，並在最後"
+            "核對使用者的原始目標是否真的完成）。任務描述要涵蓋使用者這次要求的「全部」事項，不要只"
+            "挑第一件或把多件事壓成其中一件；使用者的原話也會一併交給 Controller。單純聊天、討論、"
+            "還在釐清需求、或只是在問問題時，絕對不要輸出這一行——不確定就不要輸出。\n\n"
             "如果，而且只有在，使用者明確要你之後每隔一段時間、或每天/每個工作日固定時間"
             "重複執行某件事——才在回覆的最後另起一行，格式為「"
             f"{self._SCHEDULE_START_MARKER}<kind>::<spec>::<一句話描述要做的具體任務>」，"
@@ -3124,8 +3169,8 @@ class HarnessService:
                     self.primary_session_mgr.record_turn(
                         project=scope.name, speaker="user", turn_type="decision", content=goal
                     )
-                    if not self._hold_for_overlap(scope, goal, audience):
-                        self._start_or_queue_task(scope, goal, audience)
+                    if not self._hold_for_overlap(scope, goal, audience, request=text):
+                        self._start_or_queue_task(scope, goal, audience, request=text)
                 if review_request and not goal:
                     self.send_message(audience, self._start_work_review(scope, audience))
                 if memory_rebuild and not goal:
@@ -3631,7 +3676,14 @@ class HarnessService:
             return f"✅ 已取消排程 {schedule_id}。"
         return f"⚠️ 找不到可取消的排程 {schedule_id}（可能已經被取消，或 ID 打錯了）。"
 
-    def _run_new_task(self, scope: ProjectScope, conv_id: str, goal: str, schedule_id: str | None = None):
+    def _run_new_task(
+        self,
+        scope: ProjectScope,
+        conv_id: str,
+        goal: str,
+        schedule_id: str | None = None,
+        request: str | None = None,
+    ):
         # A task works in one repo of the project: the one its goal names, else the primary one.
         repo_name, model_spec, goal = split_goal_directives(goal)
         scope = scope.for_repo(scope.resolve_repo(repo_name))
@@ -3641,7 +3693,10 @@ class HarnessService:
             workspace_id=scope.workspace_id,
             goal=goal,
             context_refs=[],
-            context_items=self._project_context_items(scope, exclude_conversation=conv_id),
+            context_items=[
+                *self._project_context_items(scope, exclude_conversation=conv_id),
+                *([user_request_item(request)] if request and request.strip() else []),
+            ],
             constraints=list(scope.off_limits or []),
             risk_level=scope.default_risk_level,
             source="chat",

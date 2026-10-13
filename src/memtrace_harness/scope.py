@@ -21,24 +21,42 @@ REPO_GOAL_PREFIX = re.compile(r"^repo=([A-Za-z0-9_-]{1,40})::(.*)$", re.DOTALL)
 
 # A one-off model for this task only: `model=<model>::` or `model=<provider>/<model>::`.
 MODEL_GOAL_PREFIX = re.compile(r"^model=((?:[a-z]+/)?[A-Za-z0-9][A-Za-z0-9.\-]{0,79})::(.*)$", re.DOTALL)
+# The same for one skill of the Controller: `plan=…::`, `review=…::`, `develop=…::` (`model=` means develop).
+SKILL_MODEL_PREFIX = re.compile(
+    r"^(plan|review|develop)=((?:[a-z]+/)?[A-Za-z0-9][A-Za-z0-9.\-]{0,79})::(.*)$", re.DOTALL
+)
 
 
 def split_goal_directives(goal: str) -> tuple[str | None, str | None, str]:
-    """(`repo` name, one-off `model` spec, the goal without its leading `repo=…::` / `model=…::`
-    prefixes — either, in either order). Missing ones are None."""
+    """(`repo` name, one-off `model` spec, the goal without its leading `repo=…::` / `model=…::` /
+    `<skill>=…::` prefixes — in any order). Missing ones are None.
+
+    The model spec is a plain model for the develop skill (`model=opus::` or `develop=opus::`), or, when any
+    other skill is named too, `skill=model` pairs joined by commas (`develop=opus,review=codex/gpt-5.6-sol`);
+    model_override.parse_skill_models reads both."""
     repo: str | None = None
-    model: str | None = None
+    models: dict[str, str] = {}
     rest = goal.strip()
     while True:
         if repo is None and (match := REPO_GOAL_PREFIX.match(rest)):
             repo = match.group(1)
-        elif model is None and (match := MODEL_GOAL_PREFIX.match(rest)):
-            model = match.group(1)
+            rest = match.group(2).strip()
+        elif "develop" not in models and (match := MODEL_GOAL_PREFIX.match(rest)):
+            models["develop"] = match.group(1)
+            rest = match.group(2).strip()
+        elif (match := SKILL_MODEL_PREFIX.match(rest)) and match.group(1) not in models:
+            models[match.group(1)] = match.group(2)
+            rest = match.group(3).strip()
         else:
             break
-        rest = match.group(2).strip()
-    if repo is None and model is None:
+    if repo is None and not models:
         return None, None, goal
+    if not models:
+        model = None
+    elif set(models) == {"develop"}:
+        model = models["develop"]
+    else:
+        model = ",".join(f"{skill}={spec}" for skill, spec in sorted(models.items()))
     return repo, model, rest
 
 

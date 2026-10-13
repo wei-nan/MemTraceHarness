@@ -10,7 +10,9 @@
         "stop",
         "no_action_needed",
         "finish",
-        "merge"
+        "merge",
+        "next_phase",
+        "revise_phases"
       ]
     },
     "reason": {
@@ -171,6 +173,185 @@
         ],
         "additionalProperties": false
       }
+    },
+    "goal_plan": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "At the start stage with action run_planner: the plan for the user's WHOLE original request. Null at every other stage.",
+      "properties": {
+        "restated_goal": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "success_criteria": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "maxLength": 600
+          }
+        },
+        "phases": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "maxLength": 120
+              },
+              "purpose": {
+                "type": "string",
+                "maxLength": 600
+              },
+              "skills": {
+                "type": "array",
+                "maxItems": 2,
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "plan",
+                    "develop"
+                  ]
+                }
+              },
+              "acceptance": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                  "type": "string",
+                  "maxLength": 600
+                }
+              }
+            },
+            "required": [
+              "title",
+              "purpose",
+              "skills",
+              "acceptance"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "restated_goal",
+        "success_criteria",
+        "phases"
+      ],
+      "additionalProperties": false
+    },
+    "goal_check": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "After a phase finished: whether each success criterion of the user's original request is met, with evidence. Null at the start stage.",
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "met",
+            "partly_met",
+            "not_met"
+          ]
+        },
+        "criteria": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "criterion": {
+                "type": "string",
+                "maxLength": 600
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "met",
+                  "unmet",
+                  "unverified"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "maxLength": 400
+              }
+            },
+            "required": [
+              "criterion",
+              "status",
+              "evidence"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "remaining": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "type": "string",
+            "maxLength": 300
+          }
+        }
+      },
+      "required": [
+        "verdict",
+        "criteria",
+        "remaining"
+      ],
+      "additionalProperties": false
+    },
+    "phases": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "description": "With action revise_phases: the phases still to do, replacing any not yet run. Null otherwise.",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "purpose": {
+            "type": "string",
+            "maxLength": 600
+          },
+          "skills": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+              "type": "string",
+              "enum": [
+                "plan",
+                "develop"
+              ]
+            }
+          },
+          "acceptance": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+              "type": "string",
+              "maxLength": 600
+            }
+          }
+        },
+        "required": [
+          "title",
+          "purpose",
+          "skills",
+          "acceptance"
+        ],
+        "additionalProperties": false
+      }
     }
   },
   "required": [
@@ -178,7 +359,10 @@
     "reason",
     "searched_history",
     "decision_card",
-    "kb_updates"
+    "kb_updates",
+    "goal_plan",
+    "goal_check",
+    "phases"
   ],
   "additionalProperties": false
 }
