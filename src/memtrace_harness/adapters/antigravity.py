@@ -68,14 +68,24 @@ class AntigravityCliAdapter(CliModelAdapter):
         has_usage = bool(usage_data)
         usage = TokenUsage(
             input_tokens=_first_int(usage_data, "input_tokens", "inputTokens", "prompt_tokens"),
+            # agy's stream reports the cache hit as cache_read_tokens; without it the
+            # cached prefix looked like zero and the uncached delta was all that showed.
             cached_input_tokens=_first_int(
-                usage_data, "cached_input_tokens", "cachedInputTokens", "cache_read_input_tokens"
+                usage_data,
+                "cached_input_tokens",
+                "cachedInputTokens",
+                "cache_read_input_tokens",
+                "cache_read_tokens",
             ),
             output_tokens=_first_int(
                 usage_data, "output_tokens", "outputTokens", "completion_tokens"
             ),
             reasoning_output_tokens=_first_int(
-                usage_data, "reasoning_output_tokens", "reasoningTokens", "thoughts_tokens"
+                usage_data,
+                "reasoning_output_tokens",
+                "reasoningTokens",
+                "thoughts_tokens",
+                "thinking_tokens",
             ),
             total_tokens=_first_optional_int(usage_data, "total_tokens", "totalTokens"),
             cost_usd=_first_optional_float(usage_data, "cost_usd", "total_cost_usd"),
