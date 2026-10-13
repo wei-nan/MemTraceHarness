@@ -433,6 +433,37 @@ class CliAdapterTests(TestCase):
         self.assertIsNone(response.execution.exit_code)
         self.assertEqual(response.execution.usage.completeness, "unavailable")
 
+    def test_antigravity_cache_read_and_thinking_tokens_are_recorded(self) -> None:
+        # Shape taken from a real agy develop trace: the final usage object reports
+        # cache_read_tokens and thinking_tokens, not the cached_input/reasoning names.
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "sessionId": "agy_session",
+                "response": "done",
+                "usage": {
+                    "input_tokens": 1060197,
+                    "cache_read_tokens": 35059760,
+                    "output_tokens": 141829,
+                    "thinking_tokens": 101001,
+                    "total_tokens": 1202026,
+                },
+            }
+        )
+        adapter = self._adapter(
+            AntigravityCliAdapter,
+            StaticProcessRunner(process_result(stdout)),
+            structured_output=True,
+        )
+
+        response = adapter.run(self.task, "run_antigravity_cache")
+
+        usage = response.execution.usage
+        self.assertEqual(usage.input_tokens, 1060197)
+        self.assertEqual(usage.cached_input_tokens, 35059760)
+        self.assertEqual(usage.reasoning_output_tokens, 101001)
+        self.assertEqual(usage.output_tokens, 141829)
+
     def test_antigravity_text_mode_does_not_claim_usage(self) -> None:
         adapter = self._adapter(
             AntigravityCliAdapter,
