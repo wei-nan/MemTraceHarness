@@ -75,7 +75,13 @@ from memtrace_harness.allowlist import AllowList, rule_for
 from memtrace_harness.plan_runner import PlanRunner
 from memtrace_harness.command_policy import REFUSAL_HINT, forbidden_reason
 from memtrace_harness import tool_registry
-from memtrace_harness.ops_mcp import ops_context_for_scope, ops_server_spec, run_confirmed_tool
+from memtrace_harness.ops_mcp import (
+    JOB_REMINDER_LEAD_SECONDS,
+    JOB_REQUEST_TTL_SECONDS,
+    ops_context_for_scope,
+    ops_server_spec,
+    run_confirmed_tool,
+)
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.schedule import (
@@ -878,6 +884,8 @@ class HarnessService:
             return self._resolve_overlap(action, request_id, audience, message_ref)[:200]
         if action in {"job_confirm", "job_confirm_always", "job_cancel"}:
             return self._resolve_job_action(action, request_id, audience, message_ref)[:200]
+        if action == "job_retry":
+            return self._retry_job_request(request_id, audience, message_ref)[:200]
         if action in {"order_confirm", "order_cancel"}:
             return self._resolve_order_action(action, request_id, audience, message_ref)[:200]
         return self._resolve_approval_action(request_id, action, audience, None)[:200]
@@ -1029,6 +1037,98 @@ class HarnessService:
     JOB_TIMEOUT_SECONDS = 900
     JOB_OUTPUT_CHARS = 1500
 
+    def _job_card(self, job: dict) -> tuple[str, list[list[dict[str, str]]]]:
+        """The confirm card (text and buttons) for one request waiting for a tap."""
+        if job["kind"] == "scope_change":
+            run_after = bool((job["payload"] or {}).get("run_after"))
+            text = (
+                f"🔧 待確認新增工具設定{'並立即執行' if run_after else ''}（{job['project']}）\n"
+                f"{job['command']}\n"
+                f"有效至：{job['expires_at']}\n\n"
+                + (
+                    "這是模型提出的要求，還沒有套用。按「確認新增並執行」會把上面這個 job 寫進專案的 "
+                    "harness-scope.md，並立刻執行一次，不會再問第二次；不按、按取消、或時間到都不會改、也不會跑。"
+                    if run_after
+                    else "這是模型提出的要求，還沒有套用。按「確認新增」才會寫進專案的 harness-scope.md；"
+                    "不按、按取消、或時間到都不會改。新增的 job 之後仍要再按一次確認才會執行。"
+                )
+            )
+            confirm_label = "✅ 確認新增並執行" if run_after else "✅ 確認新增"
+        elif job["kind"] == "model_change":
+            text = (
+                f"🔁 待確認永久變更模型（{job['project']}）\n"
+                f"{job['command']}\n"
+                f"有效至：{job['expires_at']}\n\n"
+                "這是模型提出的要求，還沒有套用。按「確認變更」才會寫進設定並從下一次呼叫起生效；"
+                "不按、按取消、或時間到都不會改。只改主要模型，備援不動。"
+            )
+            confirm_label = "✅ 確認變更"
+        elif job["kind"] == "install":
+            payload = job["payload"] or {}
+            details = "\n".join(capabilities_mod.card_lines(payload))
+            if len(details) > 3200:
+                details = details[:3200] + f"\n…（共 {len(details)} 字，這裡只顯示前 3200 字）"
+            text = (
+                f"📦 待確認安裝（{job['project']}）\n"
+                f"{job['command']}\n{details}\n\n"
+                f"有效至：{job['expires_at']}\n"
+                "這是模型提出的要求，還沒有安裝。按「確認安裝」才會裝；不按、按取消、或時間到都不會裝。"
+                "安裝每次都要你確認，沒有「之後都允許」；sudo 一律不執行。"
+            )
+            confirm_label = "✅ 確認安裝"
+        elif job["kind"] == "tool_call":
+            text = (
+                f"🛠 待確認工具操作（{job['project']}）\n"
+                f"{job['command']}\n"
+                f"有效至：{job['expires_at']}\n\n"
+                "這是模型提出的要求，還沒有執行。按「確認執行」才會做；不按、按取消、或時間到都不會做。"
+            )
+            confirm_label = "✅ 確認執行"
+        elif job["kind"] == "external_action":
+            payload = job["payload"] or {}
+            spec = ACTIONS.get(payload.get("action"))
+            title = self._action_target_title(
+                next((p for p in self.projects if p.name == job["project"]), None), payload
+            )
+            details = "\n".join(detail_lines(payload))
+            if len(details) > 2800:
+                details = details[:2800] + f"\n…（共 {len(details)} 字，這裡只顯示前 2800 字）"
+            text = (
+                f"📝 待確認 GitHub 操作（{job['project']}）\n"
+                f"{job['command']}" + (f"（{title}）" if title else "") + f"\n{details}\n\n"
+                f"有效至：{job['expires_at']}\n"
+                "這是模型提出的要求，還沒有執行。按確認才會執行；不按、按取消、或時間到都不會做。"
+            )
+            confirm_label = f"✅ 確認{spec.confirm_word if spec else '執行'}"
+        else:
+            text = (
+                f"▶️ 待確認重跑工作（{job['project']}）\n"
+                f"{job['job_name']}：{job['command']}\n"
+                f"有效至：{job['expires_at']}\n\n"
+                "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
+            )
+            confirm_label = "✅ 確認執行"
+        keyboard = [[
+            {"label": confirm_label, "id": f"job_confirm:{job['request_id']}"},
+            {"label": "❌ 取消", "id": f"job_cancel:{job['request_id']}"},
+        ]]
+        if job["kind"] == "job":
+            scope = next((p for p in self.projects if p.name == job["project"]), None)
+            declared = (scope.jobs or {}).get(job["job_name"]) if scope else None
+            if declared is not None and not forbidden_reason(declared):
+                keyboard.append([{"label": "🔓 確認並之後都允許（指令不變時）", "id": f"job_confirm_always:{job['request_id']}"}])
+        else:
+            rule = None if (job["kind"] == "scope_change" and (job["payload"] or {}).get("run_after")) else self._request_rule(job)
+            if rule is not None:
+                scope_note = {
+                    "tool_call": "同一個工具、同樣的參數",
+                    "external_action": "同一 repo 的同類操作",
+                    "scope_change": "這個完全相同的設定",
+                    "model_change": "這個完全相同的模型變更",
+                }.get(job["kind"], "同類")
+                keyboard.append([{"label": f"🔓 確認並之後都允許（{scope_note}）", "id": f"job_confirm_always:{job['request_id']}"}])
+        return text, keyboard
+
     def process_job_requests(self) -> None:
         """Harness tick: put newly requested jobs in front of the human; close the unanswered."""
         trace_store = self.approval_manager.trace_store
@@ -1037,68 +1137,14 @@ class HarnessService:
                 # The user approved every step of the plan this belongs to (plan_runner.py).
                 self._resolve_job_action("job_confirm", job["request_id"], None, None)
                 continue
-            if job["kind"] != "job" and self.allowlist.is_rule_allowed(
+            adds_and_runs = job["kind"] == "scope_change" and bool((job["payload"] or {}).get("run_after"))
+            if job["kind"] != "job" and not adds_and_runs and self.allowlist.is_rule_allowed(
                 job["project"], job["kind"], job["payload"], self._request_rule(job)
             ):
                 self.send_message(None, f"🔓 在你的允許清單內，自動執行：{job['command']}")
                 self._resolve_job_action("job_confirm", job["request_id"], None, None)
                 continue
-            if job["kind"] == "scope_change":
-                text = (
-                    f"🔧 待確認新增工具設定（{job['project']}）\n"
-                    f"{job['command']}\n"
-                    f"有效至：{job['expires_at']}\n\n"
-                    "這是模型提出的要求，還沒有套用。按「確認新增」才會寫進專案的 harness-scope.md；"
-                    "不按、按取消、或時間到都不會改。新增的 job 之後仍要再按一次確認才會執行。"
-                )
-                confirm_label = "✅ 確認新增"
-            elif job["kind"] == "model_change":
-                text = (
-                    f"🔁 待確認永久變更模型（{job['project']}）\n"
-                    f"{job['command']}\n"
-                    f"有效至：{job['expires_at']}\n\n"
-                    "這是模型提出的要求，還沒有套用。按「確認變更」才會寫進設定並從下一次呼叫起生效；"
-                    "不按、按取消、或時間到都不會改。只改主要模型，備援不動。"
-                )
-                confirm_label = "✅ 確認變更"
-            elif job["kind"] == "install":
-                payload = job["payload"] or {}
-                details = "\n".join(capabilities_mod.card_lines(payload))
-                if len(details) > 3200:
-                    details = details[:3200] + f"\n…（共 {len(details)} 字，這裡只顯示前 3200 字）"
-                text = (
-                    f"📦 待確認安裝（{job['project']}）\n"
-                    f"{job['command']}\n{details}\n\n"
-                    f"有效至：{job['expires_at']}\n"
-                    "這是模型提出的要求，還沒有安裝。按「確認安裝」才會裝；不按、按取消、或時間到都不會裝。"
-                    "安裝每次都要你確認，沒有「之後都允許」；sudo 一律不執行。"
-                )
-                confirm_label = "✅ 確認安裝"
-            elif job["kind"] == "tool_call":
-                text = (
-                    f"🛠 待確認工具操作（{job['project']}）\n"
-                    f"{job['command']}\n"
-                    f"有效至：{job['expires_at']}\n\n"
-                    "這是模型提出的要求，還沒有執行。按「確認執行」才會做；不按、按取消、或時間到都不會做。"
-                )
-                confirm_label = "✅ 確認執行"
-            elif job["kind"] == "external_action":
-                payload = job["payload"] or {}
-                spec = ACTIONS.get(payload.get("action"))
-                title = self._action_target_title(
-                    next((p for p in self.projects if p.name == job["project"]), None), payload
-                )
-                details = "\n".join(detail_lines(payload))
-                if len(details) > 2800:
-                    details = details[:2800] + f"\n…（共 {len(details)} 字，這裡只顯示前 2800 字）"
-                text = (
-                    f"📝 待確認 GitHub 操作（{job['project']}）\n"
-                    f"{job['command']}" + (f"（{title}）" if title else "") + f"\n{details}\n\n"
-                    f"有效至：{job['expires_at']}\n"
-                    "這是模型提出的要求，還沒有執行。按確認才會執行；不按、按取消、或時間到都不會做。"
-                )
-                confirm_label = f"✅ 確認{spec.confirm_word if spec else '執行'}"
-            else:
+            if job["kind"] == "job":
                 scope = next((p for p in self.projects if p.name == job["project"]), None)
                 declared = (scope.jobs or {}).get(job["job_name"]) if scope else None
                 if declared is not None and self.allowlist.is_allowed(job["project"], job["job_name"], declared):
@@ -1106,47 +1152,52 @@ class HarnessService:
                     self.send_message(None, f"🔓 {job['job_name']} 在你的允許清單內，自動執行（指令內容未變）。")
                     self._resolve_job_action("job_confirm", job["request_id"], None, None)
                     continue
-                text = (
-                    f"▶️ 待確認重跑工作（{job['project']}）\n"
-                    f"{job['job_name']}：{job['command']}\n"
-                    f"有效至：{job['expires_at']}\n\n"
-                    "這是模型提出的要求，還沒有執行。按「確認執行」才會跑；不按、按取消、或時間到都不會跑。"
-                )
-                confirm_label = "✅ 確認執行"
-            keyboard = [[
-                {"label": confirm_label, "id": f"job_confirm:{job['request_id']}"},
-                {"label": "❌ 取消", "id": f"job_cancel:{job['request_id']}"},
-            ]]
-            if job["kind"] == "job":
-                scope = next((p for p in self.projects if p.name == job["project"]), None)
-                declared = (scope.jobs or {}).get(job["job_name"]) if scope else None
-                if declared is not None and not forbidden_reason(declared):
-                    keyboard.append([{"label": "🔓 確認並之後都允許（指令不變時）", "id": f"job_confirm_always:{job['request_id']}"}])
-            else:
-                rule = self._request_rule(job)
-                if rule is not None:
-                    scope_note = {
-                        "tool_call": "同一個工具、同樣的參數",
-                        "external_action": "同一 repo 的同類操作",
-                        "scope_change": "這個完全相同的設定",
-                        "model_change": "這個完全相同的模型變更",
-                    }.get(job["kind"], "同類")
-                    keyboard.append([{"label": f"🔓 確認並之後都允許（{scope_note}）", "id": f"job_confirm_always:{job['request_id']}"}])
+            text, keyboard = self._job_card(job)
             self.send_message_with_keyboard(
                 None, text, keyboard, bind={"type": "job", "id": job["request_id"]}
             )
-        for job in trace_store.expire_job_requests(datetime.now(timezone.utc).isoformat()):
+        now = datetime.now(timezone.utc)
+        for job in trace_store.remind_due_job_requests(now.isoformat(), JOB_REMINDER_LEAD_SECONDS):
+            # Still waiting and close to expiring: move the buttons to a fresh message so it is not missed.
             self.clear_actions(job["message_ref"])
-            msg = {
-                "scope_change": f"⌛ 新增工具設定的要求已過期、沒有套用：{job['command']}",
-                "external_action": f"⌛ GitHub 操作的要求已過期、沒有執行：{job['command']}",
-                "model_change": f"⌛ 模型變更的要求已過期、沒有套用：{job['command']}",
-                "tool_call": f"⌛ 工具操作的要求已過期、沒有執行：{job['command']}",
-                "install": f"⌛ 安裝的要求已過期、沒有安裝：{job['command']}",
-            }.get(job["kind"], f"⌛ 重跑要求已過期、沒有執行：{job['job_name']}")
+            text, keyboard = self._job_card(job)
+            minutes = max(1, round((datetime.fromisoformat(job["expires_at"]) - now).total_seconds() / 60))
+            self.send_message_with_keyboard(
+                None, f"⏰ 提醒：這項還在等你確認，約 {minutes} 分鐘後過期，過期就不會做。\n\n{text}", keyboard,
+                bind={"type": "job", "id": job["request_id"]},
+            )
+        for job in trace_store.expire_job_requests(now.isoformat()):
+            self.clear_actions(job["message_ref"])
+            what = {
+                "scope_change": "新增工具設定",
+                "external_action": "GitHub 操作",
+                "model_change": "模型變更",
+                "tool_call": "工具操作",
+                "install": "安裝",
+            }.get(job["kind"], "重跑工作")
+            label = job["job_name"] if job["kind"] == "job" else job["command"]
+            msg = (
+                f"⌛ 沒有人確認，{what}已過期，這件事沒有做成：{label}\n"
+                "要繼續的話按下面的「重新提出」，會用同樣的內容再給你一次確認。"
+            )
             if job["message_ref"]:
-                self.notify_operator(msg)
+                self.send_message_with_keyboard(
+                    None, msg, [[{"label": "🔁 重新提出", "id": f"job_retry:{job['request_id']}"}]]
+                )
             self._record_order_turn(job["project"], msg)
+
+    def _retry_job_request(self, request_id: str, audience: str | None, message_ref: str | None) -> str:
+        """The user tapped "重新提出" on an expired request: queue the same request again with a fresh time limit."""
+        trace_store = self.approval_manager.trace_store
+        self.clear_actions(message_ref)
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+        fresh = trace_store.retry_expired_job_request(request_id, expires)
+        if fresh is None:
+            result = "這個要求已經重新提出過，或不是過期的，沒有再建立。"
+        else:
+            result = "🔁 已重新提出，確認卡馬上會出現。"
+        self.send_message(audience, result)
+        return result
 
     def _resolve_job_action(
         self, action: str, request_id: str, audience: str | None, message_ref: str | None
@@ -1297,14 +1348,39 @@ class HarnessService:
             result = f"⚠️ 沒能套用：{job['command']}（{exc}）"
         else:
             trace_store.finish_job_request(job["request_id"], "done", {"changed": changed})
+            run_after = change["kind"] == "job" and bool((job["payload"] or {}).get("run_after"))
             result = (
-                f"✅ 已新增：{job['command']}。從下一則回覆起可用。"
+                f"✅ 已新增：{job['command']}。" + ("" if run_after else "從下一則回覆起可用。")
                 if changed
                 else f"ℹ️ 設定裡本來就有：{job['command']}，沒有變動。"
             )
+            if run_after:
+                self.send_message(audience, result)
+                self._record_order_turn(job["project"], result)
+                return self._run_added_job(scope, change["name"], audience)
         self.send_message(audience, result)
         self._record_order_turn(job["project"], result)
         return result
+
+    def _run_added_job(self, scope: ProjectScope, job_name: str, audience: str | None) -> str:
+        """The job was just added with a confirmation that said it would also run: start it without a second tap."""
+        trace_store = self.approval_manager.trace_store
+        command = (scope.jobs or {}).get(job_name)
+        if command is None:
+            result = f"⚠️ {job_name} 已新增，但讀不回來，沒有執行。"
+            self.send_message(audience, result)
+            return result
+        request_id = f"job_{uuid4().hex[:10]}"
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
+        if not trace_store.create_job_request(
+            request_id=request_id, project=scope.name, job_name=job_name, command=command, expires_at=expires
+        ):
+            result = f"⚠️ 沒能建立 {job_name} 的執行紀錄，沒有執行。"
+            self.send_message(audience, result)
+            return result
+        # The tap that added it already named this run: take the request straight to "awaiting" and run it.
+        trace_store.transition_job_request(request_id, ("pending",), "awaiting")
+        return self._resolve_job_action("job_confirm", request_id, audience, None)
 
     def _apply_model_change(self, job: dict, audience: str | None) -> str:
         """The human confirmed: re-validate and write the new primary model (models.toml or the roles file)."""
@@ -1376,6 +1452,7 @@ class HarnessService:
         try:
             done = subprocess.run(
                 command, shell=True, cwd=scope.working_directory, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",  # bad bytes in the output must not hide the real result
                 timeout=self.JOB_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL, env=self._job_env(),
             )
             output = ((done.stdout or "") + (done.stderr or "")).strip()
@@ -2781,6 +2858,13 @@ class HarnessService:
             "需要的工具或 job 不存在時（例如要探測的主機不在清單、要讀的 log 沒列出、要啟動預覽服務），"
             "用 `propose_scope_change` 向使用者提出新增（probe_host／log_file／job），使用者按確認才會"
             "生效；說「已請你確認」，不要說已經加上，也不要叫使用者去改設定檔。確認後從你的下一則回覆起可用。\n"
+            "新增 job 的規則：job 只能是一行短指令。有邏輯的事（改版號、多步驟推送、含引號的內嵌程式）一律先在專案裡"
+            "寫成腳本檔（例如 scripts/<名稱>.sh）。你的沙盒是唯讀的、不能寫檔：腳本還不存在時，用任務啟動標記請開發流程"
+            "寫好並測過，合併後再提出只執行它的 job（`bash scripts/<名稱>.sh`）；腳本已存在就直接提出；"
+            "`python -c`、`node -e` 這類內嵌程式碼與過長的單行指令會被拒絕。會變的值（版號、分支名）在腳本裡"
+            "執行時讀取，不要寫死在指令裡。已有類似的 job 時，用同一個名稱重新提出來取代它，不要另開名稱變體。"
+            "使用者的要求本來就是「加入並執行」時，提案加上 run_after=true，他按一次確認就會新增並立刻跑一次；"
+            "只是要加入就不要加。\n"
             "使用者要你對 GitHub 做任何寫入（開單、關單、重開、留言、調整標籤、在 PR 留言）時，用 "
             "`propose_github_action`；它只是提出，使用者看過完整內容按確認才會執行。說「已請你確認」，不要說"
             "已經做了；不要試著用其他 GitHub 工具直接寫入（沙盒沒有核准機制，一定會被拒絕）。開單的內文要寫清楚"

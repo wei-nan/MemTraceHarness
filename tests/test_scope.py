@@ -90,6 +90,36 @@ class ScopeChangeTests(TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 validate_scope_change(self.tmp, *args)
 
+    def test_a_new_job_must_be_a_short_parseable_call_not_inline_code(self) -> None:
+        from memtrace_harness.scope import validate_scope_change
+
+        bad = [
+            "python3 -c 'print(1)'",
+            "node -e \"console.log(1)\"",
+            "echo " + "x" * 400,
+            "echo 'unbalanced",
+            "if then fi done",
+            "bash scripts/missing.sh",
+        ]
+        for command in bad:
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                validate_scope_change(self.tmp, "job", None, "j", command)
+        self.assertEqual(validate_scope_change(self.tmp, "job", None, "j", "echo ok")["command"], "echo ok")
+
+    def test_a_job_that_runs_a_project_script_checks_the_script_too(self) -> None:
+        from memtrace_harness.scope import validate_scope_change
+
+        scripts = self.tmp / "scripts"
+        scripts.mkdir()
+        (scripts / "good.sh").write_text("#!/bin/bash\nset -e\necho ok\n")
+        (scripts / "broken.sh").write_text("#!/bin/bash\nif true; then\n")
+        (scripts / "deletes.sh").write_text("#!/bin/bash\nrm -rf build\n")
+        (scripts / "broken.py").write_text("def x(:\n")
+        self.assertEqual(validate_scope_change(self.tmp, "job", None, "j", "bash scripts/good.sh")["name"], "j")
+        for command in ("bash scripts/broken.sh", "bash scripts/deletes.sh", "python3 scripts/broken.py"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                validate_scope_change(self.tmp, "job", None, "j", command)
+
     def test_changes_are_written_once_and_keep_the_rest_of_the_file(self) -> None:
         from memtrace_harness.scope import apply_scope_change, validate_scope_change
 
