@@ -150,7 +150,7 @@ class ModelChainTests(TestCase):
                 [("claude", "claude-sonnet-5-5"), ("codex", "gpt-5.6-luna"),
                  ("antigravity", "gemini-3.8-flash-high"), ("claude", "claude-haiku-5-5")],
             )
-            self.assertEqual(role_profiles.load_role_profiles(roles)["planner"].model, "sonnet")
+            self.assertEqual(role_profiles.load_role_profiles(roles)["plan"].model, "sonnet")
             with self.assertRaises(ValueError):
                 admin.update_role_profile_chain(config, "controller", [
                     {"provider": "claude", "model": "m", "reasoning_effort": "bogus"}])

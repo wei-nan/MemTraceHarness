@@ -14,7 +14,7 @@ from dataclasses import replace
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.role_profiles import ModelCandidate, RoleProfile, _validate_provider_effort
 
-OVERRIDE_PROFILE = "developer"
+OVERRIDE_PROFILE = "develop"
 PROVIDERS = ("claude", "codex", "antigravity")
 _CLAUDE_ALIASES = {"opus", "sonnet", "haiku"}
 

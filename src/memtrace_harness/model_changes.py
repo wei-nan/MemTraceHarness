@@ -12,22 +12,23 @@ import re
 from typing import Any
 
 from memtrace_harness.model_override import infer_provider
+from memtrace_harness.role_profiles import canonical_profile_id
 
 PROVIDERS = ("claude", "codex", "antigravity")
 ENV_TARGETS = {"chat": "對話", "digest": "夜間摘要", "archive": "記憶歸檔", "audit": "夜間稽核", "recall": "主題回想"}
 ROLE_TARGETS = {
     "controller": "Controller",
-    "planner": "Planner",
-    "planner-escalation": "Planner-escalation",
-    "red-team": "Red Team",
-    "developer": "Developer",
+    "plan": "Plan skill",
+    "plan-escalation": "Plan skill (escalation)",
+    "review": "Review skill",
+    "develop": "Develop skill",
 }
 TARGETS = (*ENV_TARGETS, *ROLE_TARGETS)
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,79}$")
 
 
 def validate_model_change(arguments: dict[str, Any]) -> dict[str, str]:
-    target = str(arguments.get("target") or "").strip()
+    target = canonical_profile_id(str(arguments.get("target") or "").strip())
     if target not in TARGETS:
         raise ValueError(f"target must be one of: {', '.join(TARGETS)}")
     model = str(arguments.get("model") or "").strip()

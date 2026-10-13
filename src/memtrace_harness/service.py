@@ -1570,7 +1570,7 @@ class HarnessService:
             scope.resolve_repo(repo_name)
             if model_spec:
                 resolve_model_override(
-                    model_spec, load_role_profiles(self.config.role_profiles_file_for(scope.name))["developer"], self.config
+                    model_spec, load_role_profiles(self.config.role_profiles_file_for(scope.name))["develop"], self.config
                 )
         except ValueError as exc:
             msg = f"⚠️ 任務沒有開始：{exc}"
@@ -1621,11 +1621,11 @@ class HarnessService:
         if not model_spec:
             return profiles, frozenset()
         try:
-            candidate = resolve_model_override(model_spec, profiles["developer"], self.config)
+            candidate = resolve_model_override(model_spec, profiles["develop"], self.config)
         except ValueError as exc:
             logger.warning(f"ignoring one-off model {model_spec!r} for project {project!r}: {exc}")
             return profiles, frozenset()
-        return with_developer_override(profiles, candidate), frozenset({"developer"})
+        return with_developer_override(profiles, candidate), frozenset({"develop"})
 
     @staticmethod
     def _task_started_text(scope: ProjectScope, goal: str, schedule_id: str | None) -> str:
@@ -2881,8 +2881,8 @@ class HarnessService:
             "已經做了；不要試著用其他 GitHub 工具直接寫入（沙盒沒有核准機制，一定會被拒絕）。開單的內文要寫清楚"
             "需求與驗收。\n"
             "使用者要「永久」換模型（例如「以後 developer 都用 opus 5.5」「對話改用 sonnet」）時，用 "
-            "`propose_model_change`（target 是 chat、digest、archive、recall 或 controller、planner、"
-            "planner-escalation、red-team、developer）；它只是提出，使用者按確認才會寫進設定，只改主要模型、備援不動。"
+            "`propose_model_change`（target 是 chat、digest、archive、recall 或 controller，或它的階段 skill：plan、"
+            "plan-escalation、review、develop）；它只是提出，使用者按確認才會寫進設定，只改主要模型、備援不動。"
             "說「已請你確認」，不要說已經換了。只有這一個任務要用某模型時不要用它，改用任務標記的 model=。\n"
             "使用者要你做某件事（例如「開預覽」「讓我看頁面」「啟動服務」）而你的沙盒做不到時，先呼叫 "
             "`list_jobs` 看有沒有名稱或指令相符的 job（例如 preview_start），有就用 `run_job` 提出，"

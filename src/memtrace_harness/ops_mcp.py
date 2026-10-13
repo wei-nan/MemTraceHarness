@@ -265,7 +265,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "name": "propose_model_change",
         "description": (
             "Ask the user to PERMANENTLY change the primary model of the chat, a background job (digest, archive, "
-            "recall) or an Agent Loop role (controller, planner, planner-escalation, red-team, developer). Use it "
+            "recall) or the Controller or one of its stage skills (controller, plan, plan-escalation, review, develop). Use it "
             "only when the user wants the new model from now on, not for one task (for one task the task marker "
             "carries model=). This does NOT change anything: the user sees the exact change and a confirm button, "
             "and only a tap writes it. Say that a confirmation is waiting; never say it is changed."

@@ -2552,7 +2552,7 @@ class TraceStore:
                 ),
                 "gates": rows(
                     "SELECT json_extract(l.artifact_json, '$.verdict'), json_extract(l.artifact_json, '$.reason_code'), "
-                    "COUNT(*) FROM loop_stages l JOIN runs r ON r.id = l.run_id WHERE l.profile_id = 'red-team' "
+                    "COUNT(*) FROM loop_stages l JOIN runs r ON r.id = l.run_id WHERE l.profile_id IN ('review', 'red-team') "
                     f"AND l.artifact_json IS NOT NULL AND {in_run} GROUP BY 1, 2", run_args,
                 ),
                 "approvals": rows(

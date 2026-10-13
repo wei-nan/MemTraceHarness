@@ -26,7 +26,7 @@ class GoalPrefixTests(TestCase):
 class OverrideTests(TestCase):
     def setUp(self) -> None:
         self.profiles = load_role_profiles()
-        self.developer = self.profiles["developer"]
+        self.developer = self.profiles["develop"]
         self.config = MagicMock(workspace_root=None)
 
     def test_provider_is_inferred_or_given(self) -> None:
@@ -43,22 +43,22 @@ class OverrideTests(TestCase):
 
     def test_developer_tries_the_chosen_model_then_its_usual_chain(self) -> None:
         candidate = resolve_model_override("claude-opus-5-5", self.developer, self.config)
-        profile = with_developer_override(self.profiles, candidate)["developer"]
+        profile = with_developer_override(self.profiles, candidate)["develop"]
         models = [(c.provider, c.model) for c in profile.candidates]
         self.assertEqual(models[0], ("claude", "claude-opus-5-5"))
         self.assertEqual(models[1], (self.developer.provider, self.developer.model))
         self.assertEqual(len(models), 1 + len(self.developer.candidates))
         self.assertEqual(profile.permission, "workspace-write")
         # the other roles and the stored defaults are untouched
-        self.assertEqual(self.profiles["developer"], self.developer)
+        self.assertEqual(self.profiles["develop"], self.developer)
 
     def test_any_failure_of_the_chosen_model_falls_back_but_the_default_keeps_its_rules(self) -> None:
         runner = AgentLoopRunner.__new__(AgentLoopRunner)
         runner.role_profiles = self.profiles
         runner.max_total_tokens = None
-        runner.model_override_profiles = frozenset({"developer"})
+        runner.model_override_profiles = frozenset({"develop"})
         candidates = [object(), object(), object()]
-        kwargs = dict(profile_id="developer", candidates=candidates, stages=[])
+        kwargs = dict(profile_id="develop", candidates=candidates, stages=[])
         self.assertTrue(runner._may_fallback(category="unknown", attempt_index=0, **kwargs))
         self.assertFalse(runner._may_fallback(category="unknown", attempt_index=1, **kwargs))
         runner.model_override_profiles = frozenset()
@@ -70,8 +70,8 @@ class PermanentChangeTests(TestCase):
         from memtrace_harness.model_changes import validate_model_change
 
         self.assertEqual(
-            validate_model_change({"target": "developer", "model": "claude-opus-5-5"}),
-            {"target": "developer", "provider": "claude", "model": "claude-opus-5-5"},
+            validate_model_change({"target": "develop", "model": "claude-opus-5-5"}),
+            {"target": "develop", "provider": "claude", "model": "claude-opus-5-5"},
         )
         self.assertEqual(validate_model_change({"target": "chat", "model": "codex/x-1"})["provider"], "codex")
         for bad in ({"target": "nope", "model": "opus"}, {"target": "chat", "model": "mystery"},
@@ -91,17 +91,17 @@ class PermanentChangeTests(TestCase):
             shutil.copy(Path(__file__).parents[1] / "src/memtrace_harness/default-role-profiles.toml", roles)
             config = MagicMock(workspace_root=Path(tmp))
             config.role_profiles_file_for.return_value = roles
-            before = load_role_profiles(roles)["developer"]
-            apply_model_change(config, {"target": "developer", "provider": "claude", "model": "claude-opus-5-5"})
-            after = load_role_profiles(roles)["developer"]
+            before = load_role_profiles(roles)["develop"]
+            apply_model_change(config, {"target": "develop", "provider": "claude", "model": "claude-opus-5-5"})
+            after = load_role_profiles(roles)["develop"]
             self.assertEqual((after.provider, after.model), ("claude", "claude-opus-5-5"))
             self.assertEqual(after.fallbacks, before.fallbacks)
             self.assertEqual(after.permission, "workspace-write")
             # an effort the new provider does not accept: nothing changes
-            head, dev = roles.read_text(encoding="utf-8").split("[profiles.developer]")
-            text = head + "[profiles.developer]" + dev.replace('reasoning_effort = "high"', 'reasoning_effort = "max"', 1)
+            head, dev = roles.read_text(encoding="utf-8").split("[profiles.develop]")
+            text = head + "[profiles.develop]" + dev.replace('reasoning_effort = "high"', 'reasoning_effort = "max"', 1)
             roles.write_text(text, encoding="utf-8")
             snapshot = roles.read_text(encoding="utf-8")
             with self.assertRaises(ValueError):
-                apply_model_change(config, {"target": "developer", "provider": "codex", "model": "gpt-6-sol"})
+                apply_model_change(config, {"target": "develop", "provider": "codex", "model": "gpt-6-sol"})
             self.assertEqual(roles.read_text(encoding="utf-8"), snapshot)

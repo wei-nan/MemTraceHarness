@@ -33,8 +33,8 @@ model = "sonnet"
 reasoning_effort = "medium"
 quota_bucket = "claude-account"
 
-[profiles.planner]
-role = "Planner"
+[profiles.plan]
+role = "Plan"
 provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
@@ -59,14 +59,14 @@ fallback_cooldown_seconds = 1800
 # 2026-09-05: fallback switched from Antigravity/Gemini to Codex (gpt-5.6-sol) —
 # same reliability review as Controller's above; Antigravity dropped from this
 # role's candidate list entirely rather than kept as an unreliable backstop.
-[[profiles.planner.fallbacks]]
+[[profiles.plan.fallbacks]]
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 quota_bucket = "codex-account"
 
-[profiles.planner-escalation]
-role = "Planning Escalation"
+[profiles.plan-escalation]
+role = "Plan Escalation"
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
@@ -82,14 +82,14 @@ fallback_cooldown_seconds = 1800
 # fallback) promoted to primary, Antigravity (was primary) demoted to fallback,
 # per the same reliability review noted on Controller/Planner above (Antigravity
 # 53% clean vs Claude 96% across Beri's actual run history).
-[[profiles.planner-escalation.fallbacks]]
+[[profiles.plan-escalation.fallbacks]]
 provider = "antigravity"
 model = "claude-opus-4-6-thinking"
 reasoning_effort = "high"
 quota_bucket = "antigravity-account"
 
-[profiles.red-team]
-role = "Red Team"
+[profiles.review]
+role = "Review"
 provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
@@ -110,14 +110,14 @@ fallback_cooldown_seconds = 1800
 # (Antigravity 53% clean vs Claude 96% across Beri's actual run history; Red
 # Team's own Antigravity primary had contributed a provider_overloaded timeout to
 # that count).
-[[profiles.red-team.fallbacks]]
+[[profiles.review.fallbacks]]
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 quota_bucket = "codex-account"
 
-[profiles.developer]
-role = "Developer"
+[profiles.develop]
+role = "Develop"
 provider = "antigravity"
 model = "gemini-3.8-flash-high"
 reasoning_effort = "high"
@@ -136,13 +136,13 @@ fallback_cooldown_seconds = 1800
 # roles above: Developer needs workspace-write, and this was a "same provider,
 # newer/higher-tier model" request, not part of the reliability-driven move off
 # Antigravity applied to the read-only roles.
-[[profiles.developer.fallbacks]]
+[[profiles.develop.fallbacks]]
 provider = "antigravity"
 model = "claude-sonnet-4-6"
 reasoning_effort = "high"
 quota_bucket = "antigravity-account"
 
-[[profiles.developer.fallbacks]]
+[[profiles.develop.fallbacks]]
 provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
