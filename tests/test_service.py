@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tests.support import outbox, relay
 from unittest import TestCase
+from unittest.mock import MagicMock
 
 from memtrace_harness.approval import ApprovalManager
 from memtrace_harness.chat_triage import ChatTriage
@@ -643,6 +645,110 @@ class HarnessServiceTests(TestCase):
         gateway.process_job_requests()
         self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
         self.assertEqual(store.get_job_request("job_3")["status"], "awaiting")
+
+    def test_a_job_whose_output_is_not_valid_utf8_still_reports_its_result(self) -> None:
+        gateway, scope, store = self._job_gateway("printf 'ok \\357 bad\\n'; exit 3")
+        status, code, output = gateway._exec_job_command(scope, scope.jobs["hello"])
+        self.assertEqual((status, code), ("failed", 3))
+        self.assertIn("ok", output)
+        self.assertNotIn("無法啟動", output)
+
+    def test_a_request_close_to_expiring_is_reminded_once_with_fresh_buttons(self) -> None:
+        gateway, scope, store = self._job_gateway("echo x")
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+        store.create_job_request(
+            request_id="job_1", project=scope.name, job_name="hello", command="echo x", expires_at=soon,
+        )
+        gateway.process_job_requests()  # shown
+        store.set_job_request_message("job_1", "ref-1")  # delivered
+        gateway.send_message_with_keyboard.reset_mock()
+        gateway.clear_actions = MagicMock()
+        gateway.process_job_requests()
+        self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
+        self.assertIn("提醒", gateway.send_message_with_keyboard.call_args.args[1])
+        gateway.clear_actions.assert_called_with("ref-1")  # only the new card stays live
+        gateway.send_message_with_keyboard.reset_mock()
+        gateway.process_job_requests()
+        gateway.send_message_with_keyboard.assert_not_called()  # once only
+
+    def test_a_request_far_from_expiring_is_not_reminded(self) -> None:
+        gateway, scope, store = self._job_gateway("echo x")
+        later = (datetime.now(timezone.utc) + timedelta(minutes=9)).isoformat()
+        store.create_job_request(request_id="job_1", project=scope.name, job_name="hello", command="echo x", expires_at=later)
+        gateway.process_job_requests()
+        store.set_job_request_message("job_1", "ref-1")
+        gateway.send_message_with_keyboard.reset_mock()
+        gateway.process_job_requests()
+        gateway.send_message_with_keyboard.assert_not_called()
+
+    def test_an_expired_request_says_nothing_was_done_and_can_be_raised_again_once(self) -> None:
+        gateway, scope, store = self._job_gateway("echo x")
+        past = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
+        store.create_job_request(request_id="job_1", project=scope.name, job_name="hello", command="echo x", expires_at=past)
+        store.transition_job_request("job_1", ("pending",), "awaiting")
+        store.set_job_request_message("job_1", "ref-1")
+        gateway.process_job_requests()
+        self.assertEqual(store.get_job_request("job_1")["status"], "expired")
+        text = gateway.send_message_with_keyboard.call_args.args[1]
+        keyboard = gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertIn("沒有做成", text)
+        self.assertEqual(keyboard[0][0]["id"], "job_retry:job_1")
+
+        gateway.send_message_with_keyboard.reset_mock()
+        gateway._retry_job_request("job_1", None, "ref-2")
+        self.assertEqual(store.get_job_request("job_1")["status"], "retried")
+        fresh = [r for r in store.claim_pending_job_requests([scope.name])]
+        self.assertEqual(len(fresh), 1)
+        self.assertEqual((fresh[0]["job_name"], fresh[0]["command"], fresh[0]["kind"]), ("hello", "echo x", "job"))
+        self.assertGreater(fresh[0]["expires_at"], datetime.now(timezone.utc).isoformat())
+        self.assertIn("沒有再建立", gateway._retry_job_request("job_1", None, "ref-2"))  # a second tap does nothing
+
+    def test_adding_a_job_with_run_after_runs_it_on_the_same_tap(self) -> None:
+        gateway, scope, store = self._job_gateway("echo x")
+        tmp = Path(tempfile.mkdtemp())
+        scope_file = tmp / "harness-scope.md"
+        scope_file.write_text("- workspace_id: ws_x\n- working_directory: " + str(tmp) + "\n", encoding="utf-8")
+        scope.scope_file_path = scope_file
+        scope.working_directory = tmp
+        change = {"kind": "job", "name": "say", "command": "echo added-and-ran", "run_after": True}
+        store.create_scope_change_request(
+            request_id="scope_1", project=scope.name, change=change, summary="job say = echo added-and-ran",
+            expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        text, keyboard = gateway.send_message_with_keyboard.call_args.args[1], gateway.send_message_with_keyboard.call_args.args[2]
+        self.assertEqual(keyboard[0][0]["label"], "✅ 確認新增並執行")
+        self.assertIn("立刻執行一次", text)
+        self.assertFalse(any("之後都允許" in b["label"] for row in keyboard for b in row))
+        gateway._resolve_job_action("job_confirm", "scope_1", None, 77)
+        started = [t for t in threading.enumerate() if t.name.startswith("job-job_")]
+        for thread in started:
+            thread.join(10)
+        self.assertEqual(scope.jobs["say"], "echo added-and-ran")
+        with store._connection() as conn:
+            runs = conn.execute(
+                "SELECT status, result_json FROM job_requests WHERE job_name = 'say' AND kind = 'job'"
+            ).fetchall()
+        self.assertEqual([r[0] for r in runs], ["done"])
+        self.assertIn("added-and-ran", runs[0][1])
+
+    def test_adding_a_job_without_run_after_still_needs_its_own_confirm_to_run(self) -> None:
+        gateway, scope, store = self._job_gateway("echo x")
+        tmp = Path(tempfile.mkdtemp())
+        scope_file = tmp / "harness-scope.md"
+        scope_file.write_text("- workspace_id: ws_x\n- working_directory: " + str(tmp) + "\n", encoding="utf-8")
+        scope.scope_file_path = scope_file
+        scope.working_directory = tmp
+        store.create_scope_change_request(
+            request_id="scope_1", project=scope.name, change={"kind": "job", "name": "say", "command": "echo hi"},
+            summary="job say = echo hi", expires_at="2999-01-01T00:00:00+00:00",
+        )
+        gateway.process_job_requests()
+        gateway._resolve_job_action("job_confirm", "scope_1", None, 77)
+        self.assertEqual(scope.jobs["say"], "echo hi")
+        with store._connection() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM job_requests WHERE kind = 'job'").fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_github_scope_and_model_requests_can_be_always_allowed_too(self) -> None:
         from unittest.mock import MagicMock

@@ -1241,6 +1241,7 @@ class TraceStore:
             self._ensure_column(conn, "job_requests", "message_ref", "TEXT")
             self._ensure_column(conn, "job_requests", "kind", "TEXT NOT NULL DEFAULT 'job'")
             self._ensure_column(conn, "job_requests", "payload_json", "TEXT")
+            self._ensure_column(conn, "job_requests", "reminded_at", "TEXT")
             self._backfill_message_refs(conn)
             self._ensure_column(conn, "approval_requests", "decision_card", "TEXT")
             self._ensure_column(conn, "decision_records", "subject", "TEXT")
@@ -3899,6 +3900,45 @@ class TraceStore:
             ]
         expired = [i for i in ids if self.transition_job_request(i, ("pending", "awaiting"), "expired")]
         return [d for d in (self.get_job_request(i) for i in expired) if d]
+
+    def remind_due_job_requests(self, now_iso: str, lead_seconds: int) -> list[dict]:
+        """Requests still waiting for a tap that expire within `lead_seconds` and have not been reminded yet.
+        Each is returned once: marking it reminded is the claim."""
+        horizon = (datetime.fromisoformat(now_iso) + timedelta(seconds=lead_seconds)).isoformat()
+        with self._connection() as conn:
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT request_id FROM job_requests WHERE status = 'awaiting' AND reminded_at IS NULL "
+                    "AND message_ref IS NOT NULL AND expires_at > ? AND expires_at <= ?",
+                    (now_iso, horizon),
+                )
+            ]
+            due = [
+                i for i in ids
+                if conn.execute(
+                    "UPDATE job_requests SET reminded_at = ? WHERE request_id = ? AND reminded_at IS NULL "
+                    "AND status = 'awaiting'", (now_iso, i),
+                ).rowcount > 0
+            ]
+        return [d for d in (self.get_job_request(i) for i in due) if d]
+
+    def retry_expired_job_request(self, request_id: str, expires_at: str) -> str | None:
+        """Queue a copy of an expired request (same kind, command and payload) with a new time limit. The
+        expired one is marked retried so a second tap does nothing. Returns the new request id, or None."""
+        old = self.get_job_request(request_id)
+        if old is None or not self.transition_job_request(request_id, ("expired",), "retried"):
+            return None
+        new_id = f"{request_id.split('_')[0]}_{uuid4().hex[:10]}"
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO job_requests (request_id, project, job_name, command, status, expires_at, "
+                "created_at, updated_at, kind, payload_json) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+                (new_id, old["project"], old["job_name"], old["command"], expires_at, now, now, old["kind"],
+                 json.dumps(old["payload"], ensure_ascii=False) if old["payload"] is not None else None),
+            )
+        return new_id
 
     def get_latest_turn(self, conversation_id: str) -> dict | None:
         """Most recently completed Agent Loop stage for a conversation — written by

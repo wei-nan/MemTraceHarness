@@ -59,6 +59,8 @@ BODY_PREVIEW_CHARS = 300
 LOG_DEFAULT_LINES = 80
 LOG_MAX_LINES = 300
 JOB_REQUEST_TTL_SECONDS = 600
+# A request still waiting this long before it expires gets one reminder with fresh buttons.
+JOB_REMINDER_LEAD_SECONDS = 180
 
 
 OpsError = tool_registry.OpsError
@@ -206,9 +208,16 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "Ask the user to give this project another ops capability when the tool or job you need does "
             "not exist: kind=probe_host (value=hostname http_probe may request), kind=log_file "
             "(value=path relative to the project that read_log may read) or kind=job (name + one-line shell "
-            "command that run_job may run, for example starting a preview server). This does NOT change "
-            "anything: the user sees exactly what is proposed and a confirm button, and only a tap applies "
-            "it. Say that a confirmation is waiting; the new tool or job exists from your next reply on."
+            "command that run_job may run, for example starting a preview server). A job command must be a "
+            "short call: real logic lives in a script file in the project (scripts/<name>.sh) that already "
+            "exists (you cannot write files; if it is missing, hand the writing to the development flow first), and "
+            "the job only runs it. Inline interpreter code (python -c, node -e) and "
+            "long one-liners are rejected, and values that change (a version, a branch) must be read inside "
+            "the script, never hard-coded in the command. Reuse an existing job's name to replace it instead "
+            "of adding a variant. Set run_after=true when the user's request is to add the job AND run it: "
+            "one tap then adds it and runs it once. This does NOT change anything by itself: the user sees "
+            "exactly what is proposed and a confirm button, and only a tap applies it. Say that a "
+            "confirmation is waiting; the new tool or job exists from your next reply on."
         ),
         "inputSchema": {
             "type": "object",
@@ -216,7 +225,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "kind": {"type": "string", "enum": list(SCOPE_CHANGE_KINDS)},
                 "value": _string_param("hostname (probe_host) or relative file path (log_file)"),
                 "name": _string_param("job name (kind=job)"),
-                "command": _string_param("single-line shell command (kind=job)"),
+                "command": _string_param("short single-line shell command, e.g. `bash scripts/x.sh` (kind=job)"),
+                "run_after": {
+                    "type": "boolean",
+                    "description": "kind=job: also run it once, in the same confirmation, as soon as it is added",
+                },
             },
             "required": ["kind"],
             "additionalProperties": False,
@@ -402,9 +415,17 @@ def request_job(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     )
 
 
+def _similar_jobs(ctx: OpsContext, name: str) -> list[str]:
+    """Declared jobs whose name is a prefix of the new one or the other way round (a variant of the same job)."""
+    return sorted(n for n in ctx.jobs if n != name and (n.startswith(name) or name.startswith(n)))
+
+
 def propose_scope_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
     if ctx.store is None:
         raise OpsError("scope change requests are not available here")
+    run_after = bool(arguments.get("run_after"))
+    if run_after and str(arguments.get("kind", "")) != "job":
+        raise OpsError("run_after only applies to kind=job")
     try:
         change = validate_scope_change(
             ctx.working_directory,
@@ -415,17 +436,35 @@ def propose_scope_change(ctx: OpsContext, arguments: dict[str, Any]) -> str:
         )
     except ValueError as exc:
         raise OpsError(str(exc)) from exc
+    if change["kind"] == "job":
+        similar = _similar_jobs(ctx, change["name"])
+        if similar:
+            raise OpsError(
+                f"a similar job already exists: {', '.join(similar)}. If this is the same purpose, propose it again "
+                f"with that exact name to replace it (and write the command so nothing that changes is hard-coded); "
+                "otherwise choose a clearly different name."
+            )
+    summary = describe_scope_change(change)
+    if run_after:
+        change = {**change, "run_after": True}
+        summary += "（新增後立即執行一次）"
     expires = (datetime.now(timezone.utc) + timedelta(seconds=JOB_REQUEST_TTL_SECONDS)).isoformat()
     if not ctx.store.create_scope_change_request(
         request_id=f"scope_{uuid.uuid4().hex[:10]}",
         project=ctx.project,
         change=change,
-        summary=describe_scope_change(change),
+        summary=summary,
         expires_at=expires,
     ):
         raise OpsError("could not record the request")
+    if run_after:
+        return (
+            f"Proposed: {summary}. The user now has one confirm button in the chat (valid 10 minutes); a single tap "
+            "adds the job and runs it once, and the result is reported to them. Say that a confirmation is waiting; "
+            "do not say it was added or run."
+        )
     return (
-        f"Proposed: {describe_scope_change(change)}. The user now has a confirm button in the chat "
+        f"Proposed: {summary}. The user now has a confirm button in the chat "
         "(valid 10 minutes); nothing changes until they tap it. After they confirm, the new capability "
         "is available from your next reply on."
     )

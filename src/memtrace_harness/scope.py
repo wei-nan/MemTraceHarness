@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
+import shlex
+import subprocess
 import tomllib
 
 from memtrace_harness.command_policy import REFUSAL_HINT, forbidden_reason
@@ -327,6 +329,61 @@ SCOPE_CHANGE_KINDS = ("probe_host", "log_file", "job")
 _HOST_NAME = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
 _JOB_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 MAX_JOB_COMMAND_CHARS = 1000
+# A new job is a short call, not a program (operator decision, 2026-10-13): anything longer, or with code
+# written inline for an interpreter, belongs in a script file in the project that the job runs. Quoting inside a
+# one-line string was what broke two proposals in a row, and a script can be tested before it is proposed.
+MAX_NEW_JOB_COMMAND_CHARS = 400
+_INLINE_CODE = re.compile(r"\b(?:python[0-9.]*|perl|ruby|node|php|osascript)\s+(?:-[A-Za-z]+\s+)*-[ce]\b")
+_SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".py")
+SCRIPT_RULE_HINT = (
+    "Put the logic in a script file inside the project (for example scripts/<name>.sh), test it there, and "
+    "propose a job that only runs it (`bash scripts/<name>.sh`). Read changing values (a version, a branch) "
+    "inside the script, never hard-code them in the command."
+)
+
+
+def check_job_command(command: str, working_directory: Path) -> None:
+    """Raise ValueError when a new job is not a short, parseable call: no inline interpreter code, no more than
+    MAX_NEW_JOB_COMMAND_CHARS, balanced quoting, valid shell syntax, and any script it runs exists, parses and
+    contains nothing the Harness refuses to run (command_policy). Only checks; nothing is executed."""
+    if len(command) > MAX_NEW_JOB_COMMAND_CHARS:
+        raise ValueError(f"job command is longer than {MAX_NEW_JOB_COMMAND_CHARS} characters. {SCRIPT_RULE_HINT}")
+    if _INLINE_CODE.search(command):
+        raise ValueError(f"job command carries code written inline for an interpreter (-c / -e). {SCRIPT_RULE_HINT}")
+    try:
+        tokens = shlex.split(command)
+    except ValueError as exc:
+        raise ValueError(f"job command has unbalanced quotes ({exc}). {SCRIPT_RULE_HINT}") from exc
+    try:
+        result = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is not None and result.returncode != 0:
+        raise ValueError(f"job command is not valid shell: {result.stderr.strip()[:300]}")
+    base = working_directory.resolve()
+    for token in tokens:
+        if not token.endswith(_SCRIPT_SUFFIXES):
+            continue
+        path = Path(token).expanduser()
+        path = (path if path.is_absolute() else base / path).resolve()
+        if base != path and base not in path.parents:
+            continue  # a script outside the project is not ours to read or vouch for
+        if not path.is_file():
+            raise ValueError(f"job command runs {token}, which does not exist in the project yet. Create it first.")
+        source = path.read_text(encoding="utf-8", errors="replace")
+        if path.suffix == ".py":
+            try:
+                compile(source, str(path), "exec")
+            except SyntaxError as exc:
+                raise ValueError(f"{token} has a syntax error: {exc}") from exc
+        else:
+            check = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True, timeout=5, check=False)
+            if check.returncode != 0:
+                raise ValueError(f"{token} has a shell syntax error: {check.stderr.strip()[:300]}")
+        for number, line in enumerate(source.splitlines(), 1):
+            reason = forbidden_reason(line.strip()) if line.strip() and not line.lstrip().startswith("#") else None
+            if reason:
+                raise ValueError(f"{token} line {number}: {reason}。{REFUSAL_HINT}")
 
 
 def validate_scope_change(
@@ -363,6 +420,7 @@ def validate_scope_change(
         reason = forbidden_reason(job_command)
         if reason:
             raise ValueError(f"{reason}：{REFUSAL_HINT}")
+        check_job_command(job_command, working_directory)
         return {"kind": kind, "name": job_name, "command": job_command}
     raise ValueError(f"unknown scope change kind {kind!r} (allowed: {', '.join(SCOPE_CHANGE_KINDS)})")
 

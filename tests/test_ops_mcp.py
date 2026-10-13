@@ -131,6 +131,26 @@ class ScopeAndSpecTests(unittest.TestCase):
         with self.assertRaises(OpsError):
             call_tool(self.ctx, "propose_scope_change", {"kind": "log_file", "value": "../x.log"})
 
+    def test_a_similar_job_name_is_refused_so_the_existing_one_is_replaced_instead(self) -> None:
+        self.ctx = self._ctx(jobs={"push_main": "echo old"})
+        with self.assertRaises(OpsError) as caught:
+            call_tool(self.ctx, "propose_scope_change", {"kind": "job", "name": "push_main_fixed", "command": "echo new"})
+        self.assertIn("push_main", str(caught.exception))
+        text = call_tool(self.ctx, "propose_scope_change", {"kind": "job", "name": "push_main", "command": "echo new"})
+        self.assertIn("Proposed", text)  # the same name replaces the job
+
+    def test_run_after_is_recorded_and_only_allowed_for_jobs(self) -> None:
+        self.ctx = self._ctx()
+        text = call_tool(
+            self.ctx, "propose_scope_change", {"kind": "job", "name": "say", "command": "echo hi", "run_after": True}
+        )
+        self.assertIn("single tap", text)
+        pending = self.ctx.store.claim_pending_job_requests(["P"])
+        self.assertTrue(pending[0]["payload"]["run_after"])
+        self.assertIn("立即執行", pending[0]["command"])
+        with self.assertRaises(OpsError):
+            call_tool(self.ctx, "propose_scope_change", {"kind": "probe_host", "value": "a.example.com", "run_after": True})
+
     def test_a_project_with_nothing_declared_can_still_propose(self) -> None:
         tmp = Path(tempfile.mkdtemp())
         (tmp / "harness-scope.md").write_text("- workspace_id: ws_x\n")

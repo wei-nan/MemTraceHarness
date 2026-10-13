@@ -271,7 +271,7 @@ reported, never followed), `log_files` (what `read_log` may tail) and `job: name
 those allowlists; `run_job` never runs anything — it records a `job_requests` row, the Harness shows a
 confirm button in the chat, and the command (re-read from the scope file at tap time) runs in a daemon thread only after the
 tap, once per request, with a 15-minute limit; its result is sent and written to the chat log. Unanswered
-requests expire after 10 minutes. **Prompt policy, not enforced:** that the model probes before answering and only
+requests expire after 10 minutes (reminded once before that, see below). **Prompt policy, not enforced:** that the model probes before answering and only
 starts a development task when the cause is in the project's code. Wired for Codex and Claude chat models only
 (Antigravity chat gets the notice but no tools). **Unverified against live models:** that a chat model calls these
 tools sensibly. A project that declares nothing is told to say it cannot verify from the chat sandbox.
@@ -288,6 +288,25 @@ reloaded so the next chat reply has the tool, with no restart. A newly added `jo
 confirm tap before it runs. A project that declares nothing still gets `propose_scope_change`. **Prompt policy,
 not enforced:** that the model checks `list_jobs` first and only proposes what the user's request needs.
 **Not implemented:** removing a declaration through the chat (edit the scope file), and any other scope field.
+
+*Job shape, add-and-run, reminders (operator decision, 2026-10-13; ENFORCED, `tests/test_scope.py`,
+`tests/test_ops_mcp.py`, `tests/test_service.py`; the same for every Harness, nothing is Beri-specific).* A newly
+proposed job must be a short call, not a program: at most 400 characters, no code written inline for an
+interpreter (`python -c`, `node -e`, `perl -e`, ...), balanced quotes, and valid shell (`bash -n`, nothing is run).
+Logic goes in a script file inside the project that the job only runs (`bash scripts/x.sh`): the script must
+already exist, parse (`bash -n` / Python `compile`) and contain no line the command policy refuses
+(`command_policy.py`). The chat sandbox is read-only, so a missing script is written through the development flow
+first. A proposed name that is a prefix of an existing job's name (or the reverse) is refused with a pointer to
+re-propose under the existing name, which replaces it. **Add-and-run:** `propose_scope_change` takes
+`run_after=true` (jobs only) when the request is "add it and run it"; the card then says so and reads
+"確認新增並執行", and that one tap adds the job and runs it once. It is never offered "always allow" and is never
+auto-approved by the allow list; without `run_after` a new job still needs its own tap to run. **Reminders:** a
+request that is still waiting 3 minutes before its 10-minute limit gets one reminder, which replaces the original
+card's buttons; an expired request is reported as "not done" with a "重新提出" button that queues the same
+request again with a fresh limit (once; the expired one becomes `retried`). **Known limit:** the allow list binds
+to the command text, so editing a script a job runs does not make an "always allowed" job ask again; the script
+is checked when the job is proposed or added, not on each run. **Not implemented:** a configurable limit
+(`JOB_REQUEST_TTL_SECONDS` and `JOB_REMINDER_LEAD_SECONDS` are constants in `ops_mcp.py`).
 The Developer can still edit the scope file as project code unless `off_limits` says otherwise.
 
 **Read freely, ask before changing, never for some things (operator decision, 2026-10-12; ENFORCED, `tests/test_ops_read.py`).**
