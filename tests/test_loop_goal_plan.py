@@ -326,3 +326,10 @@ class StageLabelTests(TestCase):
         self.assertEqual(label("progress-1"), "階段檢查 1")
         self.assertEqual(label("converge-2"), "收尾 2")
         self.assertEqual(label("something-new"), "something-new")
+
+
+class PhaseSizingPromptTests(TestCase):
+    def test_the_controller_is_told_to_default_to_one_phase(self) -> None:
+        goal = controller_task(TaskEnvelope(task_id="t", workspace_id="w", goal="g"), stage="start", stages=[]).goal
+        self.assertIn("Default to ONE phase", goal)
+        self.assertIn("Never split work into phases just to organize it", goal)
