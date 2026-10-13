@@ -2208,6 +2208,9 @@ class HarnessService:
         if rehydration:
             parts.append(f"Prior discussion for this project (open items may still need action):\n\n{rehydration}")
         operator_profile = self._operator_profile_context(scope)
+        calibration = self._calibration_context(scope)
+        if calibration:
+            parts.append(calibration.strip())
         if operator_profile:
             parts.append(
                 "Operator preferences — the Harness itself derived these from this human's "
@@ -2258,12 +2261,19 @@ class HarnessService:
         automatic classifier appended raw turns to, with no evidence check, and a whole
         stock-analysis reply ended up injected into every chat as an instruction."""
         try:
-            trace_store = self.primary_session_mgr.trace_store
-            return preference_context_for(trace_store, scope.name, with_ids=True) + calibration_block(
-                trace_store, scope.name, "chat"
-            )
+            return preference_context_for(self.primary_session_mgr.trace_store, scope.name, with_ids=True)
         except Exception:
             logger.exception("Failed to load adopted operator preferences; continuing without them")
+            return ""
+
+    def _calibration_context(self, scope: ProjectScope) -> str:
+        """The nightly audit's calibration notes for chat (calibration.py). Kept apart from the
+        operator preferences: those the Harness derived from what the operator said, these it wrote
+        about its own mistakes, so the prompt labels them differently."""
+        try:
+            return calibration_block(self.primary_session_mgr.trace_store, scope.name, "chat")
+        except Exception:
+            logger.exception("Failed to load calibration notes; continuing without them")
             return ""
 
     def _kb_index_rows(self, scope: ProjectScope) -> list[tuple[str, str, str]]:
@@ -2296,6 +2306,7 @@ class HarnessService:
                 self.primary_session_mgr.trace_store,
                 scope.name,
                 preferences=self._operator_profile_context(scope),
+                calibration=self._calibration_context(scope),
             )
         except Exception:
             logger.exception("Failed to build operator precedent; continuing without it")
@@ -3362,7 +3373,10 @@ class HarnessService:
                 result=summary.recommendation,
                 history=history[:5],
                 precedent=precedent_block(
-                    trace_store, scope.name, preferences=self._operator_profile_context(scope)
+                    trace_store,
+                    scope.name,
+                    preferences=self._operator_profile_context(scope),
+                    calibration=self._calibration_context(scope),
                 ),
                 last_operator_message=last_operator,
             )
