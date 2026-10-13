@@ -5,10 +5,10 @@ from pathlib import Path
 
 PROFILE_SCHEMAS = {
     "controller": "controller.json",
-    "planner": "plan.json",
-    "planner-escalation": "plan.json",
-    "red-team": "gate.json",
-    "developer": "development.json",
+    "plan": "plan.json",
+    "plan-escalation": "plan.json",
+    "review": "gate.json",
+    "develop": "development.json",
 }
 
 

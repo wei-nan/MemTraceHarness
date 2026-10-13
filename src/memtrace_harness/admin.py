@@ -444,6 +444,21 @@ def update_recall_fallbacks(config: HarnessConfig, fallbacks: str) -> None:
     _apply(config, {"HARNESS_RECALL_FALLBACKS": _check_fallbacks(fallbacks)})
 
 
+def _profile_table(text: str, profile_id: str) -> str:
+    """The TOML table name (without brackets) that holds this profile in a role-profiles file, whichever
+    way the file spells it: the skill name, a pre-skill role name, or — for `plan-escalation` — the plan
+    skill's `[profiles.plan.escalation]` sub-table. Raises ValueError when the file has none of them."""
+    from memtrace_harness.role_profiles import profile_id_variants
+
+    candidates = [f"profiles.{variant}" for variant in profile_id_variants(profile_id)]
+    if profile_id_variants(profile_id)[0] == "plan-escalation":
+        candidates.append("profiles.plan.escalation")
+    for table in candidates:
+        if re.search(rf"(?m)^\[{re.escape(table)}\]", text):
+            return table
+    raise ValueError(f"profile {profile_id!r} not found in the role-profiles file")
+
+
 def update_role_profile(config: HarnessConfig, profile_id: str, provider: str, model: str) -> None:
     """Surgical, comment-preserving edit of one role's primary provider/model line in this
     workspace's role-profiles TOML — a targeted text patch, not a full TOML parse+rewrite, since
@@ -468,10 +483,11 @@ def update_role_profile(config: HarnessConfig, profile_id: str, provider: str, m
         raise ValueError(f"the role-profiles file does not exist: {path}")
 
     text = path.read_text(encoding="utf-8")
-    header = f"[profiles.{profile_id}]"
+    try:
+        header = f"[{_profile_table(text, profile_id)}]"
+    except ValueError:
+        raise ValueError(f"profile {profile_id!r} not found in {path}") from None
     start = text.find(header)
-    if start == -1:
-        raise ValueError(f"profile {profile_id!r} not found in {path}")
     body_start = start + len(header)
     # Bound this profile's own primary block at the next section header of any kind
     # (a later [profiles.X] or this role's own [[profiles.X.fallbacks]]) — the
@@ -548,12 +564,14 @@ def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: obj
             "`memtrace-harness roles-independent`"
         )
     text = path.read_text(encoding="utf-8")
-    header = f"[profiles.{profile_id}]"
+    try:
+        table = _profile_table(text, profile_id)
+    except ValueError:
+        raise ValueError(f"profile {profile_id!r} not found in {path}") from None
+    header = f"[{table}]"
     start = text.find(header)
-    if start == -1:
-        raise ValueError(f"profile {profile_id!r} not found in {path}")
     body_start = start + len(header)
-    fb_header = f"[[profiles.{profile_id}.fallbacks]]"
+    fb_header = f"[[{table}.fallbacks]]"
     # This role's section = from its header up to the next table that is not its own fallbacks.
     end = len(text)
     for m in re.finditer(r"(?m)^\[+[^\]]+\]+", text[body_start:]):
@@ -563,7 +581,9 @@ def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: obj
     section = text[body_start:end]
     fb_at = section.find(fb_header)
     primary = section if fb_at == -1 else section[:fb_at]
-    old = tomllib.loads(text).get("profiles", {}).get(profile_id, {})
+    old: dict = tomllib.loads(text)
+    for part in table.split("."):
+        old = old.get(part, {})
     old_fallbacks = old.get("fallbacks", [])
     old_effort = old
 

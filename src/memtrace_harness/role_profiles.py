@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import tomllib
 from typing import Literal, Mapping, cast
@@ -8,6 +9,7 @@ from typing import Literal, Mapping, cast
 from memtrace_harness.fallback import CROSS_PROVIDER_FALLBACK_CATEGORIES
 from memtrace_harness.schemas import FailureCategory, ProviderId
 
+logger = logging.getLogger(__name__)
 
 Permission = Literal["read-only", "workspace-write"]
 ContextPolicy = Literal[
@@ -17,13 +19,32 @@ ContextPolicy = Literal[
     "accepted-plan-and-repo",
 ]
 
+# The Controller is the only role. Everything else is a stage skill it runs (stage_skills.py):
+# `plan`, `review` (the G1/G2 gates) and `develop`, plus `plan-escalation`, the plan skill's
+# stronger-model mode. Profile ids are those skill names; the pre-skill role names still load.
 REQUIRED_PROFILES = (
     "controller",
-    "planner",
-    "planner-escalation",
-    "red-team",
-    "developer",
+    "plan",
+    "plan-escalation",
+    "review",
+    "develop",
 )
+LEGACY_PROFILE_IDS = {
+    "planner": "plan",
+    "planner-escalation": "plan-escalation",
+    "red-team": "review",
+    "developer": "develop",
+}
+# a profile id as it may still appear in older rows, files and chat requests -> the id that
+# stands for it now (canonical ids map to themselves)
+def canonical_profile_id(profile_id: str) -> str:
+    return LEGACY_PROFILE_IDS.get(profile_id, profile_id)
+
+
+def profile_id_variants(profile_id: str) -> tuple[str, ...]:
+    """The canonical id and every legacy spelling of it (for matching stored rows and file headers)."""
+    canonical = canonical_profile_id(profile_id)
+    return (canonical, *(old for old, new in LEGACY_PROFILE_IDS.items() if new == canonical))
 
 
 @dataclass(frozen=True)
@@ -221,9 +242,8 @@ def load_role_profiles(path: Path | None = None) -> dict[str, RoleProfile]:
     if not isinstance(raw_profiles, dict):
         raise ValueError(f"Role profile file has no [profiles] table: {source}")
     profiles = {
-        str(profile_id): RoleProfile.from_mapping(str(profile_id), data)
-        for profile_id, data in raw_profiles.items()
-        if isinstance(data, dict)
+        profile_id: RoleProfile.from_mapping(profile_id, data)
+        for profile_id, data in _normalized_profile_tables(raw_profiles).items()
     }
     missing = [profile_id for profile_id in REQUIRED_PROFILES if profile_id not in profiles]
     if missing:
@@ -232,34 +252,63 @@ def load_role_profiles(path: Path | None = None) -> dict[str, RoleProfile]:
     return profiles
 
 
+def _normalized_profile_tables(raw_profiles: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
+    """The profile tables under their skill names: a legacy key (planner, red-team, developer,
+    planner-escalation) is read as its skill, and the plan skill's `[profiles.plan.escalation]`
+    sub-table becomes the `plan-escalation` profile, which inherits the plan's permission and
+    context policy. A file that spells the same profile both ways is ambiguous and refused."""
+    tables: dict[str, Mapping[str, object]] = {}
+    for key, data in raw_profiles.items():
+        if not isinstance(data, dict):
+            continue
+        profile_id = canonical_profile_id(str(key))
+        if profile_id in tables:
+            raise ValueError(f"Role profile {profile_id!r} is defined twice (also as a legacy name)")
+        tables[profile_id] = data
+    plan = tables.get("plan")
+    nested = plan.get("escalation") if isinstance(plan, dict) else None
+    if isinstance(nested, dict):
+        if "plan-escalation" in tables:
+            raise ValueError("Role profile 'plan-escalation' is defined twice (also as [profiles.plan.escalation])")
+        assert isinstance(plan, dict)
+        tables["plan-escalation"] = {
+            "role": "Plan Escalation",
+            "permission": plan.get("permission"),
+            "context_policy": plan.get("context_policy"),
+            **nested,
+        }
+        tables["plan"] = {key: value for key, value in plan.items() if key != "escalation"}
+    return tables
+
+
 def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
-    """Provider/model choice is fully project-configurable for every role — Controller,
-    Planner, Planner-escalation, Red Team, and Developer alike. A role's identity is its
-    job in the pipeline (route, plan, escalate, verify, implement), not a vendor pin; the
-    "independent reviewer" and "consistent behavior" properties people actually rely on
-    come from each stage being a fresh, separately-invoked CLI call and from the
-    permission/context boundaries below, not from forcing a specific model onto a role.
+    """Provider/model choice is fully project-configurable for every profile: the Controller and
+    the plan, plan-escalation, review and develop skills alike. A skill's identity is its job
+    (plan, escalate, verify, implement), not a vendor pin. The "independent reviewer" property
+    comes from every skill running as a fresh, separately-invoked CLI call that is handed
+    artifacts, never another skill's conversation (so `review` never sees `develop`'s
+    transcript), and from the permission/context boundaries below. Pointing `review` at the same
+    provider/model as `develop` is allowed but logged, since it weakens that independence in
+    practice even though the context stays separate.
 
     What stays enforced, because these are safety/architecture properties independent of
-    which vendor executes a role:
-    - each role's permission level (only Developer may hold workspace-write — every
-      other role must stay read-only);
-    - each role's context_policy (how much of the repo/evidence it is allowed to see —
-      e.g. Controller only ever gets a loop snapshot, Red Team only gate-scoped
-      evidence, regardless of which model is behind it).
+    which vendor executes a skill:
+    - each profile's permission level (only `develop` may hold workspace-write; the Controller
+      and every other skill stay read-only);
+    - each profile's context_policy (how much of the repo/evidence it is allowed to see:
+      the Controller only ever gets a loop snapshot, `review` only gate-scoped evidence,
+      regardless of which model is behind it).
 
-    Red Team and Planner-escalation may now carry a fallback chain too (this used to be
-    hard-blocked). The original concern was a gate verdict or an escalated plan silently
-    degrading to a weaker/different model without anyone noticing — but every fallback
-    is already recorded on the stage result (`fallback_from_model`) and surfaced in the
-    human-facing completion summary, so "silently" no longer applies; a visible fallback
-    is an acceptable resilience trade, not a stealth downgrade."""
+    `review` and `plan-escalation` may carry a fallback chain too. The original concern was a
+    gate verdict or an escalated plan silently degrading to a weaker/different model, but every
+    fallback is recorded on the stage result (`fallback_from_model`) and surfaced in the
+    human-facing completion summary, so it is a visible resilience trade, not a stealth downgrade."""
     expected_shape = {
         "controller": ("read-only", "loop-snapshot"),
-        "planner": ("read-only", "task-and-targeted-evidence"),
-        "planner-escalation": ("read-only", "task-and-targeted-evidence"),
-        "red-team": ("read-only", "gate-evidence-only"),
-        "developer": ("workspace-write", "accepted-plan-and-repo"),
+        "plan": ("read-only", "task-and-targeted-evidence"),
+        "plan-escalation": ("read-only", "task-and-targeted-evidence"),
+        "review": ("read-only", "gate-evidence-only"),
+        "develop": ("workspace-write", "accepted-plan-and-repo"),
     }
     for profile_id, (permission, context_policy) in expected_shape.items():
         profile = profiles[profile_id]
@@ -272,8 +321,16 @@ def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
         for item in profiles.values()
         if item.permission == "workspace-write"
     ]
-    if writable != ["developer"]:
-        raise ValueError("Only the developer role profile may use workspace-write")
+    if writable != ["develop"]:
+        raise ValueError("Only the develop skill profile may use workspace-write")
+    review, develop = profiles["review"], profiles["develop"]
+    if (review.provider, review.model) == (develop.provider, develop.model):
+        logger.warning(
+            "the review skill and the develop skill both use %s/%s: review still runs in a fresh "
+            "context, but a different provider or model would make it a more independent check",
+            review.provider,
+            review.model,
+        )
 
 
 def _validate_provider_effort(label: str, provider: str, reasoning_effort: str) -> None:

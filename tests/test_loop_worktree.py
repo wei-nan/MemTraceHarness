@@ -22,7 +22,7 @@ class WritingDeveloper(QueueAdapter):
     """A Developer that really edits files in the directory it was given."""
 
     def __init__(self, directory: Path, files: dict[str, str]) -> None:
-        super().__init__("developer", "antigravity", "gemini", [completed_development()])
+        super().__init__("develop", "antigravity", "gemini", [completed_development()])
         self.directory = directory
         self.files = files
 
@@ -50,10 +50,10 @@ class WorktreeLoopTests(TestCase):
             "controller": QueueAdapter(
                 "controller", "codex", "m", [{"action": "run_planner", "reason": "go"}, converge]
             ),
-            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
-            "planner-escalation": QueueAdapter("planner-escalation", "claude", "opus", []),
-            "red-team": QueueAdapter("red-team", "codex", "m", [passed_gate(), passed_gate()]),
-            "developer": WritingDeveloper(worktree.path, files),
+            "plan": QueueAdapter("plan", "claude", "sonnet", [ready_plan()]),
+            "plan-escalation": QueueAdapter("plan-escalation", "claude", "opus", []),
+            "review": QueueAdapter("review", "codex", "m", [passed_gate(), passed_gate()]),
+            "develop": WritingDeveloper(worktree.path, files),
         }
         runner = AgentLoopRunner(
             adapters=adapters,
@@ -134,10 +134,10 @@ class SharedFolderEditLockTests(TestCase):
     def _adapters(self, controller):
         return {
             "controller": QueueAdapter("controller", "codex", "m", controller),
-            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
-            "planner-escalation": QueueAdapter("planner-escalation", "claude", "opus", []),
-            "red-team": QueueAdapter("red-team", "codex", "m", [passed_gate(), passed_gate()]),
-            "developer": QueueAdapter("developer", "antigravity", "g", [completed_development()]),
+            "plan": QueueAdapter("plan", "claude", "sonnet", [ready_plan()]),
+            "plan-escalation": QueueAdapter("plan-escalation", "claude", "opus", []),
+            "review": QueueAdapter("review", "codex", "m", [passed_gate(), passed_gate()]),
+            "develop": QueueAdapter("develop", "antigravity", "g", [completed_development()]),
         }
 
     def _runner(self, adapters, results, **kwargs):
@@ -171,7 +171,7 @@ class SharedFolderEditLockTests(TestCase):
         summary = runner.run(self.task)
         self.assertEqual(summary.status, "needs_human")
         self.assertIn("Another development task", summary.recommendation)
-        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 0)
         self.assertNotIn("release", calls)          # never held it, nothing to release
 
     def test_an_operational_task_never_asks_for_the_lock(self) -> None:
@@ -185,7 +185,7 @@ class SharedFolderEditLockTests(TestCase):
         adapters = self._adapters(
             [{"action": "run_planner", "reason": "go"}, {"action": "finish", "reason": "done"}]
         )
-        adapters["developer"].run = MagicMock(side_effect=RuntimeError("boom"))
+        adapters["develop"].run = MagicMock(side_effect=RuntimeError("boom"))
         runner, calls = self._runner(adapters, [True])
         with self.assertRaises(RuntimeError):
             runner.run(self.task)

@@ -82,7 +82,7 @@ class QueueAdapter(ModelAdapter):
                 requested_model=self.model,
                 reasoning_effort="high",
                 permission=(
-                    "workspace-write" if self.adapter_id == "developer" else "read-only"
+                    "workspace-write" if self.adapter_id == "develop" else "read-only"
                 ),
                 context_policy="test-policy",
                 cli_version=f"{self.provider}-test-version",
@@ -366,10 +366,10 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "succeeded")
         self.assertEqual(
             [stage.profile_id for stage in summary.stages],
-            ["controller", "planner", "red-team", "developer", "red-team", "controller"],
+            ["controller", "plan", "review", "develop", "review", "controller"],
         )
-        self.assertEqual(len(adapters["planner"].calls), 1)
-        self.assertEqual(len(adapters["planner-escalation"].calls), 0)
+        self.assertEqual(len(adapters["plan"].calls), 1)
+        self.assertEqual(len(adapters["plan-escalation"].calls), 0)
         self.assertEqual(summary.total_usage.input_tokens, 60)
         with closing(sqlite3.connect(self.db_path)) as connection:
             stage_count = connection.execute("SELECT COUNT(*) FROM loop_stages").fetchone()[0]
@@ -388,8 +388,8 @@ class AgentLoopRunnerTests(TestCase):
             "gpt-5.6-luna",
             [{"action": "run_operational_action", "reason": "just needs a check"}],
         )
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [
@@ -411,13 +411,13 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "succeeded")
         self.assertIn("5% stop-loss", summary.recommendation)
         self.assertEqual(
-            [stage.profile_id for stage in summary.stages], ["controller", "developer"]
+            [stage.profile_id for stage in summary.stages], ["controller", "develop"]
         )
-        self.assertEqual(len(adapters["planner"].calls), 0)
-        self.assertEqual(len(adapters["red-team"].calls), 0)
-        self.assertEqual(len(adapters["developer"].calls), 1)
+        self.assertEqual(len(adapters["plan"].calls), 0)
+        self.assertEqual(len(adapters["review"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 1)
         self.assertIn(
-            "NOT a code-development task", adapters["developer"].calls[0].goal
+            "NOT a code-development task", adapters["develop"].calls[0].goal
         )
 
     def test_run_operational_action_needs_human_is_reported_without_g2(self) -> None:
@@ -428,8 +428,8 @@ class AgentLoopRunnerTests(TestCase):
             "gpt-5.6-luna",
             [{"action": "run_operational_action", "reason": "just needs a check"}],
         )
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [
@@ -450,7 +450,7 @@ class AgentLoopRunnerTests(TestCase):
 
         self.assertEqual(summary.status, "needs_human")
         self.assertIn("quote source", summary.recommendation)
-        self.assertEqual(len(adapters["red-team"].calls), 0)
+        self.assertEqual(len(adapters["review"].calls), 0)
 
     def test_agent_loop_disabled_blocks_run_planner_deterministically(self) -> None:
         # A model picking run_planner anyway despite controller_task()'s own
@@ -467,8 +467,8 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "needs_human")
         self.assertIn("agent_loop", summary.recommendation)
         self.assertIn("disabled", summary.recommendation)
-        self.assertEqual(len(adapters["planner"].calls), 0)
-        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertEqual(len(adapters["plan"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 0)
 
     def test_agent_loop_enabled_by_default_allows_run_planner(self) -> None:
         # Sanity check that the new constructor default doesn't change any existing
@@ -479,7 +479,7 @@ class AgentLoopRunnerTests(TestCase):
             trace_store=TraceStore(self.db_path),
         ).run(self.task)
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["planner"].calls), 1)
+        self.assertEqual(len(adapters["plan"].calls), 1)
 
     def test_developer_needs_human_still_flows_to_g2_for_review(self) -> None:
         # A developer's own "needs_human"/"failed" status must not skip G2 and go
@@ -488,8 +488,8 @@ class AgentLoopRunnerTests(TestCase):
         # scope), via the same REJECT verdict it already renders for a "completed"
         # development.
         adapters = self._adapters()
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [
@@ -508,13 +508,13 @@ class AgentLoopRunnerTests(TestCase):
             trace_store=TraceStore(self.db_path),
         ).run(self.task)
 
-        self.assertEqual(len(adapters["red-team"].calls), 2)
+        self.assertEqual(len(adapters["review"].calls), 2)
         self.assertEqual(summary.status, "succeeded")
 
     def test_developer_needs_human_g2_reject_triggers_one_revision(self) -> None:
         adapters = self._adapters()
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [
@@ -528,8 +528,8 @@ class AgentLoopRunnerTests(TestCase):
                 completed_development(),
             ],
         )
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -551,7 +551,7 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["developer"].calls), 2)
+        self.assertEqual(len(adapters["develop"].calls), 2)
         self.assertIn("develop-revision", [stage.stage for stage in summary.stages])
 
     def test_verify_command_failure_skips_g2_model_and_forces_a_revision(self) -> None:
@@ -559,8 +559,8 @@ class AgentLoopRunnerTests(TestCase):
         # G2's model is never even asked, and the resulting synthetic REJECT drives
         # the same one-bounded-revision loop a real G2 REJECT would.
         adapters = self._adapters()
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [completed_development(), completed_development()],
@@ -575,8 +575,8 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "needs_human")
         # Only G1 called the red-team model; both G2 attempts were pre-empted by the
         # failing verification command instead of reaching the model.
-        self.assertEqual(len(adapters["red-team"].calls), 1)
-        self.assertEqual(len(adapters["developer"].calls), 2)
+        self.assertEqual(len(adapters["review"].calls), 1)
+        self.assertEqual(len(adapters["develop"].calls), 2)
         stage_names = [stage.stage for stage in summary.stages]
         self.assertIn("g2", stage_names)
         self.assertIn("develop-revision", stage_names)
@@ -592,7 +592,7 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["red-team"].calls), 2)
+        self.assertEqual(len(adapters["review"].calls), 2)
 
     def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
         self,
@@ -608,8 +608,8 @@ class AgentLoopRunnerTests(TestCase):
                 {"action": "finish", "reason": "complete"},
             ],
         )
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -630,23 +630,23 @@ class AgentLoopRunnerTests(TestCase):
             self.task, conversation_id="chat_resume_test"
         )
         self.assertEqual(first.status, "needs_human")
-        self.assertEqual(len(adapters["planner"].calls), 1)
-        self.assertEqual(len(adapters["red-team"].calls), 1)
+        self.assertEqual(len(adapters["plan"].calls), 1)
+        self.assertEqual(len(adapters["review"].calls), 1)
 
         second = AgentLoopRunner(adapters=adapters, trace_store=trace_store).run(
             self.task, conversation_id="chat_resume_test"
         )
         self.assertEqual(second.status, "succeeded")
         # The settled plan from the first run is reused, not regenerated.
-        self.assertEqual(len(adapters["planner"].calls), 1)
+        self.assertEqual(len(adapters["plan"].calls), 1)
         # G1 had not PASSed yet, so it (and everything after it) reruns.
-        self.assertEqual(len(adapters["red-team"].calls), 3)
-        self.assertEqual(len(adapters["developer"].calls), 1)
+        self.assertEqual(len(adapters["review"].calls), 3)
+        self.assertEqual(len(adapters["develop"].calls), 1)
 
     def test_opus_is_used_only_after_g1_reasoning_gap(self) -> None:
         adapters = self._adapters()
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -668,7 +668,7 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["planner-escalation"].calls), 1)
+        self.assertEqual(len(adapters["plan-escalation"].calls), 1)
         self.assertIn("plan-escalation", [stage.stage for stage in summary.stages])
         self.assertIn("g1-recheck", [stage.stage for stage in summary.stages])
 
@@ -689,12 +689,12 @@ class AgentLoopRunnerTests(TestCase):
 
         self.assertEqual(summary.status, "budget_exhausted")
         self.assertEqual(len(summary.stages), 1)
-        self.assertEqual(len(adapters["planner"].calls), 0)
+        self.assertEqual(len(adapters["plan"].calls), 0)
 
     def test_non_reasoning_g1_reject_does_not_invoke_opus(self) -> None:
         adapters = self._adapters()
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -714,8 +714,8 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "needs_human")
-        self.assertEqual(len(adapters["planner-escalation"].calls), 0)
-        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertEqual(len(adapters["plan-escalation"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 0)
 
     def _g1_implementation_gap(self) -> dict:
         return {
@@ -747,8 +747,8 @@ class AgentLoopRunnerTests(TestCase):
 
     def test_g1_implementation_gap_is_asked_again_not_sent_to_plan_revision(self) -> None:
         adapters = self._adapters()
-        adapters["red-team"] = QueueAdapter(
-            "red-team", "codex", "gpt-5.6-sol",
+        adapters["review"] = QueueAdapter(
+            "review", "codex", "gpt-5.6-sol",
             [self._g1_implementation_gap(), passed_gate(), passed_gate()],
         )
 
@@ -760,13 +760,13 @@ class AgentLoopRunnerTests(TestCase):
         stages = [stage.stage for stage in summary.stages]
         self.assertIn("g1-rescope", stages)
         self.assertNotIn("plan-revision", stages)
-        self.assertEqual(len(adapters["planner"].calls), 1)          # no revision round
-        self.assertIn("CORRECTION", adapters["red-team"].calls[1].goal)
+        self.assertEqual(len(adapters["plan"].calls), 1)          # no revision round
+        self.assertIn("CORRECTION", adapters["review"].calls[1].goal)
 
     def test_g1_implementation_gap_twice_stops_without_a_pointless_revision(self) -> None:
         adapters = self._adapters()
-        adapters["red-team"] = QueueAdapter(
-            "red-team", "codex", "gpt-5.6-sol",
+        adapters["review"] = QueueAdapter(
+            "review", "codex", "gpt-5.6-sol",
             [self._g1_implementation_gap(), self._g1_implementation_gap()],
         )
 
@@ -776,15 +776,15 @@ class AgentLoopRunnerTests(TestCase):
 
         self.assertEqual(summary.status, "needs_human")
         self.assertIn("cannot apply before any code exists", summary.recommendation)
-        self.assertEqual(len(adapters["planner"].calls), 1)
-        self.assertEqual(len(adapters["developer"].calls), 0)
+        self.assertEqual(len(adapters["plan"].calls), 1)
+        self.assertEqual(len(adapters["develop"].calls), 0)
         self.assertNotIn("plan-revision", [stage.stage for stage in summary.stages])
 
     def test_g1_test_gap_is_treated_the_same_way(self) -> None:
         adapters = self._adapters()
         gap = {**self._g1_implementation_gap(), "reason_code": "test_gap"}
-        adapters["red-team"] = QueueAdapter(
-            "red-team", "codex", "gpt-5.6-sol", [gap, passed_gate(), passed_gate()]
+        adapters["review"] = QueueAdapter(
+            "review", "codex", "gpt-5.6-sol", [gap, passed_gate(), passed_gate()]
         )
         summary = AgentLoopRunner(
             adapters=adapters, trace_store=TraceStore(self.db_path)
@@ -795,11 +795,11 @@ class AgentLoopRunnerTests(TestCase):
     def test_a_genuine_plan_defect_still_gets_its_revision(self) -> None:
         # acceptance_gap is a real plan defect: unchanged behavior, no rescope round.
         adapters = self._adapters()
-        adapters["planner"] = QueueAdapter(
-            "planner", "claude", "sonnet", [ready_plan("first"), ready_plan("revised")]
+        adapters["plan"] = QueueAdapter(
+            "plan", "claude", "sonnet", [ready_plan("first"), ready_plan("revised")]
         )
-        adapters["red-team"] = QueueAdapter(
-            "red-team", "codex", "gpt-5.6-sol",
+        adapters["review"] = QueueAdapter(
+            "review", "codex", "gpt-5.6-sol",
             [
                 {**self._g1_implementation_gap(), "reason_code": "acceptance_gap"},
                 passed_gate(),
@@ -815,14 +815,14 @@ class AgentLoopRunnerTests(TestCase):
 
     def test_g1_acceptance_gap_gets_one_sonnet_revision_not_opus(self) -> None:
         adapters = self._adapters()
-        adapters["planner"] = QueueAdapter(
-            "planner",
+        adapters["plan"] = QueueAdapter(
+            "plan",
             "claude",
             "sonnet",
             [ready_plan("first plan"), ready_plan("revised plan")],
         )
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -844,20 +844,20 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["planner"].calls), 2)
-        self.assertEqual(len(adapters["planner-escalation"].calls), 0)
+        self.assertEqual(len(adapters["plan"].calls), 2)
+        self.assertEqual(len(adapters["plan-escalation"].calls), 0)
         self.assertIn("plan-revision", [stage.stage for stage in summary.stages])
 
     def test_g2_reject_gets_one_gemini_revision_then_recheck(self) -> None:
         adapters = self._adapters()
-        adapters["developer"] = QueueAdapter(
-            "developer",
+        adapters["develop"] = QueueAdapter(
+            "develop",
             "antigravity",
             "gemini-3.1-pro-high",
             [completed_development(), completed_development()],
         )
-        adapters["red-team"] = QueueAdapter(
-            "red-team",
+        adapters["review"] = QueueAdapter(
+            "review",
             "codex",
             "gpt-5.6-sol",
             [
@@ -879,7 +879,7 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
-        self.assertEqual(len(adapters["developer"].calls), 2)
+        self.assertEqual(len(adapters["develop"].calls), 2)
         self.assertIn("develop-revision", [stage.stage for stage in summary.stages])
         self.assertIn("g2-recheck", [stage.stage for stage in summary.stages])
 
@@ -912,7 +912,7 @@ class AgentLoopRunnerTests(TestCase):
             "gpt-5.6-luna",
             [{"_status": "failed", "_error": "Quota exhausted for weekly limit"}],
         )
-        adapters["red-team"].quota_bucket = "codex-red-team-test-account"
+        adapters["review"].quota_bucket = "codex-red-team-test-account"
         fallback = QueueAdapter(
             "controller-fallback-1",
             "claude",
@@ -1011,9 +1011,9 @@ class AgentLoopRunnerTests(TestCase):
         ).run(self.task)
 
         self.assertEqual(summary.status, "failed")
-        self.assertEqual(len(adapters["red-team"].calls), 0)
+        self.assertEqual(len(adapters["review"].calls), 0)
         self.assertEqual(summary.stages[-1].state, "quota_cooldown")
-        self.assertEqual(summary.stages[-1].profile_id, "red-team")
+        self.assertEqual(summary.stages[-1].profile_id, "review")
 
     def test_authentication_failure_uses_fallback_and_alerts_the_operator(self) -> None:
         adapters = self._adapters()
@@ -1079,7 +1079,7 @@ class AgentLoopRunnerTests(TestCase):
 
     def _run_stopped_planner(self, plan: dict) -> list[dict]:
         adapters = self._adapters()
-        adapters["planner"] = QueueAdapter("planner", "claude", "sonnet", [plan])
+        adapters["plan"] = QueueAdapter("plan", "claude", "sonnet", [plan])
         requests: list[dict] = []
 
         class FakeApprovals:
@@ -1148,9 +1148,9 @@ class AgentLoopRunnerTests(TestCase):
             return {i.ref for call in adapters[role].calls for i in call.context_items}
 
         self.assertIn("harness:operator-precedent:p", refs("controller"))
-        self.assertNotIn("harness:operator-precedent:p", refs("planner"))
-        self.assertNotIn("harness:operator-precedent:p", refs("developer"))
-        self.assertNotIn("harness:operator-precedent:p", refs("red-team"))
+        self.assertNotIn("harness:operator-precedent:p", refs("plan"))
+        self.assertNotIn("harness:operator-precedent:p", refs("develop"))
+        self.assertNotIn("harness:operator-precedent:p", refs("review"))
 
     def test_a_card_can_only_cite_precedents_it_was_shown(self) -> None:
         card = {
@@ -1277,15 +1277,15 @@ class AgentLoopRunnerTests(TestCase):
                     {"action": "finish", "reason": "complete"},
                 ],
             ),
-            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
-            "planner-escalation": QueueAdapter(
-                "planner-escalation", "claude", "opus", [ready_plan("deep plan")]
+            "plan": QueueAdapter("plan", "claude", "sonnet", [ready_plan()]),
+            "plan-escalation": QueueAdapter(
+                "plan-escalation", "claude", "opus", [ready_plan("deep plan")]
             ),
-            "red-team": QueueAdapter(
-                "red-team", "codex", "gpt-5.6-sol", [passed_gate(), passed_gate()]
+            "review": QueueAdapter(
+                "review", "codex", "gpt-5.6-sol", [passed_gate(), passed_gate()]
             ),
-            "developer": QueueAdapter(
-                "developer",
+            "develop": QueueAdapter(
+                "develop",
                 "antigravity",
                 "gemini-3.1-pro-high",
                 [completed_development()],
@@ -1299,7 +1299,7 @@ def _stub_adapters() -> dict[str, QueueAdapter]:
     never .run() — the queues are empty because they're never dequeued."""
     return {
         role: QueueAdapter(role, "codex", "gpt-5.6-luna", [])
-        for role in ("controller", "planner", "planner-escalation", "red-team", "developer")
+        for role in ("controller", "plan", "plan-escalation", "review", "develop")
     }
 
 
@@ -1407,15 +1407,15 @@ class MalformedOutputRepairTests(TestCase):
                     {"action": "finish", "reason": "complete"},
                 ],
             ),
-            "planner": QueueAdapter("planner", "claude", "sonnet", [ready_plan()]),
-            "planner-escalation": QueueAdapter(
-                "planner-escalation", "claude", "opus", [ready_plan("deep plan")]
+            "plan": QueueAdapter("plan", "claude", "sonnet", [ready_plan()]),
+            "plan-escalation": QueueAdapter(
+                "plan-escalation", "claude", "opus", [ready_plan("deep plan")]
             ),
-            "red-team": QueueAdapter(
-                "red-team", "codex", "gpt-5.6-sol", [passed_gate(), passed_gate()]
+            "review": QueueAdapter(
+                "review", "codex", "gpt-5.6-sol", [passed_gate(), passed_gate()]
             ),
-            "developer": QueueAdapter(
-                "developer",
+            "develop": QueueAdapter(
+                "develop",
                 "antigravity",
                 "gemini-3.1-pro-high",
                 [completed_development()],

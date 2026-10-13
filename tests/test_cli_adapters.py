@@ -171,7 +171,7 @@ class CliAdapterTests(TestCase):
             ClaudeCliAdapter,
             StaticProcessRunner(process_result("")),
             permission="read-only",
-            role_profile_id="red-team",
+            role_profile_id="review",
         )
         command = adapter.build_command("prompt")
         allowed = command[command.index("--allowedTools") + 1]
@@ -506,11 +506,11 @@ class CliAdapterTests(TestCase):
         planner = self._adapter(
             ClaudeCliAdapter,
             planner_runner,
-            role_profile_id="planner",
+            role_profile_id="plan",
             model="sonnet",
             reasoning_effort="medium",
             permission="read-only",
-            output_schema_path=output_schema_path("planner"),
+            output_schema_path=output_schema_path("plan"),
         )
         planner.run(self.task, "run_planner")
         planner_command = planner_runner.calls[0][0]
@@ -537,11 +537,11 @@ class CliAdapterTests(TestCase):
             AntigravityCliAdapter,
             developer_runner,
             structured_output=True,
-            role_profile_id="developer",
+            role_profile_id="develop",
             model="gemini-3.1-pro-high",
             reasoning_effort="high",
             permission="workspace-write",
-            output_schema_path=output_schema_path("developer"),
+            output_schema_path=output_schema_path("develop"),
         )
         developer_response = developer.run(self.task, "run_developer")
         developer_command = developer_runner.calls[0][0]
@@ -596,7 +596,7 @@ class ReadOnlyWriteDetectionTests(TestCase):
 
     def _adapter(self, runner, *, permission: str) -> ClaudeCliAdapter:
         return ClaudeCliAdapter(
-            adapter_id="red-team",
+            adapter_id="review",
             role="Red Team",
             executable="claude",
             working_directory=self.repo,
@@ -604,7 +604,7 @@ class ReadOnlyWriteDetectionTests(TestCase):
             timeout_seconds=30,
             process_runner=runner,
             permission=permission,
-            role_profile_id="red-team",
+            role_profile_id="review",
         )
 
     def test_read_only_role_that_writes_fails_closed(self) -> None:

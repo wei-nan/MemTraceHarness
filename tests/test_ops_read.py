@@ -60,7 +60,7 @@ class RuleAllowListTests(unittest.TestCase):
         self.assertFalse(allowed.is_rule_allowed("P", "external_action", {**comment, "repo": "o/other"}))
         self.assertFalse(allowed.is_rule_allowed("Q", "external_action", comment))
 
-        model = {"target": "developer", "provider": "claude", "model": "claude-opus-5-5"}
+        model = {"target": "develop", "provider": "claude", "model": "claude-opus-5-5"}
         allowed.add_rule("P", "model_change", model)
         self.assertTrue(allowed.is_rule_allowed("P", "model_change", model))
         self.assertFalse(allowed.is_rule_allowed("P", "model_change", {**model, "model": "claude-sonnet-5-5"}))

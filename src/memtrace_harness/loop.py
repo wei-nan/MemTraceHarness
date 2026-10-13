@@ -8,6 +8,7 @@ import subprocess
 import time
 from typing import Any, Callable, TYPE_CHECKING
 
+from memtrace_harness import stage_skills
 from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
@@ -289,7 +290,7 @@ class AgentLoopRunner:
                 trace_id=trace_id,
                 stages=stages,
                 stage="plan",
-                profile_id="planner",
+                profile_id="plan",
             )
             stopped = self._stop_after_execution(task, trace_id, stages, plan)
             if stopped:
@@ -317,7 +318,7 @@ class AgentLoopRunner:
                 trace_id=trace_id,
                 stages=stages,
                 stage="g1",
-                profile_id="red-team",
+                profile_id="review",
             )
             stopped = self._stop_after_execution(task, trace_id, stages, g1)
             if stopped:
@@ -335,7 +336,7 @@ class AgentLoopRunner:
                     trace_id=trace_id,
                     stages=stages,
                     stage="g1-rescope",
-                    profile_id="red-team",
+                    profile_id="review",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, g1)
                 if stopped:
@@ -368,7 +369,7 @@ class AgentLoopRunner:
                     trace_id=trace_id,
                     stages=stages,
                     stage="plan-escalation" if use_opus else "plan-revision",
-                    profile_id="planner-escalation" if use_opus else "planner",
+                    profile_id="plan-escalation" if use_opus else "plan",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, revised_plan)
                 if stopped:
@@ -391,7 +392,7 @@ class AgentLoopRunner:
                     trace_id=trace_id,
                     stages=stages,
                     stage="g1-recheck",
-                    profile_id="red-team",
+                    profile_id="review",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, g1)
                 if stopped:
@@ -441,7 +442,7 @@ class AgentLoopRunner:
                 trace_id=trace_id,
                 stages=stages,
                 stage="develop",
-                profile_id="developer",
+                profile_id="develop",
             )
             stopped = self._stop_after_execution(task, trace_id, stages, development)
             if stopped:
@@ -475,7 +476,7 @@ class AgentLoopRunner:
                     stages=stages,
                     trace_id=trace_id,
                     stage="g2",
-                    profile_id="red-team",
+                    profile_id="review",
                     verification=verification,
                 )
             else:
@@ -488,7 +489,7 @@ class AgentLoopRunner:
                     trace_id=trace_id,
                     stages=stages,
                     stage="g2",
-                    profile_id="red-team",
+                    profile_id="review",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, g2)
                 if stopped:
@@ -506,7 +507,7 @@ class AgentLoopRunner:
                     trace_id=trace_id,
                     stages=stages,
                     stage="develop-revision",
-                    profile_id="developer",
+                    profile_id="develop",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, development)
                 if stopped:
@@ -533,7 +534,7 @@ class AgentLoopRunner:
                         stages=stages,
                         trace_id=trace_id,
                         stage="g2-recheck",
-                        profile_id="red-team",
+                        profile_id="review",
                         verification=recheck_verification,
                     )
                 else:
@@ -545,7 +546,7 @@ class AgentLoopRunner:
                         trace_id=trace_id,
                         stages=stages,
                         stage="g2-recheck",
-                        profile_id="red-team",
+                        profile_id="review",
                     )
                     stopped = self._stop_after_execution(task, trace_id, stages, g2)
                     if stopped:
@@ -686,7 +687,7 @@ class AgentLoopRunner:
             trace_id=trace_id,
             stages=stages,
             stage="operate",
-            profile_id="developer",
+            profile_id="develop",
         )
         stopped = self._stop_after_execution(task, trace_id, stages, result)
         if stopped:
@@ -1404,14 +1405,14 @@ class AgentLoopRunner:
     def _validate_adapters(self) -> None:
         required = {
             "controller",
-            "planner",
-            "planner-escalation",
-            "red-team",
-            "developer",
+            "plan",
+            "plan-escalation",
+            "review",
+            "develop",
         }
         missing = sorted(required.difference(self.adapters))
         if missing:
-            raise ValueError(f"Agent loop is missing role adapters: {', '.join(missing)}")
+            raise ValueError(f"Agent loop is missing skill adapters: {', '.join(missing)}")
 
 
 def controller_task(
@@ -1710,43 +1711,15 @@ def planner_revision_task(
 # (2026-10-05, chat_0a2de06d: two full plan+gate rounds, then a pointless question to the human).
 G1_MISSCOPED_CODES = {"implementation_gap", "test_gap"}
 
-_G1_SCOPE = (
-    "\nThis is G1, the PLAN gate. No code has been written yet: the repository, its tests and any "
-    "'delivery evidence' are deliberately still in their before-state, so the feature, files or tests "
-    "not existing yet is expected and is NEVER a finding. Do not use reason_code 'implementation_gap' "
-    "or 'test_gap' (those belong to G2, after development). Judge only the plan itself: are the "
-    "acceptance criteria observable and complete, is the approach feasible against the code you can "
-    "read, is the scope right, are risks and failure modes handled, is any required decision or input "
-    "missing or ambiguous. REJECT only for a defect in the plan that a revised plan could fix."
-)
-_G1_RESCOPE = (
-    "\nCORRECTION: your previous G1 verdict rejected this plan with implementation_gap/test_gap, i.e. "
-    "because the implementation or tests do not exist. That cannot apply at the plan gate. Judge the "
-    "plan again from scratch and drop every finding that only says code or tests are absent."
-)
-_G2_SCOPE = (
-    "\nThis is G2, the IMPLEMENTATION gate: development has finished. Judge the Developer's evidence "
-    "and the actual changes against the accepted plan and its acceptance criteria."
-)
+_G1_SCOPE = "\n" + stage_skills.section("review", "g1_scope")
+_G1_RESCOPE = "\n" + stage_skills.section("review", "g1_rescope")
+_G2_SCOPE = "\n" + stage_skills.section("review", "g2_scope")
 # Operator decision 2026-10-09: a gate's job is to stop what is unsafe, not to perfect the work. A
 # trivial request (add sendPhoto) spent four G1 rounds, ~80% of its tokens and the operator's
 # attention on rounds of spec polish, each round's revision adding detail the next found
 # contradictory. Prompt policy, not enforced: the gate stays a model verdict the Harness cannot
 # override, only told what is worth a REJECT.
-_GATE_PASS_POLICY = (
-    "\nPASS BY DEFAULT. Return REJECT only for a safety or security violation: exposing a secret, "
-    "token or personal identifier (in code, logs, output or tests), an unsafe or unauthorized external "
-    "side effect, a destructive or irreversible action, reading or writing something the project marks "
-    "off-limits, or bypassing a protective control. Missing edge-case tests, unclear wording, "
-    "inconsistent field names, extra polish, style, scope you would have drawn differently and "
-    "anything you could not verify are NOT grounds to reject: return PASS and list them in findings "
-    "with severity 'low' or 'medium' for the Developer and operator to see. Use reason_code "
-    "'security' for a REJECT. If the request itself cannot be understood or a needed input is "
-    "missing, use NEEDS_HUMAN/'missing_input', not REJECT.\n"
-    "Do NOT require a git repository, a git diff or a version-control baseline: many governed "
-    "projects are plain folders. Read the files as they are; the lack of a diff is neither a finding "
-    "nor a reason to withhold PASS."
-)
+_GATE_PASS_POLICY = "\n" + stage_skills.section("review", "pass_policy")
 
 
 # Requirement tiers (operator decision 2026-10-09): the plan states up front which acceptance
@@ -1759,41 +1732,14 @@ TIER_OPTIONAL = "[建議]"
 DEFER_SEVERITY = "defer"
 MAX_DEFERRED_NOTES = 12
 
-_TIER_RULE = (
-    f"\nTIER every acceptance criterion by starting it with '{TIER_REQUIRED}' or '{TIER_OPTIONAL}'. "
-    f"'{TIER_REQUIRED}' is only what the request cannot be called done or safe without: the behaviour "
-    "the operator asked for, and not exposing secrets/identifiers or causing an unauthorized or "
-    f"destructive side effect. '{TIER_OPTIONAL}' is hardening: extra edge-case tests, extra error "
-    "classes, output formats, polish. Plan the smallest implementation that satisfies the request; do "
-    "not widen scope to look thorough, and keep '[必要]' items few.\n"
-)
-_TIER_REVISION_RULE = (
-    "\nRevise ONLY for the blocking findings (a [必要] criterion that is unmet or contradicted, or a "
-    "safety/security problem). Findings whose severity starts with 'defer' are not yours to fix now: "
-    "leave them out, they go to the Developer. Do not add new criteria, fields or scope while revising.\n"
-)
-_G1_TIER_POLICY = (
-    f"\nThe plan's acceptance criteria are tiered. Gate ONLY the '{TIER_REQUIRED}' ones and safety/"
-    f"security. Anything you notice on '{TIER_OPTIONAL}' items or beyond must not change the verdict: "
-    f"list it in findings with severity '{DEFER_SEVERITY}' (e.g. '{DEFER_SEVERITY}: edge case') and it "
-    f"will be handed to the Developer and G2. If a criterion has no tier, treat it as '{TIER_OPTIONAL}'."
-)
-_G1_TIGHTEN = (
-    "\nThis is a re-check after the plan was already revised once. Reject now ONLY for a safety/"
-    "security violation (reason_code 'security'). Every other finding, including new ones, is a "
-    f"'{DEFER_SEVERITY}' finding on a PASS."
-)
-_G2_DEFERRED_NOTE = (
-    "\nThe 'deferred-notes' context item lists non-blocking observations G1 passed on to the "
-    "Developer. They are not acceptance criteria: do not reject because one is unaddressed."
-)
+_TIER_RULE = "\n" + stage_skills.section("plan", "tier_rule") + "\n"
+_TIER_REVISION_RULE = "\n" + stage_skills.section("plan", "tier_revision_rule") + "\n"
+_G1_TIER_POLICY = "\n" + stage_skills.section("review", "g1_tier_policy")
+_G1_TIGHTEN = "\n" + stage_skills.section("review", "g1_tighten")
+_G2_DEFERRED_NOTE = "\n" + stage_skills.section("review", "g2_deferred_note")
 
 
-_DEFERRED_FOR_DEVELOPER = (
-    "G1 passed the plan and left the 'deferred-notes' context item for you. Handle a note only when it "
-    "is cheap and inside the request; otherwise list it under gaps. Implement the '[必要]' criteria "
-    "first and do not grow the change to cover every note.\n"
-)
+_DEFERRED_FOR_DEVELOPER = stage_skills.section("develop", "deferred_for_developer") + "\n"
 
 
 def deferred_findings(*gates: dict[str, Any] | None) -> list[dict[str, Any]]:

@@ -20,8 +20,8 @@ PROFILES = (
     'provider = "claude"\n'
     'model = "sonnet"\n'
     '\n'
-    '[profiles.planner]\n'
-    'role = "Planner"\n'
+    '[profiles.plan]\n'
+    'role = "Plan"\n'
     'provider = "claude"\n'
     'model = "sonnet"\n'
 )
@@ -52,7 +52,7 @@ class UpdateRoleProfileTests(TestCase):
         self.assertIn('provider = "claude"\nmodel = "opus"', text)
         self.assertIn("# A decision-rationale comment that must survive the edit untouched.", text)
         self.assertIn('[[profiles.controller.fallbacks]]\nprovider = "claude"\nmodel = "sonnet"', text)
-        self.assertIn('[profiles.planner]\nrole = "Planner"\nprovider = "claude"\nmodel = "sonnet"', text)
+        self.assertIn('[profiles.plan]\nrole = "Plan"\nprovider = "claude"\nmodel = "sonnet"', text)
 
     def test_rejects_unknown_provider_and_a_model_with_a_quote(self) -> None:
         _, config = self._config(own_file=True)
@@ -70,7 +70,7 @@ class UpdateRoleProfileTests(TestCase):
     def test_rejects_unknown_profile_id(self) -> None:
         _, config = self._config(own_file=True)
         with self.assertRaises(ValueError):
-            admin.update_role_profile(config, "red-team", "claude", "opus")
+            admin.update_role_profile(config, "review", "claude", "opus")
 
 
 class DedicatedRoleProfilesTests(TestCase):

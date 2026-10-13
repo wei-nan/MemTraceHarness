@@ -26,8 +26,8 @@ model = "sonnet"
 reasoning_effort = "medium"
 quota_bucket = "claude-account"
 
-[profiles.planner]
-role = "Planner"
+[profiles.plan]
+role = "Plan"
 provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
@@ -36,8 +36,8 @@ context_policy = "task-and-targeted-evidence"
 max_attempts = 1
 quota_bucket = "claude-account"
 
-[profiles.planner-escalation]
-role = "Planning Escalation"
+[profiles.plan-escalation]
+role = "Plan Escalation"
 provider = "claude"
 model = "opus"
 reasoning_effort = "high"
@@ -46,8 +46,8 @@ context_policy = "task-and-targeted-evidence"
 max_attempts = 1
 quota_bucket = "claude-account"
 
-[profiles.red-team]
-role = "Red Team"
+[profiles.review]
+role = "Review"
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "high"
@@ -56,8 +56,8 @@ context_policy = "gate-evidence-only"
 max_attempts = 1
 quota_bucket = "codex-account"
 
-[profiles.developer]
-role = "Developer"
+[profiles.develop]
+role = "Develop"
 provider = "antigravity"
 model = "gemini-3.8-flash-high"
 reasoning_effort = "high"

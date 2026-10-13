@@ -21,7 +21,7 @@ from tests.test_service import _build_schedule_gateway
 def _adapters(controller):
     adapters = {
         role: QueueAdapter(role, "codex", "m", [])
-        for role in ("planner", "planner-escalation", "red-team", "developer")
+        for role in ("plan", "plan-escalation", "review", "develop")
     }
     adapters["controller"] = QueueAdapter("controller", "codex", "m", controller)
     return adapters

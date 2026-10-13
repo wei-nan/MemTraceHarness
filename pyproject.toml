@@ -19,7 +19,7 @@ memtrace-web = "memtrace_services.web.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-memtrace_harness = ["default-role-profiles.toml", "output_schemas/*.json"]
+memtrace_harness = ["default-role-profiles.toml", "output_schemas/*.json", "skills/*/SKILL.md"]
 memtrace_services = ["web/static/*"]
 
 [tool.ruff]
