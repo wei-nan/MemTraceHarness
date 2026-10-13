@@ -177,7 +177,12 @@ def select_precedents(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def precedent_block(
-    trace_store: TraceStore, project: str, *, preferences: str = "", kind: str | None = None
+    trace_store: TraceStore,
+    project: str,
+    *,
+    preferences: str = "",
+    calibration: str = "",
+    kind: str | None = None,
 ) -> str:
     """The text of the Controller's precedent item, or "" when there is nothing to say."""
     records = select_precedents(trace_store.list_decision_records(project, kind=kind, limit=40))
@@ -195,6 +200,8 @@ def precedent_block(
             "explicit instruction in the current request outranks all of them):\n"
             + preferences.strip()
         )
+    if calibration.strip():
+        parts.append(calibration.strip())
     return "\n\n".join(parts)
 
 
