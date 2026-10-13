@@ -26,7 +26,7 @@ class AntigravityCliAdapter(CliModelAdapter):
         if self.model:
             command.extend(["--model", self.model])
         # Some Antigravity model names already bake an effort tier into the name itself
-        # (e.g. "gemini-3.6-flash-high", "gpt-oss-120b-medium") — passing --effort
+        # (e.g. "gemini-3.8-flash-high", "gpt-oss-120b-medium") — passing --effort
         # alongside one of these is a hard CLI error ("--model X conflicts with
         # --effort=Y"), not a warning.
         if self.reasoning_effort and not _model_has_builtin_effort(self.model):
@@ -127,7 +127,7 @@ def _model_has_builtin_effort(model: str | None) -> bool:
     if not model:
         return False
     suffix = model.rsplit("-", 1)[-1].lower()
-    # "-high"/"-medium"/"-low" (e.g. gemini-3.6-flash-high) bake in an effort tier.
+    # "-high"/"-medium"/"-low" (e.g. gemini-3.8-flash-high) bake in an effort tier.
     # "-thinking" (e.g. claude-opus-4-6-thinking) isn't an effort tier at all — it's a
     # fixed reasoning mode — but the CLI rejects --effort for it just the same
     # ("--effort is not supported for model ..."), confirmed directly against `agy`

@@ -19,7 +19,7 @@ quota_bucket = "claude-account"
 
 [[profiles.controller.fallbacks]]
 provider = "antigravity"
-model = "gemini-3.6-flash-high"
+model = "gemini-3.8-flash-high"
 reasoning_effort = "high"
 quota_bucket = "antigravity-account"
 
@@ -56,7 +56,7 @@ quota_bucket = "codex-account"
 [profiles.developer]
 role = "Developer"
 provider = "antigravity"
-model = "gemini-3.1-pro-high"
+model = "gemini-3.8-flash-high"
 reasoning_effort = "high"
 permission = "workspace-write"
 context_policy = "accepted-plan-and-repo"

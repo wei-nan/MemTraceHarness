@@ -154,7 +154,7 @@ class ModelSettingTests(TestCase):
 
 class StatusDataTests(TestCase):
     def test_known_models_collects_every_configured_pair(self) -> None:
-        env = {"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "gemini-3.6-flash-high"}
+        env = {"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "gemini-3.8-flash-high"}
         with workspace(env) as (root, config):
             # the real packaged default is a known-good example of the five-role shape
             default = Path(__file__).parent.parent / "src/memtrace_harness/default-role-profiles.toml"
@@ -166,7 +166,7 @@ class StatusDataTests(TestCase):
                 data = admin.collect_status_data(config, scope)
         self.assertIn("gpt-5.6-luna", data["known_models"]["codex"])
         self.assertIn("sonnet", data["known_models"]["claude"])
-        self.assertIn("gemini-3.6-flash-high", data["known_models"]["antigravity"])
+        self.assertIn("gemini-3.8-flash-high", data["known_models"]["antigravity"])
         self.assertEqual(set(data["known_models"]), {"claude", "codex", "antigravity"})
         self.assertEqual([p["name"] for p in data["projects"]], ["ws"])  # the folder name
         self.assertEqual(data["harness"]["outbox_backlog"], 0)
