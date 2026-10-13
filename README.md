@@ -129,21 +129,27 @@ The packaged profile policy lives in
 
 | Profile | Provider/model (packaged default) | Permission | Purpose |
 | --- | --- | --- | --- |
-| `controller` | Codex `gpt-5.6-luna` | read-only | Start routing and convergence; quota fallback to Sonnet then Gemini 3.6 |
-| `planner` | Claude `sonnet` | read-only | Default planning for every risk level |
-| `planner-escalation` | Claude `opus` | read-only | G1 reasoning-gap escalation only |
-| `red-team` | Codex `gpt-5.6-sol` | read-only | G1/G2 adversarial review |
-| `developer` | Antigravity `gemini-3.1-pro-high` | workspace-write | Accepted-plan implementation and one bounded correction |
+| `controller` | Codex `gpt-5.6-luna` | read-only | The only role: plans the goal in phases, picks the skills, checks the goal is met; quota fallback to Sonnet then Gemini |
+| `plan` | Claude `sonnet` | read-only | Skill: the plan for one phase |
+| `plan-escalation` | Claude `opus` | read-only | The plan skill's stronger-model mode (G1 reasoning-gap only) |
+| `review` | Codex `gpt-5.6-sol` | read-only | Skill: independent G1/G2 review in a fresh context |
+| `develop` | Antigravity `gemini-3.8-flash-high` | workspace-write | Skill: accepted-plan implementation and one bounded correction |
+
+The Controller is the only role; `plan`, `review` and `develop` are skills it runs (`skills/<name>/SKILL.md`).
+For the user's whole request it writes a goal plan (success criteria and phases), and a task is reported
+done only when its final goal check answers every criterion — see "One Controller, stage skills" in
+[`docs/architecture.md`](docs/architecture.md). The pre-skill profile names (`planner`, `red-team`,
+`developer`, `planner-escalation`) still load from an older roles file.
 
 Use `--profiles-file <path.toml>` to load another file, or `HARNESS_ROLE_PROFILES_FILE_<PROJECT>`
-for a per-project override — every role's provider/model is project-configurable, including
-Controller and Developer, not just the packaged defaults above. What validation actually enforces,
-independent of vendor choice: only `developer` may hold `workspace-write` (every other role stays
-`read-only`); each role's `context_policy` shape (Controller only a compact loop snapshot, Red Team
-only gate-scoped evidence, Developer the accepted plan plus repo); and Red Team / Planning
-escalation both fail closed with no packaged fallback chain. Each role stage is already a fresh,
-independently-invoked CLI call — that's what makes a reviewer distinct from the role it's
-reviewing, not a forced vendor split.
+for a per-project override — every profile's provider/model is project-configurable, including
+Controller and develop, not just the packaged defaults above. What validation actually enforces,
+independent of vendor choice: only `develop` may hold `workspace-write` (every other profile stays
+`read-only`); each profile's `context_policy` shape (Controller only a compact loop snapshot, `review`
+only gate-scoped evidence, `develop` the accepted plan plus repo). Each skill is already a fresh,
+independently-invoked CLI call that is handed artifacts, never another skill's conversation — that's what
+makes a reviewer distinct from the work it's reviewing, not a forced vendor split. A task can name models
+for its own skills with `model=`/`develop=`, `plan=` and `review=` prefixes on its goal.
 
 Each role also receives a packaged JSON Schema through the provider's structured-output flag. An
 invalid or missing final JSON object stops the loop; the Harness never infers a PASS from prose.

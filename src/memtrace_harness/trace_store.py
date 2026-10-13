@@ -105,6 +105,24 @@ class TraceStore:
                 )
         return trace_id
 
+    def conversation_user_request(self, conversation_id: str) -> str | None:
+        """The user's own words that started this conversation (the ``user_request`` context item of its
+        earliest run that carried one), so a resumed run still plans for the whole original request."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT task_json FROM runs WHERE conversation_id = ? ORDER BY created_at, rowid",
+                (conversation_id,),
+            ).fetchall()
+        for (task_json,) in rows:
+            try:
+                items = json.loads(task_json).get("context_items") or []
+            except (ValueError, AttributeError):
+                continue
+            for item in items:
+                if isinstance(item, dict) and item.get("content_type") == "user_request" and item.get("body"):
+                    return str(item["body"])
+        return None
+
     def save_summary(self, summary: HarnessSummary) -> None:
         with self._connection() as conn:
             conn.execute(

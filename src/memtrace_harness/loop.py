@@ -3,12 +3,25 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import logging
+import re
 from pathlib import Path
 import subprocess
 import time
 from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness import stage_skills
+from memtrace_harness.goal_plan import (
+    MAX_CRITERIA,
+    MAX_PHASES,
+    GoalPlan,
+    Phase,
+    assignment_plan,
+    default_goal_plan,
+    judge_goal_check,
+    parse_goal_plan,
+    parse_phases,
+    render_goal_report,
+)
 from memtrace_harness.cli_process import child_env
 from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.continuation import build_resume_envelope, with_resume_envelope
@@ -189,6 +202,10 @@ class AgentLoopRunner:
         previous = self.trace_store.latest_resume_envelope(self._conversation_id)
         if previous is not None:
             task = with_resume_envelope(task, previous)
+        if not any(item.content_type == USER_REQUEST_CONTENT_TYPE for item in task.context_items):
+            original = self.trace_store.conversation_user_request(self._conversation_id)
+            if original:
+                task = replace(task, context_items=[*task.context_items, user_request_item(original)])
         trace_id = self.trace_store.create_run(
             task, conversation_id=self._conversation_id
         )
@@ -204,9 +221,14 @@ class AgentLoopRunner:
         reconstructed = self._reconstruct_progress(self._conversation_id)
         stages.extend(reconstructed.values())
 
+        previous_goal_plan = self._previous_goal_plan(self._conversation_id)
         controller = self._execute(
             task=controller_task(
-                task, stage="start", stages=stages, agent_loop_enabled=self.agent_loop_enabled
+                task,
+                stage="start",
+                stages=stages,
+                agent_loop_enabled=self.agent_loop_enabled,
+                previous_goal_plan=previous_goal_plan,
             ),
             trace_id=trace_id,
             stages=stages,
@@ -234,7 +256,7 @@ class AgentLoopRunner:
             # Deterministic backstop for the instruction controller_task() already
             # gave it (agent_loop_enabled=False strips "run_planner" from the allowed
             # list in the prompt) — a misbehaving model picking it anyway must not
-            # reach Planner/Developer on a project that opted out of development work.
+            # reach the plan or develop skill on a project that opted out of development work.
             return self._persist(
                 self._summary(
                     task,
@@ -281,131 +303,355 @@ class AgentLoopRunner:
                 writeback=writeback,
             )
 
-        reused_plan = reconstructed.get("plan")
-        if reused_plan is not None:
-            plan = reused_plan
-        else:
-            plan = self._execute(
-                task=planner_task(task),
-                trace_id=trace_id,
-                stages=stages,
-                stage="plan",
-                profile_id="plan",
-            )
-            stopped = self._stop_after_execution(task, trace_id, stages, plan)
-            if stopped:
-                return self._persist(stopped, writeback=writeback)
-            if not valid_plan(plan.artifact):
-                artifact = plan.artifact or {}
-                detail = (
-                    summarize_plan_needs_human("Planner", artifact)
-                    if artifact.get("status") == "needs_human" and _plan_structure_ok(artifact)
-                    else summarize_invalid_artifact("Planner", artifact)
-                )
-                return self._persist(
-                    self._summary(task, trace_id, stages, "needs_human", detail),
-                    writeback=writeback,
-                )
-
-        g1_artifacts: list[dict[str, Any] | None] = []
-        reused_g1 = reconstructed.get("g1")
-        if reused_g1 is not None:
-            g1 = reused_g1
-            gate = "PASS"
-        else:
-            g1 = self._execute(
-                task=gate_task(task, "G1", plan.artifact or {}),
-                trace_id=trace_id,
-                stages=stages,
-                stage="g1",
-                profile_id="review",
-            )
-            stopped = self._stop_after_execution(task, trace_id, stages, g1)
-            if stopped:
-                return self._persist(stopped, writeback=writeback)
-
-            g1_artifacts.append(g1.artifact)
-            gate = normalized_gate(g1.artifact)
-            reason_code = str((g1.artifact or {}).get("reason_code", "other"))
-            if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
-                # The gate judged the plan by implementation standards. Revising the plan
-                # cannot satisfy "the code doesn't exist yet", so ask the gate again with
-                # the correction instead of burning a planner revision and a second gate.
-                g1 = self._execute(
-                    task=gate_task(task, "G1", plan.artifact or {}, rescope=True),
+        goal_plan = parse_goal_plan(controller_artifact.get("goal_plan")) or default_goal_plan(task.goal)
+        reconstructed, stale = self._reusable_for_plan(reconstructed, previous_goal_plan, goal_plan)
+        if stale:
+            stale_ids = {id(item) for item in stale}
+            stages[:] = [item for item in stages if id(item) not in stale_ids]
+        phases = list(goal_plan.phases)
+        done = 0
+        converge_round = 0
+        while True:
+            while done < len(phases):
+                done += 1
+                stopped = self._run_phase(
+                    task=task,
                     trace_id=trace_id,
                     stages=stages,
-                    stage="g1-rescope",
-                    profile_id="review",
+                    writeback=writeback,
+                    phase=phases[done - 1],
+                    index=done,
+                    total_phases=len(phases),
+                    reconstructed=reconstructed,
                 )
-                stopped = self._stop_after_execution(task, trace_id, stages, g1)
                 if stopped:
-                    return self._persist(stopped, writeback=writeback)
-                gate = normalized_gate(g1.artifact)
-                reason_code = str((g1.artifact or {}).get("reason_code", "other"))
-                if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
-                    return self._persist(
-                        self._summary(
-                            task,
-                            trace_id,
-                            stages,
-                            "needs_human",
-                            "G1 (plan gate) rejected the plan twice for "
-                            f"'{reason_code}', which cannot apply before any code exists — the "
-                            "gate is judging the plan as if it were an implementation, so the plan "
-                            "was not sent back for revision. Its findings, for reference:\n"
-                            + summarize_gate_artifact("G1", g1.artifact),
-                        ),
-                        writeback=writeback,
-                    )
-            if gate == "REJECT" and reason_code != "missing_input":
-                use_opus = reason_code == "reasoning_gap"
-                revised_plan = self._execute(
-                    task=(
-                        planner_escalation_task(task, plan.artifact or {}, g1.artifact or {})
-                        if use_opus
-                        else planner_revision_task(task, plan.artifact or {}, g1.artifact or {})
+                    return stopped
+                if done == len(phases):
+                    break
+                # More phases are planned: the Controller looks at what this one produced against the
+                # goal before the next one starts, and may drop, add or reorder what is left.
+                progress = self._execute(
+                    task=controller_task(
+                        task,
+                        stage="progress",
+                        stages=stages,
+                        goal_plan=GoalPlan(goal_plan.restated_goal, goal_plan.success_criteria, tuple(phases)),
+                        phases_done=done,
                     ),
                     trace_id=trace_id,
                     stages=stages,
-                    stage="plan-escalation" if use_opus else "plan-revision",
-                    profile_id="plan-escalation" if use_opus else "plan",
+                    stage=f"progress-{done}",
+                    profile_id="controller",
                 )
-                stopped = self._stop_after_execution(task, trace_id, stages, revised_plan)
+                stopped = self._stop_after_execution(task, trace_id, stages, progress)
                 if stopped:
                     return self._persist(stopped, writeback=writeback)
-                if not valid_plan(revised_plan.artifact):
-                    planner_name = "Opus escalation" if use_opus else "Sonnet revision"
-                    artifact = revised_plan.artifact or {}
+                if not valid_controller(progress.artifact, {"next_phase", "revise_phases", "finish", "ask_human"}):
+                    return self._persist(
+                        self._summary(
+                            task, trace_id, stages, "needs_human",
+                            summarize_invalid_artifact("Controller (progress)", progress.artifact),
+                        ),
+                        writeback=writeback,
+                    )
+                progress_action = (progress.artifact or {}).get("action")
+                if progress_action == "ask_human":
+                    return self._persist(
+                        self._summary(
+                            task, trace_id, stages, "needs_human",
+                            "Controller stopped between phases: "
+                            + str((progress.artifact or {}).get("reason") or "(no reason given)"),
+                        ),
+                        writeback=writeback,
+                    )
+                if progress_action == "finish":
+                    del phases[done:]  # the goal is already met; the converge check below confirms it
+                elif progress_action == "revise_phases":
+                    revised = parse_phases((progress.artifact or {}).get("phases"), limit=MAX_PHASES - done)
+                    if revised is None:
+                        return self._persist(
+                            self._summary(
+                                task, trace_id, stages, "needs_human",
+                                "Controller asked to revise the remaining phases but gave none the harness "
+                                "could use (each needs a title, a purpose and plan and/or develop; "
+                                f"at most {MAX_PHASES} phases in all).",
+                            ),
+                            writeback=writeback,
+                        )
+                    phases[done:] = revised
+
+            integration = self._prepare_integration(task)
+            can_revise = len(phases) < MAX_PHASES
+            converge_actions = {"finish", "ask_human"} | (
+                {"merge"} if integration is not None and integration.has_changes else set()
+            ) | ({"revise_phases"} if can_revise else set())
+            converge_round += 1
+            current_plan = GoalPlan(goal_plan.restated_goal, goal_plan.success_criteria, tuple(phases))
+            converge = self._execute(
+                task=controller_task(
+                    task,
+                    stage="converge",
+                    stages=stages,
+                    integration=integration,
+                    goal_plan=current_plan,
+                    phases_done=done,
+                    can_revise=can_revise,
+                ),
+                trace_id=trace_id,
+                stages=stages,
+                stage="converge" if converge_round == 1 else f"converge-{converge_round}",
+                profile_id="controller",
+            )
+            stopped = self._stop_after_execution(task, trace_id, stages, converge)
+            if stopped:
+                return self._persist(stopped, writeback=writeback)
+            if not valid_controller(converge.artifact, converge_actions):
+                return self._persist(
+                    self._summary(
+                        task,
+                        trace_id,
+                        stages,
+                        "needs_human",
+                        summarize_invalid_artifact("Controller (converge)", converge.artifact),
+                    ),
+                    writeback=writeback,
+                )
+            converge_action = (converge.artifact or {}).get("action")
+            if converge_action == "revise_phases":
+                # The goal is not reached yet and the Controller says what still has to be done: run it,
+                # then check again. Bounded by MAX_PHASES, so this cannot go on forever.
+                more = parse_phases((converge.artifact or {}).get("phases"), limit=MAX_PHASES - len(phases))
+                if more is None:
+                    return self._persist(
+                        self._summary(
+                            task, trace_id, stages, "needs_human",
+                            "Controller said the goal is not reached yet and asked for more phases, but gave "
+                            "none the harness could use (or the phase limit is reached). "
+                            + str((converge.artifact or {}).get("reason") or ""),
+                        ),
+                        writeback=writeback,
+                    )
+                phases.extend(more)
+                continue
+            break
+
+        goal_check = (converge.artifact or {}).get("goal_check")
+        verdict = judge_goal_check(current_plan, goal_check)
+        report = render_goal_report(current_plan, goal_check, verdict)
+        merge_note = ""
+        if converge_action in {"finish", "merge"} and not verdict.complete:
+            # The Controller wants to close the task but its own check says the user's goal is not fully
+            # met (or it never checked). Report it as unfinished instead of calling half the job done.
+            problems = [verdict.problem, *(f"沒做到：{item}" for item in verdict.unmet)]
+            return self._persist(
+                self._summary(
+                    task,
+                    trace_id,
+                    stages,
+                    "needs_human",
+                    "這個任務只完成了一部分，原始目標還沒有達成，所以沒有標成完成。\n"
+                    + "\n".join(item for item in problems if item)
+                    + (f"\n\n{report}" if report else ""),
+                ),
+                writeback=writeback,
+            )
+        if converge_action == "merge":
+            merged = self._merge_worktree(task)
+            if not merged.ok:
+                return self._persist(
+                    self._summary(task, trace_id, stages, "needs_human", merged.detail),
+                    writeback=writeback,
+                )
+            merge_note = f" {merged.detail}"
+        elif converge_action != "finish":
+            return self._persist(
+                self._summary(
+                    task,
+                    trace_id,
+                    stages,
+                    "needs_human",
+                    "Controller chose not to finish: "
+                    + str((converge.artifact or {}).get("reason") or "(no reason given)")
+                    + (f"\n\n{report}" if report else ""),
+                ),
+                writeback=writeback,
+            )
+        elif integration is not None and integration.has_changes:
+            merge_note = (
+                f" The task's changes are on branch '{integration.branch}' in "
+                f"{self.working_directory} and have NOT been merged into "
+                f"'{integration.base_branch}'."
+            )
+        return self._persist(
+            self._summary(
+                task,
+                trace_id,
+                stages,
+                "succeeded",
+                (f"{report}\n\n" if report else "")
+                + (
+                    "The bounded local loop completed with draft evidence. This does not assert "
+                    "a MemTrace server-side gate or task-state transition."
+                    + merge_note
+                ),
+            ),
+            writeback=writeback,
+        )
+
+    @staticmethod
+    def _stage(index: int, name: str) -> str:
+        """A stage's recorded name. Phase 1 keeps the plain names; later phases are prefixed
+        (``p2-develop``) so a resumed run can tell whose artifact is whose."""
+        return name if index == 1 else f"p{index}-{name}"
+
+    def _run_phase(
+        self,
+        *,
+        task: TaskEnvelope,
+        trace_id: str,
+        stages: list[LoopStageResult],
+        writeback: bool,
+        phase: Phase,
+        index: int,
+        total_phases: int,
+        reconstructed: dict[tuple[int, str], LoopStageResult],
+    ) -> LoopSummary | None:
+        """Run one phase of the goal plan: the skills the Controller chose for it, each followed by the
+        independent review that skill always gets (``plan`` by G1, ``develop`` by the harness's own build/test
+        and G2). None when the phase settled; otherwise the persisted summary that ends the whole run."""
+        phase_items = phase_context_items(phase, index, total_phases, stages)
+        g1_artifacts: list[dict[str, Any] | None] = []
+        if "plan" in phase.skills:
+            reused_plan = reconstructed.get((index, "plan"))
+            if reused_plan is not None:
+                plan = reused_plan
+            else:
+                plan = self._execute(
+                    task=planner_task(task, phase_items=phase_items),
+                    trace_id=trace_id,
+                    stages=stages,
+                    stage=self._stage(index, "plan"),
+                    profile_id="plan",
+                )
+                stopped = self._stop_after_execution(task, trace_id, stages, plan)
+                if stopped:
+                    return self._persist(stopped, writeback=writeback)
+                if not valid_plan(plan.artifact):
+                    artifact = plan.artifact or {}
                     detail = (
-                        summarize_plan_needs_human(planner_name, artifact)
+                        summarize_plan_needs_human("Planner", artifact)
                         if artifact.get("status") == "needs_human" and _plan_structure_ok(artifact)
-                        else summarize_invalid_artifact(planner_name, artifact)
+                        else summarize_invalid_artifact("Planner", artifact)
                     )
                     return self._persist(
                         self._summary(task, trace_id, stages, "needs_human", detail),
                         writeback=writeback,
                     )
-                plan = revised_plan
+
+            reused_g1 = reconstructed.get((index, "g1"))
+            if reused_g1 is not None:
+                g1 = reused_g1
+                gate = "PASS"
+            else:
                 g1 = self._execute(
-                    task=gate_task(task, "G1", plan.artifact or {}, tighten=True),
+                    task=gate_task(task, "G1", plan.artifact or {}),
                     trace_id=trace_id,
                     stages=stages,
-                    stage="g1-recheck",
+                    stage=self._stage(index, "g1"),
                     profile_id="review",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, g1)
                 if stopped:
                     return self._persist(stopped, writeback=writeback)
+
                 g1_artifacts.append(g1.artifact)
                 gate = normalized_gate(g1.artifact)
+                reason_code = str((g1.artifact or {}).get("reason_code", "other"))
+                if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
+                    # The gate judged the plan by implementation standards. Revising the plan
+                    # cannot satisfy "the code doesn't exist yet", so ask the gate again with
+                    # the correction instead of burning a planner revision and a second gate.
+                    g1 = self._execute(
+                        task=gate_task(task, "G1", plan.artifact or {}, rescope=True),
+                        trace_id=trace_id,
+                        stages=stages,
+                        stage=self._stage(index, "g1-rescope"),
+                        profile_id="review",
+                    )
+                    stopped = self._stop_after_execution(task, trace_id, stages, g1)
+                    if stopped:
+                        return self._persist(stopped, writeback=writeback)
+                    gate = normalized_gate(g1.artifact)
+                    reason_code = str((g1.artifact or {}).get("reason_code", "other"))
+                    if gate == "REJECT" and reason_code in G1_MISSCOPED_CODES:
+                        return self._persist(
+                            self._summary(
+                                task,
+                                trace_id,
+                                stages,
+                                "needs_human",
+                                "G1 (plan gate) rejected the plan twice for "
+                                f"'{reason_code}', which cannot apply before any code exists — the "
+                                "gate is judging the plan as if it were an implementation, so the plan "
+                                "was not sent back for revision. Its findings, for reference:\n"
+                                + summarize_gate_artifact("G1", g1.artifact),
+                            ),
+                            writeback=writeback,
+                        )
+                if gate == "REJECT" and reason_code != "missing_input":
+                    use_opus = reason_code == "reasoning_gap"
+                    revised_plan = self._execute(
+                        task=(
+                            planner_escalation_task(task, plan.artifact or {}, g1.artifact or {}, phase_items=phase_items)
+                            if use_opus
+                            else planner_revision_task(task, plan.artifact or {}, g1.artifact or {}, phase_items=phase_items)
+                        ),
+                        trace_id=trace_id,
+                        stages=stages,
+                        stage=self._stage(index, "plan-escalation" if use_opus else "plan-revision"),
+                        profile_id="plan-escalation" if use_opus else "plan",
+                    )
+                    stopped = self._stop_after_execution(task, trace_id, stages, revised_plan)
+                    if stopped:
+                        return self._persist(stopped, writeback=writeback)
+                    if not valid_plan(revised_plan.artifact):
+                        planner_name = "Opus escalation" if use_opus else "Sonnet revision"
+                        artifact = revised_plan.artifact or {}
+                        detail = (
+                            summarize_plan_needs_human(planner_name, artifact)
+                            if artifact.get("status") == "needs_human" and _plan_structure_ok(artifact)
+                            else summarize_invalid_artifact(planner_name, artifact)
+                        )
+                        return self._persist(
+                            self._summary(task, trace_id, stages, "needs_human", detail),
+                            writeback=writeback,
+                        )
+                    plan = revised_plan
+                    g1 = self._execute(
+                        task=gate_task(task, "G1", plan.artifact or {}, tighten=True),
+                        trace_id=trace_id,
+                        stages=stages,
+                        stage=self._stage(index, "g1-recheck"),
+                        profile_id="review",
+                    )
+                    stopped = self._stop_after_execution(task, trace_id, stages, g1)
+                    if stopped:
+                        return self._persist(stopped, writeback=writeback)
+                    g1_artifacts.append(g1.artifact)
+                    gate = normalized_gate(g1.artifact)
 
-            if gate != "PASS":
-                detail = summarize_gate_artifact("G1", g1.artifact)
-                return self._persist(
-                    self._summary(task, trace_id, stages, "needs_human", detail),
-                    writeback=writeback,
-                )
+                if gate != "PASS":
+                    detail = summarize_gate_artifact("G1", g1.artifact)
+                    return self._persist(
+                        self._summary(task, trace_id, stages, "needs_human", detail),
+                        writeback=writeback,
+                    )
+            plan_artifact = plan.artifact or {}
+        else:
+            # No plan skill: the Controller assigned this work directly, so there is no plan to gate.
+            plan_artifact = assignment_plan(phase)
+        if "develop" not in phase.skills:
+            return None
 
         if "git push" in task.goal.lower() and self.approval_manager:
             pending = self.approval_manager.get_pending_for_conversation(self._required_conversation_id())
@@ -433,15 +679,17 @@ class AgentLoopRunner:
         if blocked is not None:
             return self._persist(blocked, writeback=writeback)
 
-        reused_develop = reconstructed.get("develop")
+        reused_develop = reconstructed.get((index, "develop"))
         if reused_develop is not None:
             development = reused_develop
         else:
             development = self._execute(
-                task=developer_task(task, plan.artifact or {}, deferred_findings(*g1_artifacts) or None),
+                task=developer_task(
+                    task, plan_artifact, deferred_findings(*g1_artifacts) or None, phase_items=phase_items
+                ),
                 trace_id=trace_id,
                 stages=stages,
-                stage="develop",
+                stage=self._stage(index, "develop"),
                 profile_id="develop",
             )
             stopped = self._stop_after_execution(task, trace_id, stages, development)
@@ -465,7 +713,7 @@ class AgentLoopRunner:
         # already runs for a "completed" development. Only G2's own verdict (or the
         # INVALID case above) should end this without a human.
 
-        reused_g2 = reconstructed.get("g2")
+        reused_g2 = reconstructed.get((index, "g2"))
         if reused_g2 is not None:
             g2 = reused_g2
             g2_verdict = "PASS"
@@ -475,20 +723,20 @@ class AgentLoopRunner:
                 g2 = self._deterministic_reject_result(
                     stages=stages,
                     trace_id=trace_id,
-                    stage="g2",
+                    stage=self._stage(index, "g2"),
                     profile_id="review",
                     verification=verification,
                 )
             else:
                 g2 = self._execute(
                     task=gate_task(
-                        task, "G2", development.artifact or {}, plan.artifact or {},
+                        task, "G2", development.artifact or {}, plan_artifact,
                         verification=verification,
                         deferred=deferred_findings(*g1_artifacts) or None,
                     ),
                     trace_id=trace_id,
                     stages=stages,
-                    stage="g2",
+                    stage=self._stage(index, "g2"),
                     profile_id="review",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, g2)
@@ -500,13 +748,13 @@ class AgentLoopRunner:
                 development = self._execute(
                     task=developer_revision_task(
                         task,
-                        plan.artifact or {},
+                        plan_artifact,
                         development.artifact or {},
                         g2.artifact or {},
                     ),
                     trace_id=trace_id,
                     stages=stages,
-                    stage="develop-revision",
+                    stage=self._stage(index, "develop-revision"),
                     profile_id="develop",
                 )
                 stopped = self._stop_after_execution(task, trace_id, stages, development)
@@ -533,19 +781,19 @@ class AgentLoopRunner:
                     g2 = self._deterministic_reject_result(
                         stages=stages,
                         trace_id=trace_id,
-                        stage="g2-recheck",
+                        stage=self._stage(index, "g2-recheck"),
                         profile_id="review",
                         verification=recheck_verification,
                     )
                 else:
                     g2 = self._execute(
                         task=gate_task(
-                            task, "G2", development.artifact or {}, plan.artifact or {},
+                            task, "G2", development.artifact or {}, plan_artifact,
                             verification=recheck_verification,
                         ),
                         trace_id=trace_id,
                         stages=stages,
-                        stage="g2-recheck",
+                        stage=self._stage(index, "g2-recheck"),
                         profile_id="review",
                     )
                     stopped = self._stop_after_execution(task, trace_id, stages, g2)
@@ -564,76 +812,7 @@ class AgentLoopRunner:
                     ),
                     writeback=writeback,
                 )
-
-        integration = self._prepare_integration(task)
-        converge_actions = {"finish", "ask_human"} | (
-            {"merge"} if integration is not None and integration.has_changes else set()
-        )
-        converge = self._execute(
-            task=controller_task(
-                task, stage="converge", stages=stages, integration=integration
-            ),
-            trace_id=trace_id,
-            stages=stages,
-            stage="converge",
-            profile_id="controller",
-        )
-        stopped = self._stop_after_execution(task, trace_id, stages, converge)
-        if stopped:
-            return self._persist(stopped, writeback=writeback)
-        if not valid_controller(converge.artifact, converge_actions):
-            return self._persist(
-                self._summary(
-                    task,
-                    trace_id,
-                    stages,
-                    "needs_human",
-                    summarize_invalid_artifact("Controller (converge)", converge.artifact),
-                ),
-                writeback=writeback,
-            )
-        converge_action = (converge.artifact or {}).get("action")
-        merge_note = ""
-        if converge_action == "merge":
-            merged = self._merge_worktree(task)
-            if not merged.ok:
-                return self._persist(
-                    self._summary(task, trace_id, stages, "needs_human", merged.detail),
-                    writeback=writeback,
-                )
-            merge_note = f" {merged.detail}"
-        elif converge_action != "finish":
-            return self._persist(
-                self._summary(
-                    task,
-                    trace_id,
-                    stages,
-                    "needs_human",
-                    "Controller chose not to finish: "
-                    + str((converge.artifact or {}).get("reason") or "(no reason given)"),
-                ),
-                writeback=writeback,
-            )
-        elif integration is not None and integration.has_changes:
-            merge_note = (
-                f" The task's changes are on branch '{integration.branch}' in "
-                f"{self.working_directory} and have NOT been merged into "
-                f"'{integration.base_branch}'."
-            )
-        return self._persist(
-            self._summary(
-                task,
-                trace_id,
-                stages,
-                "succeeded",
-                (
-                    "The bounded local loop completed with draft evidence. This does not assert "
-                    "a MemTrace server-side gate or task-state transition."
-                    + merge_note
-                ),
-            ),
-            writeback=writeback,
-        )
+        return None
 
     def _prepare_integration(self, task: TaskEnvelope) -> IntegrationReport | None:
         """Commit what Developer left in the task's worktree and work out what merging
@@ -996,19 +1175,53 @@ class AgentLoopRunner:
         )
         return result
 
-    def _reconstruct_progress(self, conversation_id: str) -> dict[str, LoopStageResult]:
+    def _previous_goal_plan(self, conversation_id: str) -> GoalPlan | None:
+        """The goal plan the Controller wrote the last time this conversation started, if it wrote a usable one."""
+        latest: dict[str, Any] | None = None
+        for row in self.trace_store.get_conversation_pipeline(conversation_id):
+            if row.get("stage") == "control-start" and row.get("state") == "succeeded":
+                detail = self.trace_store.get_turn_detail(row["turn_id"])
+                latest = detail.get("artifact") if detail else None
+        return parse_goal_plan((latest or {}).get("goal_plan"))
+
+    @staticmethod
+    def _reusable_for_plan(
+        reconstructed: dict[tuple[int, str], LoopStageResult],
+        previous: GoalPlan | None,
+        current: GoalPlan,
+    ) -> tuple[dict[tuple[int, str], LoopStageResult], list[LoopStageResult]]:
+        """Which settled stages of earlier runs still belong to the plan the Controller just wrote. Stages are
+        recorded by phase number, so a re-planned goal must not inherit another phase's artifact: a phase is
+        reused only while it and every phase before it are unchanged (same title and skills). With no earlier
+        plan on record, only a default one-phase plan may reuse the stages of the older single-pass loop."""
+        def same_prefix(count: int) -> bool:
+            if previous is None:
+                return current.defaulted and count <= 1
+            if count > len(previous.phases) or count > len(current.phases):
+                return False
+            return all(
+                (a.title, a.skills) == (b.title, b.skills)
+                for a, b in zip(previous.phases[:count], current.phases[:count])
+            )
+
+        kept = {key: value for key, value in reconstructed.items() if same_prefix(key[0])}
+        stale = [value for key, value in reconstructed.items() if key not in kept]
+        return kept, stale
+
+    def _reconstruct_progress(self, conversation_id: str) -> dict[tuple[int, str], LoopStageResult]:
         """Scan this conversation's full turn history (across every prior run() call,
         not just this one) for the latest skip-worthy artifact per stage family — see
         _skip_worthy(). Returns a synthetic, unpersisted LoopStageResult per family
         (state="reused") built from trace_store data alone, without invoking any
         adapter; run() uses these to bypass re-executing stages that already reached a
         genuinely reusable outcome."""
-        found: dict[str, LoopStageResult] = {}
+        found: dict[tuple[int, str], LoopStageResult] = {}
         for row in self.trace_store.get_conversation_pipeline(conversation_id):
             if row.get("state") != "succeeded":
                 continue
+            phase_number, base_stage = split_stage_name(str(row["stage"]))
             family = next(
-                (name for name, names in _STAGE_FAMILIES.items() if row["stage"] in names),
+                (name for name, names in _STAGE_FAMILIES.items() if base_stage in names),
                 None,
             )
             if family is None:
@@ -1038,7 +1251,7 @@ class AgentLoopRunner:
                 requires_human_decision=False,
                 final_text=json.dumps(artifact, ensure_ascii=False) if artifact else "",
             )
-            found[family] = LoopStageResult(
+            found[(phase_number, family)] = LoopStageResult(
                 sequence=int(row.get("sequence") or 0),
                 stage=f"{row['stage']}-reused",
                 profile_id=str(row.get("profile_id")),
@@ -1415,6 +1628,103 @@ class AgentLoopRunner:
             raise ValueError(f"Agent loop is missing skill adapters: {', '.join(missing)}")
 
 
+USER_REQUEST_CONTENT_TYPE = "user_request"
+MAX_USER_REQUEST_CHARS = 4_000
+
+
+def user_request_item(text: str) -> ContextItem:
+    """The user's own message, verbatim. The chat model hands the loop a one-line goal; planning from that
+    alone is how a request with several parts ended up half done."""
+    return ContextItem(
+        ref="harness:user-request",
+        title="The user's own words (verbatim; the task goal may be a shorter summary of this)",
+        body=text.strip()[:MAX_USER_REQUEST_CHARS],
+        content_type=USER_REQUEST_CONTENT_TYPE,
+        source="harness",
+    )
+
+_GOAL_PLAN_START = (
+    "When you choose run_planner you must also return `goal_plan`, your plan for the user's WHOLE request. "
+    "Read the request in full: the `user_request` context item, when present, holds their own words and the task "
+    "goal above may be a shorter summary of it, so plan for everything they asked, not only what the summary "
+    "mentions. `restated_goal` says what the whole request amounts to. `success_criteria` (1 to "
+    f"{MAX_CRITERIA}) are observable conditions that together mean the WHOLE request is done, one for each "
+    "distinct thing they asked for. `phases` (at most "
+    f"{MAX_PHASES}) are the ordered steps that get there. Each phase lists the skills it needs: [\"plan\"], "
+    "[\"develop\"] or [\"plan\", \"develop\"], with a title, a purpose and its own acceptance conditions. "
+    "Review is never listed: every plan is reviewed (G1) and every development is reviewed (G2) automatically. "
+    "Use [\"develop\"] alone for a small, clear change that needs no plan; [\"plan\"] alone when a design must be "
+    "settled before anything is built; one [\"plan\", \"develop\"] phase for ordinary work. Split into several "
+    "phases only when later work depends on what earlier work produces, or one pass cannot hold it all. "
+    "Skills you can use:\n{catalog}\n"
+    "`goal_check` and `phases` must be null at this stage.\n"
+)
+_GOAL_PLAN_KEPT = (
+    "The loop snapshot's `previous_goal_plan` is the plan this conversation had before. Keep its phases "
+    "(same titles and skills) unless new information changes what has to be done: phases that already settled "
+    "are reused only while their titles and skills are unchanged.\n"
+)
+_GOAL_CHECK = (
+    "\nBefore deciding, check the user's original request against what the stages actually produced. Return "
+    "`goal_check`: `verdict` ('met', 'partly_met' or 'not_met'); `criteria`, one entry for EACH success "
+    "criterion in the loop snapshot's goal_plan (its text, a status of 'met', 'unmet' or 'unverified', and the "
+    "evidence from the stage results that supports it); and `remaining`, the work still undone. Never mark a "
+    "criterion 'met' without evidence in the stage results; use 'unverified' when it could not be confirmed "
+    "independently. A task is finished only when every part of the original request is done, not when one "
+    "phase went well. `goal_plan` must be null at this stage.\n"
+)
+_GOAL_CHECK_PROGRESS = (
+    "Choose next_phase if the remaining plan still fits, revise_phases (and give the phases still to do in "
+    "`phases`) if what you found changes it, finish only if every criterion is already met, and ask_human only "
+    "for a real decision the operator must make.\n"
+)
+_GOAL_CHECK_CONVERGE = (
+    "Choose finish or merge only if `verdict` is 'met' and no criterion is 'unmet': the harness refuses to close "
+    "a task otherwise and reports it to the operator as only partly done. If something is unmet and plan or "
+    "develop can still do it, choose revise_phases and give those phases in `phases`; if it needs the operator, "
+    "choose ask_human.\n"
+)
+
+
+def _goal_plan_notice(
+    stage: str,
+    agent_loop_enabled: bool,
+    goal_plan: GoalPlan | None,
+    previous_goal_plan: GoalPlan | None,
+) -> str:
+    if stage == "start":
+        if not agent_loop_enabled:
+            return "\n`goal_plan`, `goal_check` and `phases` must be null at this stage.\n"
+        notice = "\n" + _GOAL_PLAN_START.replace("{catalog}", stage_skills.catalog())
+        return notice + (_GOAL_PLAN_KEPT if previous_goal_plan is not None else "")
+    derive = ""
+    if goal_plan is None or not goal_plan.success_criteria:
+        derive = (
+            "This goal has no recorded success criteria, so derive them yourself from the original request "
+            "(the `user_request` context item when present, else the goal) and check against those.\n"
+        )
+    tail = _GOAL_CHECK_PROGRESS if stage == "progress" else _GOAL_CHECK_CONVERGE
+    return _GOAL_CHECK + derive + tail + "`phases` is null unless you choose revise_phases.\n"
+
+
+def phase_context_items(
+    phase: Phase, index: int, total: int, stages: list[LoopStageResult]
+) -> list[ContextItem]:
+    """What the plan and develop skills are told about the phase they work on. Nothing for the default
+    single phase, so an ordinary one-pass run reads exactly as it always did."""
+    if total == 1 and index == 1 and not phase.acceptance and phase.skills == ("plan", "develop"):
+        return []
+    body: dict[str, Any] = {"phase": index, "of": total, **phase.to_dict()}
+    earlier = [
+        {"stage": item.stage, "artifact": artifact_snapshot(item.artifact)}
+        for item in stages
+        if item.profile_id in {"plan", "plan-escalation", "develop"} and item.state != "failed"
+    ]
+    if index > 1 and earlier:
+        body["earlier_stage_results"] = earlier
+    return [artifact_item("harness:phase", f"Phase {index} of {total}: {phase.title}", body)]
+
+
 def controller_task(
     task: TaskEnvelope,
     *,
@@ -1422,8 +1732,12 @@ def controller_task(
     stages: list[LoopStageResult],
     agent_loop_enabled: bool = True,
     integration: IntegrationReport | None = None,
+    goal_plan: GoalPlan | None = None,
+    previous_goal_plan: GoalPlan | None = None,
+    phases_done: int = 0,
+    can_revise: bool = False,
 ) -> TaskEnvelope:
-    snapshot = {
+    snapshot: dict[str, Any] = {
         "task_id": task.task_id,
         "stage": stage,
         "risk_level": task.risk_level,
@@ -1439,14 +1753,23 @@ def controller_task(
         ],
         "token_spent": token_budget_units(stages),
     }
+    if goal_plan is not None:
+        snapshot["goal_plan"] = goal_plan.to_dict()
+        snapshot["phases_done"] = phases_done
+    if previous_goal_plan is not None:
+        snapshot["previous_goal_plan"] = previous_goal_plan.to_dict()
     if stage == "start":
         allowed = ["run_operational_action", "ask_human", "stop", "no_action_needed"]
         if agent_loop_enabled:
             allowed.insert(0, "run_planner")
+    elif stage == "progress":
+        allowed = ["next_phase", "revise_phases", "finish", "ask_human"]
     else:
         allowed = ["finish", "ask_human"]
         if integration is not None and integration.has_changes:
             allowed.insert(1, "merge")
+        if can_revise:
+            allowed.append("revise_phases")
     # run_planner starts the full plan-then-review development loop (Planner/G1/
     # Developer/G2) — pick it only for a request that actually changes this project's
     # code. run_operational_action skips straight to Developer and reports its result
@@ -1460,7 +1783,7 @@ def controller_task(
     if stage == "start":
         operational_action_notice = (
             "run_planner starts the full plan-then-review development loop "
-            "(Planner/G1/Developer/G2) — choose it only when the goal actually needs "
+            "(plan, develop and their reviews, in phases you plan) — choose it only when the goal actually needs "
             "code changed in this project's repository. run_operational_action skips "
             "straight to Developer and reports its result directly, with no plan or "
             "review step — choose it when the goal just needs something done or "
@@ -1520,9 +1843,10 @@ def controller_task(
         "\"ask_human\" only for a real decision the operator must make (a requirement that is "
         "ambiguous, a safety or scope question, a merge that conflicts) — never merely to have "
         "someone eyeball the result.\n"
-        if stage != "start"
+        if stage == "converge"
         else "\nkb_updates must be null at this stage.\n"
     )
+    goal_notice = _goal_plan_notice(stage, agent_loop_enabled, goal_plan, previous_goal_plan)
     return stage_task(
         task,
         suffix=f"controller-{stage}",
@@ -1531,7 +1855,7 @@ def controller_task(
             "You are deliberately running in a neutral, empty sandbox directory, not the "
             "project's actual repository — this is intentional so this stage stays cheap "
             "and fast, not a malfunction. Any working_directory/path mentioned in the goal "
-            "text above is informational context for later stages (Planner/Developer, "
+            "text above is informational context for later stages (the plan and develop skills, "
             "which do have real repo access), not something you can or should verify "
             "yourself.\n"
             "Do not call any tool other than MemTrace's own lookup tools "
@@ -1563,6 +1887,7 @@ def controller_task(
             "immediately answer the JSON decision anyway using whatever you already have; "
             "a partial answer is always better than none.\n"
             f"{operational_action_notice}"
+            f"{goal_notice}"
             f"{integration_notice}"
             f"{_PRECEDENT_NOTICE}"
             "The JSON schema enforced on this call's output is shared by both controller "
@@ -1596,7 +1921,7 @@ def controller_task(
                 # Controller's zero-tool-call sandbox guarantee intact, just gives it
                 # more to read before deciding.
                 if item.content_type
-                in {"harness_resume_envelope", "context", PRECEDENT_CONTENT_TYPE}
+                in {"harness_resume_envelope", "context", PRECEDENT_CONTENT_TYPE, USER_REQUEST_CONTENT_TYPE}
             ],
         ],
     )
@@ -1644,7 +1969,7 @@ def _for_working_roles(items: list[ContextItem]) -> list[ContextItem]:
     return [item for item in items if item.content_type != PRECEDENT_CONTENT_TYPE]
 
 
-def planner_task(task: TaskEnvelope) -> TaskEnvelope:
+def planner_task(task: TaskEnvelope, *, phase_items: list[ContextItem] | None = None) -> TaskEnvelope:
     return stage_task(
         task,
         suffix="plan",
@@ -1659,12 +1984,16 @@ def planner_task(task: TaskEnvelope) -> TaskEnvelope:
             f"{CARD_INSTRUCTION}\n"
             f"{_TOOL_DENIAL_RESILIENCE}"
         ),
-        context_items=_for_working_roles(task.context_items),
+        context_items=[*_for_working_roles(task.context_items), *(phase_items or [])],
     )
 
 
 def planner_escalation_task(
-    task: TaskEnvelope, plan: dict[str, Any], gate: dict[str, Any]
+    task: TaskEnvelope,
+    plan: dict[str, Any],
+    gate: dict[str, Any],
+    *,
+    phase_items: list[ContextItem] | None = None,
 ) -> TaskEnvelope:
     return stage_task(
         task,
@@ -1680,12 +2009,17 @@ def planner_escalation_task(
         context_items=[
             artifact_item("harness:sonnet-plan", "Rejected Sonnet plan", plan),
             artifact_item("harness:g1-reject", "G1 rejection", gate),
+            *(phase_items or []),
         ],
     )
 
 
 def planner_revision_task(
-    task: TaskEnvelope, plan: dict[str, Any], gate: dict[str, Any]
+    task: TaskEnvelope,
+    plan: dict[str, Any],
+    gate: dict[str, Any],
+    *,
+    phase_items: list[ContextItem] | None = None,
 ) -> TaskEnvelope:
     return stage_task(
         task,
@@ -1701,6 +2035,7 @@ def planner_revision_task(
         context_items=[
             artifact_item("harness:sonnet-plan", "Rejected Sonnet plan", plan),
             artifact_item("harness:g1-reject", "G1 rejection", gate),
+            *(phase_items or []),
         ],
     )
 
@@ -1890,7 +2225,11 @@ def operational_task(task: TaskEnvelope) -> TaskEnvelope:
 
 
 def developer_task(
-    task: TaskEnvelope, plan: dict[str, Any], deferred: list[dict[str, Any]] | None = None
+    task: TaskEnvelope,
+    plan: dict[str, Any],
+    deferred: list[dict[str, Any]] | None = None,
+    *,
+    phase_items: list[ContextItem] | None = None,
 ) -> TaskEnvelope:
     return stage_task(
         task,
@@ -1908,6 +2247,7 @@ def developer_task(
         context_items=[
             *_for_working_roles(task.context_items),
             artifact_item("harness:accepted-plan", "Accepted plan", plan),
+            *(phase_items or []),
             *(
                 [artifact_item("harness:deferred-notes", "Non-blocking notes passed on from G1", deferred)]
                 if deferred
@@ -2197,6 +2537,15 @@ def normalized_gate(value: dict[str, Any] | None) -> str:
     ):
         return "INVALID"
     return verdict
+
+
+_PHASE_PREFIX = re.compile(r"^p(\d+)-(.+)$")
+
+
+def split_stage_name(stage: str) -> tuple[int, str]:
+    """(phase number, plain stage name) of a recorded stage name; unprefixed names are phase 1."""
+    match = _PHASE_PREFIX.match(stage)
+    return (int(match.group(1)), match.group(2)) if match else (1, stage)
 
 
 _STAGE_FAMILIES: dict[str, set[str]] = {

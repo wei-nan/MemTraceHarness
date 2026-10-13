@@ -1,10 +1,11 @@
 """A model chosen for one task only ("用 opus 5.5 來設計這個頁面").
 
-The chat model writes `model=<model>::` (or `model=<provider>/<model>::`) in front of a task goal.
-That model becomes the Developer's first candidate for this task; the project's own Developer
-chain follows it, so a model that cannot be reached or that fails falls back to the usual default
-(`AgentLoopRunner(model_override_profiles=...)` lifts the capacity-only fallback limit for it).
-Nothing is written to models.toml or the role-profiles file: the next task is back to the defaults.
+The chat model writes `model=<model>::` (or `model=<provider>/<model>::`) in front of a task goal; that
+model is for the `develop` skill. `plan=…::`, `review=…::` and `develop=…::` choose a model for those skills
+the same way (several may be given). The chosen model becomes that skill's first candidate for this task;
+the project's own chain for the skill follows it, so a model that cannot be reached or that fails falls back
+to the usual default (`AgentLoopRunner(model_override_profiles=...)` lifts the capacity-only fallback limit
+for it). Nothing is written to models.toml or the role-profiles file: the next task is back to the defaults.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from memtrace_harness.config import HarnessConfig
 from memtrace_harness.role_profiles import ModelCandidate, RoleProfile, _validate_provider_effort
 
 OVERRIDE_PROFILE = "develop"
+OVERRIDE_SKILLS = ("plan", "review", "develop")
 PROVIDERS = ("claude", "codex", "antigravity")
 _CLAUDE_ALIASES = {"opus", "sonnet", "haiku"}
 
@@ -39,8 +41,8 @@ def infer_provider(model: str, config: HarnessConfig | None = None) -> str | Non
 
 
 def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessConfig) -> ModelCandidate:
-    """The candidate a `model=` spec names. Raises ValueError (with text for the operator)
-    when the provider cannot be told."""
+    """The candidate a model spec names for the skill whose profile is `developer`. Raises ValueError
+    (with text for the operator) when the provider cannot be told."""
     provider, _, model = spec.rpartition("/")
     provider = provider or (infer_provider(model, config) or "")
     if provider not in PROVIDERS:
@@ -60,11 +62,32 @@ def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessCon
     )
 
 
+def parse_skill_models(spec: str) -> dict[str, str]:
+    """{skill: model spec} from a task's model directive: a plain spec is the develop skill's;
+    `skill=spec,skill=spec` names each. Unknown skills raise ValueError."""
+    if "=" not in spec:
+        return {OVERRIDE_PROFILE: spec}
+    chosen: dict[str, str] = {}
+    for part in spec.split(","):
+        skill, _, model = part.partition("=")
+        if skill not in OVERRIDE_SKILLS or not model:
+            raise ValueError(f"不認得的模型指定「{part}」；技能要是 {', '.join(OVERRIDE_SKILLS)} 之一。")
+        chosen[skill] = model
+    return chosen
+
+
 def with_developer_override(
     profiles: dict[str, RoleProfile], candidate: ModelCandidate
 ) -> dict[str, RoleProfile]:
     """`profiles` with the Developer trying `candidate` first and its own chain after it."""
-    developer = profiles[OVERRIDE_PROFILE]
+    return with_skill_override(profiles, OVERRIDE_PROFILE, candidate)
+
+
+def with_skill_override(
+    profiles: dict[str, RoleProfile], skill: str, candidate: ModelCandidate
+) -> dict[str, RoleProfile]:
+    """`profiles` with this skill trying `candidate` first and its own chain after it."""
+    developer = profiles[skill]
     chain = (
         ModelCandidate(
             provider=developer.provider,
@@ -84,7 +107,7 @@ def with_developer_override(
         fallback_on=developer.fallback_on or ("quota_exhausted", "rate_limit", "provider_overloaded"),
         max_fallback_hops=len(chain),
     )
-    return {**profiles, OVERRIDE_PROFILE: overridden}
+    return {**profiles, skill: overridden}
 
 
 def describe(candidate: ModelCandidate) -> str:

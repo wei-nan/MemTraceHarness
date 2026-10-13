@@ -462,13 +462,14 @@ and installs in a plan step.
 **One-off model for a task (operator decision, 2026-10-11).** The operator can name a model for a single task in
 chat ("請用 opus 5.5 設計這個頁面"); the chat model writes `model=<model>::` (or `model=<provider>/<model>::`, alongside
 `repo=`) in front of the `HARNESS_TASK_START::` goal. **ENFORCED** (`tests/test_model_override.py`): the prefix is routing,
-not part of the goal; it applies to the Developer only, as its first candidate, with the project's own Developer chain
-behind it, so any failed call of the chosen model (not only capacity errors) continues on the defaults; nothing is
+not part of the goal; it applies to the develop skill, as its first candidate, with the project's own chain for that
+skill behind it, so any failed call of the chosen model (not only capacity errors) continues on the defaults; nothing is
 written to `models.toml` or the role-profiles file, so the next task is back to the defaults; the permission and context
 shape of the Developer are unchanged; an unresolvable provider refuses the task before a slot is taken. It is
 carried by the goal text, so queued tasks, schedules and approval resumes keep it. **Prompt policy, not enforced:** that the chat
 model adds the prefix only when the operator names a model. **Not covered:** the chat reply itself and the
-other roles (Controller, Planner, Red Team) always use their configured models; a chosen model that succeeds with
+other skills (the Controller, plan, review) use their configured models unless the goal also names them with
+`plan=<model>::` or `review=<model>::` (same rules; `develop=<model>::` is `model=`); a chosen model that succeeds with
 unparseable output does not fall back (the stage stops as for any invalid output).
 
 **Controller can end a task with nothing to do (2026-10-11).** At the start stage the Controller may choose
@@ -495,7 +496,7 @@ small model may try to write files or use built-in scheduling instead of answeri
 
 **Permanent model changes from the chat (operator decision, 2026-10-11).** The chat model can propose a lasting model
 change with the ops tool `propose_model_change` (target: `chat`, `digest`, `archive`, `recall`, or a role:
-`controller`, `planner`, `planner-escalation`, `red-team`, `developer`). **ENFORCED** (`tests/test_model_override.py`,
+`controller`, `plan`, `plan-escalation`, `review`, `develop`; the older role names are read as these). **ENFORCED** (`tests/test_model_override.py`,
 `tests/test_service.py`): the tool only records a request (valid 10 minutes); nothing is written until the operator taps
 「確認變更」; only the target's *primary* provider/model changes (fallbacks, reasoning effort, permission and context
 policy stay), written to `models.toml` or the workspace's own roles file exactly as the status page does; a role change
@@ -752,27 +753,40 @@ workspace; `ws_spec_plan` is not a universal default for every project.
 
 ## Role contract
 
-**ENFORCED** packaged primary roles (packaged defaults — see below for what's actually validated):
+The Controller is the only role; plan, review and develop are skills it runs (see "One Controller, stage
+skills" in `docs/architecture.md`). **ENFORCED** packaged primary profiles (packaged defaults — see below for
+what's actually validated):
 
 ```text
-Controller          Codex gpt-5.6-luna        read-only
-Planner             Claude sonnet             read-only
-Planning escalation Claude opus               read-only
-Red Team             Codex gpt-5.6-sol         read-only
-Developer            Antigravity Gemini        workspace-write
+controller          Codex gpt-5.6-luna        read-only        the only role
+plan                Claude sonnet             read-only        skill
+plan-escalation     Claude opus               read-only        the plan skill's stronger-model mode
+review              Codex gpt-5.6-sol         read-only        skill (G1 and G2)
+develop             Antigravity Gemini        workspace-write  skill
 ```
 
-A role's identity is its job in the pipeline, not a vendor pin. Every role's provider/model —
-Controller, Planner, Planning escalation, Red Team, and Developer alike — is project-configurable
-via `HARNESS_ROLE_PROFILES_FILE_<PROJECT>`; the table above is only the packaged default a project
-gets if it doesn't override anything. What **is** hard-validated regardless of vendor choice:
+A skill's identity is its job, not a vendor pin. Every profile's provider/model is
+project-configurable via `HARNESS_ROLE_PROFILES_FILE_<PROJECT>`; the table above is only the packaged
+default a project gets if it doesn't override anything. What **is** hard-validated regardless of vendor
+choice (`tests/test_role_profiles.py`, `tests/test_stage_skills.py`):
 
-- only the `developer` profile may hold `workspace-write` — every other role stays `read-only`;
-- each role's `context_policy` shape (Controller only ever gets a compact loop snapshot, Red Team
-  only gate-scoped evidence, Developer the accepted plan plus repo, etc.) — this is an information-
-  flow boundary, independent of which model is behind the role;
-- Red Team and Planning escalation both fail closed with no packaged fallback chain, so a gate
-  verdict or an escalated plan never silently degrades to a different/weaker model mid-stage.
+- only the `develop` profile may hold `workspace-write` — the Controller and every other skill stay `read-only`;
+- each profile's `context_policy` shape (Controller only ever gets a compact loop snapshot, `review`
+  only gate-scoped evidence, `develop` the accepted plan plus repo, etc.) — this is an information-
+  flow boundary, independent of which model is behind the skill;
+- `review` and `plan-escalation` may carry a fallback chain; every fallback is recorded on the stage result.
+  Pointing `review` at the same provider/model as `develop` is allowed but logged, because it weakens the check
+  in practice (the context is still separate).
+
+**Goal plan and completion check (operator request 2026-10-13).** **ENFORCED**
+(`tests/test_goal_plan.py`, `tests/test_loop_goal_plan.py`): the Controller plans phases for the user's whole
+request (skills per phase: plan, develop, or both; review always follows); a task is reported `succeeded` only
+when the Controller's final `goal_check` answers every success criterion and lists none unmet; a missing or
+partial check stops the task as `needs_human` ("only partly done") and the unmet items are named; at most six
+phases per run; the user's own message reaches the Controller verbatim (`user_request`) and follows the
+conversation across resumes. **Prompt policy, not enforced:** that the Controller's criteria really cover
+everything asked and that its evidence for "met" is honest; the Harness checks the shape and coverage, not the
+truth. A resumed run's revised phases (added mid-run) are re-executed rather than reused.
 
 A fallback inherits the Role permission, structured-output schema, context policy and stage
 boundary; selecting another model does not select that model's usual role. The "independent
