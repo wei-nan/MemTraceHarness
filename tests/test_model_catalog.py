@@ -24,6 +24,15 @@ AGY_OUTPUT = (
 )
 
 
+CURSOR_OUTPUT = (
+    "Available models\n\n"
+    "auto - Auto (current, default)\n"
+    "gpt-5.6-sol-high - GPT-5.6 Sol 1M High\n"
+    "claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking\n"
+    "\nTip: use --model <id>\n"
+)
+
+
 class ModelCatalogTests(TestCase):
     def setUp(self) -> None:
         model_catalog.clear_cache()
@@ -67,8 +76,16 @@ class ModelCatalogTests(TestCase):
             first = model_catalog.provider_models(config, home=self.home)
             model_catalog.provider_models(config, home=self.home)
 
-        self.assertEqual((first["codex"], first["antigravity"]), ([], []))
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual((first["codex"], first["antigravity"], first["cursor"]), ([], [], []))
+        self.assertEqual(run.call_count, 2)  # agy + cursor-agent, once each: the second lookup is cached
+
+    def test_cursor_models_come_from_its_list_models_output(self) -> None:
+        config = MagicMock(cursor_command="cursor-agent", workspace_root=None)
+
+        with patch("memtrace_harness.model_catalog.CliProcessRunner.run", return_value=_result(CURSOR_OUTPUT)):
+            models = model_catalog._cursor_models(config)
+
+        self.assertEqual(models, ["auto", "gpt-5.6-sol-high", "claude-sonnet-5-thinking-high"])
 
     def test_status_menus_put_the_catalog_first_then_configured_extras(self) -> None:
         from memtrace_harness.admin import merge_model_catalog as _merge_model_catalog

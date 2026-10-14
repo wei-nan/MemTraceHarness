@@ -14,7 +14,7 @@ from typing import Any
 from memtrace_harness.model_override import infer_provider
 from memtrace_harness.role_profiles import canonical_profile_id
 
-PROVIDERS = ("claude", "codex", "antigravity")
+PROVIDERS = ("claude", "codex", "antigravity", "cursor")
 ENV_TARGETS = {"chat": "對話", "digest": "夜間摘要", "archive": "記憶歸檔", "audit": "夜間稽核", "recall": "主題回想"}
 ROLE_TARGETS = {
     "controller": "Controller",

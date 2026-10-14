@@ -136,7 +136,7 @@ def kill_process_for_thread(thread_ident: int) -> bool:
 
 # A provider CLI is started with start_new_session=True, so it is its own process-group leader and can outlive the
 # Harness process (a restart that is not a clean shutdown). The command a group leader runs names the provider.
-_PROVIDER_CLI = re.compile(r"(^|[/\s])(codex(-will)?|claude|agy|antigravity|gemini)(\s|$)")
+_PROVIDER_CLI = re.compile(r"(^|[/\s])(codex(-will)?|claude|agy|antigravity|gemini|cursor-agent)(\s|$)")
 
 
 def _lsof_cwds() -> list[tuple[int, str]]:
@@ -171,7 +171,7 @@ def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
 
     For abandoning a task: its worktree is the only handle left on a CLI that outlived the Harness thread that
     was waiting for it. **Enforced narrowing:** only a process group whose *leader* is a provider CLI
-    (codex / claude / agy / antigravity / gemini) and has its working directory inside `directory` is signalled,
+    (codex / claude / agy / antigravity / gemini / cursor-agent) and has its working directory inside `directory` is signalled,
     never this process or its group, so a person's own shell sitting in the folder is left alone.
     Returns the group ids signalled."""
     root = os.path.realpath(str(directory))

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 RiskLevel = Literal["low", "medium", "high"]
 RunMode = Literal["cli_run", "cli_run_draft_write", "agent_loop", "agent_loop_draft_write"]
-ProviderId = Literal["claude", "codex", "antigravity"]
+ProviderId = Literal["claude", "codex", "antigravity", "cursor"]
 ExecutionStatus = Literal["succeeded", "failed", "timed_out", "unavailable"]
 UsageCompleteness = Literal["complete", "partial", "unavailable"]
 LoopStatus = Literal["succeeded", "failed", "needs_human", "budget_exhausted"]

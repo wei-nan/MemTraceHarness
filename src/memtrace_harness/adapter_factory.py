@@ -6,6 +6,7 @@ from memtrace_harness.adapters import (
     AntigravityCliAdapter,
     ClaudeCliAdapter,
     CodexCliAdapter,
+    CursorCliAdapter,
     ModelAdapter,
 )
 from memtrace_harness.cli_process import CliProcessRunner
@@ -75,6 +76,8 @@ def build_provider_adapter(
         return ClaudeCliAdapter(**common)
     if effective_provider == "codex":
         return CodexCliAdapter(**common)
+    if effective_provider == "cursor":
+        return CursorCliAdapter(**common)
     if effective_provider == "antigravity":
         return AntigravityCliAdapter(
             structured_output=antigravity_stream_json_enabled(
@@ -163,6 +166,7 @@ def provider_commands(config: HarnessConfig) -> dict[str, str]:
         "claude": config.claude_command,
         "codex": config.codex_command,
         "antigravity": config.antigravity_command,
+        "cursor": config.cursor_command,
     }
 
 

@@ -3,7 +3,7 @@
 The menus used to offer only models already configured somewhere in this harness, so a
 newly released model (gpt-6-luna, 2026-10-02) could only be typed in by hand. Each CLI
 can tell us itself: Codex keeps the catalog it fetched in <CODEX_HOME>/models_cache.json,
-Antigravity lists its models with `agy models`, and Claude Code takes stable aliases.
+Antigravity lists its models with `agy models`, Cursor with `cursor-agent --list-models`, and Claude Code takes stable aliases.
 Best-effort and cached: a CLI that is missing or slow just contributes nothing.
 """
 
@@ -82,6 +82,21 @@ def _antigravity_models(config: HarnessConfig) -> list[str]:
     return models
 
 
+def _cursor_models(config: HarnessConfig) -> list[str]:
+    """`cursor-agent --list-models` prints a header, then one `<id> - <label>` per line."""
+    result = CliProcessRunner().run(
+        [config.cursor_command, "--list-models"], cwd=Path.home(), timeout_seconds=AGY_TIMEOUT_SECONDS
+    )
+    if result.return_code != 0:
+        return []
+    models = []
+    for line in result.stdout.splitlines():
+        first, separator, _ = line.strip().partition(" - ")
+        if separator and _MODEL_ID.match(first) and first not in models:
+            models.append(first)
+    return models
+
+
 def _claude_models_from_api(workspace_root: Path | None) -> list[str]:
     """Claude's ids from the Models endpoint, newest first. The one place the Harness talks to a
     provider over HTTP: a read-only listing with a key that is allowed to do nothing else (see
@@ -117,7 +132,7 @@ def provider_models(config: HarnessConfig, *, home: Path | None = None) -> dict[
     with _lock:
         if _cache is not None and time.monotonic() - _cache[0] < CACHE_SECONDS:
             return _cache[1]
-        catalog: dict[str, list[str]] = {"claude": list(CLAUDE_ALIASES), "codex": [], "antigravity": []}
+        catalog: dict[str, list[str]] = {"claude": list(CLAUDE_ALIASES), "codex": [], "antigravity": [], "cursor": []}
         try:
             listed = _claude_models_from_api(config.workspace_root)
             if listed:
@@ -132,6 +147,10 @@ def provider_models(config: HarnessConfig, *, home: Path | None = None) -> dict[
             catalog["antigravity"] = _antigravity_models(config)
         except Exception:
             logger.exception("listing Antigravity models failed; menus fall back to configured models")
+        try:
+            catalog["cursor"] = _cursor_models(config)
+        except Exception:
+            logger.exception("listing Cursor models failed; menus fall back to configured models")
         _cache = (time.monotonic(), catalog)
         return catalog
 

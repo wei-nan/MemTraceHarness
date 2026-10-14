@@ -167,7 +167,7 @@ class StatusDataTests(TestCase):
         self.assertIn("gpt-5.6-luna", data["known_models"]["codex"])
         self.assertIn("sonnet", data["known_models"]["claude"])
         self.assertIn("gemini-3.8-flash-high", data["known_models"]["antigravity"])
-        self.assertEqual(set(data["known_models"]), {"claude", "codex", "antigravity"})
+        self.assertEqual(set(data["known_models"]), {"claude", "codex", "antigravity", "cursor"})
         self.assertEqual([p["name"] for p in data["projects"]], ["ws"])  # the folder name
         self.assertEqual(data["harness"]["outbox_backlog"], 0)
         self.assertNotIn("bot", data["projects"][0]["dedicated"])  # nothing Telegram-shaped

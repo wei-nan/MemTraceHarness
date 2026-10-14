@@ -6,7 +6,7 @@ work; do not report policy-only behavior as implemented.
 
 Hard project boundaries:
 
-- Claude, Codex, and Antigravity model execution is CLI-only. Do not add provider HTTP clients,
+- Claude, Codex, Antigravity, and Cursor model execution is CLI-only. Do not add provider HTTP clients,
   SDKs, endpoints, or provider API-key configuration. The one exception (operator decision,
   2026-10-10): a read-only `GET /v1/models` for the status page's Claude model menu, with a key
   (`HARNESS_MODEL_LIST_ANTHROPIC_KEY`) that is used for nothing else — see "Model list key" in

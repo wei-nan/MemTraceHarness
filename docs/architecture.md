@@ -73,6 +73,19 @@ is summed when a process emits multiple completed turns. Antigravity output mode
 detected from `agy --help`: older versions use text and report usage as unavailable; versions that
 advertise stream JSON are parsed conservatively as partial until their schema is pinned by fixture.
 
+Cursor (`cursor-agent`, provider `cursor`, command override `HARNESS_CURSOR_COMMAND`) runs
+`--print --output-format stream-json`; usage comes from the final `result` event and is `partial`
+because the stream does not say whether `inputTokens` already contains `cacheReadTokens`. Probed
+against 2026.10.14 (2026-10-14): a `read-only` profile maps to `--mode ask` (reads, refuses to write or
+run commands; `--mode plan` is not used because it answers with a plan instead of doing the stage), and
+`workspace-write` maps to `--force` (without it `-p` can edit files but every shell command is denied).
+The CLI has no schema flag, so a profile's output schema is appended to the prompt. The tier is part of
+the model name (`gpt-5.6-sol-high`), so `reasoning_effort` is recorded but not passed. Hard failures (bad
+model, not logged in) print plain text on stderr with exit 1; model-side failures are a `result` event
+with `is_error`. Read-only calls still get the git-status safety net. **Not wired for Cursor:** the
+MemTrace MCP read tools (Cursor reads its own `~/.cursor/mcp.json`; the Harness does not inject or
+check it), so a Cursor role has no MemTrace lookups unless the operator registers them there.
+
 ## Failure and safety semantics
 
 - The single-run command requires exactly one provider. The bounded loop runs multiple read-only
@@ -81,6 +94,7 @@ advertise stream JSON are parsed conservatively as partial until their schema is
   already run in separate per-task git worktrees (see the operating contract).
 - `probe` calls only `--version` and does not send a model prompt.
 - The harness never uses `shell=True` or injects credentials into argv.
+- Cursor takes the prompt as its last argument (redacted from SQLite command metadata like Antigravity's).
 - Claude and Codex receive the task through stdin, avoiding OS command-line disclosure and Windows
   argv length limits. Antigravity 1.0.13 still requires a positional print prompt; it is redacted
   from SQLite command metadata.

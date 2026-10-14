@@ -275,7 +275,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {
                 "target": {"type": "string", "enum": list(MODEL_TARGETS)},
                 "model": _string_param("model id, e.g. claude-opus-5-5, or provider/model"),
-                "provider": {"type": "string", "enum": ["claude", "codex", "antigravity"]},
+                "provider": {"type": "string", "enum": ["claude", "codex", "antigravity", "cursor"]},
             },
             "required": ["target", "model"],
             "additionalProperties": False,
