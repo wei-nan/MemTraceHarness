@@ -32,13 +32,14 @@ class RoleProfileTests(TestCase):
             ["develop"],
         )
 
-    def test_only_developer_has_a_longer_timeout_than_the_global_default(self) -> None:
+    def test_only_develop_has_a_longer_timeout_and_only_the_controller_a_shorter_one(self) -> None:
         profiles = load_role_profiles()
 
         self.assertEqual(profiles["develop"].timeout_seconds, 3600)
+        self.assertEqual(profiles["controller"].timeout_seconds, 180)
         self.assertEqual(
-            [p.profile_id for p in profiles.values() if p.timeout_seconds],
-            ["develop"],
+            sorted(p.profile_id for p in profiles.values() if p.timeout_seconds),
+            ["controller", "develop"],
         )
 
     def test_custom_profile_cannot_grant_controller_write_access(self) -> None:

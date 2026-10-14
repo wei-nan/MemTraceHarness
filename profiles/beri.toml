@@ -10,6 +10,9 @@ quota_bucket = "codex-account"
 fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
 max_fallback_hops = 1
 fallback_cooldown_seconds = 1800
+# 2026-10-14: a Controller call takes 7-15 seconds; one that is silent for 15 minutes is hung, not slow
+# (chat_c8eddfd8). Fail it early so the fallback chain can take over (a read-only timeout falls back).
+timeout_seconds = 180
 
 # 2026-08-13: Antigravity is usable for read-only roles again — adapters/cli.py's
 # CliModelAdapter.run() now independently diffs git status before/after any
