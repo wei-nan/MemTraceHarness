@@ -17,7 +17,7 @@ from memtrace_harness.role_profiles import ModelCandidate, RoleProfile, _validat
 
 OVERRIDE_PROFILE = "develop"
 OVERRIDE_SKILLS = ("plan", "review", "develop")
-PROVIDERS = ("claude", "codex", "antigravity")
+PROVIDERS = ("claude", "codex", "antigravity", "cursor")
 _CLAUDE_ALIASES = {"opus", "sonnet", "haiku"}
 
 
@@ -28,6 +28,8 @@ def infer_provider(model: str, config: HarnessConfig | None = None) -> str | Non
         return "codex"
     if model.startswith("gemini"):
         return "antigravity"
+    if model.startswith(("composer", "cursor-")):
+        return "cursor"
     if config is None:
         return None
     from memtrace_harness.model_catalog import extra_models, provider_models
@@ -47,7 +49,7 @@ def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessCon
     provider = provider or (infer_provider(model, config) or "")
     if provider not in PROVIDERS:
         raise ValueError(
-            f"認不出模型「{spec}」屬於哪個供應商；請寫成 claude/<模型>、codex/<模型> 或 antigravity/<模型>。"
+            f"認不出模型「{spec}」屬於哪個供應商；請寫成 claude/<模型>、codex/<模型>、antigravity/<模型> 或 cursor/<模型>。"
         )
     effort = developer.reasoning_effort
     try:

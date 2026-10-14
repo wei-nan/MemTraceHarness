@@ -27,7 +27,7 @@ from memtrace_harness.workspace import STATE_DIR_NAME, models_file, update_model
 
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ("claude", "codex", "antigravity")
+PROVIDERS = ("claude", "codex", "antigravity", "cursor")
 
 
 def merge_model_catalog(config: HarnessConfig, configured: dict[str, set[str]]) -> dict[str, list[str]]:

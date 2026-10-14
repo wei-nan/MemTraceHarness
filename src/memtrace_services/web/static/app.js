@@ -46,7 +46,7 @@ function matchesQuery(project, q) {
   });
 }
 
-var PROVIDERS = ["claude", "codex", "antigravity"];
+var PROVIDERS = ["claude", "codex", "antigravity", "cursor"];
 
 function providerOptions(selected) {
   return PROVIDERS.map(function (p) {
@@ -74,7 +74,8 @@ function modelOptions(provider, currentModel) {
 var EFFORTS = {
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["minimal", "low", "medium", "high", "xhigh"],
-  antigravity: ["low", "medium", "high"]
+  antigravity: ["low", "medium", "high"],
+  cursor: ["low", "medium", "high", "xhigh", "max"]
 };
 
 function effortOptions(provider, selected) {

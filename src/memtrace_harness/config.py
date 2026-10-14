@@ -78,6 +78,7 @@ class HarnessConfig:
     # Command template that turns a voice / audio / video file into text (attachments.py); {input} and {outdir} are
     # filled in. None -> the whisper CLI, when a model is already downloaded.
     transcribe_command: str | None = None
+    cursor_command: str = "cursor-agent"
 
     def chat_command(
         self,
@@ -174,6 +175,12 @@ class HarnessConfig:
             )
         if provider == "claude" and claude_allowed_tools:
             command += ["--allowedTools", claude_allowed_tools]
+        if provider == "cursor":
+            # Plain answer call: read-only `ask` mode, workspace trusted so it never stops to ask.
+            command += ["--print", "--mode", "ask", "--trust"]
+            if model:
+                command += ["--model", model]
+            return command + [prompt]
         if model:
             command += ["--model", model]
         return command + ["--print", prompt]
@@ -185,6 +192,8 @@ class HarnessConfig:
             return self.codex_command
         if provider == "antigravity":
             return self.antigravity_command
+        if provider == "cursor":
+            return self.cursor_command
         return provider
 
     # The `project_name` parameters below are kept so callers written for the old
@@ -316,6 +325,7 @@ class HarnessConfig:
             claude_command=os.getenv("HARNESS_CLAUDE_COMMAND", "claude"),
             codex_command=os.getenv("HARNESS_CODEX_COMMAND", "codex"),
             antigravity_command=os.getenv("HARNESS_ANTIGRAVITY_COMMAND", "agy"),
+            cursor_command=os.getenv("HARNESS_CURSOR_COMMAND", "cursor-agent"),
             antigravity_output_mode=_antigravity_output_mode(
                 os.getenv("HARNESS_ANTIGRAVITY_OUTPUT_MODE", "auto")
             ),

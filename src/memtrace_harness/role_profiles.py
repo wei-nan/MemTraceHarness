@@ -338,6 +338,8 @@ def _validate_provider_effort(label: str, provider: str, reasoning_effort: str) 
         "antigravity": {"low", "medium", "high"},
         "claude": {"low", "medium", "high", "xhigh", "max"},
         "codex": {"minimal", "low", "medium", "high", "xhigh"},
+        # Cursor puts the tier in the model name; the value is recorded, never passed to the CLI.
+        "cursor": {"low", "medium", "high", "xhigh", "max"},
     }
     if provider not in allowed_effort:
         raise ValueError(f"Model candidate {label!r} has unknown provider: {provider}")

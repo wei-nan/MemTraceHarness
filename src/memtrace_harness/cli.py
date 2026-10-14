@@ -35,7 +35,7 @@ from memtrace_harness.workspace import (
 
 logger = logging.getLogger(__name__)
 
-PROVIDERS = ("claude", "codex", "antigravity")
+PROVIDERS = ("claude", "codex", "antigravity", "cursor")
 
 DEFAULT_CONSTRAINTS = [
     "Do not automatically resolve MemTrace inquiries.",

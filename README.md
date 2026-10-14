@@ -424,7 +424,7 @@ $env:PYTHONPATH = "src"
 .\.venv\Scripts\pytest -v
 ```
 
-Tests inject deterministic subprocess results and mock external HTTP/API connections; they do not launch Claude, Codex, or Antigravity, nor do they hit Telegram servers.
+Tests inject deterministic subprocess results and mock external HTTP/API connections; they do not launch Claude, Codex, Antigravity, or Cursor, nor do they hit Telegram servers.
 
 ## TaiwanTrade proxy (read-only, plus confirm-first orders)
 

@@ -13,6 +13,7 @@ from memtrace_harness.adapters import (
     AntigravityCliAdapter,
     ClaudeCliAdapter,
     CodexCliAdapter,
+    CursorCliAdapter,
 )
 from memtrace_harness.cli_process import ProcessResult
 from memtrace_harness.fallback import classify_execution_failure
@@ -553,6 +554,110 @@ class CliAdapterTests(TestCase):
         self.assertIn("--json-schema", developer_command)
         self.assertIn("Inspect the repository", developer_command[-1])
         self.assertEqual(developer_response.execution.command[-1], "<task-prompt>")
+
+    def _cursor_stream(self, *, result: dict | None = None) -> str:
+        events = [
+            {"type": "system", "subtype": "init", "model": "Auto", "session_id": "sess_cursor"},
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}},
+            result
+            or {
+                "type": "result", "subtype": "success", "is_error": False, "result": "hello",
+                "session_id": "sess_cursor",
+                "usage": {"inputTokens": 15364, "outputTokens": 160, "cacheReadTokens": 6528, "cacheWriteTokens": 0},
+            },
+        ]
+        return "\n".join(json.dumps(event) for event in events)
+
+    def test_cursor_read_only_role_runs_in_ask_mode_and_never_force(self) -> None:
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result("")), permission="read-only", model="auto")
+        command = adapter.build_command("PROMPT")
+        self.assertEqual(command[0], "tool")
+        self.assertIn("--print", command)
+        self.assertEqual(command[command.index("--mode") + 1], "ask")
+        self.assertNotIn("--force", command)
+        self.assertNotIn("plan", command)
+        self.assertEqual(command[command.index("--model") + 1], "auto")
+        self.assertEqual(command[command.index("--workspace") + 1], str(self.root))
+        self.assertEqual(command[-1], "PROMPT")
+
+    def test_cursor_develop_role_gets_force_so_it_can_run_tests_and_git(self) -> None:
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result("")), permission="workspace-write")
+        command = adapter.build_command("PROMPT")
+        self.assertIn("--force", command)
+        self.assertNotIn("--mode", command)
+
+    def test_cursor_output_schema_goes_into_the_prompt_because_the_cli_has_no_flag(self) -> None:
+        adapter = self._adapter(
+            CursorCliAdapter, StaticProcessRunner(process_result("")), output_schema_path=output_schema_path("develop")
+        )
+        command = adapter.build_command("PROMPT")
+        self.assertNotIn("--json-schema", command)
+        self.assertTrue(command[-1].startswith("PROMPT"))
+        self.assertIn("JSON Schema", command[-1])
+
+    def test_cursor_stream_is_parsed_with_partial_usage_and_resolved_model(self) -> None:
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result(self._cursor_stream())))
+
+        response = adapter.run(self.task, "run_cursor")
+
+        self.assertEqual(response.execution.status, "succeeded")
+        self.assertEqual(response.final_text, "hello")
+        self.assertEqual(response.execution.provider_run_id, "sess_cursor")
+        self.assertEqual(response.execution.resolved_model, "Auto")
+        usage = response.execution.usage
+        self.assertEqual((usage.input_tokens, usage.cached_input_tokens, usage.output_tokens), (15364, 6528, 160))
+        self.assertEqual(usage.completeness, "partial")
+
+    def test_cursor_result_without_usage_is_unavailable_not_zero(self) -> None:
+        stdout = self._cursor_stream(result={"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result(stdout)))
+
+        response = adapter.run(self.task, "run_cursor_nousage")
+
+        self.assertEqual(response.execution.usage.completeness, "unavailable")
+
+    def test_cursor_error_result_with_exit_zero_is_a_failure_that_can_fall_back(self) -> None:
+        stdout = self._cursor_stream(
+            result={"type": "result", "subtype": "error", "is_error": True, "result": "You've hit your usage limit"}
+        )
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result(stdout, return_code=0)))
+
+        response = adapter.run(self.task, "run_cursor_quota")
+
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("usage limit", response.execution.error)
+        self.assertEqual(classify_execution_failure(response.execution), "quota_exhausted")
+
+    def test_cursor_hard_failure_prints_plain_text_on_stderr_and_is_reported(self) -> None:
+        runner = StaticProcessRunner(
+            process_result("", return_code=1, stderr="Cannot use this model: nope. Available models: auto\n")
+        )
+        adapter = self._adapter(CursorCliAdapter, runner)
+
+        response = adapter.run(self.task, "run_cursor_badmodel")
+
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("Cannot use this model", response.execution.error)
+
+    def test_the_factory_builds_a_cursor_adapter_from_the_configured_command(self) -> None:
+        from memtrace_harness.adapter_factory import build_provider_adapter
+        from memtrace_harness.config import HarnessConfig
+
+        config = HarnessConfig(
+            memtrace_mcp_url=None, memtrace_api_token=None, trace_db_path=self.root / "t.sqlite3",
+            trace_root=self.root, claude_command="claude", codex_command="codex", antigravity_command="agy",
+            antigravity_output_mode="auto", cli_timeout_seconds=900, chat_provider="claude", chat_model="haiku",
+            unattended_write_requires_approval=True, cursor_command="/opt/cursor-agent",
+        )
+        adapter = build_provider_adapter(
+            provider="cursor", config=config, working_directory=self.root, timeout_seconds=30
+        )
+        self.assertIsInstance(adapter, CursorCliAdapter)
+        self.assertEqual(adapter.executable, "/opt/cursor-agent")
+        self.assertEqual(
+            config.chat_command("cursor", "auto", "hi"),
+            ["/opt/cursor-agent", "--print", "--mode", "ask", "--trust", "--model", "auto", "hi"],
+        )
 
     def _adapter(self, adapter_class, runner, **kwargs):
         return adapter_class(
