@@ -840,6 +840,12 @@ GET-only forwarder that adds the key from the key file on each call; the script 
 The key never enters a model-visible environment. Any local process can use the gateway, which is the same read-only
 reach the MCP tools already give. **Not done:** a per-caller token for the gateway.
 
+**No repeated question after a resume (operator request, 2026-10-14).** **ENFORCED as instruction only**
+(`tests/test_loop.py`): when the goal carries a `Human clarification:` (what a resumed task gets), every Controller
+stage is told to treat that answer as settled, never ask the same or an equivalent question again, and, if the answer
+gives the operator a step, finish with that step named as pending on them. **Not enforced in code:** a model that
+ignores the instruction can still re-ask; a deterministic duplicate-question check is not built.
+
 **Goal plan and completion check (operator request 2026-10-13).** **ENFORCED**
 (`tests/test_goal_plan.py`, `tests/test_loop_goal_plan.py`): the Controller plans phases for the user's whole
 request (skills per phase: plan, develop, or both; review always follows); a task is reported `succeeded` only
