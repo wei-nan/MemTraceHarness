@@ -25,6 +25,7 @@ from memtrace_harness.kb_gardening import (
 )
 from memtrace_harness.kb_promotion import PROMOTION_TIMEOUT_SECONDS, run_promotion_pass
 from memtrace_harness.memory_audit import AuditOutcome, due_audit_dates, run_audit_pass
+from memtrace_harness.live_state import collect_live_state
 from memtrace_harness.memory_digest import (
     AUTO_CATCH_UP_DAYS,
     DigestError,
@@ -434,7 +435,10 @@ def run_memory_digests(
             if respect_retry_backoff and time.monotonic() - _digest_failures.get(key, -DIGEST_RETRY_SECONDS) < DIGEST_RETRY_SECONDS:
                 continue
             try:
-                outcome = run_digest_for_date(trace_store, scope.name, session_id, d, tz, call_model)
+                outcome = run_digest_for_date(
+                    trace_store, scope.name, session_id, d, tz, call_model,
+                    live_state=collect_live_state(scope.digest_state_queries),
+                )
             except Exception as exc:
                 _digest_failures[key] = time.monotonic()
                 logger.exception(f"[{scope.name}] memory digest for {d} failed; will retry later")

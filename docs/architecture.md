@@ -124,6 +124,13 @@ review              Codex gpt-5.6-sol         read-only        skill (G1 on a pl
 develop             Antigravity Gemini        workspace-write  skill
 ```
 
+A second kind, the *domain skill* (`kind: domain` in the front matter), is rule text only: a background duty reads
+it when it builds its prompt (`stage_skills.domain_section`). It names no profile, schema or permission, so it
+cannot hold write access or become a stage; it is not in the Controller's catalog or `PRECONDITIONS`. The first one
+is `skills/digest-rules/` (the nightly digest's rules). The Harness still builds the data, validates every
+citation and does every write; only the wording of the rules moved out of Python. Lookups a duty must always make
+before asking the model are code, not skill text (`live_state.py`).
+
 Profile ids are the skill names. The pre-skill names (`planner`, `planner-escalation`, `red-team`,
 `developer`) still load from an older roles file, and a `[profiles.plan.escalation]` sub-table is read as
 the `plan-escalation` profile.

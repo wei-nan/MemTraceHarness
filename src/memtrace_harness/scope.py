@@ -156,6 +156,9 @@ class ProjectScope:
     # the project's own folder: "- read_roots: <workspace>/Beri, ~/.config/memtraceharness". Declared by the operator;
     # credential files stay unreadable inside them. Reading another Harness's workspace needs it declared here.
     read_roots: list[str] | None = None
+    # Read-only tools the nightly digest calls first, so it does not ask the operator about a status they answer:
+    # "- digest_state_queries: list_orders, get_positions" (see live_state.py). Empty = none.
+    digest_state_queries: list[str] | None = None
     # Name of a declared job the Harness runs by itself after a task finishes with its work
     # delivered (e.g. republishing a preview); "- publish_job: preview_start". No confirm tap:
     # the operator already chose the command by declaring it, and it must exist in `jobs`.
@@ -277,6 +280,7 @@ class ProjectScope:
         probe_hosts = _split_list(_extract_field(content, "probe_hosts"))
         log_files = _split_list(_extract_field(content, "log_files"))
         read_roots = _split_list(_extract_field(content, "read_roots"))
+        digest_state_queries = _split_list(_extract_field(content, "digest_state_queries"))
         jobs = {
             match.group(1): match.group(2).strip()
             for match in re.finditer(
@@ -306,6 +310,7 @@ class ProjectScope:
             probe_hosts=[h.lower() for h in probe_hosts],
             log_files=log_files,
             read_roots=read_roots,
+            digest_state_queries=digest_state_queries,
             jobs=jobs,
             publish_job=publish_job,
         )
