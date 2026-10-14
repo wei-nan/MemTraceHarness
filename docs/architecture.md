@@ -239,6 +239,33 @@ provider call, and saves the terminal summary before optional MemTrace writeback
 writeback failure therefore leaves an auditable partial run instead of discarding already-spent
 model usage.
 
+## Planned: safety envelope, one final gate, project-owned loops
+
+Direction decided 2026-10-14; **PLANNED**, nothing here is built. The role-profile loop above (G1, G2, goal check)
+is what runs today and stays so until each piece ships. The contract section is "Safety envelope and
+project-owned loops" in `operating-contract.md`.
+
+- **Split.** The Harness owns a safety envelope and dispatch; a project owns the shape of its loop, in its own
+  repository, in the form its CLIs already load (`AGENTS.md`, `CLAUDE.md`, skills). The Harness sees diff, trace
+  and declared permissions, not the stages in between.
+- **One final gate.** The mid-loop gates go away as Harness mechanism. After the work, a single gate, run as
+  code, checks (1) scope: the diff against the paths the task declared; (2) safety: no unconfirmed tool or loop
+  definition, no forbidden command, no write outside the worktree; (3) sensitivity: no secret or private data in
+  the diff or output, and redaction before anything reaches the trace store or MemTrace. A failure is
+  `needs_human` with the finding. A model may add a finding but never clear one.
+- **Tool confirmation.** A script, scheduled job, skill, MCP server, outbound call or the project's loop
+  definition is a draft until a person confirms the diff plus its declared reads, writes and connections. Approval
+  binds to a content hash and lapses on any change.
+- **Where it lives.** The gate and its limits sit in the Harness, outside the worktree the project's agent can
+  write, so a project's loop cannot lower them. A project with no loop of its own gets one develop run, its
+  `verify_command`, then the gate.
+- **Cost.** Stage-aware features (resume past settled stages, stage detail in approvals, status-page progress)
+  need the Harness to know the stages; a project loop may emit checkpoints and `needs_human`, otherwise it is a
+  black box.
+- **Today's code that maps onto it:** the git-status safety net on read-only calls, the per-job command-hash
+  allowlist, capability install consent, per-task worktrees, `verify_command`. Missing: declared scope and its diff
+  check, the secret scan, redaction before writes, the tool declaration and confirmation card.
+
 ## Token budget
 
 A configured hard budget is evaluated after every terminal stage. Budget units prefer a provider's
