@@ -9,6 +9,7 @@ neighbours) plus the local HTTP API (api.py) that services use to reach it.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -175,6 +176,14 @@ def serve(
 
     api = HarnessApi(service, config, scope, bus=bus, started_at=started_at)
     api.start()
+    from memtrace_harness.taiwantrade_gateway import start_gateway
+
+    from memtrace_harness.taiwantrade_gateway import photo_notifier
+
+    gateway = start_gateway(
+        dict(os.environ),
+        notify_photo=photo_notifier(scope.working_directory, service._enqueue),
+    )
     print(
         f"Serving Harness '{scope.name}' (workspace {config.workspace_root}); API on "
         f"http://{config.api_host}:{config.api_port}; scan_interval={scan_interval}s "
@@ -352,6 +361,8 @@ def serve(
     deadline = time.monotonic() + config.shutdown_grace_seconds
     drain_inflight_agent_loops(max(1, int(deadline - time.monotonic())))
     api.stop()
+    if gateway is not None:
+        gateway.shutdown()
     print("Harness serve loop stopped.", flush=True)
     return 0
 

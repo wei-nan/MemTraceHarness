@@ -4451,7 +4451,8 @@ class TraceStore:
         ref: str | None = None,
     ) -> int:
         """kind: 'message' (text, optional button rows [{label, id}], bind = what to remember the
-        delivered message for), 'clear' (remove the buttons of the message `ref`), 'typing'."""
+        delivered message for), 'clear' (remove the buttons of the message `ref`), 'typing', 'photo' (an image
+        file at the absolute path `ref`, caption in `text`)."""
         with self._connection() as conn:
             cursor = conn.execute(
                 "INSERT INTO outbox (kind, audience, text, actions_json, bind_json, ref, created_at) "
