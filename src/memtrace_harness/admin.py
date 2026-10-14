@@ -132,6 +132,18 @@ def collect_waiting(trace_store: TraceStore, scope: ProjectScope, pending_approv
     return {"total": len(items), "items": items, "backlog": trace_store.get_scan_snapshot(scope.name), "lock_holders": holders}
 
 
+def _peer_name(config: HarnessConfig, scope: ProjectScope) -> str:
+    from memtrace_harness.peer_links import harness_name
+
+    return harness_name(config, scope)
+
+
+def _peer_links_view(config: HarnessConfig) -> dict:
+    from memtrace_harness.peer_links import PeerLinks, links_path
+
+    return PeerLinks(links_path(config)).public_view()
+
+
 def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: str | None = None) -> dict:
     """Gather the harness's current diagnostic state as plain structured data (JSON-
     safe: only str/int/bool/list/dict). Read-only — never modifies process state,
@@ -246,6 +258,10 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                         for name, repo in scope.repos.items()
                     ],
                 ],
+                "peer_name": _peer_name(config, scope),
+                "peer_description": config.peer_description_now(),
+                "peer_enabled": bool(config.peer_api_token),
+                "peer_links": _peer_links_view(config),
                 "dedicated": {
                     "chat_model": bool(os.getenv("HARNESS_CHAT_PROVIDER")),
                     "memory": bool(os.getenv("HARNESS_MEMORY_WORKSPACE_ID") or config.harness_memory_workspace_id),
@@ -438,6 +454,60 @@ def update_recall_model(config: HarnessConfig, provider: str, model: str) -> Non
     """Same as update_digest_model(), for the background topic-recall model."""
     _check_model(provider, model)
     _apply(config, {"HARNESS_RECALL_PROVIDER": provider, "HARNESS_RECALL_MODEL": model})
+
+
+PEER_DESCRIPTION_MAX_CHARS = 600
+
+
+def update_peer_name(config: HarnessConfig, name: str) -> None:
+    """The name other Harnesses call this one by. Only the label changes: a peer's access rests on its token, so existing links
+    keep working; pairing again under the new name makes a new link next to the old one."""
+    from memtrace_harness.peer_links import PEER_NAME
+
+    if not isinstance(name, str) or not PEER_NAME.match(name.strip()):
+        raise ValueError("a Harness name is lowercase letters, digits, - or _ (at most 32)")
+    _apply(config, {"HARNESS_PEER_NAME": name.strip()})
+
+
+def peer_link_action(config: HarnessConfig, action: str, body: dict) -> dict:
+    """The status page's changes to who may talk to this Harness (peer_links.py). Only `inbound-create` returns anything: the
+    token of the new link, which exists in clear nowhere else and is never stored."""
+    from memtrace_harness.peer_links import LinkError, PeerLinks, links_path
+
+    links = PeerLinks(links_path(config))
+    try:
+        if action == "inbound-create":
+            return {"token": links.create_inbound(str(body["name"]), str(body["trust"]))}
+        if action == "inbound-trust":
+            links.set_inbound_trust(str(body["name"]), str(body["trust"]))
+        elif action == "inbound-revoke":
+            if not links.revoke_inbound(str(body["name"])):
+                raise ValueError("no such peer")
+        elif action == "outbound-set":
+            links.set_outbound(str(body["name"]), str(body["url"]), str(body["token"]), bool(body.get("collaborate")))
+        elif action == "outbound-collaborate":
+            links.set_outbound_collaborate(str(body["name"]), bool(body["collaborate"]))
+        elif action == "outbound-remove":
+            if not links.remove_outbound(str(body["name"])):
+                raise ValueError("no such link")
+        else:
+            raise ValueError(f"unknown peer-link action {action!r}")
+    except LinkError as exc:
+        raise ValueError(str(exc)) from None
+    return {}
+
+
+def update_peer_description(config: HarnessConfig, description: str) -> None:
+    """What this Harness tells its peers about itself. Plain text, kept short: it is read by other Harnesses' models and
+    shown in an Agent Card that any caller of the A2A service can fetch, so nothing private belongs in it."""
+    if not isinstance(description, str):
+        raise ValueError("description must be text")
+    cleaned = "\n".join(line.rstrip() for line in description.strip().splitlines())
+    if len(cleaned) > PEER_DESCRIPTION_MAX_CHARS:
+        raise ValueError(f"description is longer than {PEER_DESCRIPTION_MAX_CHARS} characters")
+    if any(ord(c) < 32 and c != "\n" for c in cleaned):
+        raise ValueError("description contains control characters")
+    _apply(config, {"HARNESS_PEER_DESCRIPTION": cleaned})
 
 
 def update_recall_fallbacks(config: HarnessConfig, fallbacks: str) -> None:

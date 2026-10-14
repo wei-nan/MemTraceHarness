@@ -40,6 +40,7 @@ class ToolSpec:
     validate: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None  # change tier: normalise or raise ValueError
     summarize: Callable[[dict[str, Any]], str] | None = None  # change tier: one line for the confirm card
     rule: Callable[[dict[str, Any]], tuple[str, str] | None] | None = None  # change tier: what "always allow" covers
+    always_note: str | None = None  # change tier: the card's words for what "always allow" covers (default: same arguments)
 
 
 _REGISTRY: dict[str, ToolSpec] = {}

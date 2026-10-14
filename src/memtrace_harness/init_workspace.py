@@ -70,6 +70,23 @@ def write_scope_file(path: Path, name: str, workspace_id: str, off_limits: str) 
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+PEER_DESCRIPTION_KEY = "HARNESS_PEER_DESCRIPTION"
+PEER_NAME_KEY = "HARNESS_PEER_NAME"
+PEER_PURPOSE_MAX_CHARS = 300
+
+
+def default_peer_description(name: str, purpose: str | None = None) -> str:
+    """The first thing a new Harness tells the other Harnesses about itself (docs/a2a-peers.md, "Each Harness describes itself
+    once"). It is only a start: it says what the project is and how to ask, never what the Harness can do beyond answering,
+    because a link's trust is the operator's to grant. The operator refines it on the status page (設定 → 給其他 Harness 的自我介紹)."""
+    one_line = " ".join((purpose or "").split())[:PEER_PURPOSE_MAX_CHARS].rstrip("。 ")
+    return (
+        f"專案「{name}」的 Harness。" + (f"{one_line}。" if one_line else "")
+        + "想知道這個專案的規格、決策或進度時，可以用 ask_peer 提問（唯讀：只回答，不會動手做事）。"
+        "請把問題寫完整，不要附金鑰或私人資料。"
+    )
+
+
 def service_env_dir(name: str, services_dir: Path | None = None) -> Path:
     return (services_dir or DEFAULT_SERVICES_DIR) / name
 
@@ -154,6 +171,33 @@ def init_workspace_command(args: argparse.Namespace) -> int:
 
     # --- .harness.env
     updates: dict[str, str] = {}
+    if PEER_NAME_KEY not in existing:
+        # What the other Harnesses call this one: its own name, not the folder's or the project's (docs/a2a-peers.md).
+        from memtrace_harness.peer_links import LinkError, PEER_NAME, sanitize_name
+
+        wanted = (getattr(args, "harness_name", None) or "").strip()
+        if interactive and not wanted:
+            suggestion = ""
+            try:
+                suggestion = sanitize_name(name)
+            except LinkError:
+                pass
+            wanted = _prompt("這個 Harness 的名稱（其他 Harness 用它稱呼；小寫英數字、- 或 _）", default=suggestion)
+        if wanted and not PEER_NAME.match(wanted):
+            raise ValueError(f"--harness-name {wanted!r}: use lowercase letters, digits, - or _ (at most 32)")
+        if not wanted:
+            try:
+                wanted = sanitize_name(name)
+            except LinkError:
+                wanted = ""
+        if wanted:
+            updates[PEER_NAME_KEY] = wanted
+    if PEER_DESCRIPTION_KEY not in existing:
+        # What this Harness tells the others about itself; given at creation so no Harness starts out unexplained.
+        purpose = getattr(args, "description", None)
+        if interactive and not purpose:
+            purpose = _prompt("這個專案是做什麼的？一句話（其他 Harness 會看到；之後可在狀態頁修改，可留空）")
+        updates[PEER_DESCRIPTION_KEY] = default_peer_description(name, purpose)
     if "HARNESS_API_TOKEN" not in existing:
         updates["HARNESS_API_TOKEN"] = secrets.token_urlsafe(32)
     if "HARNESS_API_PORT" not in existing:

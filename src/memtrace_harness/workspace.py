@@ -53,6 +53,12 @@ MODEL_SETTINGS: dict[tuple[str, str], tuple[str, str]] = {
     ("behavior", "schedule_timezone"): ("HARNESS_SCHEDULE_TIMEZONE", "str"),
     ("behavior", "approval_ttl_hours"): ("HARNESS_APPROVAL_TTL_HOURS", "int"),
     ("behavior", "reply_language"): ("HARNESS_REPLY_LANGUAGE", "str"),
+    # What this Harness tells the other Harnesses about itself (what it is, when to come to it): edited on the status
+    # page, served to the A2A service, shown in its Agent Card and in every peer's `list_peers`.
+    ("peers", "description"): ("HARNESS_PEER_DESCRIPTION", "str"),
+    # The name other Harnesses call this one by (docs/a2a-peers.md): its identity on the peer network, apart from the project's
+    # or the folder's name. Unset: the project's name, lowercased.
+    ("peers", "name"): ("HARNESS_PEER_NAME", "str"),
 }
 MODEL_ENV_VARS = {name: (table, key, kind) for (table, key), (name, kind) in MODEL_SETTINGS.items()}
 

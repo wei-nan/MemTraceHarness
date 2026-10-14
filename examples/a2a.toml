@@ -1,0 +1,33 @@
+# The A2A front of one Harness: another Harness may ask it read-only questions (docs/a2a-peers.md).
+# Keep it mode 0600 (it holds the Harness's peer token). One file and one process per Harness.
+# Run:  python -m memtrace_services.a2a.main --config <this file>
+# New peer:  python -m memtrace_services.a2a.main --new-peer beri   (prints its token once and the lines below)
+
+name = "my-project"
+# Only a fallback: what this Harness says about itself is written on the status page (設定 → 給其他 Harness 的自我介紹)
+# and is what other Harnesses see; this line is used until that is filled in, or if the Harness cannot be reached.
+description = "Answers read-only questions about my-project from its knowledge base."
+host = "127.0.0.1"                       # loopback; widening it needs TLS in front (docs/a2a-peers.md)
+port = 8900
+public_url = "http://127.0.0.1:8900"     # what goes into the Agent Card
+
+# Who may talk to whom is normally made on the status page (設定 → Harness 連線), which also reads this service's address from
+# it; the [peers.*] and [outbound.*] sections below are optional and add to what the page makes.
+
+[harness]
+url = "http://127.0.0.1:8800"
+peer_token = "<that Harness's HARNESS_PEER_API_TOKEN, which must differ from its HARNESS_API_TOKEN>"
+
+[peers.beri]
+token_sha256 = "<64 hex characters>"
+skills = ["ask"]
+max_concurrent = 2
+rate_per_min = 10
+
+# Harnesses this one may ask (the model's ask_peer tool; it needs the operator's tap, once per peer if
+# "always allow" is chosen). `url` is the peer's A2A base; its Agent Card is read from <url>/.well-known/agent-card.json.
+# Skip the section to only answer, never ask.
+[outbound.beri]
+url = "http://127.0.0.1:8901"
+token = "<the token that peer's operator generated for this Harness>"
+description = "Fallback only: beri's own description is read from its Agent Card whenever it is reachable."

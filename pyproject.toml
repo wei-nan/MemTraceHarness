@@ -14,6 +14,7 @@ dependencies = []
 memtrace-harness = "memtrace_harness.cli:main"
 memtrace-telegram = "memtrace_services.telegram.main:main"
 memtrace-web = "memtrace_services.web.main:main"
+memtrace-a2a = "memtrace_services.a2a.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

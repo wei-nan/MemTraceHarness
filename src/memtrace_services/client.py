@@ -108,3 +108,7 @@ class HarnessClient:
 
     def admin(self, setting: str, body: dict) -> dict:
         return self._request("POST", f"/v1/admin/{setting}", body, timeout=60.0)
+
+    # ---- peer links (what the status page's pairing uses; no secret comes back except a new link's token)
+    def peer_links(self) -> dict:
+        return self._request("GET", "/v1/peer-links")

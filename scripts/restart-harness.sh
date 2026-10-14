@@ -13,7 +13,7 @@ labels=()
 if [ "$target" = "all" ]; then
   for plist in "$agents"/com.memtraceharness.*.plist; do
     name="$(basename "$plist" .plist)"; name="${name#com.memtraceharness.}"
-    case "$name" in *.telegram|web) continue ;; esac
+    case "$name" in *.telegram|*.a2a|web) continue ;; esac
     labels+=("$name")
   done
 else

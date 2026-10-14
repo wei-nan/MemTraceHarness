@@ -214,3 +214,10 @@ details.chain-edit summary { cursor: pointer; color: var(--accent); font-size: 0
 .approval-actions { flex-wrap: wrap; }
 .approval-btn.choice { background: var(--accent); color: #16181d; }
 .answer-box { width: 100%; box-sizing: border-box; margin: 0.25rem 0; background: transparent; color: inherit; border: 1px solid var(--warn); border-radius: 0.3rem; padding: 0.3rem; font: inherit; }
+
+.peer-desc-text { width: 100%; box-sizing: border-box; padding: 8px; border: 1px solid var(--border, #d0d7de); border-radius: 6px; background: var(--card, #fff); color: inherit; font: inherit; resize: vertical; }
+.peer-desc-count { color: #888; font-size: 12px; margin-left: 8px; }
+
+.peer-links .pl-row { margin: 0.3rem 0; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.peer-links code { font-size: 0.75rem; }
+.peer-links textarea { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font: inherit; min-width: 20rem; }

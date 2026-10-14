@@ -12,6 +12,7 @@ from memtrace_services.client import HarnessError, HarnessUnavailable
 from memtrace_services.web.aggregate import HEARTBEAT_SECONDS, Aggregator
 from memtrace_services.web.chat import ChatHub
 from memtrace_services.web.page import STATIC_DIR, STATIC_TYPES, render_page
+from memtrace_services.web import pairing
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ ADMIN_ROUTES = {
     "/api/stuck": "stuck",
     "/api/chat-question": "chat-question",
     "/api/preference": "preference",
+    "/api/peer-description": "peer-description",
+    "/api/peer-name": "peer-name",
+    # Pairing is not here: making a link returns its token, which must not reach the browser (pairing.py does both halves).
+    "/api/peer-link-trust": "peer-link-inbound-trust",
+    "/api/peer-link-revoke": "peer-link-inbound-revoke",
+    "/api/peer-link-outbound-flag": "peer-link-outbound-collaborate",
+    "/api/peer-link-outbound-remove": "peer-link-outbound-remove",
 }
 
 
@@ -147,6 +155,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in ("/api/chat-send", "/api/chat-action"):
             self._chat_post(path, body)
             return
+        if path in ("/api/peer-pair", "/api/peer-invite", "/api/peer-accept"):
+            self._pairing_post(path, body)
+            return
         setting = ADMIN_ROUTES.get(path)  # (body first: see api.py)
         if setting is None:
             self._json(404, {"error": "not found"})
@@ -165,6 +176,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
         except HarnessUnavailable as exc:
             self._json(502, {"error": f"Harness unreachable: {exc}"})
+            return
+        self.aggregator.changes.publish()
+        self._json(200, result)
+
+    def _pairing_post(self, path: str, body) -> None:
+        if not isinstance(body, dict):
+            self._json(400, {"error": "malformed request body"})
+            return
+        text = lambda key: body.get(key) if isinstance(body.get(key), str) else ""  # noqa: E731
+        try:
+            if path == "/api/peer-pair":
+                result = pairing.pair(
+                    self.aggregator, text("from"), text("to"), text("trust"),
+                    both=body.get("both") is True, reverse_trust=text("reverse_trust") or "ask",
+                )
+            elif path == "/api/peer-invite":
+                result = {"invite": pairing.make_invite(self.aggregator, text("project"), text("name"), text("trust"))}
+            else:
+                result = pairing.accept_invite(self.aggregator, text("project"), text("invite"))
+        except pairing.PairingError as exc:
+            self._json(400, {"error": str(exc)})
             return
         self.aggregator.changes.publish()
         self._json(200, result)

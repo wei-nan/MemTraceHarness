@@ -15,6 +15,22 @@ long-polls with GET /v1/events and acknowledges with POST /v1/events/<id>/ack.
     GET  /v1/changes?since=&wait=         long-poll: returns when something worth redrawing happened
     GET  /v1/turns/<id>                   one stage attempt's full detail
     POST /v1/admin/<setting>              change a model setting / resolve an approval or preference
+
+    A second, narrower token (HARNESS_PEER_API_TOKEN) opens only these, for the A2A service relaying
+    another Harness's read-only question (peer.py, docs/a2a-peers.md); the main token does not open them:
+    POST /v1/peer/requests                {peer, context_id, text, skill, hops} -> 202 {request}
+    GET  /v1/peer/profile                 {name, description}: what this Harness is called and says about itself (status page settings)
+    GET  /v1/peer/requests?peer=&context_id=        that peer's requests
+    GET  /v1/peer/requests/<id>?peer=     one request, 404 for anything not that peer's
+    POST /v1/peer/requests/<id>/cancel    {peer}
+and the other direction, questions this Harness asks (peer.py PeerOutbound):
+    GET  /v1/peer/outbound?wait=          queued questions to carry (long-poll), marked sent
+    POST /v1/peer/outbound/<id>/result    {state: completed|failed, text?, reason?}
+    POST /v1/peer/directory               {peers: [{name, description}]} the peers the service can reach
+    GET  /v1/peer/links                   who may call this Harness (token hashes) and whom it may call (tokens): peer_links.py
+    POST /v1/peer/endpoint                {url} the A2A service's own public address
+and, for the status page with the main token: GET /v1/peer-links (the same without any secret), and
+POST /v1/admin/peer-link-<inbound-create|inbound-trust|inbound-revoke|outbound-set|outbound-collaborate|outbound-remove>
 """
 
 from __future__ import annotations
@@ -33,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from memtrace_harness import admin, attachments
 from memtrace_harness.cli_process import kill_process_for_thread
+from memtrace_harness.peer import PeerAskService, PeerOutbound
 
 if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
@@ -247,13 +264,24 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _authorized(self) -> bool:
-        token = self.api.token
-        if not token:
-            return False
+    def _bearer(self) -> str:
         header = self.headers.get("Authorization") or ""
         scheme, _, supplied = header.partition(" ")
-        return scheme.lower() == "bearer" and hmac.compare_digest(supplied.strip(), token)
+        return supplied.strip() if scheme.lower() == "bearer" else ""
+
+    def _authorized(self, path: str = "") -> bool:
+        """Two tokens, two doors: the main token opens everything except /v1/peer/*, the peer token opens
+        only /v1/peer/*. Neither opens the other's routes, so a leaked peer token cannot approve an action
+        and a service holding the main token cannot pose as a peer."""
+        supplied = self._bearer()
+        if not supplied:
+            return False
+        is_peer_route = path.startswith("/v1/peer/") or path == "/v1/peer"
+        if is_peer_route:
+            token = self.api.peer_token
+        else:
+            token = self.api.token
+        return bool(token) and hmac.compare_digest(supplied, token)
 
     def _query(self) -> tuple[str, dict[str, str]]:
         parsed = urllib.parse.urlsplit(self.path)
@@ -273,11 +301,36 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/v1/health":
             self._send(200, {"ok": True, "project": self.api.scope.name, "pid": os.getpid()})
             return
-        if not self._authorized():
+        if not self._authorized(path):
             self._send(401, {"error": "unauthorized"})
             return
         try:
-            if path == "/v1/commands":
+            if path.startswith("/v1/peer/requests"):
+                self._peer_get(path, query)
+            elif path == "/v1/peer-links":
+                # The main token's view, for the status page: names, trust, addresses; never a token or a hash.
+                from memtrace_harness.peer_links import PeerLinks, links_path
+
+                self._send(200, PeerLinks(links_path(self.api.config)).public_view())
+            elif path == "/v1/peer/links":
+                from memtrace_harness.peer_links import PeerLinks, links_path
+
+                self._send(200, PeerLinks(links_path(self.api.config)).snapshot_for_service())
+            elif path == "/v1/peer/profile":
+                from memtrace_harness.peer_links import harness_name
+
+                self._send(200, {
+                    "name": harness_name(self.api.config, self.api.scope),
+                    "description": self.api.config.peer_description_now(),
+                })
+            elif path == "/v1/peer/outbound":
+                outbound = self.api.outbound
+                if outbound is None:
+                    self._send(404, {"error": "not found"})
+                else:
+                    wait = self._float(query, "wait", 0, MAX_WAIT_SECONDS)
+                    self._send(200, {"requests": outbound.claim(wait)})
+            elif path == "/v1/commands":
                 self._send(200, {"commands": self.api.service.commands()})
             elif path == "/v1/events":
                 limit = int(self._float(query, "limit", 20, 100))
@@ -314,14 +367,18 @@ class _Handler(BaseHTTPRequestHandler):
         # The body is read before anything is refused: answering and closing with it unread resets
         # the client's connection instead of letting it see the 401/404.
         body = _json_body(self, MAX_MESSAGE_BODY_BYTES if path == "/v1/messages" else MAX_BODY_BYTES)
-        if not self._authorized():
+        if not self._authorized(path):
             self._send(401, {"error": "unauthorized"})
             return
         if body is None:
             self._send(400, {"error": "malformed request body"})
             return
         try:
-            if path == "/v1/messages":
+            if path.startswith("/v1/peer/requests"):
+                self._peer_post(path, body)
+            elif path.startswith("/v1/peer/outbound/") or path in ("/v1/peer/directory", "/v1/peer/endpoint"):
+                self._outbound_post(path, body)
+            elif path == "/v1/messages":
                 text = body.get("text")
                 try:
                     uploads = attachments.decode_uploads(body.get("attachments"))
@@ -374,6 +431,83 @@ class _Handler(BaseHTTPRequestHandler):
             logger.exception(f"POST {path} failed")
             self._send(500, {"error": "internal error"})
 
+    # ---- another Harness's questions (peer.py); the peer token is the only one that reaches these
+    def _peer(self, source: dict) -> str | None:
+        peer = source.get("peer")
+        return peer.strip() if isinstance(peer, str) and peer.strip() and len(peer) <= 64 else None
+
+    def _peer_get(self, path: str, query: dict[str, str]) -> None:
+        peers = self.api.peers
+        peer = self._peer(query)
+        if peers is None or peer is None:
+            self._send(400, {"error": "peer is required"})
+            return
+        parts = path.split("/")  # ["", "v1", "peer", "requests", <id>?]
+        if len(parts) == 4:
+            self._send(200, {"requests": peers.list(peer, query.get("context_id") or None)})
+        elif len(parts) == 5:
+            found = peers.get(peer, parts[4])
+            self._send(200 if found else 404, {"request": found} if found else {"error": "not found"})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def _peer_post(self, path: str, body: dict) -> None:
+        peers = self.api.peers
+        peer = self._peer(body)
+        if peers is None or peer is None:
+            self._send(400, {"error": "peer is required"})
+            return
+        parts = path.split("/")
+        if len(parts) == 4:
+            hops = body.get("hops", 0)
+            text = body.get("text")
+            if not isinstance(text, str) or isinstance(hops, bool) or not isinstance(hops, int) or hops < 0:
+                self._send(400, {"error": "text and a non-negative hops are required"})
+                return
+            created = peers.submit(
+                peer=peer, context_id=str(body.get("context_id") or "")[:200] or f"ctx_{os.urandom(6).hex()}",
+                text=text, skill=str(body.get("skill") or "ask"), hops=hops,
+            )
+            self._send(202, {"request": created})
+        elif len(parts) == 6 and parts[5] == "cancel":
+            found = peers.cancel(peer, parts[4])
+            self._send(200 if found else 404, {"request": found} if found else {"error": "not found"})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def _outbound_post(self, path: str, body: dict) -> None:
+        outbound = self.api.outbound
+        if outbound is None:
+            self._send(404, {"error": "not found"})
+            return
+        if path == "/v1/peer/endpoint":
+            from memtrace_harness.peer_links import LinkError, PeerLinks, links_path
+
+            try:
+                PeerLinks(links_path(self.api.config)).set_endpoint(str(body.get("url") or ""))
+            except LinkError as exc:
+                self._send(400, {"error": str(exc)})
+                return
+            self.api.bus.publish()
+            self._send(200, {"ok": True})
+            return
+        if path == "/v1/peer/directory":
+            peers = body.get("peers")
+            if not isinstance(peers, list):
+                self._send(400, {"error": "peers is required"})
+                return
+            self._send(200, {"count": outbound.set_directory(peers)})
+            return
+        parts = path.split("/")  # ["", "v1", "peer", "outbound", <id>, "result"]
+        if len(parts) != 6 or parts[5] != "result":
+            self._send(404, {"error": "not found"})
+            return
+        state, text, reason = body.get("state"), body.get("text"), body.get("reason")
+        if state not in ("completed", "failed") or any(v is not None and not isinstance(v, str) for v in (text, reason)):
+            self._send(400, {"error": "state (completed or failed) is required"})
+            return
+        self._send(200, {"accepted": outbound.complete(parts[4], state, text=text, reason=reason)})
+
     def _admin(self, setting: str, body: dict) -> None:
         config = self.api.config
         try:
@@ -390,6 +524,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self.api.bus.publish()
                 self._send(200, {"ok": True, "path": str(dest)})
                 return
+            elif setting.startswith("peer-link-"):
+                result = admin.peer_link_action(config, setting[len("peer-link-"):], body)
+                self.api.bus.publish()
+                self._send(200, {"ok": True, **result})
+                return
+            elif setting == "peer-name":
+                admin.update_peer_name(config, body["name"])
+            elif setting == "peer-description":
+                admin.update_peer_description(config, body["description"])
             elif setting == "chat-model":
                 admin.update_chat_model(config, str(body["provider"]), str(body["model"]))
             elif setting == "digest-model":
@@ -544,10 +687,28 @@ class HarnessApi:
         self.config = config
         self.scope = scope
         self.token = config.api_token
+        self.peer_token = config.peer_api_token
         self.bus = bus or ChangeBus()
         self.started_at = started_at or datetime.now(timezone.utc).isoformat()
         self.worker = MessageWorker(service, self.bus)
+        self.peers = (
+            PeerAskService(config, scope, service.approval_manager.trace_store, on_change=self.bus.publish)
+            if self.peer_token
+            else None
+        )
+        if self.peers is not None:
+            service.on_task_finished = self.peers.task_finished
+        self.outbound = (
+            PeerOutbound(service.approval_manager.trace_store, self._deliver_peer_answer, self.bus.publish)
+            if self.peer_token
+            else None
+        )
         self._server: ThreadingHTTPServer | None = None
+
+    def _deliver_peer_answer(self, project: str, text: str) -> None:
+        """A peer's reply (or the lack of one): to the operator, and into the transcript so the chat model knows."""
+        self.service.send_message(None, text)
+        self.service._record_order_turn(project, text)
 
     def status(self) -> dict:
         return admin.collect_status_data(self.config, self.scope, self.started_at)
@@ -557,6 +718,8 @@ class HarnessApi:
             raise RuntimeError(
                 "HARNESS_API_TOKEN is not set in .harness.env: the API refuses to start without a token"
             )
+        if self.peer_token and self.peer_token == self.token:
+            raise RuntimeError("HARNESS_PEER_API_TOKEN must differ from HARNESS_API_TOKEN")
         handler = type("BoundHandler", (_Handler,), {"api": self})
         server = ThreadingHTTPServer((self.config.api_host, self.config.api_port), handler)
         server.daemon_threads = True  # long-polls must not keep the process alive at shutdown
