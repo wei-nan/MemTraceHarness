@@ -41,6 +41,12 @@ def classify_execution_failure(execution: CliExecution) -> FailureCategory:
         "currently unavailable",
         "service unavailable",
         "code 503",
+        "code 502",
+        "code 504",
+        "bad gateway",
+        "gateway timeout",
+        "error 502",
+        "error 503",
         "eligibility check failed",
         "timeout waiting for response",
     ):

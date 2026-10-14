@@ -28,6 +28,8 @@ class FailureClassifierTests(TestCase):
             "Provider overloaded; try later": "provider_overloaded",
             "Eligibility check failed: UNAVAILABLE (code 503): The service is currently unavailable.": "provider_overloaded",
             "timeout waiting for response": "provider_overloaded",
+            "API error (attempt 1): request failed (code 502): HTML response \"Error 502 (Server Error)!!1\"": "provider_overloaded",
+            "upstream returned Bad Gateway": "provider_overloaded",
             "maximum context length exceeded": "context_limit",
             "Access denied": "permission",
             "login required": "authentication",
