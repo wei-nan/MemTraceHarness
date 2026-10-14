@@ -1818,6 +1818,18 @@ def controller_task(
     # reports "succeeded") may write to MemTrace — update_node/create_node are
     # explicitly disallowed for every other stage/role, so this is the one place
     # the KB reflects a task actually finishing, decided by the user.
+    # A resumed task carries the operator's earlier answer as "Human clarification:" (service.py). Asking
+    # the same question again after that is the failure seen on 2026-10-14 (the operator picked "I will
+    # switch the schedule myself", and the next round asked whether it had been switched, twice).
+    answered_notice = ""
+    if "Human clarification:" in task.goal:
+        answered_notice = (
+            "The goal ends with a \"Human clarification:\" — the operator already answered the question that "
+            "stopped the earlier round. Treat that answer as settled and do NOT ask the same or an equivalent "
+            "question again. If the answer gives the operator a step to do themselves, do everything that remains "
+            "on your side and finish, stating that step as still pending on them in `reason`; do not "
+            "ask_human or stop to wait for it. Ask again only about something the answer did not cover.\n"
+        )
     integration_notice = ""
     if integration is not None and integration.has_changes:
         snapshot["integration"] = integration.to_dict()
@@ -1896,6 +1908,7 @@ def controller_task(
             "immediately answer the JSON decision anyway using whatever you already have; "
             "a partial answer is always better than none.\n"
             f"{operational_action_notice}"
+            f"{answered_notice}"
             f"{goal_notice}"
             f"{integration_notice}"
             f"{_PRECEDENT_NOTICE}"

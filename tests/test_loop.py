@@ -316,6 +316,19 @@ class ControllerTaskContextTests(TestCase):
             "['run_planner', 'run_operational_action', 'ask_human', 'stop', 'no_action_needed']", goal_text
         )
 
+    def test_a_resumed_goal_tells_the_controller_not_to_ask_the_answered_question_again(self) -> None:
+        fresh = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
+        resumed = TaskEnvelope(
+            task_id="task_1",
+            workspace_id="ws_test",
+            goal="check something\n\nHuman clarification: I will switch the schedule myself",
+        )
+        for stage in ("start", "progress", "converge"):
+            self.assertNotIn("already answered", controller_task(fresh, stage=stage, stages=[]).goal)
+            text = controller_task(resumed, stage=stage, stages=[]).goal
+            self.assertIn("already answered the question", text)
+            self.assertIn("still pending on them", text)
+
     def test_agent_loop_disabled_strips_run_planner_from_allowed_actions(self) -> None:
         task = TaskEnvelope(task_id="task_1", workspace_id="ws_test", goal="check something")
         goal_text = controller_task(
