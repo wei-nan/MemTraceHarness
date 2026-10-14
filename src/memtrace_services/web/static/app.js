@@ -1,4 +1,4 @@
-var state = { data: null, query: "", prefDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview" };
+var state = { data: null, query: "", prefDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview", invite: null };
 var GLOBAL_TAB = "__global__";
 var PROJECT_TABS = [["overview", "總覽"], ["memory", "記憶"], ["schedules", "排程"], ["settings", "設定"]];
 
@@ -396,6 +396,84 @@ function saveChain(chainEl, btn) {
       statusEl.textContent = "儲存失敗（連線問題）";
     });
 }
+
+document.addEventListener("input", function (e) {
+  if (e.target.classList && e.target.classList.contains("peer-name-text")) state.chainDirty = true;
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList || !e.target.classList.contains("peer-name-save")) return;
+  var btn = e.target;
+  var box = btn.closest(".peer-name");
+  var statusEl = box.querySelector(".peer-name-status");
+  var value = box.querySelector(".peer-name-text").value.trim();
+  if (!confirm("把這個 Harness 的名稱改成「" + value + "」？已建立的連線不會斷，但重新配對會多出一筆新連線。")) return;
+  statusEl.className = "peer-name-status rp-status";
+  statusEl.textContent = "儲存中…";
+  btn.disabled = true;
+  fetch("/api/peer-name", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: box.getAttribute("data-project"), name: value })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      statusEl.className = "peer-name-status rp-status " + (res.ok ? "ok" : "err");
+      if (res.ok) {
+        state.chainDirty = false;
+        if (state.renderDeferred) setTimeout(render, 1500);
+        statusEl.textContent = "已儲存";
+      } else {
+        statusEl.textContent = res.body.error || "儲存失敗";
+      }
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "peer-name-status rp-status err";
+      statusEl.textContent = "儲存失敗（連線問題）";
+    });
+});
+
+document.addEventListener("input", function (e) {
+  if (!e.target.classList || !e.target.classList.contains("peer-desc-text")) return;
+  state.chainDirty = true;  // same rule as the model chains: no redraw under the cursor
+  var box = e.target.closest(".peer-desc");
+  box.querySelector(".peer-desc-count").textContent = e.target.value.length + " / 600";
+  box.querySelector(".peer-desc-status").textContent = "";
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList || !e.target.classList.contains("peer-desc-save")) return;
+  var btn = e.target;
+  var box = btn.closest(".peer-desc");
+  var statusEl = box.querySelector(".peer-desc-status");
+  statusEl.className = "peer-desc-status rp-status";
+  statusEl.textContent = "儲存中…";
+  btn.disabled = true;
+  fetch("/api/peer-description", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project: box.getAttribute("data-project"), description: box.querySelector(".peer-desc-text").value })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      btn.disabled = false;
+      statusEl.className = "peer-desc-status rp-status " + (res.ok ? "ok" : "err");
+      if (res.ok) {
+        state.chainDirty = false;
+        if (state.renderDeferred) setTimeout(render, 1500);
+        statusEl.textContent = "已儲存。其他 Harness 同步時會讀到（最多約五分鐘）";
+      } else {
+        statusEl.textContent = res.body.error || "儲存失敗";
+      }
+    })
+    .catch(function () {
+      btn.disabled = false;
+      statusEl.className = "peer-desc-status rp-status err";
+      statusEl.textContent = "儲存失敗（連線問題）";
+    });
+});
 
 function refreshModelCatalog(btn) {
   btn.disabled = true;
@@ -820,6 +898,169 @@ function renderDigests(project) {
 
 // The settings tab: each chain shows as chips; "編輯" opens its editor (open state is remembered
 // across the live re-renders).
+var TRUST_LABELS = { ask: "只能提問（唯讀）", collaborate: "可回報問題、請對方修復" };
+
+function trustSelect(cls, value, name) {
+  return '<select class="' + cls + '" data-name="' + esc(name || "") + '">' +
+    Object.keys(TRUST_LABELS).map(function (k) {
+      return '<option value="' + k + '"' + (k === value ? " selected" : "") + ">" + TRUST_LABELS[k] + "</option>";
+    }).join("") + "</select>";
+}
+
+function renderPeerName(project) {
+  return '<div class="section-label">Harness 名稱</div>' +
+    '<div class="hint">其他 Harness 用這個名字稱呼這個 Harness（連線、稽核標示都用它），和專案或資料夾的名稱無關。小寫英數字、- 或 _，最多 32 字。'
+    + "改名只改標示，已建立的連線不會斷；但改名後重新配對會多出一筆新連線，舊的要自己撤銷。</div>" +
+    '<div class="peer-name" data-project="' + esc(project.name) + '">' +
+    '<input class="peer-name-text" size="24" maxlength="32" value="' + esc(project.peer_name || "") + '"> ' +
+    '<button class="peer-name-save">儲存</button> <span class="peer-name-status rp-status"></span></div>';
+}
+
+function renderPeerLinks(project) {
+  var links = project.peer_links || { endpoint: null, inbound: [], outbound: [] };
+  var others = state.data.projects.filter(function (p) { return p.name !== project.name; });
+  var out = '<div class="section-label">Harness 連線</div><div class="peer-links" data-project="' + esc(project.name) + '">';
+  out += '<div class="hint">決定哪些 Harness 可以互相提問、或回報問題請對方處理。連線後立刻生效，不用改設定檔、不用重啟。'
+    + "這個頁面沒有登入，請只在本機使用。</div>";
+  out += '<div class="hint">本 Harness 的名稱：<b>' + esc(project.peer_name || project.name) + "</b></div>";
+  out += links.endpoint
+    ? '<div class="hint">本 Harness 的 A2A 位址：<code>' + esc(links.endpoint) + "</code></div>"
+    : '<div class="hint">A2A 服務還沒有回報位址：memtrace-a2a 沒有在跑，或工作區 .harness.env 沒有 HARNESS_PEER_API_TOKEN。連線要兩邊的 A2A 服務都在跑才做得成。</div>';
+
+  out += '<div class="hint"><b>可以來問我的 Harness</b></div>';
+  out += links.inbound.length ? links.inbound.map(function (l) {
+    return '<div class="pl-row">' + esc(l.name) + " " + trustSelect("pl-trust", l.trust, l.name) +
+      ' <button class="pl-revoke" data-name="' + esc(l.name) + '">撤銷</button></div>';
+  }).join("") : '<div class="hint">（沒有）</div>';
+
+  out += '<div class="hint"><b>我可以問的 Harness</b></div>';
+  out += links.outbound.length ? links.outbound.map(function (l) {
+    return '<div class="pl-row">' + esc(l.name) + ' <code>' + esc(l.url) + "</code> " +
+      '<label><input type="checkbox" class="pl-flag" data-name="' + esc(l.name) + '"' + (l.collaborate ? " checked" : "") +
+      "> 我的模型可以向它回報問題</label>" +
+      ' <button class="pl-remove" data-name="' + esc(l.name) + '">移除</button></div>';
+  }).join("") : '<div class="hint">（沒有）</div>';
+
+  out += '<div class="hint"><b>連到這個頁面上的另一個 Harness</b></div>';
+  if (others.length) {
+    out += '<div class="pl-row">我可以問 <select class="pl-target">' +
+      others.map(function (p) {
+        return '<option value="' + esc(p.name) + '">' + esc(p.peer_name || p.name) + "</option>";
+      }).join("") +
+      "</select> 對方給我的權限：" + trustSelect("pl-newtrust", "ask") +
+      ' <label><input type="checkbox" class="pl-both"> 反過來它也可以問我（只能提問）</label>' +
+      ' <button class="pl-pair">連線</button></div>';
+  } else {
+    out += '<div class="hint">（這個頁面上沒有其他 Harness。跨機器請用下面的邀請碼。）</div>';
+  }
+
+  out += '<div class="hint"><b>跨機器：邀請碼</b>　在被問的那一邊產生，貼到發問的那一邊。邀請碼含一把密鑰，只顯示這一次。</div>';
+  out += '<div class="pl-row">讓名為 <input class="pl-input pl-invite-name" size="14" placeholder="對方的名稱"> 來問我：' +
+    trustSelect("pl-invite-trust", "ask") + ' <button class="pl-invite">產生邀請碼</button></div>';
+  if (state.invite && state.invite.project === project.name) {
+    out += '<div class="pl-row"><textarea class="pl-invite-text" rows="3" readonly>' + esc(state.invite.text) + "</textarea>" +
+      ' <button class="pl-invite-done">我已複製，清除</button></div>';
+  }
+  out += '<div class="pl-row">貼上別人給我的邀請碼：<textarea class="pl-input pl-accept-text" rows="2" placeholder="mtinv1:…"></textarea> ' +
+    '<button class="pl-accept">接受邀請</button></div>';
+  out += '<div class="pl-status rp-status"></div></div>';
+  return out;
+}
+
+function peerLinkPost(box, url, body, okText) {
+  var statusEl = box.querySelector(".pl-status");
+  statusEl.className = "pl-status rp-status";
+  statusEl.textContent = "處理中…";
+  body.project = body.project || box.getAttribute("data-project");
+  return fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      statusEl.className = "pl-status rp-status " + (res.ok ? "ok" : "err");
+      statusEl.textContent = res.ok ? okText : (res.body.error || "失敗");
+      if (res.ok) {
+        state.chainDirty = false;
+        if (state.renderDeferred) setTimeout(render, 800);
+      }
+      return res;
+    })
+    .catch(function () {
+      statusEl.className = "pl-status rp-status err";
+      statusEl.textContent = "連線問題";
+      return { ok: false, body: {} };
+    });
+}
+
+var COLLAB_WARNING = "「可回報問題、請對方修復」是最大的授權：對方的 Harness 可以請這個 Harness 診斷問題、並在你同意後開始修改程式。確定嗎？";
+
+document.addEventListener("input", function (e) {
+  if (e.target.classList && e.target.classList.contains("pl-input")) state.chainDirty = true;
+});
+
+document.addEventListener("change", function (e) {
+  var t = e.target;
+  if (!t.classList) return;
+  var box = t.closest(".peer-links");
+  if (!box) return;
+  if (t.classList.contains("pl-trust")) {
+    if (t.value === "collaborate" && !confirm(COLLAB_WARNING)) { render(); return; }
+    peerLinkPost(box, "/api/peer-link-trust", { name: t.getAttribute("data-name"), trust: t.value }, "已更新");
+  } else if (t.classList.contains("pl-flag")) {
+    peerLinkPost(box, "/api/peer-link-outbound-flag", { name: t.getAttribute("data-name"), collaborate: t.checked }, "已更新");
+  }
+});
+
+document.addEventListener("click", function (e) {
+  var t = e.target;
+  if (!t.classList) return;
+  var box = t.closest && t.closest(".peer-links");
+  if (!box) return;
+  var project = box.getAttribute("data-project");
+  if (t.classList.contains("pl-revoke")) {
+    var who = t.getAttribute("data-name");
+    if (confirm("撤銷後「" + who + "」就不能再來問這個 Harness（它手上的密鑰立刻失效）。確定嗎？"))
+      peerLinkPost(box, "/api/peer-link-revoke", { name: who }, "已撤銷");
+  } else if (t.classList.contains("pl-remove")) {
+    var target = t.getAttribute("data-name");
+    if (confirm("移除後這個 Harness 就不能再問「" + target + "」。對方那邊的授權不會跟著撤銷。確定嗎？"))
+      peerLinkPost(box, "/api/peer-link-outbound-remove", { name: target }, "已移除");
+  } else if (t.classList.contains("pl-pair")) {
+    var row = t.closest(".pl-row");
+    var trust = row.querySelector(".pl-newtrust").value;
+    if (trust === "collaborate" && !confirm(COLLAB_WARNING)) return;
+    peerLinkPost(box, "/api/peer-pair", {
+      from: project, to: row.querySelector(".pl-target").value, trust: trust,
+      both: row.querySelector(".pl-both").checked, reverse_trust: "ask"
+    }, "已連線");
+  } else if (t.classList.contains("pl-invite")) {
+    var inviteRow = t.closest(".pl-row");
+    var trustValue = inviteRow.querySelector(".pl-invite-trust").value;
+    if (trustValue === "collaborate" && !confirm(COLLAB_WARNING)) return;
+    peerLinkPost(box, "/api/peer-invite", {
+      name: inviteRow.querySelector(".pl-invite-name").value, trust: trustValue
+    }, "邀請碼已產生，請複製後貼到對方的頁面").then(function (res) {
+      if (res.ok) { state.invite = { project: project, text: res.body.invite }; render(); }
+    });
+  } else if (t.classList.contains("pl-invite-done")) {
+    state.invite = null;
+    render();
+  } else if (t.classList.contains("pl-accept")) {
+    var text = box.querySelector(".pl-accept-text").value;
+    peerLinkPost(box, "/api/peer-accept", { invite: text }, "已接受，現在可以問對方了");
+  }
+});
+
+function renderPeerDescription(project) {
+  var off = project.peer_enabled ? "" :
+    '<div class="hint">這個 Harness 還沒有啟用 Harness 之間的通訊（工作區 .harness.env 沒有 HARNESS_PEER_API_TOKEN），先寫好也可以，啟用後才會被其他 Harness 看到。</div>';
+  return '<div class="section-label">給其他 Harness 的自我介紹</div>' +
+    '<div class="hint">其他 Harness 的 list_peers 和這個 Harness 的 Agent Card 會顯示這段話，它們的模型靠它判斷什麼時候該找你。'
+    + '寫：這是什麼、什麼情況該找它、要附哪些資訊。會被所有已配對的 Harness 看到，不要放金鑰、路徑或私人資料。最多 600 字。</div>' + off +
+    '<div class="peer-desc" data-project="' + esc(project.name) + '">' +
+    '<textarea class="peer-desc-text" rows="5" maxlength="600" placeholder="例如：Harness 平台本身。平台的錯誤、卡住的任務、行為不對，請用 report_issue 附上錯誤文字、任務編號與你已排除的原因。">'
+    + esc(project.peer_description || "") + "</textarea>" +
+    '<div class="pref-actions"><button class="peer-desc-save">儲存</button> <span class="peer-desc-count"></span> <span class="peer-desc-status rp-status"></span></div></div>';
+}
+
 function renderModelSettings(project) {
   return '<div class="hint">每一處都可設定主模型與任意數量的備援（依序嘗試）；按「編輯」展開。清單包含各 CLI 目前提供的模型；'
     + '沒列出的選「— 自訂 —」輸入名稱，之後所有選單都會記住。 <button class="catalog-refresh" onclick="refreshModelCatalog(this)">重新抓取模型清單</button></div>' +
@@ -847,7 +1088,7 @@ function renderProject(project, q) {
       '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "已設定" : "預設") + "</span>" +
       '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "同專案") + "</span>" +
       '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "自己的檔案" : "預設") + "</span>" +
-      "</div>" + renderModelSettings(project);
+      "</div>" + renderPeerName(project) + renderPeerLinks(project) + renderPeerDescription(project) + renderModelSettings(project);
   } else {
     var lock = running || (project.queue || []).length ? renderLock(project) : "";
     var pipelineSection = "";

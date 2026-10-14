@@ -65,6 +65,7 @@ settings (bot token, chat ids) are in neither — `doctor` flags them, and a pre
 | `GET /v1/commands` | the slash commands, for a service's own menu |
 | `GET /v1/status`, `GET /v1/changes?since=&wait=`, `GET /v1/turns/<id>` | what the status page shows |
 | `POST /v1/admin/<setting>` | model settings, role profiles, approve/reject, preferences |
+| `POST/GET /v1/peer/requests…` | a peer's read-only questions (A2A service only; the separate `HARNESS_PEER_API_TOKEN`) |
 
 **Messages are answered once per burst (operator decision, 2026-10-11; enforced).** A plain chat message is handled at once. If the same person sends another plain chat message before the reply has gone out, the reply being made is cancelled — a chat model call in flight is killed, a finished-but-unsent reply is dropped, and anything the model asked to have confirmed meanwhile (jobs, settings, orders still `pending`) is cancelled — and the model thinks again with everything said so far, so there is one answer. Nothing a dropped reply said (task, schedule, note, preference markers) has been acted on, because markers are only read from a reply that goes out. Only the new words are added to the transcript again. A command, a reply to a specific message, or another audience's message is never merged and waits its turn. After `MAX_RESTARTS` (3) restarts for one burst the worker stops interrupting. **Not implemented:** a message that arrives while a *non-chat* step (a command, a started task) is running; it simply waits its turn.
 
@@ -105,11 +106,39 @@ address a service handed in earlier (`tg:<chat>`), or `null` for "the operator, 
   token POST `/v1/send {"text"}` or `/v1/send_photo {"path"}` with the relay's own token instead. Photos are read only from
   `TELEGRAM_RELAY_PHOTO_ROOTS`.
 
+## The A2A service
+
+`memtrace_services/a2a/` — one process per Harness, `memtrace-a2a --config a2a.toml`
+(`examples/a2a.toml`). It lets another Harness ask this one a read-only question over A2A 1.0 (JSON-RPC):
+`GET /.well-known/agent-card.json` (public) and `POST /rpc` behind a per-peer bearer token. It reaches its
+Harness only through `/v1/peer/*` with `HARNESS_PEER_API_TOKEN`, a token that opens nothing else. With
+`[outbound.*]` configured it also carries this Harness's `ask_peer` / `report_issue` questions to those peers; a peer with
+`trust = "collaborate"` may report problems for this Harness to diagnose and fix. Who may talk to whom is
+made on the status page (設定 → Harness 連線) and kept by the Harness; the service reads it live. Design,
+rules and limits: [`a2a-peers.md`](a2a-peers.md).
+
+### Running an A2A service
+
+One per Harness, like the Telegram service. It needs `HARNESS_PEER_API_TOKEN` in that Harness's `.harness.env` (a token
+different from `HARNESS_API_TOKEN`; restart the Harness after adding it) and an `a2a.toml` with the same token as
+`[harness] peer_token` (`examples/a2a.toml`; mode 0600). Convention here: `~/.config/memtraceharness/<Project>/a2a.toml`,
+port = the Harness's API port + 100 (Beri 8800 → 8900, MemTraceHarness 8804 → 8904).
+
+```
+scripts/run-a2a.sh ~/.config/memtraceharness/<Project>/a2a.toml        # foreground
+```
+
+As a launchd job, copy `com.memtraceharness.<Project>.a2a.plist` (same shape as the status page's) into
+`~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u) <plist>`; `scripts/restart-harness.sh all` skips `*.a2a`.
+The service is up when `curl http://127.0.0.1:<port>/.well-known/agent-card.json` answers; the status page's
+設定 → Harness 連線 then shows its address, and pairing works.
+
 ## The status page
 
 `memtrace_services/web/` — one process over any number of Harnesses (`examples/web.toml`). It
 aggregates their `/v1/status`, pushes the result to browsers over SSE (redrawn when any Harness
-reports a change), and forwards each write to the Harness that owns the project. Preference ids are
+reports a change), and forwards each write to the Harness that owns the project (including the Settings tab's "給其他 Harness 的自我介紹",
+which other Harnesses read from this Harness's Agent Card; see [`a2a-peers.md`](a2a-peers.md)). Preference ids are
 only unique per Harness, so the page addresses them as `<harness>:<id>`. Loopback by default and no login of its own.
 
 ## Running it

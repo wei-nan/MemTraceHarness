@@ -310,6 +310,7 @@ class OpsContext:
         store: Any | None = None,
         github_repos: list[str] | None = None,
         read_roots: list[str] | None = None,
+        read_only: bool = False,
     ) -> None:
         self.project = project
         self.working_directory = working_directory.resolve()
@@ -324,10 +325,17 @@ class OpsContext:
         self.jobs = jobs
         self.store = store
         self.github_repos = list(github_repos or [])
+        # Only the `read` tier is offered (a peer's diagnosis, peer.py): nothing that proposes or changes.
+        self.read_only = read_only
+        # Set by the Harness for a confirmed tool that has to start a governed task: (goal, request) -> text.
+        self.start_task: Any = None
 
     def tool_names(self) -> set[str]:
         return {
-            spec.name for spec in tool_registry.all_specs() if spec.available is None or spec.available(self)
+            spec.name
+            for spec in tool_registry.all_specs()
+            if (spec.available is None or spec.available(self))
+            and (not self.read_only or spec.tier == tool_registry.READ)
         }
 
 
@@ -613,6 +621,7 @@ def _register_builtin_tools() -> None:
 _register_builtin_tools()
 from memtrace_harness import browser  # noqa: E402,F401  (registers `browse`)
 from memtrace_harness import github_ci  # noqa: E402,F401  (registers `github_ci`)
+from memtrace_harness import peer_tools  # noqa: E402,F401  (registers `ask_peer`, `list_peers`)
 
 
 def handle_message(message: dict[str, Any], ctx: OpsContext) -> dict[str, Any] | None:
@@ -665,6 +674,7 @@ def context_from_env(env: Any) -> OpsContext | None:
         store=store,
         github_repos=json.loads(env.get("HARNESS_OPS_GITHUB_REPOS") or "[]"),
         read_roots=json.loads(env.get("HARNESS_OPS_READ_ROOTS") or "[]"),
+        read_only=env.get("HARNESS_OPS_READ_ONLY") == "1",
     )
 
 
@@ -688,7 +698,9 @@ def serve(stdin=None, stdout=None) -> None:
             stdout.flush()
 
 
-def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str | None = None) -> dict[str, Any] | None:
+def ops_server_spec(
+    scope: Any, trace_db_path: Path | str | None, *, python: str | None = None, read_only: bool = False
+) -> dict[str, Any] | None:
     """Launch spec for this server for one project. The read-only tools are always there; with a store a project that
     declares nothing also gets propose_scope_change, the way to get its first capability."""
     hosts, logs, jobs = scope.probe_hosts or [], scope.log_files or [], scope.jobs or {}
@@ -703,6 +715,8 @@ def ops_server_spec(scope: Any, trace_db_path: Path | str | None, *, python: str
     }
     if trace_db_path:
         env["HARNESS_TRACE_DB"] = str(Path(trace_db_path).resolve())
+    if read_only:
+        env["HARNESS_OPS_READ_ONLY"] = "1"
     return {"command": python or sys.executable, "args": ["-m", "memtrace_harness.ops_mcp"], "env": env}
 
 

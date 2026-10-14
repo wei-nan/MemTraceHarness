@@ -64,6 +64,12 @@ class HarnessConfig:
     api_host: str = "127.0.0.1"
     api_port: int = 8800
     api_token: str | None = None
+    # A second, narrower token for the A2A service (memtrace_services/a2a): it opens only /v1/peer/*, never
+    # /v1/actions or /v1/admin/*, so a leaked peer path cannot approve or change anything (docs/a2a-peers.md).
+    peer_api_token: str | None = None
+    peer_max_concurrent: int = 2
+    peer_description: str | None = None
+    peer_name: str | None = None
     # The workspace this Harness is (None only for legacy/one-off CLI use without a workspace).
     workspace_root: Path | None = None
     role_profiles_file: Path | None = None
@@ -201,6 +207,11 @@ class HarnessConfig:
     # the name no longer selects anything. The model settings are read from the environment at
     # call time (falling back to what was loaded at startup) so that changing one — from the status
     # page, through the Harness API — takes effect on the next call without a restart.
+
+    def peer_description_now(self) -> str:
+        """What this Harness says about itself to its peers. Read at call time, like the model settings, so an edit on the
+        status page shows up in the next Agent Card without a restart."""
+        return os.getenv("HARNESS_PEER_DESCRIPTION", self.peer_description or "").strip()
 
     def chat_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for the quick chat reply. Chat is cheap and
@@ -355,6 +366,10 @@ class HarnessConfig:
             api_host=os.getenv("HARNESS_API_HOST", "127.0.0.1"),
             api_port=_positive_int(os.getenv("HARNESS_API_PORT"), 8800),
             api_token=os.getenv("HARNESS_API_TOKEN") or None,
+            peer_api_token=os.getenv("HARNESS_PEER_API_TOKEN") or None,
+            peer_max_concurrent=_positive_int(os.getenv("HARNESS_PEER_MAX_CONCURRENT"), 2),
+            peer_description=os.getenv("HARNESS_PEER_DESCRIPTION") or None,
+            peer_name=os.getenv("HARNESS_PEER_NAME") or None,
             workspace_root=root,
             role_profiles_file=roles_file,
             shutdown_grace_seconds=_positive_int(os.getenv("HARNESS_SHUTDOWN_GRACE_SECONDS"), 120),

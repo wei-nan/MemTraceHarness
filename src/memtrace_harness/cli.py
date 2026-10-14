@@ -274,6 +274,14 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("directory", nargs="?", type=Path, help="The workspace folder (may be empty, need not be a git repo)")
     init_parser.add_argument("--name", help="Project name (default: the folder name)")
     init_parser.add_argument("--memtrace-workspace", help="MemTrace workspace id (ws_...) of the project's spec/backlog")
+    init_parser.add_argument(
+        "--harness-name",
+        help="What other Harnesses call this one (lowercase letters, digits, - or _; default: the project name, lowercased)",
+    )
+    init_parser.add_argument(
+        "--description",
+        help="One line on what the project is, shown to other Harnesses (a default is written if you give none)",
+    )
     init_parser.add_argument("--non-interactive", action="store_true", help="Ask nothing; use flags and defaults")
 
     migrate_parser = subparsers.add_parser(

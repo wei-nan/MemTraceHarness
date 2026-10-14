@@ -74,6 +74,45 @@ Claude Code cannot list its models, so the status page's Claude menu may ask Ant
 - No key, or a failed call, falls back to the built-in list plus models added by hand
   (`.harness/extra_models.json`); nothing else depends on it.
 
+## Questions from another Harness (operator decision, 2026-10-14)
+
+Another Harness may ask this one a read-only question over A2A (`memtrace_services/a2a`, `peer.py`; design in
+[`a2a-peers.md`](a2a-peers.md)). **ENFORCED** for the receiving side (`tests/test_peer_api.py`,
+`tests/test_a2a_service.py`), and for the calling side (`tests/test_peer_calling.py`):
+
+- A peer is an outsider, not the operator. It reaches the Harness only through `/v1/peer/*` with
+  `HARNESS_PEER_API_TOKEN`, which opens nothing else; the main token does not open `/v1/peer/*`, and the two
+  tokens must differ. The a2a service authenticates peers by SHA-256 of a per-peer bearer token.
+- Read-only: only the `ask` skill exists. The model gets MemTrace's read tools in an empty scratch folder;
+  no ops tools, trading proxy, attachments, operator identity or preferences. The peer's words are quoted to it
+  as data, and every `HARNESS_*` directive line in its reply is dropped, so nothing a peer says can start a
+  task, schedule, note, install or approval. Delegation is not offered; when it is, it will stop at the
+  receiving operator's tap.
+- Limits: a request that has passed through 2 Harnesses is rejected (`hops`, cooperative); a global cap of
+  `HARNESS_PEER_MAX_CONCURRENT` (default 2) unfinished requests, then `rejected: busy`; per-peer rate and
+  concurrency limits in `a2a.toml`.
+- A request is visible only to the peer that made it; another peer's id and a missing id are indistinguishable.
+  A peer sees only the answer and fixed reason phrases. Requests are kept in the trace store (`peer_requests`).
+- Asking a peer (`ask_peer`) is a `change`-tier tool: it needs the operator's tap, or a standing "always allow"
+  bound to the peer name (revocable). The model never opens a connection; only peers listed in the a2a service's
+  `[outbound.*]` can be asked. A peer's answer reaches the operator and the chat transcript only as quoted,
+  unverified data with every `HARNESS_*` line removed; it is never an instruction.
+- **Collaboration (`trust = "collaborate"`, ENFORCED, `tests/test_peer_collaborate.py`):** a peer the operator marks in the
+  a2a service's `[peers.*]` may also report a problem. The Harness diagnoses it with the read-only ops tools in the
+  project; if it proposes a fix, that is a confirm card (`peer_fix`, one tap or a standing per-peer "always allow"),
+  and the tap starts an ordinary governed task. Code changes still go only through the Agent Loop, the peer's Task ends
+  with that task, a declined or lapsed card ends it `REJECTED`, and the peer sees only fixed phrases until it
+  completes.
+- **A Harness has its own name on the peer network** (`HARNESS_PEER_NAME`, default the project's name lowercased; ENFORCED, `tests/test_peer_pairing.py`): links, the Agent Card and audit labels use it, never the folder's or project's name; a rename changes only the label (access rests on the token), and two Harnesses with one name cannot be paired.
+- **Links are kept by the Harness and changed on the status page** (`peer_links.py`, `web/pairing.py`;
+  ENFORCED, `tests/test_peer_pairing.py`): `.harness/peer_links.json`, mode 0600, holds only the SHA-256 of an inbound token
+  (shown once, when the link is made) and the token of an outbound link; the main-token view and the page's data carry no
+  secret. A revocation takes effect at the A2A service's next read (≤ 10 s) without a restart. A pairing is both halves
+  or neither; the token goes between Harnesses through the page's process and never to the browser (an invite string is the one
+  deliberate exception, shown once). The generic admin routes cannot make a link. The status page has no login.
+- **POLICY_ONLY:** under Codex the CLI's read-only sandbox, not this code, decides what else the model could read;
+  see "Honest limits" in `a2a-peers.md`.
+
 ## Authority and memory routing
 
 The Harness uses three authoritative memory planes:
@@ -790,6 +829,16 @@ digest the replies as `[live:<tool>]` blocks, which it may cite as `state_refs` 
 Default is none, so projects without the line or the key are unchanged; a failed query reads as unknown and cannot be
 cited. **Not done:** other duties (archive, gardening, promotion, work review, trigger review) still carry their
 rules in Python; moving them is to be decided after a few nights of digests show the pilot helps.
+
+**TaiwanTrade gateway for scheduled scripts (operator decision, 2026-10-14).** **ENFORCED**
+(`tests/test_taiwantrade_gateway.py`): a scheduled job is a script run by a model CLI whose environment is an
+allowlist with no secrets, so it could not send `X-API-KEY` (the TAIEX chart job got 401). With
+`HARNESS_TAIWANTRADE_GATEWAY_PORT` set (and `HARNESS_TAIWANTRADE_API_KEY_FILE`), the Harness serves a loopback,
+GET-only forwarder that adds the key from the key file on each call; the script points its base URL at it
+(non-secret `TAIWANTRADE_BASE_URL`, passed via `HARNESS_PASSTHROUGH_ENV`). Only the read-only tool paths of
+`taiwantrade_mcp.TOOLS` plus `/api/v1/charts/taiex` are forwarded; orders, other methods and other paths get 403/405.
+The key never enters a model-visible environment. Any local process can use the gateway, which is the same read-only
+reach the MCP tools already give. **Not done:** a per-caller token for the gateway.
 
 **Goal plan and completion check (operator request 2026-10-13).** **ENFORCED**
 (`tests/test_goal_plan.py`, `tests/test_loop_goal_plan.py`): the Controller plans phases for the user's whole

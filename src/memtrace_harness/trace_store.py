@@ -587,8 +587,21 @@ class TraceStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _add_missing_columns(conn: sqlite3.Connection) -> None:
+        """The peer tables gained columns the day they were made; a database that already has the older shape keeps its rows."""
+        for table, column, ddl in (
+            ("peer_requests", "fix_job_id", "TEXT"),
+            ("peer_outbound", "skill", "TEXT NOT NULL DEFAULT 'ask'"),
+            ("peer_directory", "collaborate", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if existing and column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
     def _init_db(self) -> None:
         with self._connection() as conn:
+            self._add_missing_columns(conn)
             self._migrate_workspace_locks(conn)
             conn.executescript(
                 """
@@ -986,6 +999,40 @@ class TraceStore:
                     result_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS peer_requests (
+                    request_id TEXT PRIMARY KEY,
+                    peer TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    skill TEXT NOT NULL,
+                    hops INTEGER NOT NULL,
+                    question TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    reason TEXT,
+                    result_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    fix_job_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS peer_outbound (
+                    request_id TEXT PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    hops INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    reason TEXT,
+                    result_text TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    skill TEXT NOT NULL DEFAULT 'ask'
+                );
+                CREATE TABLE IF NOT EXISTS peer_directory (
+                    name TEXT PRIMARY KEY,
+                    description TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    collaborate INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS plans (
                     plan_id TEXT PRIMARY KEY,
@@ -3857,6 +3904,181 @@ class TraceStore:
                 f"WHERE request_id = ? AND status IN ({marks})",
                 (to_status, utc_now_iso(), request_id, *from_statuses),
             ).rowcount > 0
+
+    # ---- requests from another Harness (peer.py): one row per question a peer asked
+    _PEER_COLUMNS = (
+        "request_id, peer, context_id, skill, hops, question, state, reason, result_text, created_at, updated_at, "
+        "fix_job_id"
+    )
+    PEER_TERMINAL_STATES = ("completed", "failed", "canceled", "rejected")
+
+    @classmethod
+    def _peer_row_to_dict(cls, row: tuple) -> dict:
+        keys = cls._PEER_COLUMNS.replace(" ", "").split(",")
+        return dict(zip(keys, row))
+
+    def create_peer_request(
+        self, *, request_id: str, peer: str, context_id: str, skill: str, hops: int, question: str,
+        state: str = "submitted", reason: str | None = None,
+    ) -> None:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO peer_requests (request_id, peer, context_id, skill, hops, question, state, reason, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (request_id, peer, context_id, skill, hops, question, state, reason, now, now),
+            )
+
+    def get_peer_request(self, request_id: str, peer: str) -> dict | None:
+        """Only the peer that made it can see it: another peer's id looks exactly like a missing one."""
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._PEER_COLUMNS} FROM peer_requests WHERE request_id = ? AND peer = ?",
+                (request_id, peer),
+            ).fetchone()
+        return self._peer_row_to_dict(row) if row else None
+
+    def list_peer_requests(self, peer: str, context_id: str | None = None, limit: int = 50) -> list[dict]:
+        query = f"SELECT {self._PEER_COLUMNS} FROM peer_requests WHERE peer = ?"
+        args: list = [peer]
+        if context_id:
+            query += " AND context_id = ?"
+            args.append(context_id)
+        with self._connection() as conn:
+            rows = conn.execute(query + " ORDER BY created_at DESC LIMIT ?", (*args, limit)).fetchall()
+        return [self._peer_row_to_dict(r) for r in rows]
+
+    def set_peer_request_fix_job(self, request_id: str, fix_job_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute("UPDATE peer_requests SET fix_job_id = ? WHERE request_id = ?", (fix_job_id, request_id))
+
+    def get_peer_request_any(self, request_id: str) -> dict | None:
+        """By id alone, for the Harness itself (a finished task looking for the peer it was started for)."""
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._PEER_COLUMNS} FROM peer_requests WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        return self._peer_row_to_dict(row) if row else None
+
+    def count_peer_requests_in_states(self, states: tuple[str, ...]) -> int:
+        marks = ",".join("?" for _ in states)
+        with self._connection() as conn:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM peer_requests WHERE state IN ({marks})", states
+            ).fetchone()[0]
+
+    def transition_peer_request(
+        self, request_id: str, from_states: tuple[str, ...], to_state: str,
+        *, result_text: str | None = None, reason: str | None = None,
+    ) -> bool:
+        """Moves a request on only from the states given, so a late result cannot overwrite a cancel."""
+        marks = ",".join("?" for _ in from_states)
+        with self._connection() as conn:
+            return conn.execute(
+                f"UPDATE peer_requests SET state = ?, result_text = COALESCE(?, result_text), "
+                f"reason = COALESCE(?, reason), updated_at = ? WHERE request_id = ? AND state IN ({marks})",
+                (to_state, result_text, reason, utc_now_iso(), request_id, *from_states),
+            ).rowcount > 0
+
+    def fail_interrupted_peer_requests(self) -> int:
+        """A restart kills the threads answering peers; their rows must not stay 'working' forever."""
+        with self._connection() as conn:
+            return conn.execute(
+                "UPDATE peer_requests SET state = 'failed', reason = 'interrupted', updated_at = ? "
+                "WHERE state IN ('submitted', 'working')",
+                (utc_now_iso(),),
+            ).rowcount
+
+    # ---- questions this Harness asks other Harnesses (peer.py PeerOutbound); the A2A service carries them
+    _OUTBOUND_COLUMNS = (
+        "request_id, project, peer, context_id, question, hops, state, reason, result_text, created_at, updated_at, skill"
+    )
+
+    def _outbound_row_to_dict(self, row: tuple) -> dict:
+        return dict(zip(self._OUTBOUND_COLUMNS.replace(" ", "").split(","), row))
+
+    def create_peer_outbound(
+        self, *, request_id: str, project: str, peer: str, context_id: str, question: str, hops: int,
+        skill: str = "ask",
+    ) -> None:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute(
+                f"INSERT INTO peer_outbound ({self._OUTBOUND_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, ?, ?, ?)",
+                (request_id, project, peer, context_id, question, hops, now, now, skill),
+            )
+
+    def get_peer_outbound(self, request_id: str) -> dict | None:
+        with self._connection() as conn:
+            row = conn.execute(
+                f"SELECT {self._OUTBOUND_COLUMNS} FROM peer_outbound WHERE request_id = ?", (request_id,)
+            ).fetchone()
+        return self._outbound_row_to_dict(row) if row else None
+
+    def claim_peer_outbound(self, limit: int = 5) -> list[dict]:
+        """Hands the oldest queued questions to the A2A service and marks them sent, so none is carried twice."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._OUTBOUND_COLUMNS} FROM peer_outbound WHERE state = 'queued' ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                if conn.execute(
+                    "UPDATE peer_outbound SET state = 'sent', updated_at = ? WHERE request_id = ? AND state = 'queued'",
+                    (utc_now_iso(), row[0]),
+                ).rowcount:
+                    claimed.append(self._outbound_row_to_dict(row) | {"state": "sent"})
+        return claimed
+
+    def finish_peer_outbound(
+        self, request_id: str, state: str, *, result_text: str | None = None, reason: str | None = None
+    ) -> bool:
+        """Only a question still queued or sent can be finished, so a late duplicate report changes nothing."""
+        with self._connection() as conn:
+            return conn.execute(
+                "UPDATE peer_outbound SET state = ?, result_text = ?, reason = ?, updated_at = ? "
+                "WHERE request_id = ? AND state IN ('queued', 'sent')",
+                (state, result_text, reason, utc_now_iso(), request_id),
+            ).rowcount > 0
+
+    def expire_peer_outbound(self, older_than_iso: str, collaborate_older_than_iso: str | None = None) -> list[dict]:
+        """Questions that were carried (or never picked up) and never came back. A collaboration request may take
+        as long as a fix does, so it has its own, later cutoff."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                f"SELECT {self._OUTBOUND_COLUMNS} FROM peer_outbound WHERE state IN ('queued', 'sent') AND "
+                "((skill != 'collaborate' AND updated_at < ?) OR (skill = 'collaborate' AND updated_at < ?))",
+                (older_than_iso, collaborate_older_than_iso or older_than_iso),
+            ).fetchall()
+        expired = []
+        for row in rows:
+            item = self._outbound_row_to_dict(row)
+            if self.finish_peer_outbound(item["request_id"], "failed", reason="no reply"):
+                expired.append(item)
+        return expired
+
+    def count_peer_outbound_unfinished(self, peer: str | None = None) -> int:
+        query, args = "SELECT COUNT(*) FROM peer_outbound WHERE state IN ('queued', 'sent')", []
+        if peer:
+            query += " AND peer = ?"
+            args.append(peer)
+        with self._connection() as conn:
+            return conn.execute(query, args).fetchone()[0]
+
+    def replace_peer_directory(self, peers: list[dict]) -> None:
+        now = utc_now_iso()
+        with self._connection() as conn:
+            conn.execute("DELETE FROM peer_directory")
+            conn.executemany(
+                "INSERT INTO peer_directory (name, description, updated_at, collaborate) VALUES (?, ?, ?, ?)",
+                [(p["name"], p["description"], now, 1 if p.get("collaborate") else 0) for p in peers],
+            )
+
+    def list_peer_directory(self) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT name, description, collaborate FROM peer_directory ORDER BY name").fetchall()
+        return [{"name": r[0], "description": r[1], "collaborate": bool(r[2])} for r in rows]
 
     def cancel_unshown_proposals(self, project: str, since_iso: str) -> int:
         """Cancel what the chat model proposed (jobs, settings, orders) since `since_iso` that has not
