@@ -26,6 +26,22 @@ logger = logging.getLogger(__name__)
 MAX_PHOTO_BYTES = 10 * 1024 * 1024  # Telegram's own limit for photos
 
 
+def read_photo(roots: tuple[Path, ...], raw_path: object) -> tuple[str, bytes]:
+    """The file name and bytes of a photo to send, only from inside one of ``roots``."""
+    if not roots:
+        raise ValueError("photos are disabled (TELEGRAM_RELAY_PHOTO_ROOTS is empty)")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("path is required")
+    path = Path(raw_path).resolve()
+    if not any(path == root or root in path.parents for root in roots):
+        raise ValueError("path is outside TELEGRAM_RELAY_PHOTO_ROOTS")
+    if not path.is_file():
+        raise ValueError("file does not exist")
+    if path.stat().st_size > MAX_PHOTO_BYTES:
+        raise ValueError("file is larger than 10 MB")
+    return path.name, path.read_bytes()
+
+
 class _Handler(BaseHTTPRequestHandler):
     service: TelegramService
     token: str
@@ -73,19 +89,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200 if ok else 502, {"ok": ok, "message_ids": [i for i in ids if i is not None]})
 
     def _read_photo(self, raw_path: object) -> tuple[str, bytes]:
-        roots = self.service.settings.relay_photo_roots
-        if not roots:
-            raise ValueError("photos are disabled (TELEGRAM_RELAY_PHOTO_ROOTS is empty)")
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ValueError("path is required")
-        path = Path(raw_path).resolve()
-        if not any(path == root or root in path.parents for root in roots):
-            raise ValueError("path is outside TELEGRAM_RELAY_PHOTO_ROOTS")
-        if not path.is_file():
-            raise ValueError("file does not exist")
-        if path.stat().st_size > MAX_PHOTO_BYTES:
-            raise ValueError("file is larger than 10 MB")
-        return path.name, path.read_bytes()
+        return read_photo(self.service.settings.relay_photo_roots, raw_path)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         logger.debug("telegram relay: " + format, *args)

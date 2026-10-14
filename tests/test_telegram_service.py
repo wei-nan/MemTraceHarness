@@ -345,6 +345,21 @@ class OutgoingTests(TestCase):
         self.assertEqual(bot.typing, [ALLOWED])
         self.assertEqual([ok for _, ok, _ in client.acks], [True, True, True])
 
+    def test_photo_events_are_sent_from_inside_the_photo_roots_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "ws"
+            root.mkdir()
+            (root / "taiex.png").write_bytes(b"png")
+            (Path(tmp) / "secret.png").write_bytes(b"png")
+            service, bot, client = make_service(tmp, TELEGRAM_RELAY_PHOTO_ROOTS=str(root))
+            client.events_queue = [
+                {"id": 1, "kind": "photo", "audience": None, "text": "cap", "ref": str(root / "taiex.png")},
+                {"id": 2, "kind": "photo", "audience": None, "text": "x", "ref": str(Path(tmp) / "secret.png")},
+            ]
+            service.deliver_once()
+        self.assertEqual(bot.photos, [(ALLOWED, "taiex.png", "cap")])
+        self.assertEqual([(i, ok) for i, ok, _ in client.acks], [(1, True), (2, True)])
+
     def test_the_bot_commands_are_registered_once_the_harness_answers(self) -> None:
         with TemporaryDirectory() as tmp:
             service, bot, client = make_service(tmp)

@@ -278,6 +278,23 @@ class TelegramService:
             for chat in targets:
                 self.bot.send_typing(chat)
             return True, []
+        if kind == "photo":
+            from memtrace_services.telegram.relay import read_photo
+
+            try:
+                name, data = read_photo(self.settings.relay_photo_roots, event.get("ref"))
+            except ValueError as exc:
+                logger.warning(f"outbox photo {event.get('id')} not sent: {exc}")
+                return True, []  # a refused file will not get better by retrying
+            refs = []
+            ok = True
+            for chat in targets:
+                message_id = self.bot.send_photo(chat, data, name, event.get("text") or None)
+                if message_id is None:
+                    ok = False
+                else:
+                    refs.append(message_ref(chat, message_id))
+            return ok, refs
         if kind != "message":
             logger.warning(f"unknown outbox event kind {kind!r}; dropping it")
             return True, []
