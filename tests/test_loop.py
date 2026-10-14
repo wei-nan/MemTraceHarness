@@ -904,6 +904,46 @@ class AgentLoopRunnerTests(TestCase):
         self.assertIsNone(run[1])
         self.assertEqual(execution_count, 6)
 
+    def test_a_hung_controller_call_falls_back_to_the_next_model(self) -> None:
+        # chat_c8eddfd8 (2026-10-13): a Codex Controller call that normally takes seconds timed out after
+        # 900 and the whole task failed, because a timeout was never a fallback signal. A read-only
+        # profile's timeout now is.
+        adapters = self._adapters()
+        # the primary is tried again at the next Controller stage, which is why it also has a converge answer
+        adapters["controller"] = QueueAdapter(
+            "controller", "codex", "gpt-5.6-luna",
+            [{"_status": "timed_out", "_error": "CLI timed out after 180 seconds"}, {"action": "finish", "reason": "complete"}],
+        )
+        fallback = QueueAdapter(
+            "controller-fallback-1", "claude", "sonnet", [{"action": "run_planner", "reason": "continued"}]
+        )
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            fallback_adapters={"controller": [fallback]},
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(summary.stages[0].response.execution.failure_category, "timeout")
+        self.assertEqual(summary.stages[1].attempt_index, 1)
+
+    def test_a_timed_out_develop_call_is_not_handed_to_another_model(self) -> None:
+        adapters = self._adapters()
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.8-flash-high", [{"_status": "timed_out", "_error": "CLI timed out"}]
+        )
+        fallback = QueueAdapter("develop-fallback-1", "claude", "sonnet", [completed_development()])
+        summary = AgentLoopRunner(
+            adapters=adapters,
+            fallback_adapters={"develop": [fallback]},
+            role_profiles=load_role_profiles(),
+            trace_store=TraceStore(self.db_path),
+        ).run(self.task)
+
+        self.assertEqual(summary.status, "failed")
+        self.assertEqual(fallback.calls, [])
+
     def test_controller_quota_failure_falls_back_and_checkpoints_every_attempt(self) -> None:
         adapters = self._adapters()
         adapters["controller"] = QueueAdapter(

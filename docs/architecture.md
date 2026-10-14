@@ -188,6 +188,12 @@ one: Beri's Developer, for example, falls back to Antigravity Claude Sonnet and 
 both on quota, rate-limit or overload failures. Opus escalation and Sol Red Team fail closed; an unavailable Sol run
 cannot produce a gate PASS.
 
+A timed-out call of a read-only profile (the Controller, plan, review) also falls back to the next
+candidate, whatever its `fallback_on` says: it cannot have changed anything, and a call silent for the
+whole timeout says nothing about the request (**ENFORCED**, `tests/test_loop.py`). `develop` never does, since
+a timed-out call may already have edited files. The packaged Controller timeout is 180 seconds (its calls
+take seconds), so a hung call is given up early; `develop` keeps 3600 and the rest the global 900.
+
 Quota buckets are explicit because multiple models can share one account limit. A failed bucket is
 placed in an exponentially increasing cooldown (capped at one week) and is not repeatedly probed.
 Attempts, fallback index, failure category and

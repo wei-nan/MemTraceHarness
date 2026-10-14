@@ -93,6 +93,15 @@ def permits_cross_provider_fallback(category: FailureCategory) -> bool:
     return category in CROSS_PROVIDER_FALLBACK_CATEGORIES
 
 
+def permits_read_only_timeout_fallback(category: FailureCategory, permission: str) -> bool:
+    """A timed-out call of a read-only profile (the Controller, plan, review) may go to the next candidate.
+    It cannot have changed anything, and a call that hangs for the whole timeout says nothing about the
+    request itself (2026-10-13, TWTradingStrategy chat_c8eddfd8: a Codex Controller call that normally takes
+    7-15 seconds sat silent for 900 and failed the whole task). A write-capable profile is excluded: its
+    timed-out call may already have edited files, so another model is not simply tried in its place."""
+    return category == "timeout" and permission == "read-only"
+
+
 def error_signature(execution: CliExecution) -> str | None:
     detail = (execution.error or "").strip().lower()
     if not detail:

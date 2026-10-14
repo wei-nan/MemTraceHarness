@@ -32,6 +32,7 @@ from memtrace_harness.fallback import (
     classify_execution_failure,
     error_signature,
     permits_cross_provider_fallback,
+    permits_read_only_timeout_fallback,
 )
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.output_contracts import output_schema_path
@@ -1415,16 +1416,21 @@ class AgentLoopRunner:
         if profile_id in self.model_override_profiles and attempt_index == 0:
             return True
         profile = self.role_profiles.get(profile_id)
+        # A read-only profile's timeout also bypasses fallback_on (see permits_read_only_timeout_fallback).
+        timed_out_read_only = profile is not None and permits_read_only_timeout_fallback(
+            category, profile.permission
+        )
         # cli_unavailable and authentication bypass the profile's fallback_on: that list is
         # about capacity policy, whereas a CLI that cannot launch or whose login has expired
         # never evaluated the request at all.
         if (
             profile is not None
             and category not in {"cli_unavailable", "authentication"}
+            and not timed_out_read_only
             and category not in profile.fallback_on
         ):
             return False
-        if not permits_cross_provider_fallback(category):
+        if not timed_out_read_only and not permits_cross_provider_fallback(category):
             return False
         if self.max_total_tokens is not None and any(
             item.response.execution.usage.completeness == "unavailable"

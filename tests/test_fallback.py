@@ -62,3 +62,13 @@ class FailureClassifierTests(TestCase):
 
         self.assertEqual(category, "timeout")
         self.assertFalse(permits_cross_provider_fallback(category))
+
+
+class ReadOnlyTimeoutFallbackTests(TestCase):
+    def test_a_read_only_timeout_may_fall_back_but_a_writing_one_may_not(self) -> None:
+        from memtrace_harness.fallback import permits_read_only_timeout_fallback
+
+        self.assertTrue(permits_read_only_timeout_fallback("timeout", "read-only"))
+        self.assertFalse(permits_read_only_timeout_fallback("timeout", "workspace-write"))
+        self.assertFalse(permits_read_only_timeout_fallback("unknown", "read-only"))
+        self.assertFalse(permits_read_only_timeout_fallback("schema", "read-only"))
