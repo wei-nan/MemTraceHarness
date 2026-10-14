@@ -778,6 +778,19 @@ choice (`tests/test_role_profiles.py`, `tests/test_stage_skills.py`):
   Pointing `review` at the same provider/model as `develop` is allowed but logged, because it weakens the check
   in practice (the context is still separate).
 
+**Domain skills and the digest's live state (operator decision, 2026-10-14).** **ENFORCED**
+(`tests/test_stage_skills.py`, `tests/test_live_state.py`): a skill with `kind: domain` is rule text for a
+background duty, read through `domain_section`. It must not declare a profile, schema, permission or modes
+(refused at load), so only the `develop` stage skill can ever hold `workspace-write`, and it is never in the
+Controller's catalog. The nightly digest's rules are the first (`skills/digest-rules/SKILL.md`); the prompt is
+byte-identical to the former inline text when no live state is given. **ENFORCED**: a project may declare
+`- digest_state_queries: list_orders, get_positions` in its scope file; before each digest the Harness calls those
+read-only TaiwanTrade tools (argument-free ones only, key from `HARNESS_TAIWANTRADE_API_KEY_FILE`) and gives the
+digest the replies as `[live:<tool>]` blocks, which it may cite as `state_refs` to review a carried item as `stale`.
+Default is none, so projects without the line or the key are unchanged; a failed query reads as unknown and cannot be
+cited. **Not done:** other duties (archive, gardening, promotion, work review, trigger review) still carry their
+rules in Python; moving them is to be decided after a few nights of digests show the pilot helps.
+
 **Goal plan and completion check (operator request 2026-10-13).** **ENFORCED**
 (`tests/test_goal_plan.py`, `tests/test_loop_goal_plan.py`): the Controller plans phases for the user's whole
 request (skills per phase: plan, develop, or both; review always follows); a task is reported `succeeded` only

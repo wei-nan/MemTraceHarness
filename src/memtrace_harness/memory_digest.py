@@ -30,6 +30,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Any, Callable
 
 from memtrace_harness.primary_session import SCHEDULE_REPORT, SCHEDULE_TRIGGER
+from memtrace_harness import stage_skills
 from memtrace_harness.calibration import calibration_block
 from memtrace_harness.trace_store import TraceStore
 
@@ -237,6 +238,10 @@ def _schedule_state(trace_store: TraceStore, project: str) -> tuple[str, set[str
     return "\n".join(lines), {s["id"] for s in rows}
 
 
+def _digest_rule(key: str) -> str:
+    return stage_skills.domain_section("digest-rules", key)
+
+
 def build_digest_prompt(
     project: str,
     digest_date: str,
@@ -246,6 +251,7 @@ def build_digest_prompt(
     adopted_rules: list[dict] | None = None,
     state_snapshot: str = "",
     calibration: str = "",
+    live_state: str = "",
 ) -> str:
     adopted_text = (
         "\n".join(f"[{r['id']}] ({'global' if r['scope'] == 'global' else 'project'}) {r['text']}" for r in adopted_rules)
@@ -289,6 +295,7 @@ def build_digest_prompt(
             if state_snapshot
             else ""
         )
+        + (f"{_digest_rule('live_state')}\n{live_state}\n\n" if live_state else "")
         + (f"{calibration}\n" if calibration else "")
         +
         "Return ONLY one JSON object, no prose and no code fence, with exactly these keys:\n"
@@ -305,45 +312,9 @@ def build_digest_prompt(
         '  "preference_retirements": [{"id": 3, "turns": [19]}]\n'
         "}\n"
         "Rules:\n"
-        "- A user turn may end with （回覆的訊息：「…」）. That quoted text is a message the "
-        "human swiped to reply to (often a push from the harness or a script), not the "
-        "human's own words: use it to understand what the reply is about, never as a "
-        "preference and never as evidence of what the human said.\n"
-        "- Every item must cite the turn numbers from THIS day's log that support it. "
-        "Items without valid citations are discarded automatically.\n"
-        "- decisions: things agreed or settled. facts: durable project knowledge worth "
-        "remembering (data, results, configuration). new_open_items: questions or tasks "
-        "raised and not finished this day. resolved_open_items: carried items this day's "
-        "log shows were resolved, cited by their index and the resolving turns.\n"
-        "- open_item_review: go through EVERY carried open item and say which of these it is. "
-        "status `decided`: the log shows the human or the harness actually settled it "
-        "(reason = what was decided). status `stale`: its premise no longer holds (for "
-        "example the position it concerns was sold, the schedule it concerns was "
-        "stopped, the failure it concerns was fixed); reason = why. status "
-        "`needs_operator`: it is still real and only the human can decide or supply "
-        "something; reason = the one decision or input needed. `decided` and `stale` must "
-        "cite turns from THIS day's log that show it (a `stale` item may instead cite "
-        "`state_refs` ids from the schedule state above), otherwise use `needs_operator` or "
-        "leave the item out. Items you leave out stay open unchanged. Do not use "
-        "resolved_open_items for these; it is only for items completed in this day's log.\n"
-        "- process_lessons: how the harness, models, or tools behaved (for example a "
-        "model timing out or a step failing), not project content.\n"
-        "- preference_candidates: ONLY standing preferences the human (speaker user) "
-        "stated about how they want to be worked with in future conversations. Cite "
-        "only user turns. One-off requests, questions about the current task, and "
-        "project content are NOT preferences; when unsure, leave it out. scope is "
-        '"global" when it applies to every project (e.g. reply language) or "project" '
-        f"when only to this one. category is one of: {categories}. explicit is true only "
-        "when the human stated it as a rule (e.g. 以後, 一律, 不要再, always). These are "
-        "adopted automatically, so be conservative. Do not repeat an adopted preference "
-        "unchanged; when a candidate refines or contradicts an adopted one, list that "
-        "one's id in `replaces`.\n"
-        "- preference_retirements: adopted preferences (by id) that the human, in THIS "
-        "day's log, explicitly withdrew or contradicted (e.g. 不用了, 那個不要了) without "
-        "giving a replacement. Cite only user turns. When unsure, leave it out.\n"
-        "- Write every text field and the summary in Traditional Chinese (繁體中文，台灣用語). "
-        "One sentence per item. Never invent anything that is not in the log.\n"
-        "- Use [] for an empty list.\n\n"
+        f"{_digest_rule('rules')}\n"
+        + (f"{_digest_rule('live_state_rule')}\n" if live_state else "")
+        + "\n"
         "Log:\n"
         f"{_format_log(turns)}\n"
     )
@@ -648,6 +619,7 @@ def run_digest_for_date(
     digest_date: str,
     tz: tzinfo,
     call_model: ModelCaller,
+    live_state: tuple[str, set[str]] = ("", set()),
 ) -> DigestOutcome:
     turns = turns_by_local_date(trace_store.get_primary_session_turns(session_id), tz).get(digest_date, [])
     if not turns:
@@ -657,12 +629,14 @@ def run_digest_for_date(
 
     turns, conversation_turns, schedule_note = split_schedule_activity(turns)
     state_snapshot, state_ids = _schedule_state(trace_store, project)
+    live_text, live_ids = live_state
+    state_ids = state_ids | live_ids
     adopted_rules = visible_rules(trace_store.list_preference_rules(statuses=("adopted",)), project)
     if turns:
         stdout, provider, model = call_model(
             build_digest_prompt(
                 project, digest_date, turns, carried, schedule_note, adopted_rules, state_snapshot,
-                calibration_block(trace_store, project, "digest"),
+                calibration_block(trace_store, project, "digest"), live_text,
             )
         )
         raw = _extract_json_object(stdout)

@@ -12,6 +12,11 @@ Callers add any leading or trailing newline themselves (see loop.py).
 
 What a skill may follow what (``PRECONDITIONS``) is code, not prose: the Controller chooses freely among the
 skills that are allowed in the current state, and the Harness refuses the rest.
+
+There is a second kind, a *domain* skill (``kind: domain``): only rule text that a background duty (the nightly
+digest, the archive, ...) reads when it builds its prompt. It names no profile, schema or permission, so it can
+never hold write access or become a stage the Controller runs; ``catalog()`` and ``PRECONDITIONS`` ignore it.
+Read one with ``domain_section``.
 """
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ SKILLS_DIR = Path(__file__).with_name("skills")
 SKILL_NAMES = ("plan", "review", "develop")
 
 
+KINDS = ("stage", "domain")
+_STAGE_ONLY_KEYS = ("profile", "schema", "permission", "modes")
+
+
 @dataclass(frozen=True)
 class StageSkill:
     name: str
@@ -35,6 +44,7 @@ class StageSkill:
     modes: tuple[str, ...]
     body: str
     sections: Mapping[str, str]
+    kind: str = "stage"
 
     def section(self, key: str) -> str:
         try:
@@ -56,10 +66,18 @@ def parse_skill(text: str, *, source: str = "SKILL.md") -> StageSkill:
         key, sep, value = line.partition(":")
         if sep:
             meta[key.strip()] = value.strip()
-    missing = [key for key in ("name", "description", "profile", "schema", "permission") if not meta.get(key)]
+    kind = meta.get("kind", "stage")
+    if kind not in KINDS:
+        raise ValueError(f"{source}: invalid kind {kind!r}")
+    required = ("name", "description") if kind == "domain" else ("name", "description", "profile", "schema", "permission")
+    missing = [key for key in required if not meta.get(key)]
     if missing:
         raise ValueError(f"{source}: front matter is missing {', '.join(missing)}")
-    if meta["permission"] not in {"read-only", "workspace-write"}:
+    if kind == "domain":
+        forbidden = [key for key in _STAGE_ONLY_KEYS if key in meta]
+        if forbidden:
+            raise ValueError(f"{source}: a domain skill holds no profile or permission; remove {', '.join(forbidden)}")
+    elif meta["permission"] not in {"read-only", "workspace-write"}:
         raise ValueError(f"{source}: invalid permission {meta['permission']!r}")
 
     body_lines: list[str] = []
@@ -76,12 +94,13 @@ def parse_skill(text: str, *, source: str = "SKILL.md") -> StageSkill:
     return StageSkill(
         name=meta["name"],
         description=meta["description"],
-        profile_id=meta["profile"],
-        schema=meta["schema"],
-        permission=meta["permission"],
+        profile_id=meta.get("profile", ""),
+        schema=meta.get("schema", ""),
+        permission=meta.get("permission", ""),
         modes=tuple(item.strip() for item in meta.get("modes", "").split(",") if item.strip()),
         body="\n".join(body_lines).strip(),
         sections={key: _reflow(value) for key, value in sections.items()},
+        kind=kind,
     )
 
 
@@ -103,7 +122,7 @@ def load_skills(root: Path = SKILLS_DIR) -> Mapping[str, StageSkill]:
         if skill.name != path.parent.name:
             raise ValueError(f"{path}: name {skill.name!r} does not match its folder")
         skills[skill.name] = skill
-    missing = [name for name in SKILL_NAMES if name not in skills]
+    missing = [name for name in SKILL_NAMES if skills.get(name) is None or skills[name].kind != "stage"]
     if missing:
         raise RuntimeError(f"Packaged stage skills are missing: {', '.join(missing)}")
     return skills
@@ -116,6 +135,14 @@ def skill(name: str) -> StageSkill:
 def section(name: str, key: str) -> str:
     """The text of one ``## key`` block of the named skill."""
     return skill(name).section(key)
+
+
+def domain_section(name: str, key: str) -> str:
+    """The text of one ``## key`` block of a domain skill (a stage skill is refused: use ``section``)."""
+    item = load_skills().get(name)
+    if item is None or item.kind != "domain":
+        raise KeyError(f"no domain skill named {name!r}")
+    return item.section(key)
 
 
 def catalog() -> str:
