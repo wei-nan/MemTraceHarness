@@ -113,6 +113,68 @@ Another Harness may ask this one a read-only question over A2A (`memtrace_servic
 - **POLICY_ONLY:** under Codex the CLI's read-only sandbox, not this code, decides what else the model could read;
   see "Honest limits" in `a2a-peers.md`.
 
+## Safety envelope and project-owned loops (operator decision, 2026-10-14)
+
+The Harness guarantees a safety envelope around every project's work; the shape of the work itself (which
+stages run, how many reviews, which providers) belongs to the project. **PLANNED** as a whole: nothing in
+this section is enforced yet, and the current single-Controller loop with its plan/review/develop skills,
+G1/G2 and goal check (see "Role contract") stays as it is until each item below ships and is marked
+**ENFORCED** here. Callers must not rely on it.
+
+**The envelope is the Harness's and a project cannot weaken it.** Its purpose is three things, and each is
+checked by code the Harness runs, not by a model's judgement:
+
+- **Stay in scope.** Writes are confined to the task's worktree and the paths the task declared. At
+  completion the Harness compares the actual diff with the declared scope; anything outside it blocks the task.
+- **Do not harm the system.** Execution stays in the sandbox; sudo and deletion are never offered; installing
+  a capability needs the operator's tap. (Largely ENFORCED today through the ops allowlist, capability
+  consent and the git-status safety net on read-only calls.)
+- **Do not leak data.** The diff and the output are scanned for secrets; `.harness.env` is never read or
+  printed; what is written to the trace store or MemTrace is redacted first; outbound network use by a
+  produced tool is declared, not assumed. (Only partly enforced today.)
+
+**A tool the Controller produces needs a person's confirmation before it can run.** A tool is anything with a
+side effect or that will run again: a script, a scheduled job, a skill, an MCP server, an outbound call, and
+the project's own loop definition. Ordinary code changes to the project are not tools; they go through the
+project's loop and its verification as usual.
+
+- The tool declares what it reads, writes and connects to. The operator is shown the diff and that
+  declaration, never only the model's summary.
+- Approval is bound to a hash of the content. Any change voids it and asks again, as the per-job command
+  hash allowlist already does.
+- An unconfirmed tool stays a draft: it cannot be scheduled or called by another task.
+- Loosening a limit asks for a tap; tightening one does not.
+
+**The loop belongs to the project.** A project defines its own loop in its own repository, in the form its
+CLIs already load natively (`AGENTS.md`, `CLAUDE.md`, skills). The Harness dispatches that loop inside the
+envelope and sees what comes out (diff, trace, declared permissions), not how it got there.
+
+- The envelope lives in the Harness, outside the worktree the project's agent can write, so a loop
+  definition cannot reduce it however it is edited. The loop definition itself is a tool and is confirmed
+  like one; otherwise an agent could rewrite its own loop to hollow out its quality checks.
+- A project with no loop of its own gets a minimal default: one develop run, the project's `verify_command`,
+  then the envelope checks.
+- **The Harness's own loop shrinks to one gate, at the end.** The several mid-loop gates (G1 on a plan, G2
+  on a development, the Controller's goal check as a stop condition) are retired as Harness mechanism. After
+  the work, the gate runs once and answers three questions, all by code the Harness runs: is the diff inside
+  the declared scope, is anything unsafe (a tool or loop definition not yet confirmed, a forbidden command,
+  a write outside the worktree), and does the diff or output hold anything sensitive. A failed check blocks
+  the task as `needs_human` with the exact finding; there is no model-revision round behind it. A model may
+  add a finding but can never clear one. "Gate" in this section means this final gate; in older text and in
+  `AGENTS.md` it also meant G1/G2, which keep running until this ships.
+- The plan, review and develop skills, and a model-based review or goal check, become a reference loop a
+  project may copy and own. They are quality layers a project chooses, not the safety guarantee, because a
+  model's verdict cannot be.
+- Stage-aware features (resuming past settled stages, the stage detail in approval messages, progress on the
+  status page) depend on the Harness knowing the stages. A project loop may emit checkpoints and
+  `needs_human`; if it emits neither, the Harness treats it as a black box and reports only the diff and
+  the trace.
+- Migration order: new projects first; projects with uncommitted work in their folder (Beri,
+  TWTradingStrategy) last, and never on a dirty checkout.
+
+Unchanged: the Harness output stays draft evidence and cannot approve its own gate; CLI-only model
+execution; one editing provider per run; the permission rules in "Role contract".
+
 ## Authority and memory routing
 
 The Harness uses three authoritative memory planes:
