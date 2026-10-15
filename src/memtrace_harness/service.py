@@ -3785,6 +3785,7 @@ class HarnessService:
             worktree_manager=self._worktree_manager() if worktree else None,
             repo_root=scope.working_directory if worktree else None,
             edit_lock=self._edit_lock_for(scope, conv_id, worktree, self.approval_manager.trace_store),
+            loop_mode=scope.loop_mode,
             create_approvals=schedule_id is None,
         )
         summary = runner.run(task, writeback=LOOP_DRAFT_WRITEBACK, conversation_id=conv_id)
@@ -3992,6 +3993,7 @@ class HarnessService:
                     worktree_manager=self._worktree_manager() if worktree else None,
                     repo_root=matching_scope.working_directory if worktree and matching_scope else None,
                     edit_lock=(
+                    loop_mode=matching_scope.loop_mode if matching_scope else "full",
                         self._edit_lock_for(matching_scope, req_data.conversation_id, worktree, trace_store)
                         if matching_scope is not None
                         else None
