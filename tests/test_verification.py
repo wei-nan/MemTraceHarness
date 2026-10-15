@@ -50,7 +50,7 @@ class LoopModeScopeTests(TestCase):
             path.write_text(f"- name: P\n- workspace_id: ws_x\n- working_directory: {tmp}\n{line}\n")
             return ProjectScope.from_file(path).loop_mode
 
-    def test_loop_mode_defaults_to_full_and_accepts_lean(self) -> None:
-        self.assertEqual(self._mode(""), "full")
-        self.assertEqual(self._mode("- loop_mode: lean"), "lean")
-        self.assertEqual(self._mode("- loop_mode: nonsense"), "full")
+    def test_loop_mode_defaults_to_lean_and_full_is_opt_in(self) -> None:
+        self.assertEqual(self._mode(""), "lean")
+        self.assertEqual(self._mode("- loop_mode: full"), "full")
+        self.assertEqual(self._mode("- loop_mode: nonsense"), "lean")
