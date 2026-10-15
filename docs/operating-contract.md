@@ -172,6 +172,40 @@ envelope and sees what comes out (diff, trace, declared permissions), not how it
 - Migration order: new projects first; projects with uncommitted work in their folder (Beri,
   TWTradingStrategy) last, and never on a dirty checkout.
 
+**A project that finds a tool missing asks the Harness that has the machine (operator decision, 2026-10-14;
+PLANNED).** `kubectl` is the running example. A project's Harness (Beri's, say) reaches a step it cannot do
+because no allowed tool covers it, for instance restarting a service, and the following happens. Nothing
+below is built; the pieces it reuses (A2A `ask`/`collaborate`, `request_install`, declared jobs with
+command-hash allowlisting) are ENFORCED as described elsewhere in this contract.
+
+- **The signal is structured.** A verification or job that cannot run because something is absent reports a
+  `MISSING_TOOL: <name>` line (Beri's `.harness/verify.sh` already does), so "the tests failed" and "the tests
+  could not run here" are different outcomes.
+- **First tap, to ask.** The project's Harness asks the operator whether it may ask the machine's Harness
+  (`ask_peer`, which already needs a tap). The card says what is being asked: whether `kubectl` exists and
+  where, for what purpose. This consent is to ask, not to use anything.
+- **The inventory is read-only and narrow.** The machine's Harness checks only `PATH` and a short fixed list of
+  locations (`command -v`, `--version`) and reports path, version and whether a credentials file (for
+  `kubectl`, a kubeconfig) exists: present or absent, never its content. It does not search the disk. What it
+  says back is data to the receiver, never an instruction.
+- **Tool absent.** The answer is the install command, shown to the operator, who decides and runs it. For a
+  tool that reaches a cluster, the system or credentials the Harness gives the command and does not install;
+  an ordinary package may still go through `request_install`'s own tap. Installing a binary is not
+  configuring it: credentials are set up by the operator and the Harness never touches them. After installing,
+  the project asks again, and this becomes the next case.
+- **Tool present.** The machine's Harness does not hand the project's agent the binary's path. It proposes a
+  named, bounded **job**, for example `kubectl rollout restart deployment/l8s -n <namespace>`, and the second
+  tap shows the exact command and the context it will run against (for `kubectl`, the kube context). The
+  Harness runs the job itself, so credentials never pass through any agent; the project's agent receives a
+  job name and its result.
+- **Scope of the grant.** Default is this one run. The operator may choose "always allow this exact command",
+  bound to the command's hash and revocable. Verbs that destroy or expose (`delete`, `exec`, `drain`, reading
+  secrets) can never be made standing, whatever is tapped. `sudo` and deletion stay refused as everywhere
+  else in the envelope.
+- **Two taps, two meanings.** The first lets the project ask; the second grants one concrete command. Neither
+  stands in for the other, and a tap given before it is known whether the tool exists never carries over to a
+  grant.
+
 Unchanged: the Harness output stays draft evidence and cannot approve its own gate; CLI-only model
 execution; one editing provider per run; the permission rules in "Role contract".
 
