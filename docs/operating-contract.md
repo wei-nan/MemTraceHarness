@@ -138,6 +138,19 @@ side effect or that will run again: a script, a scheduled job, a skill, an MCP s
 the project's own loop definition. Ordinary code changes to the project are not tools; they go through the
 project's loop and its verification as usual.
 
+**Which path a piece of work takes (the interface; PLANNED).** The split is whether the product runs again by
+itself or has a side effect, not who wrote it. A new scheduled script is a tool even if it is one line; a change
+to a View or an API is ordinary code even if it is large.
+
+| Work | Who guides it | Harness check at the end |
+|---|---|---|
+| Ordinary project code (feature, fix, refactor) | the project's own loop; Harness adds no stage | none beyond the always-on envelope (worktree-only writes, no sudo/delete, no `.harness.env`); merge stays the Controller's/operator's decision |
+| A tool (script, job, skill, MCP, outbound call, loop definition) | the Controller/Developer | the one final gate (scope, safety, sensitivity), then the operator's content-hash confirmation |
+
+The Harness never inserts a review, plan or test-gating stage into the first row. Test results are information
+to the project's loop and the operator; whether a failing test blocks progress is the project's choice, not a
+Harness gate.
+
 - The tool declares what it reads, writes and connects to. The operator is shown the diff and that
   declaration, never only the model's summary.
 - Approval is bound to a hash of the content. Any change voids it and asks again, as the per-job command
@@ -888,6 +901,10 @@ workspace; `ws_spec_plan` is not a universal default for every project.
 
 ## Role contract
 
+> **LEGACY, being retired.** This section and "Gate and adoption boundary" describe the loop the Harness runs
+> today. The target is in "Safety envelope and project-owned loops": no Harness-owned stages for ordinary
+> code, one final gate for tools. Until that ships, this is what runs; do not extend it.
+
 The Controller is the only role; plan, review and develop are skills it runs (see "One Controller, stage
 skills" in `docs/architecture.md`). **ENFORCED** packaged primary profiles (packaged defaults — see below for
 what's actually validated):
@@ -1041,6 +1058,8 @@ reserves `retry_after` and `reset_at`, but provider-specific five-hour/weekly re
 yet parsed into the availability ledger.
 
 ## Gate and adoption boundary
+
+> **LEGACY, being retired** (see the note under "Role contract").
 
 **POLICY_ONLY** (operator decision 2026-10-09): G1 and G2 are told to PASS unless the plan or change violates safety/security (secret or identifier exposure, unauthorized external side effect, destructive action, off-limits access, bypassed control); everything else is a low/medium finding on a PASS. They are told not to require a git repository or diff. Only the prompt carries this; the verdict stays the model's and the Harness does not override it. **Tiers** (same date): the Planner marks each acceptance criterion `[必要]` (essential) or `[建議]` (hardening) up front; G1 gates only `[必要]` and safety, and after the plan was revised once it rejects only for `security`. What G1 notices beyond that is returned as findings with severity `defer…` (or low/medium on a PASS); the Harness collects them (`deferred_findings`, max 12) and hands them to the Developer and G2 as a `deferred-notes` context item, which G2 must not reject over. Plan revisions fix only blocking findings and may not add scope. All prompt/convention based; no schema change.
 
