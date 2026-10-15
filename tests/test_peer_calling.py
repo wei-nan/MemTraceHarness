@@ -270,6 +270,23 @@ class EndToEndTests(TestCase):
         self.assertIn("peer unreachable", text)
         self.assertIn("no such peer configured", text)
 
+    def test_a_slow_peer_is_polled_not_held_open_past_the_call_timeout(self) -> None:
+        sent = []
+        task = {"id": "t1", "status": {"state": "TASK_STATE_WORKING"}}
+        done = {"id": "t1", "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": [{"parts": [{"text": "答覆"}]}]}
+
+        def rpc(method, params):
+            sent.append((method, params))
+            return {"task": task} if method == "SendMessage" else done
+
+        client = PeerClient(OutboundPeer("beri", "http://127.0.0.1:1", "t"), sleep=lambda s: None)
+        with patch.object(client, "_rpc", side_effect=rpc):
+            self.assertEqual(client.ask("q", "c", 0, "collaborate"), ("completed", "答覆", None))
+        # The peer would otherwise block SendMessage for up to 50s, past the client's 30s timeout.
+        self.assertEqual(sent[0][0], "SendMessage")
+        self.assertTrue(sent[0][1]["configuration"]["returnImmediately"])
+        self.assertEqual(sent[1][0], "GetTask")
+
     def test_a_peer_that_redirects_is_not_followed(self) -> None:
         client = PeerClient(OutboundPeer("beri", "http://127.0.0.1:1", "t"))
         with patch("memtrace_services.a2a.client._OPENER.open", side_effect=urllib.error.HTTPError("u", 302, "Found", {}, None)):

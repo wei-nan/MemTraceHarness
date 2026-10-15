@@ -262,6 +262,13 @@ project-owned loops" in `operating-contract.md`.
 - **Cost.** Stage-aware features (resume past settled stages, stage detail in approvals, status-page progress)
   need the Harness to know the stages; a project loop may emit checkpoints and `needs_human`, otherwise it is a
   black box.
+- **Missing tools.** A project that cannot do a step reports `MISSING_TOOL: <name>`, asks the operator for a tap,
+  then asks the Harness that has the machine over A2A. That Harness inventories read-only (PATH and fixed
+  places; a credentials file is reported present or absent, never read). Absent: it gives the operator the
+  install command and does not install anything that reaches a cluster, the system or credentials. Present: it
+  proposes a named bounded job (a second tap, exact command and context shown) that the Harness runs itself, so
+  no agent receives the binary's path or credentials. Destructive or exposing verbs are never made standing.
+  Contract text: "A project that finds a tool missing asks the Harness that has the machine".
 - **Today's code that maps onto it:** the git-status safety net on read-only calls, the per-job command-hash
   allowlist, capability install consent, per-task worktrees, `verify_command`. Missing: declared scope and its diff
   check, the secret scan, redaction before writes, the tool declaration and confirmation card.
