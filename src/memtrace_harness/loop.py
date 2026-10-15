@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness import stage_skills
+from memtrace_harness import final_gate
 from memtrace_harness import verification as verify_result
 from memtrace_harness.goal_plan import (
     MAX_CRITERIA,
@@ -78,6 +79,7 @@ class AgentLoopRunner:
         config: "HarnessConfig | None" = None,
         agent_loop_enabled: bool = True,
         loop_mode: str = "full",
+        off_limits: list[str] | None = None,
         alert_callback: Callable[[str], None] | None = None,
         worktree: TaskWorktree | None = None,
         worktree_manager: WorktreeManager | None = None,
@@ -141,6 +143,7 @@ class AgentLoopRunner:
         # back to the Developer. Only a failure the task itself caused is sent back, once.
         self.loop_mode = "lean" if loop_mode == "lean" else "full"
         self._baseline_verification: dict[str, Any] | None = None
+        self.off_limits = list(off_limits or [])
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -389,6 +392,9 @@ class AgentLoopRunner:
                         )
                     phases[done:] = revised
 
+            blocked = self._final_gate(task, trace_id, stages, phases, writeback=writeback)
+            if blocked is not None:
+                return blocked
             integration = self._prepare_integration(task)
             can_revise = len(phases) < MAX_PHASES
             converge_actions = {"finish", "ask_human"} | (
@@ -1316,6 +1322,55 @@ class AgentLoopRunner:
             "stderr_tail": stderr[-4_000:],
         }
 
+    def _final_gate(
+        self,
+        task: TaskEnvelope,
+        trace_id: str,
+        stages: list[LoopStageResult],
+        phases: list[Phase],
+        *,
+        writeback: bool,
+    ) -> LoopSummary | None:
+        """The final gate (final_gate.py), run by code once the work is done: off-limits and outside-the-folder
+        writes, files outside the paths the Controller declared, secrets in what was added. Returns the persisted
+        stop, or None to go on."""
+        directory = self.working_directory
+        if directory is None:
+            return None
+        reported = [
+            str(name)
+            for result in stages
+            if "develop" in result.stage and isinstance(result.artifact, dict)
+            for name in result.artifact.get("changed_files") or []
+        ]
+        changes = None
+        if self.worktree is not None and self.worktree.base_commit:
+            changes = final_gate.collect_git_changes(Path(directory), self.worktree.base_commit)
+        if changes is None:
+            if not reported:
+                return None
+            changes = final_gate.collect_reported_changes(Path(directory), reported)
+        developing = [phase for phase in phases if "develop" in phase.skills]
+        declared = (
+            [path for phase in developing for path in phase.paths]
+            if developing and all(phase.paths for phase in developing) else None
+        )
+        result = final_gate.check(changes, directory=Path(directory), off_limits=self.off_limits, declared_paths=declared)
+        if not changes.files:
+            return None
+        artifact = result.to_dict()
+        self._record_harness_stage(
+            stages=stages, trace_id=trace_id, stage="final-gate", profile_id="review",
+            verification={"command": "final-gate", "exit_code": 1 if result.blocked else 0, "duration_seconds": 0},
+            artifact=artifact,
+        )
+        if result.blocked and not final_gate.waived(task.goal, result):
+            return self._persist(
+                self._summary(task, trace_id, stages, "needs_human", final_gate.summary_text(result)),
+                writeback=writeback,
+            )
+        return None
+
     def _verify(self) -> dict[str, Any] | None:
         """The verify_command result, classified (see verification.py). When it fails in a task worktree, the same
         command is run once on the main checkout, so a failure the base already has is not charged to the task."""
@@ -1762,6 +1817,9 @@ _GOAL_PLAN_START = (
     "distinct thing they asked for. `phases` (at most "
     f"{MAX_PHASES}) are the ordered steps that get there. Each phase lists the skills it needs: [\"plan\"], "
     "[\"develop\"] or [\"plan\", \"develop\"], with a title, a purpose and its own acceptance conditions. "
+    "Each phase also lists `paths`: the files or folders (globs allowed, relative to the project folder) it is "
+    "expected to change, as narrowly as you honestly can; the harness stops the task if a change lands outside "
+    "every declared path. Use an empty list only when you cannot tell. "
     "Review is never listed: every plan is reviewed (G1) and every development is reviewed (G2) automatically. "
     "Default to ONE phase: [\"plan\", \"develop\"] for ordinary work, or [\"develop\"] alone for a small, clear "
     "change that needs no plan, and keep every part of the request in that one phase. Every extra phase costs a "

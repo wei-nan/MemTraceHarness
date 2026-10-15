@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 from dataclasses import replace
+from memtrace_harness.final_gate import WAIVER_PREFIX
 import json
 from pathlib import Path
 import sqlite3
@@ -682,6 +683,58 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "needs_human")
         self.assertEqual(len(adapters["develop"].calls), 2)
         self.assertEqual(len(adapters["review"].calls), 0)
+
+    def _gate_runner(self, adapters, files, *, loop_mode="lean", off_limits=None):
+        work = self.root / "gatework"
+        work.mkdir(exist_ok=True)
+        for name, text in files.items():
+            (work / name).parent.mkdir(parents=True, exist_ok=True)
+            (work / name).write_text(text)
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high",
+            [{**completed_development(), "changed_files": list(files)}],
+        )
+        return AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path), working_directory=work,
+            loop_mode=loop_mode, off_limits=off_limits,
+        )
+
+    def test_final_gate_stops_a_task_whose_change_carries_a_secret_and_a_waiver_releases_it(self) -> None:
+        key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        files = {"src/example.py": f"KEY = '{key}'\n"}
+        summary = self._gate_runner(self._adapters(), files).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("final-gate", [stage.stage for stage in summary.stages])
+        self.assertIn("最終 gate", summary.recommendation)
+        self.assertNotIn(key, summary.recommendation)
+        fingerprint = next(s for s in summary.stages if s.stage == "final-gate").artifact["fingerprint"]
+
+        waived = replace(self.task, goal=f"{self.task.goal}\n{WAIVER_PREFIX}{fingerprint}")
+        again = self._gate_runner(self._adapters(), files).run(waived)
+        self.assertEqual(again.status, "succeeded")
+
+    def test_final_gate_blocks_off_limits_files_even_when_the_loop_is_lean(self) -> None:
+        summary = self._gate_runner(
+            self._adapters(), {"private/notes.txt": "x"}, off_limits=["private/"]
+        ).run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("off-limits", summary.recommendation)
+
+    def test_final_gate_checks_the_paths_the_controller_declared(self) -> None:
+        adapters = self._adapters()
+        plan = {
+            "restated_goal": "x", "success_criteria": ["done"],
+            "phases": [{"title": "t", "purpose": "p", "skills": ["develop"], "acceptance": [], "paths": ["src/"]}],
+        }
+        adapters["controller"] = QueueAdapter(
+            "controller", "codex", "gpt-5.6-luna",
+            [{"action": "run_planner", "reason": "r", "goal_plan": plan}, {"action": "finish", "reason": "ok"}],
+        )
+        summary = self._gate_runner(adapters, {"src/a.py": "1", "docs/b.md": "2"}).run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("docs/b.md", summary.recommendation)
+        self.assertNotIn("src/a.py", summary.recommendation)
 
     def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
         self,

@@ -225,13 +225,22 @@
                   "type": "string",
                   "maxLength": 600
                 }
+              },
+              "paths": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                }
               }
             },
             "required": [
               "title",
               "purpose",
               "skills",
-              "acceptance"
+              "acceptance",
+              "paths"
             ],
             "additionalProperties": false
           }
@@ -342,13 +351,22 @@
               "type": "string",
               "maxLength": 600
             }
+          },
+          "paths": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "string",
+              "maxLength": 200
+            }
           }
         },
         "required": [
           "title",
           "purpose",
           "skills",
-          "acceptance"
+          "acceptance",
+          "paths"
         ],
         "additionalProperties": false
       }
