@@ -246,7 +246,7 @@ is what runs today and stays so until each piece ships. The contract section is 
 project-owned loops" in `operating-contract.md`.
 
 **Built 2026-10-15:** verification classified as passed / could_not_run / baseline_failing / regression (only a
-regression sends work back), and per-project `loop_mode: lean` (develop + verification, no plan/G1/G2). The rest
+regression sends work back), and `loop_mode: lean`, now the default for every project (develop + verification, no plan/G1/G2). The rest
 below is still planned. Details: "ENFORCED (2026-10-15)" in `operating-contract.md`.
 
 - **Split.** The Harness owns a safety envelope and dispatch; a project owns the shape of its loop, in its own

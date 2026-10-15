@@ -160,7 +160,7 @@ now; the tool gate, secret scan and declared-scope diff are still PLANNED.
   there) or `regression` (a failure the base does not have, or one that cannot be told apart from it). Only a
   `regression` sends work back. The others are recorded and shown to the Developer, G2 and the operator, and are
   never charged to the task.
-- `loop_mode: lean` in a project's `harness-scope.md` (default `full`, today's loop): the Harness adds no plan,
+- `loop_mode: lean` in a project's `harness-scope.md` (default since 2026-10-15; `full` is the older plan/G1/develop/G2 loop, opt-in): the Harness adds no plan,
   G1 or G2. A phase is develop, then the verification; a regression goes back to the Developer once, a second
   one stops the task as `needs_human`; anything else proceeds, and the Controller's converge step sees the
   recorded `verify` stage. The Controller is told to assign `develop` only.

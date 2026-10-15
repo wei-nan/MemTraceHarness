@@ -3993,7 +3993,7 @@ class HarnessService:
                     worktree_manager=self._worktree_manager() if worktree else None,
                     repo_root=matching_scope.working_directory if worktree and matching_scope else None,
                     edit_lock=(
-                    loop_mode=matching_scope.loop_mode if matching_scope else "full",
+                    loop_mode=matching_scope.loop_mode if matching_scope else "lean",
                         self._edit_lock_for(matching_scope, req_data.conversation_id, worktree, trace_store)
                         if matching_scope is not None
                         else None
