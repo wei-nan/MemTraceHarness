@@ -164,6 +164,23 @@ now; the tool gate, secret scan and declared-scope diff are still PLANNED.
   G1 or G2. A phase is develop, then the verification; a regression goes back to the Developer once, a second
   one stops the task as `needs_human`; anything else proceeds, and the Controller's converge step sees the
   recorded `verify` stage. The Controller is told to assign `develop` only.
+- **Final gate, first step (ENFORCED 2026-10-15, `final_gate.py`).** After the last phase and before the
+  Controller's converge step, the Harness checks what changed, by code, in every `loop_mode`:
+  - *Boundary* (stops the task): a file outside the working folder, the Harness's own files (`.harness`,
+    `.harness.env`), `.env*` (not `.env.example`), key files, or anything in the project's `off_limits`.
+  - *Scope* (stops the task): the Controller gives each `develop` phase `paths` (files or folders, globs allowed).
+    When every develop phase declared some, a change outside all of them stops the task; when any phase declared
+    none, only the boundary applies.
+  - *Secrets* (stop): private keys and common token formats in added lines. *Personal-data formats* (Taiwan ID and
+    mobile numbers) only warn. Excerpts are masked in every message and trace.
+  - *Source of the change:* with a task worktree, git (the diff against the starting commit plus new files, with
+    line numbers). Without git, or when a project is edited in place (a diff there would include the operator's own
+    uncommitted work), only the files the Developer reported are checked; a file changed but not reported is not
+    seen.
+  - A stop is `needs_human` with the exact findings and a fingerprint of those findings and contents. The operator
+    waives it by answering `放行 gate <fingerprint>`; any change to the content needs a new waiver. A model can add a
+    finding and cannot clear one. Still PLANNED: the tool check (a script, job, skill, MCP or loop definition needs
+    a content-hash confirmation), redaction before trace/MemTrace writes, entropy-based secret detection.
 - A fresh task worktree can be made usable by the project's `worktree_setup_command` (in `harness-scope.md`, or per
   repo in `.harness/repos.toml`), e.g. copying a gitignored `local.properties`; `HARNESS_REPO_ROOT` is the main
   checkout.

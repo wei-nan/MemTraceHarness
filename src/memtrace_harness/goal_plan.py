@@ -24,6 +24,7 @@ from typing import Any
 MAX_PHASES = 6
 MAX_CRITERIA = 8
 MAX_TEXT = 600
+MAX_PATHS = 20
 PHASE_SKILL_SETS = (("plan", "develop"), ("plan",), ("develop",))
 CHECK_VERDICTS = ("met", "partly_met", "not_met")
 CRITERION_STATES = ("met", "unmet", "unverified")
@@ -35,6 +36,9 @@ class Phase:
     purpose: str
     skills: tuple[str, ...]
     acceptance: tuple[str, ...] = ()
+    # Files or folders (globs allowed, relative to the project folder) this phase is expected to change. The final
+    # gate stops the task when a change lands outside every declared path; empty = the Controller declared none.
+    paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +46,7 @@ class Phase:
             "purpose": self.purpose,
             "skills": list(self.skills),
             "acceptance": list(self.acceptance),
+            "paths": list(self.paths),
         }
 
 
@@ -95,11 +100,12 @@ def parse_phases(value: Any, *, limit: int = MAX_PHASES) -> tuple[Phase, ...] | 
         title, purpose = _text(raw.get("title"), 120), _text(raw.get("purpose"))
         skills = raw.get("skills")
         acceptance = _text_list(raw.get("acceptance", []), 6)
-        if not title or not purpose or acceptance is None:
+        paths = _text_list(raw.get("paths", []), MAX_PATHS, 200)
+        if not title or not purpose or acceptance is None or paths is None:
             return None
         if not isinstance(skills, list) or tuple(skills) not in PHASE_SKILL_SETS:
             return None
-        phases.append(Phase(title=title, purpose=purpose, skills=tuple(skills), acceptance=acceptance))
+        phases.append(Phase(title=title, purpose=purpose, skills=tuple(skills), acceptance=acceptance, paths=paths))
     return tuple(phases)
 
 
