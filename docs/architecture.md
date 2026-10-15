@@ -245,6 +245,10 @@ Direction decided 2026-10-14; **PLANNED**, nothing here is built. The role-profi
 is what runs today and stays so until each piece ships. The contract section is "Safety envelope and
 project-owned loops" in `operating-contract.md`.
 
+**Built 2026-10-15:** verification classified as passed / could_not_run / baseline_failing / regression (only a
+regression sends work back), and per-project `loop_mode: lean` (develop + verification, no plan/G1/G2). The rest
+below is still planned. Details: "ENFORCED (2026-10-15)" in `operating-contract.md`.
+
 - **Split.** The Harness owns a safety envelope and dispatch; a project owns the shape of its loop, in its own
   repository, in the form its CLIs already load (`AGENTS.md`, `CLAUDE.md`, skills). The Harness sees diff, trace
   and declared permissions, not the stages in between.

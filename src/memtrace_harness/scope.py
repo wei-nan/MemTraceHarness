@@ -138,6 +138,9 @@ class ProjectScope:
     verify_timeout_seconds: int | None = None
     github_repo: str | None = None
     agent_loop_enabled: bool = True
+    # "full" (default): the Controller's plan/G1/develop/G2 loop. "lean": develop, then the verify_command's
+    # result handed back to the Developer; no Harness plan or review stage (docs/operating-contract.md).
+    loop_mode: str = "full"
     # How many tasks of this project may run at once. Each runs in its own git
     # worktree; 1 keeps the old one-task-at-a-time behavior, editing the checkout in
     # place. A project that is not a git repository always runs one task at a time.
@@ -269,6 +272,9 @@ class ProjectScope:
         agent_loop_str = _extract_field(content, "agent_loop")
         agent_loop_enabled = (agent_loop_str or "").strip().lower() != "disabled"
 
+        loop_mode = (_extract_field(content, "loop_mode") or "full").strip().lower()
+        loop_mode = loop_mode if loop_mode in {"full", "lean"} else "full"
+
         max_workers_str = _extract_field(content, "max_workers", "worker_slots")
         max_workers = (
             max(1, int(max_workers_str))
@@ -305,6 +311,7 @@ class ProjectScope:
             verify_timeout_seconds=verify_timeout_seconds,
             github_repo=github_repo,
             agent_loop_enabled=agent_loop_enabled,
+            loop_mode=loop_mode,
             max_workers=max_workers,
             worktree_setup_command=worktree_setup_command,
             probe_hosts=[h.lower() for h in probe_hosts],

@@ -151,6 +151,23 @@ The Harness never inserts a review, plan or test-gating stage into the first row
 to the project's loop and the operator; whether a failing test blocks progress is the project's choice, not a
 Harness gate.
 
+**ENFORCED (2026-10-15): verification is information, and `loop_mode: lean`.** Two parts of the above are in code
+now; the tool gate, secret scan and declared-scope diff are still PLANNED.
+
+- `verify_command` is run by the Harness and its result is classified (`verification.py`): `passed`,
+  `could_not_run` (a `MISSING_TOOL:` line, exit 127, "SDK location not found", a timeout), `baseline_failing`
+  (in a task worktree the same command is run once on the main checkout; failing only tests that already fail
+  there) or `regression` (a failure the base does not have, or one that cannot be told apart from it). Only a
+  `regression` sends work back. The others are recorded and shown to the Developer, G2 and the operator, and are
+  never charged to the task.
+- `loop_mode: lean` in a project's `harness-scope.md` (default `full`, today's loop): the Harness adds no plan,
+  G1 or G2. A phase is develop, then the verification; a regression goes back to the Developer once, a second
+  one stops the task as `needs_human`; anything else proceeds, and the Controller's converge step sees the
+  recorded `verify` stage. The Controller is told to assign `develop` only.
+- A fresh task worktree can be made usable by the project's `worktree_setup_command` (in `harness-scope.md`, or per
+  repo in `.harness/repos.toml`), e.g. copying a gitignored `local.properties`; `HARNESS_REPO_ROOT` is the main
+  checkout.
+
 - The tool declares what it reads, writes and connects to. The operator is shown the diff and that
   declaration, never only the model's summary.
 - Approval is bound to a hash of the content. Any change voids it and asks again, as the per-job command

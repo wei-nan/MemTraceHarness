@@ -10,6 +10,7 @@ import time
 from typing import Any, Callable, TYPE_CHECKING
 
 from memtrace_harness import stage_skills
+from memtrace_harness import verification as verify_result
 from memtrace_harness.goal_plan import (
     MAX_CRITERIA,
     MAX_PHASES,
@@ -76,6 +77,7 @@ class AgentLoopRunner:
         verify_timeout_seconds: int = 1200,
         config: "HarnessConfig | None" = None,
         agent_loop_enabled: bool = True,
+        loop_mode: str = "full",
         alert_callback: Callable[[str], None] | None = None,
         worktree: TaskWorktree | None = None,
         worktree_manager: WorktreeManager | None = None,
@@ -134,6 +136,11 @@ class AgentLoopRunner:
         # Controller picks it anyway) enforce this, same fail-closed shape as every
         # other hard boundary in this file.
         self.agent_loop_enabled = agent_loop_enabled
+        # "full": the plan/G1/develop/G2 loop the Controller assigns. "lean" (harness-scope.md `loop_mode: lean`):
+        # the Harness adds no plan or review stage; a phase is develop, then the project's verify_command read
+        # back to the Developer. Only a failure the task itself caused is sent back, once.
+        self.loop_mode = "lean" if loop_mode == "lean" else "full"
+        self._baseline_verification: dict[str, Any] | None = None
         self._conversation_id: str | None = None
         self._active_checkpoint_id: str | None = None
         self._validate_adapters()
@@ -229,6 +236,7 @@ class AgentLoopRunner:
                 stage="start",
                 stages=stages,
                 agent_loop_enabled=self.agent_loop_enabled,
+                loop_mode=self.loop_mode,
                 previous_goal_plan=previous_goal_plan,
             ),
             trace_id=trace_id,
@@ -522,7 +530,7 @@ class AgentLoopRunner:
         and G2). None when the phase settled; otherwise the persisted summary that ends the whole run."""
         phase_items = phase_context_items(phase, index, total_phases, stages)
         g1_artifacts: list[dict[str, Any] | None] = []
-        if "plan" in phase.skills:
+        if "plan" in phase.skills and self.loop_mode != "lean":
             reused_plan = reconstructed.get((index, "plan"))
             if reused_plan is not None:
                 plan = reused_plan
@@ -707,6 +715,11 @@ class AgentLoopRunner:
                     ),
                     writeback=writeback,
                 )
+        if self.loop_mode == "lean":
+            return self._lean_verify(
+                task=task, trace_id=trace_id, stages=stages, writeback=writeback, index=index,
+                plan_artifact=plan_artifact, development=development,
+            )
         # A developer-reported "needs_human"/"failed" status is not itself a reason to
         # stop and page a human — G2 is the reviewer built to catch exactly the gaps a
         # developer would flag (missing compile evidence, self-expanded scope, etc.)
@@ -719,8 +732,8 @@ class AgentLoopRunner:
             g2 = reused_g2
             g2_verdict = "PASS"
         else:
-            verification = self._run_deterministic_verification()
-            if verification is not None and not verification["passed"]:
+            verification = self._verify()
+            if verification is not None and verification["status"] in verify_result.BLOCKING:
                 g2 = self._deterministic_reject_result(
                     stages=stages,
                     trace_id=trace_id,
@@ -777,8 +790,8 @@ class AgentLoopRunner:
                 # Same reasoning as the first Developer stage above: a "needs_human"/
                 # "failed" revision still goes to the g2-recheck below rather than an
                 # immediate human stop — the recheck's own verdict is what's final here.
-                recheck_verification = self._run_deterministic_verification()
-                if recheck_verification is not None and not recheck_verification["passed"]:
+                recheck_verification = self._verify()
+                if recheck_verification is not None and recheck_verification["status"] in verify_result.BLOCKING:
                     g2 = self._deterministic_reject_result(
                         stages=stages,
                         trace_id=trace_id,
@@ -1263,7 +1276,7 @@ class AgentLoopRunner:
             )
         return found
 
-    def _run_deterministic_verification(self) -> dict[str, Any] | None:
+    def _run_deterministic_verification(self, directory: Path | None = None) -> dict[str, Any] | None:
         """Ground G2's review in a real build/test result instead of relying solely
         on the Developer's own self-reported evidence. A model claiming "I compiled
         this" (or a model that couldn't get tool permission to try) is not the same
@@ -1272,14 +1285,15 @@ class AgentLoopRunner:
         Returns None (no gating imposed) if this project has no verify_command
         configured; otherwise runs it directly via the harness, not the model, so its
         exit code is a hard precondition, not something an LLM can talk its way past."""
-        if not self.verify_command or not self.working_directory:
+        directory = directory or self.working_directory
+        if not self.verify_command or not directory:
             return None
         started = time.monotonic()
         timed_out = False
         try:
             completed = subprocess.run(
                 ["/bin/sh", "-c", self.verify_command],
-                cwd=self.working_directory,
+                cwd=directory,
                 capture_output=True,
                 text=True,
                 timeout=self.verify_timeout_seconds,
@@ -1302,6 +1316,87 @@ class AgentLoopRunner:
             "stderr_tail": stderr[-4_000:],
         }
 
+    def _verify(self) -> dict[str, Any] | None:
+        """The verify_command result, classified (see verification.py). When it fails in a task worktree, the same
+        command is run once on the main checkout, so a failure the base already has is not charged to the task."""
+        result = self._run_deterministic_verification()
+        if result is None:
+            return None
+        baseline = None
+        if (
+            not result["passed"]
+            and not verify_result.could_not_run(result)
+            and self.repo_root is not None
+            and self.working_directory is not None
+            and Path(self.repo_root).resolve() != Path(self.working_directory).resolve()
+        ):
+            if self._baseline_verification is None:
+                self._baseline_verification = self._run_deterministic_verification(Path(self.repo_root))
+            baseline = self._baseline_verification
+        return verify_result.classify(result, baseline)
+
+    def _verification_stage(
+        self, *, stages: list[LoopStageResult], trace_id: str, stage: str, verification: dict[str, Any]
+    ) -> LoopStageResult:
+        """Record a lean-mode verification as a stage: REJECT for a regression, otherwise PASS with the plain
+        description as a finding, so the Controller's converge step and the operator can see it."""
+        blocking = verification["status"] in verify_result.BLOCKING
+        artifact = {
+            "verdict": "REJECT" if blocking else "PASS",
+            "reason_code": "test_gap" if blocking else "none",
+            "findings": [{"description": verify_result.describe(verification)}],
+            "unverified_items": [],
+            "confidence": 1.0,
+            "verification_status": verification["status"],
+        }
+        return self._record_harness_stage(stages=stages, trace_id=trace_id, stage=stage, profile_id="review",
+                                          verification=verification, artifact=artifact)
+
+    def _lean_verify(
+        self,
+        *,
+        task: TaskEnvelope,
+        trace_id: str,
+        stages: list[LoopStageResult],
+        writeback: bool,
+        index: int,
+        plan_artifact: dict[str, Any],
+        development: LoopStageResult,
+    ) -> LoopSummary | None:
+        """Lean mode, after develop: run the project's verify_command and tell the Developer what it found. No
+        model reviews the change. A regression goes back to the Developer once; a second one stops the task for a
+        person. A command that could not run, or a failure the base already has, is recorded and the work goes on."""
+        verification = self._verify()
+        if verification is None:
+            return None
+        result = self._verification_stage(
+            stages=stages, trace_id=trace_id, stage=self._stage(index, "verify"), verification=verification
+        )
+        if verification["status"] not in verify_result.BLOCKING:
+            return None
+        development = self._execute(
+            task=developer_revision_task(task, plan_artifact, development.artifact or {}, result.artifact or {}),
+            trace_id=trace_id,
+            stages=stages,
+            stage=self._stage(index, "develop-revision"),
+            profile_id="develop",
+        )
+        stopped = self._stop_after_execution(task, trace_id, stages, development)
+        if stopped:
+            return self._persist(stopped, writeback=writeback)
+        recheck = self._verify()
+        if recheck is None:
+            return None
+        again = self._verification_stage(
+            stages=stages, trace_id=trace_id, stage=self._stage(index, "verify-recheck"), verification=recheck
+        )
+        if recheck["status"] in verify_result.BLOCKING:
+            return self._persist(
+                self._summary(task, trace_id, stages, "needs_human", summarize_gate_artifact("Verification", again.artifact)),
+                writeback=writeback,
+            )
+        return None
+
     def _deterministic_reject_result(
         self,
         *,
@@ -1316,26 +1411,35 @@ class AgentLoopRunner:
         REJECT->developer_revision_task machinery unchanged: this only needs to look
         like a normal gate artifact to the rest of run(), not literally be a model
         response."""
-        detail = verification.get("stderr_tail") or verification.get("stdout_tail") or ""
-        reason = (
-            "Verification command timed out"
-            if verification.get("timed_out")
-            else f"Verification command exited {verification.get('exit_code')}"
-        )
         artifact = {
             "verdict": "REJECT",
             "reason_code": "test_gap",
             "findings": [
                 {
                     "description": (
-                        f"Deterministic verification failed before G2 review — "
-                        f"{reason}. Command: {verification.get('command')}\n{detail}"
+                        "Deterministic verification failed before G2 review — "
+                        + verify_result.describe(verification)
                     )
                 }
             ],
             "unverified_items": [],
             "confidence": 1.0,
         }
+        return self._record_harness_stage(
+            stages=stages, trace_id=trace_id, stage=stage, profile_id=profile_id,
+            verification=verification, artifact=artifact,
+        )
+
+    def _record_harness_stage(
+        self,
+        *,
+        stages: list[LoopStageResult],
+        trace_id: str,
+        stage: str,
+        profile_id: str,
+        verification: dict[str, Any],
+        artifact: dict[str, Any],
+    ) -> LoopStageResult:
         now = utc_now_iso()
         execution = CliExecution(
             provider="harness",
@@ -1695,16 +1799,27 @@ _GOAL_CHECK_CONVERGE = (
 )
 
 
+# This project's harness-scope.md says `loop_mode: lean`.
+_LEAN_NOTICE = (
+    "This project runs lean: the harness adds no plan or review stage. Give every phase `develop` only (no `plan`); "
+    "the harness runs the project's verify_command after each develop and hands the Developer what it found. "
+    "Put what must hold in each phase's acceptance list.\n"
+)
+
+
 def _goal_plan_notice(
     stage: str,
     agent_loop_enabled: bool,
     goal_plan: GoalPlan | None,
     previous_goal_plan: GoalPlan | None,
+    loop_mode: str = "full",
 ) -> str:
     if stage == "start":
         if not agent_loop_enabled:
             return "\n`goal_plan`, `goal_check` and `phases` must be null at this stage.\n"
         notice = "\n" + _GOAL_PLAN_START.replace("{catalog}", stage_skills.catalog())
+        if loop_mode == "lean":
+            notice += _LEAN_NOTICE
         return notice + (_GOAL_PLAN_KEPT if previous_goal_plan is not None else "")
     derive = ""
     if goal_plan is None or not goal_plan.success_criteria:
@@ -1740,6 +1855,7 @@ def controller_task(
     stage: str,
     stages: list[LoopStageResult],
     agent_loop_enabled: bool = True,
+    loop_mode: str = "full",
     integration: IntegrationReport | None = None,
     goal_plan: GoalPlan | None = None,
     previous_goal_plan: GoalPlan | None = None,
@@ -1867,7 +1983,7 @@ def controller_task(
         if stage == "converge"
         else "\nkb_updates must be null at this stage.\n"
     )
-    goal_notice = _goal_plan_notice(stage, agent_loop_enabled, goal_plan, previous_goal_plan)
+    goal_notice = _goal_plan_notice(stage, agent_loop_enabled, goal_plan, previous_goal_plan, loop_mode)
     return stage_task(
         task,
         suffix=f"controller-{stage}",
@@ -2147,6 +2263,7 @@ def gate_task(
                 verification,
             )
         )
+        status = verification.get("status", verify_result.PASSED)
         verification_note = (
             "\nA deterministic build/test command was already run by the harness "
             "itself (see the 'deterministic-verification' context item) and passed "
@@ -2154,6 +2271,12 @@ def gate_task(
             "any conflicting claim in the evidence about whether it compiles/tests "
             "clean, but it does not substitute for reviewing scope, correctness, or "
             "quality."
+            if status == verify_result.PASSED
+            else "\nThe harness ran the project's build/test command (see the 'deterministic-verification' "
+            "context item, whose `status` says "
+            f"'{status}'). That is the environment or a failure the base checkout already has, not something "
+            "this change caused: do NOT reject over it, and do not ask the Developer to fix it. Review "
+            "scope, correctness and quality as usual."
         )
     return stage_task(
         task,

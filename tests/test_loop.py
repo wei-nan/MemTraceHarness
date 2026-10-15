@@ -607,6 +607,82 @@ class AgentLoopRunnerTests(TestCase):
         self.assertEqual(summary.status, "succeeded")
         self.assertEqual(len(adapters["review"].calls), 2)
 
+    def _verify_runner(self, adapters, command, *, loop_mode="full", extra=False):
+        base = self.root / "base"
+        work = self.root / "work"
+        base.mkdir(exist_ok=True)
+        work.mkdir(exist_ok=True)
+        if extra:
+            (work / "extra").write_text("x")
+        return AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+            working_directory=work,
+            repo_root=base,
+            verify_command=command,
+            loop_mode=loop_mode,
+        )
+
+    def test_verification_that_could_not_run_is_reported_not_made_a_reject(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, 'echo "MISSING_TOOL: java"; exit 1').run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["develop"].calls), 1)
+        self.assertNotIn("develop-revision", [stage.stage for stage in summary.stages])
+        self.assertEqual(len(adapters["review"].calls), 2)  # G2's model still reviews
+
+    def test_a_failure_the_base_checkout_already_has_does_not_block(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, 'echo "Foo > old FAILED"; exit 1').run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["develop"].calls), 1)
+
+    def test_a_new_failure_beyond_the_base_still_forces_a_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high", [completed_development(), completed_development()]
+        )
+        command = 'echo "Foo > old FAILED"; if [ -f extra ]; then echo "Foo > new FAILED"; fi; exit 1'
+        summary = self._verify_runner(adapters, command, extra=True).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertEqual(len(adapters["develop"].calls), 2)
+        self.assertIn("Foo > new", summary.recommendation)
+
+    def test_lean_mode_runs_develop_and_verification_with_no_plan_or_review_stage(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, "exit 0", loop_mode="lean").run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["plan"].calls), 0)
+        self.assertEqual(len(adapters["review"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 1)
+        names = [stage.stage for stage in summary.stages]
+        self.assertIn("verify", names)
+        self.assertNotIn("g1", names)
+        self.assertNotIn("g2", names)
+
+    def test_lean_mode_does_not_stop_for_an_environment_or_baseline_failure(self) -> None:
+        for command in ('echo "MISSING_TOOL: java"; exit 1', 'echo "Foo > old FAILED"; exit 1'):
+            adapters = self._adapters()
+            summary = self._verify_runner(adapters, command, loop_mode="lean").run(self.task)
+            self.assertEqual(summary.status, "succeeded", command)
+            self.assertEqual(len(adapters["develop"].calls), 1)
+
+    def test_lean_mode_sends_a_new_failure_back_once_then_stops(self) -> None:
+        adapters = self._adapters()
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high", [completed_development(), completed_development()]
+        )
+        command = 'if [ -f extra ]; then echo "Foo > new FAILED"; exit 1; fi'
+        summary = self._verify_runner(adapters, command, loop_mode="lean", extra=True).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertEqual(len(adapters["develop"].calls), 2)
+        self.assertEqual(len(adapters["review"].calls), 0)
+
     def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
         self,
     ) -> None:
