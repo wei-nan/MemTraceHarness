@@ -68,6 +68,41 @@ class ReportedChangesTests(TestCase):
         self.assertFalse(self.run_check(["src/a.py"], declared_paths=["src/**"]).blocked)
         self.assertFalse(self.run_check(["src/a.py"], declared_paths=["src/a.py"]).blocked)
 
+    def test_globstar_matching_zero_and_multiple_directory_levels(self) -> None:
+        self.assertTrue(fg._matches("tests/test_memory_audit.py", "tests/**/*.py"))
+        self.assertTrue(fg._matches("tests/sub/test_memory_audit.py", "tests/**/*.py"))
+        self.assertTrue(fg._matches("tests/a/b/c/test_memory_audit.py", "tests/**/*.py"))
+        self.assertFalse(fg._matches("tests/test_memory_audit.txt", "tests/**/*.py"))
+        self.assertFalse(fg._matches("other/tests/test_memory_audit.py", "tests/**/*.py"))
+        self.assertTrue(fg._matches("test.py", "**/*.py"))
+        self.assertTrue(fg._matches("tests/test.py", "**/*.py"))
+        self.assertTrue(fg._matches("src/a.py", "src/**"))
+        self.assertTrue(fg._matches("src/sub/a.py", "src/**"))
+        self.assertTrue(fg._matches("src", "src/**"))
+        self.assertFalse(fg._matches("src_extra/a.py", "src/**"))
+        self.assertTrue(fg._matches("a/b/c.py", "a/**/b/**/c.py"))
+        self.assertTrue(fg._matches("a/x/b/y/c.py", "a/**/b/**/c.py"))
+
+    def test_declared_paths_globstar_allows_shallow_and_deep_files(self) -> None:
+        for name in (
+            "tests/test_memory_audit.py",
+            "tests/sub/test_memory_audit.py",
+            "tests/a/b/test_deep.py",
+            "docs/guide.md",
+        ):
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text("x")
+        result = self.run_check(
+            [
+                "tests/test_memory_audit.py",
+                "tests/sub/test_memory_audit.py",
+                "tests/a/b/test_deep.py",
+                "docs/guide.md",
+            ],
+            declared_paths=["tests/**/*.py"],
+        )
+        self.assertEqual([(f.rule, f.path) for f in result.findings], [("scope", "docs/guide.md")])
+
     def test_a_waiver_must_quote_this_exact_result(self) -> None:
         (self.root / "cfg.py").write_text(f"KEY = '{KEY}'\n")
         result = self.run_check(["cfg.py"])
