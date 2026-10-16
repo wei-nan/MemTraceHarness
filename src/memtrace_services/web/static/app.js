@@ -256,11 +256,11 @@ function renderRecallCandidates(project) {
 function renderTopicBriefs(project) {
   var list = project.topic_briefs || [];
   var st = project.recall_state || {};
-  var head = '<div class="section-label">主題簡報（短效期，' + list.length + ' 份有效' +
-    (st.pending ? "，整理中 " + st.pending : "") + ")</div>";
+  var sum = list.length + " 份有效" + (st.pending ? " · 整理中 " + st.pending : "");
   var err = st.last_error ? '<div class="warn">⚠️ 上次背景整理失敗：' + esc(st.last_error) + "</div>" : "";
-  if (!list.length) return head + err + '<div class="empty">（目前沒有有效的主題簡報）</div>';
-  return head + err + list.map(function (b) {
+  var wrap = function (body) { return fold("brief-all:" + project.name, "主題簡報（短效期）", sum, body); };
+  if (!list.length) return wrap(err + '<div class="empty">（目前沒有有效的主題簡報）</div>');
+  return wrap(err + list.map(function (b) {
     var key = "brief:" + project.name + ":" + b.id;
     var related = (b.related || []).map(function (r) {
       return '<div class="evidence-item">' + esc((r.date ? r.date + " " : "") + (r.title || r.node_id)) +
@@ -270,7 +270,7 @@ function renderTopicBriefs(project) {
       esc(b.title) + (b.fresh ? "（全新主題）" : "") + (b.pushed ? " · 已推送" : "") +
       " · 到期 " + esc((b.expires_at || "").slice(0, 16).replace("T", " ")) + "</summary>" +
       '<div class="digest-body">' + esc(b.summary) + related + "</div></details>";
-  }).join("");
+  }).join(""));
 }
 
 function renderDigestCandidates(project) {
@@ -289,16 +289,17 @@ function renderAuditCandidates(project) {
 }
 
 function renderMemoryFeature(project, feature, title, purpose, enabled, chain) {
-  return '<div class="memory-feature"><div class="memory-feature-head"><div>' +
-    '<div class="section-label">' + esc(title) + '</div><div class="hint">主要用途：' + esc(purpose) + '</div></div>' +
+  var brief = { archive: project.archive_candidates, audit: project.audit_candidates, recall: project.recall_candidates }[feature];
+  return fold("model:" + feature + ":" + project.name, esc(title), (enabled ? "啟用 · " : "停用 · ") + chainBrief(brief),
+    '<div class="memory-feature"><div class="memory-feature-head"><div>' +
+    '<div class="hint">主要用途：' + esc(purpose) + '</div></div>' +
     '<label class="memory-feature-toggle"><input type="checkbox" class="memory-feature-enabled" data-project="' +
     esc(project.name) + '" data-feature="' + esc(feature) + '"' + (enabled ? " checked" : "") +
-    '> 啟用</label><span class="memory-feature-status rp-status"></span></div>' + chain + '</div>';
+    '> 啟用</label><span class="memory-feature-status rp-status"></span></div>' + chain + '</div>');
 }
 
 function renderAudit(project) {
   var a = project.audit || {};
-  var head = '<div class="section-label">夜間稽核 · 北極星：' + esc(a.north_star || "") + "</div>";
   var trend = (a.trend || []).map(function (t) {
     return esc(t.date.slice(5)) + " " + (t.friction == null ? "–" : t.friction);
   }).join(" · ");
@@ -308,10 +309,12 @@ function renderAudit(project) {
   var props = (a.open_proposals || []).map(function (p) {
     return '<div class="evidence-item">💡 ' + esc(p.date) + " " + esc(p.text) + "</div>";
   }).join("");
-  return head + (a.latest_assessment ? '<div class="hint">' + esc(a.latest_assessment) + "</div>" : "") +
+  return fold("audit:" + project.name, "夜間稽核", (props ? "有建議等你決定 · " : "") + (a.notes || []).length + " 則校正筆記",
+    '<div class="hint">北極星：' + esc(a.north_star || "") + "</div>" +
+    (a.latest_assessment ? '<div class="hint">' + esc(a.latest_assessment) + "</div>" : "") +
     '<div class="hint">摩擦指數（越低越好）：' + (trend || "尚無資料") + "</div>" +
     '<div class="section-label">生效中的校正筆記</div>' + notes +
-    (props ? '<div class="section-label">等你決定的建議</div>' + props : "");
+    (props ? '<div class="section-label">等你決定的建議</div>' + props : ""), !!props);
 }
 
 function renderRoleProfiles(project) {
@@ -744,8 +747,8 @@ function renderBacklog(project) {
   return '<div class="section-label">Issue 清單 <span class="badge">開啟 ' + b.open + "</span> " +
     '<span class="badge">排隊 ' + queued.length + '</span> <span class="badge">擱置 ' + heldIssues.length + "</span></div>" + held +
     '<div class="muted">上次檢查 ' + esc(sinceText(b.checked_at)) + "；一次只提一張，等你核准後才開工</div>" +
-    (queued.length ? '<div class="muted">排隊（最舊的先提）</div>' + queued.map(function (c) { return line(c); }).join("") : "") +
-    (heldIssues.length ? '<div class="muted">擱置</div>' + heldIssues.map(function (c) { return line(c, c.why); }).join("") : "");
+    (queued.length ? fold("backlog-queued:" + project.name, "排隊（最舊的先提）", queued.length + " 張", queued.map(function (c) { return line(c); }).join("")) : "") +
+    (heldIssues.length ? fold("backlog-held:" + project.name, "擱置", heldIssues.length + " 張", heldIssues.map(function (c) { return line(c, c.why); }).join("")) : "");
 }
 
 var STAGE_LABELS = {
@@ -844,6 +847,28 @@ function detailsOpen(key) {
   return state.openDetails[key] ? " open" : "";
 }
 
+// One section, collapsed to a single readable line (title + short status) until opened, so a page
+// shows what exists first and the detail on demand. `title` and `summary` are already-escaped HTML.
+function fold(key, title, summary, body, defaultOpen) {
+  var open = Object.prototype.hasOwnProperty.call(state.openDetails, key) ? state.openDetails[key] : !!defaultOpen;
+  return '<details class="fold" data-key="' + esc(key) + '"' + (open ? " open" : "") + '><summary>' +
+    '<span class="fold-title">' + title + "</span>" +
+    (summary ? '<span class="fold-sum">' + summary + "</span>" : "") +
+    '</summary><div class="fold-body">' + body + "</div></details>";
+}
+
+// A ready-made `.memory-card` (with its own <h2>) turned into a fold titled by that <h2>.
+function cardFold(key, html, summary, defaultOpen) {
+  var m = /<h2>(.*?)<\/h2>/.exec(html);
+  return fold(key, m ? m[1] : "", summary, m ? html.replace(m[0], "") : html, defaultOpen);
+}
+
+function chainBrief(list) {
+  if (!list || !list.length) return "未設定";
+  var c = list[0];
+  return esc(c.provider + "/" + (c.model || "(預設)")) + (list.length > 1 ? " ＋" + (list.length - 1) + " 備援" : "");
+}
+
 function renderEvidence(rule) {
   var key = "evidence:" + rule.uid;
   var items = (rule.evidence || []).map(function (e) {
@@ -906,7 +931,7 @@ function renderRetiredPreference(rule) {
 function renderExecutionSources() {
   var stores = state.data.execution_sources || [];
   var html = '<div class="memory-card"><h2>執行來源</h2><div class="hint">同一供應商可以登錄多個帳號指令。登入與帳號隔離由各 CLI wrapper 管理，這裡不儲存憑證。wrapper 須以 exec 呼叫真正 CLI，完整轉送參數、輸出與結束碼，不可在背景啟動後提早結束。同一帳號／額度池的來源請填相同額度池名稱，會共用併發上限與冷卻狀態。新增後須在各 Harness「設定」授權，再選入模型鏈。「原本指令」沿用舊設定，不納入具名來源的全域併發限制。</div>';
-  if (!stores.length) return html + '<div class="empty">目前沒有支援來源管理的 Harness 連線。</div></div>';
+  if (!stores.length) return cardFold("sources-card", html + '<div class="empty">目前沒有支援來源管理的 Harness 連線。</div></div>', "無");
   stores.forEach(function (store) {
     function editor(entry) {
       var key = store.store_id + ':' + (entry.id || 'new');
@@ -924,7 +949,7 @@ function renderExecutionSources() {
     }
     html += (store.entries || []).map(editor).join('') + editor({});
   });
-  return html + '</div>';
+  return cardFold("sources-card", html + '</div>', stores.reduce(function (n, st) { return n + (st.entries || []).length; }, 0) + " 個來源");
 }
 
 function renderExecutionSourceAccess(project) {
@@ -937,11 +962,18 @@ function renderExecutionSourceAccess(project) {
     '<button class="source-access-save">儲存來源授權</button><span class="execution-source-status"></span></div>';
 }
 
+function renderSourceAccessFold(project) {
+  var html = renderExecutionSourceAccess(project);
+  if (!html) return "";
+  var allowed = state.sourceAccessDrafts[project.name] || project.execution_sources_allowed || [];
+  return cardFold("source-access:" + project.name, html, allowed.length + " 個已授權");
+}
+
 function renderSharedMemory() {
   var stores = state.data.shared_memory || [];
   var html = '<div class="memory-card"><h2>🌐 共享記憶</h2>' +
     '<div class="hint">由你明確設定，所有使用同一份共享記憶的 Harness 都會讀取。各專案的對話與偏好維持獨立；儲存後於下一次對話或任務載入。停用的記憶不再提供給模型。</div>';
-  if (!stores.length) return html + '<div class="empty">目前沒有可管理共享記憶的 Harness 連線。</div></div>';
+  if (!stores.length) return cardFold("shared-card", html + '<div class="empty">目前沒有可管理共享記憶的 Harness 連線。</div></div>', "無");
   stores.forEach(function (store) {
     function editor(entry) {
       var key = store.store_id + ":" + (entry.id || "new");
@@ -960,7 +992,7 @@ function renderSharedMemory() {
     }
     html += (store.entries || []).map(editor).join("") + editor({});
   });
-  return html + '</div>';
+  return cardFold("shared-card", html + '</div>', stores.reduce(function (n, st) { return n + (st.entries || []).length; }, 0) + " 則");
 }
 
 function renderMemory() {
@@ -971,18 +1003,18 @@ function renderMemory() {
   var html = '<div class="memory-card"><h2>🧠 記憶整理 · 偏好</h2>' +
     '<div class="hint">Harness 會自己從你的對話歸納偏好，直接採用並套用到之後的聊天，不需要先經過你；' +
     "不同意可以直接在聊天裡說（例如「那個不用了」），或在這裡撤銷。每條都附你當時說的原話。</div>" +
-    '<div class="section-label">已採用 (' + adopted.length + ")</div>" +
-    (adopted.length ? adopted.map(renderAdoptedPreference).join("") : '<div class="empty">尚未採用任何偏好</div>') +
     (pending.length
-      ? '<div class="section-label">等你確認 <span class="badge">' + pending.length + "</span></div>" +
+      ? fold("prefs-pending", "等你確認", '<span class="badge">' + pending.length + "</span>",
         '<div class="hint">超過每日自動採用上限，或舊版留下來的候選；採用前可以先修改。</div>' +
-        pending.map(renderPendingPreference).join("")
+        pending.map(renderPendingPreference).join(""), true)
       : "") +
+    fold("prefs-adopted", "已採用", adopted.length + " 條",
+      adopted.length ? adopted.map(renderAdoptedPreference).join("") : '<div class="empty">尚未採用任何偏好</div>') +
     (retired.length
-      ? '<div class="section-label">最近撤回 (' + retired.length + ")</div>" + retired.map(renderRetiredPreference).join("")
+      ? fold("prefs-retired", "最近撤回", retired.length + " 條", retired.map(renderRetiredPreference).join(""))
       : "") +
     "</div>";
-  return html;
+  return cardFold("prefs-card", html, pending.length ? pending.length + " 條等你確認" : adopted.length + " 條已採用", pending.length > 0);
 }
 
 function renderItemList(title, items, withSince) {
@@ -997,9 +1029,11 @@ function renderItemList(title, items, withSince) {
 
 function renderDigests(project) {
   var list = project.digests || [];
-  var label = '<div class="section-label">每日摘要（最近 ' + list.length + " 天 · 寫入 " + esc(project.memory_workspace_id || "") + "）</div>";
-  if (!list.length) return label + '<div class="empty">尚無摘要（每天 02:00 整理前一天）</div>';
-  return label + list.map(function (d) {
+  var wrapDigests = function (body) {
+    return fold("digests-all:" + project.name, "每日摘要", "最近 " + list.length + " 天 · 寫入 " + esc(project.memory_workspace_id || ""), body);
+  };
+  if (!list.length) return wrapDigests('<div class="empty">尚無摘要（每天 02:00 整理前一天）</div>');
+  return wrapDigests(list.map(function (d) {
     var g = d.digest || {};
     var key = "digest:" + project.name + ":" + d.digest_date;
     var meta = d.turn_count + " 則對話 · " + (g.open_items || []).length + " 項未完成" +
@@ -1018,7 +1052,7 @@ function renderDigests(project) {
       '<div class="sub">模型：' + esc((d.provider || "?") + "/" + (d.model || "?")) +
       " · 無出處而捨棄：" + esc(g.discarded_ungrounded || 0) + "</div>" +
       "</div></details>";
-  }).join("");
+  }).join(""));
 }
 
 // The settings tab: each chain shows as chips; "編輯" opens its editor (open state is remembered
@@ -1033,18 +1067,18 @@ function trustSelect(cls, value, name) {
 }
 
 function renderPeerName(project) {
-  return '<div class="section-label">Harness 名稱</div>' +
+  return fold("peer-name:" + project.name, "Harness 名稱", esc(project.peer_name || project.name),
     '<div class="hint">其他 Harness 用這個名字稱呼這個 Harness（連線、稽核標示都用它），和專案或資料夾的名稱無關。小寫英數字、- 或 _，最多 32 字。'
     + "改名只改標示，已建立的連線不會斷；但改名後重新配對會多出一筆新連線，舊的要自己撤銷。</div>" +
     '<div class="peer-name" data-project="' + esc(project.name) + '">' +
     '<input class="peer-name-text" size="24" maxlength="32" value="' + esc(project.peer_name || "") + '"> ' +
-    '<button class="peer-name-save">儲存</button> <span class="peer-name-status rp-status"></span></div>';
+    '<button class="peer-name-save">儲存</button> <span class="peer-name-status rp-status"></span></div>');
 }
 
 function renderPeerLinks(project) {
   var links = project.peer_links || { endpoint: null, inbound: [], outbound: [] };
   var others = state.data.projects.filter(function (p) { return p.name !== project.name; });
-  var out = '<div class="section-label">Harness 連線</div><div class="peer-links" data-project="' + esc(project.name) + '">';
+  var out = '<div class="peer-links" data-project="' + esc(project.name) + '">';
   out += '<div class="hint">決定哪些 Harness 可以互相提問、或回報問題請對方處理。連線後立刻生效，不用改設定檔、不用重啟。'
     + "這個頁面沒有登入，請只在本機使用。</div>";
   out += '<div class="hint">本 Harness 的名稱：<b>' + esc(project.peer_name || project.name) + "</b></div>";
@@ -1089,7 +1123,8 @@ function renderPeerLinks(project) {
   out += '<div class="pl-row">貼上別人給我的邀請碼：<textarea class="pl-input pl-accept-text" rows="2" placeholder="mtinv1:…"></textarea> ' +
     '<button class="pl-accept">接受邀請</button></div>';
   out += '<div class="pl-status rp-status"></div></div>';
-  return out;
+  return fold("peer-links:" + project.name, "Harness 連線",
+    "可問我 " + links.inbound.length + " · 我可問 " + links.outbound.length, out);
 }
 
 function peerLinkPost(box, url, body, okText) {
@@ -1177,20 +1212,21 @@ document.addEventListener("click", function (e) {
 function renderPeerDescription(project) {
   var off = project.peer_enabled ? "" :
     '<div class="hint">這個 Harness 還沒有啟用 Harness 之間的通訊（工作區 .harness.env 沒有 HARNESS_PEER_API_TOKEN），先寫好也可以，啟用後才會被其他 Harness 看到。</div>';
-  return '<div class="section-label">給其他 Harness 的自我介紹</div>' +
+  return fold("peer-desc:" + project.name, "給其他 Harness 的自我介紹",
+    project.peer_description ? "已填 " + project.peer_description.length + " 字" : "未填寫",
     '<div class="hint">其他 Harness 的 list_peers 和這個 Harness 的 Agent Card 會顯示這段話，它們的模型靠它判斷什麼時候該找你。'
     + '寫：這是什麼、什麼情況該找它、要附哪些資訊。會被所有已配對的 Harness 看到，不要放金鑰、路徑或私人資料。最多 600 字。</div>' + off +
     '<div class="peer-desc" data-project="' + esc(project.name) + '">' +
     '<textarea class="peer-desc-text" rows="5" maxlength="600" placeholder="例如：Harness 平台本身。平台的錯誤、卡住的任務、行為不對，請用 report_issue 附上錯誤文字、任務編號與你已排除的原因。">'
     + esc(project.peer_description || "") + "</textarea>" +
-    '<div class="pref-actions"><button class="peer-desc-save">儲存</button> <span class="peer-desc-count"></span> <span class="peer-desc-status rp-status"></span></div></div>';
+    '<div class="pref-actions"><button class="peer-desc-save">儲存</button> <span class="peer-desc-count"></span> <span class="peer-desc-status rp-status"></span></div></div>');
 }
 
 function renderModelSettings(project) {
   return '<div class="hint">每一處都可設定主模型與任意數量的備援（依序嘗試）；按「編輯」展開。清單包含各 CLI 目前提供的模型；'
     + '沒列出的選「— 自訂 —」輸入名稱，之後所有選單都會記住。 <button class="catalog-refresh" onclick="refreshModelCatalog(this)">重新抓取模型清單</button></div>' +
-    '<div class="section-label">主代理（對話、規劃、執行追蹤與驗收）</div>' + renderChatCandidates(project) +
-    '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
+    fold("model:chat:" + project.name, "主代理（對話、規劃、執行追蹤與驗收）", chainBrief(project.chat_candidates), renderChatCandidates(project)) +
+    fold("model:digest:" + project.name, "每日摘要模型", chainBrief(project.digest_candidates), renderDigestCandidates(project)) +
     renderMemoryFeature(project, "archive", "記憶整理模型",
       "夜間依主題整理對話、每週檢視記憶；也供手動重建使用。停用會暫停自動夜間整理。",
       project.archive_enabled !== false, renderArchiveCandidates(project)) +
@@ -1200,7 +1236,7 @@ function renderModelSettings(project) {
     renderMemoryFeature(project, "recall", "背景回想模型",
       "收到新訊息時搜尋相關舊對話與專案記憶，提供短效主題摘要。停用後聊天不會啟動背景回想。",
       project.recall_enabled !== false, renderRecallCandidates(project)) +
-    '<div class="section-label">執行能力模型</div>' + renderRoleProfiles(project);
+    fold("model:roles:" + project.name, "執行能力模型", (project.role_profiles || []).filter(function (p) { return p.id !== "controller"; }).length + " 個角色", renderRoleProfiles(project));
 }
 
 function renderImprovement(project) {
@@ -1222,7 +1258,8 @@ function renderImprovement(project) {
     (f.evidence || []).forEach(function (ref) { html += '<div class="hint">' + esc(ref.source + ' · ' + (ref.at || '時間未提供') + ' · ' + ref.id) + '</div><blockquote>' + esc(ref.quote) + '</blockquote>'; });
     html += (f.conversation_id ? '<div class="meta">任務：' + esc(f.conversation_id) + '</div>' : '') + '</details>';
   });
-  return html + '<span class="improvement-status"></span></div>';
+  return cardFold("improvement:" + project.name, html + '<span class="improvement-status"></span></div>',
+    [o.share_enabled, o.enabled, o.auto_develop].filter(Boolean).length + " / 3 項開啟");
 }
 
 function renderProject(project, q) {
@@ -1241,7 +1278,7 @@ function renderProject(project, q) {
       '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "已設定" : "預設") + "</span>" +
       '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "同專案") + "</span>" +
       '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "自己的檔案" : "預設") + "</span>" +
-      "</div>" + renderImprovement(project) + renderPeerName(project) + renderPeerLinks(project) + renderPeerDescription(project) + renderExecutionSourceAccess(project) + renderModelSettings(project);
+      "</div>" + renderImprovement(project) + renderPeerName(project) + renderPeerLinks(project) + renderPeerDescription(project) + renderSourceAccessFold(project) + renderModelSettings(project);
   } else {
     var lock = running || (project.queue || []).length ? renderLock(project) : "";
     var pipelineSection = "";
