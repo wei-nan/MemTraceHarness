@@ -1,8 +1,8 @@
 """MemTrace Harness package."""
 
-import resource
-
 try:
+    import resource  # POSIX only; absent on Windows
+
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft < 4096:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, hard), hard))
