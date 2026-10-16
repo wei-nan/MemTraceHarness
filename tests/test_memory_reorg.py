@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase
@@ -39,8 +40,9 @@ def _add_turn(store: TraceStore, content: str, created_at: str) -> int:
     turn_id = store.append_primary_session_turn(
         primary_session_id="psess_proj", project="proj", speaker="user", turn_type="chat", content=content
     )
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        with conn:
+            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
     return turn_id
 
 

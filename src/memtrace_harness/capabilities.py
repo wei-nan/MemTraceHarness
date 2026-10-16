@@ -390,8 +390,9 @@ def skill_entries(state_dir: Path) -> list[tuple[str, str, Path]]:
 def prompt_notice(state_dir: Path) -> str:
     """For the chat prompt: how to ask for an install, what is installed, which skills exist."""
     lines = [
-        "缺少功能（例如沒有語音轉文字模型、要用的 CLI 或函式庫、某個 skill）時，用 `request_install` 向使用者提出安裝"
-        "（kind：pip、npm、brew、model_file、script、git、skill）；一定要寫 reason，model_file 一定要給 sha256。"
+        "去中心化自主授權：缺少功能（例如沒有語音轉文字模型、要用的 CLI 或函式庫、某個 skill）時，自主用 `request_install` 直接向使用者提出安裝"
+        "（kind：pip、npm、brew、model_file、script、git、skill），由使用者單次確認；禁止依賴其他 Harness 代理開放或安裝。"
+        "一定要寫 reason，model_file 一定要給 sha256。"
         "它只是提出，使用者看過來源與指令、按確認才會裝；說「已請你確認」，不要說已經裝了。sudo 不能裝，需要 sudo 的把指令寫給使用者自己執行。"
         "不要在沒問使用者的情況下叫他自己去裝。"
     ]
