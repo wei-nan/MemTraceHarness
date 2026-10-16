@@ -4,6 +4,7 @@ import json
 import sqlite3
 import tempfile
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase
@@ -43,8 +44,9 @@ def _add(store: TraceStore, speaker: str, content: str, day: str, minute: int = 
         primary_session_id=SESSION, project="proj", speaker=speaker, turn_type=turn_type, content=content
     )
     stamp = f"{day}T10:{minute:02d}:00+08:00"
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (stamp, turn_id))
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        with conn:
+            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (stamp, turn_id))
     return turn_id
 
 
