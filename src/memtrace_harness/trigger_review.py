@@ -3,8 +3,8 @@
 A schedule run and a scanner pass both used to go straight to the human: every occurrence of a
 schedule pushed its result, and the scanner turned the oldest backlog item into an approval
 request without anyone having looked at it. Both now pass through one tool-less Controller
-judgment first (same provider/model as the project's Controller role, run in the same neutral
-sandbox), which may only *reduce* what the operator is shown, and only on grounds the harness
+judgment first (same primary-agent model chain and current project context, in a tool-less
+CLI call), which may only *reduce* what the operator is shown, and only on grounds the harness
 can check:
 
 * schedule results — push, hold for the nightly digest, or pause a schedule that no longer
@@ -72,19 +72,20 @@ class ScannerVerdict:
 
 
 def make_review_caller(
-    config: HarnessConfig, project_name: str, *, timeout_seconds: int = REVIEW_TIMEOUT_SECONDS
+    config: HarnessConfig, project_name: str, *, timeout_seconds: int = REVIEW_TIMEOUT_SECONDS,
+    context: Callable[[], str] | None = None,
 ) -> ReviewCaller:
-    """One call through the project's Controller role: its own model first, then its own
-    fallbacks, in the Controller's neutral workspace. Returns the model's stdout or None."""
+    """A tool-less primary-agent decision about an unattended result."""
     from memtrace_harness.cli_process import CliProcessRunner
-    from memtrace_harness.role_profiles import load_role_profiles
+    from memtrace_harness.primary_agent import PRIMARY_AGENT_POLICY, PrimaryAgent
 
     def call(prompt: str) -> str | None:
-        profile = load_role_profiles(config.role_profiles_file_for(project_name))["controller"]
+        agent = PrimaryAgent(config)
+        prompt = PRIMARY_AGENT_POLICY + "\n" + (context() + "\n" if context else "") + prompt
         sandbox = (config.trace_root / "controller-workspace").resolve()
         sandbox.mkdir(parents=True, exist_ok=True)
-        for candidate in [profile, *profile.fallbacks]:
-            cmd = config.chat_command(candidate.provider, candidate.model, prompt)
+        for provider, model in agent.candidates(project_name):
+            cmd = agent.dialogue_command(provider, model, prompt)
             result = CliProcessRunner().run(cmd, cwd=sandbox, timeout_seconds=timeout_seconds)
             if result.return_code == 0 and result.stdout.strip():
                 return result.stdout

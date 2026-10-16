@@ -99,6 +99,9 @@ class MessageWorker:
     MAX_RESTARTS restarts for one burst the worker stops interrupting and lets the reply through."""
 
     MAX_RESTARTS = 3
+    _PROGRESS_QUERIES = frozenset({
+        "有在處理嗎", "還在處理嗎", "有在跑嗎", "還在嗎", "進度如何", "目前進度", "現在進度",
+    })
 
     def __init__(self, service: HarnessService, bus: ChangeBus) -> None:
         self._service = service
@@ -115,6 +118,18 @@ class MessageWorker:
 
     def submit(self, payload: dict) -> None:
         with self._cond:
+            # A status-only follow-up must not throw away minutes of ongoing lookup work.
+            if (
+                self._current is not None
+                and not self._superseded
+                and self._service.chat_generating
+                and payload.get("audience") == self._current.get("audience")
+                and not any(payload.get(k) for k in ("reply_to_ref", "reply_to_text", "attachments"))
+                and (payload.get("text") or "").strip().rstrip("？?！!。.") in self._PROGRESS_QUERIES
+            ):
+                self._service.report_chat_wait(payload["text"], payload.get("audience"))
+                self._bus.publish()
+                return
             self._inbox.append(payload)
             interrupt = (
                 self._current is not None
@@ -332,6 +347,12 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, {"requests": outbound.claim(wait)})
             elif path == "/v1/commands":
                 self._send(200, {"commands": self.api.service.commands()})
+            elif path == "/v1/observations":
+                from memtrace_harness.improvement import export_observations
+                self._send(200, export_observations(self.api.service.approval_manager.trace_store, self.api.config, self.api.scope, int(query.get("after", "0"))))
+            elif path == "/v1/improvement":
+                from memtrace_harness.improvement import ImprovementStore
+                self._send(200, ImprovementStore(self.api.service.approval_manager.trace_store).public(self.api.config, self.api.scope))
             elif path == "/v1/events":
                 limit = int(self._float(query, "limit", 20, 100))
                 wait = self._float(query, "wait", 0, MAX_WAIT_SECONDS)
@@ -400,6 +421,11 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 )
                 self._send(202, {"accepted": True})
+            elif path == "/v1/observations":
+                from memtrace_harness.improvement import ImprovementStore
+                count = ImprovementStore(self.api.service.approval_manager.trace_store).ingest(self.api.config, body)
+                self.api.bus.publish()
+                self._send(200, {"accepted": count})
             elif path == "/v1/actions":
                 action_id = body.get("id")
                 if not isinstance(action_id, str) or not action_id:
@@ -511,7 +537,14 @@ class _Handler(BaseHTTPRequestHandler):
     def _admin(self, setting: str, body: dict) -> None:
         config = self.api.config
         try:
-            if setting == "role-profile":
+            if setting == "execution-source":
+                entry = admin.execution_source_action(config, body)
+                self.api.bus.publish()
+                self._send(200, {"ok": True, "entry": entry})
+                return
+            elif setting == "execution-source-allowlist":
+                admin.update_execution_source_allowlist(config, body.get("allowed"))
+            elif setting == "role-profile":
                 admin.update_role_profile(config, str(body["profile_id"]), str(body["provider"]), str(body["model"]))
             elif setting == "role-profile-chain":
                 admin.update_role_profile_chain(config, str(body["profile_id"]), body["chain"])
@@ -543,11 +576,24 @@ class _Handler(BaseHTTPRequestHandler):
                 admin.update_recall_model(config, str(body["provider"]), str(body["model"]))
             elif setting == "recall-fallbacks":
                 admin.update_recall_fallbacks(config, str(body["fallbacks"]))
+            elif setting == "memory-feature-enabled":
+                admin.update_automation_enabled(config, str(body.get("feature", "")), body.get("enabled"))
+            elif setting == "improvement":
+                from memtrace_harness.improvement import update_settings
+                update_settings(config, body)
             elif setting == "approval":
                 self._resolve_approval(body)
                 return
             elif setting == "preference":
                 self._resolve_preference(body)
+                return
+            elif setting == "shared-memory":
+                from memtrace_harness.shared_memory import SharedMemoryStore
+                if config.shared_memory_path is None:
+                    raise ValueError("shared memory is not configured")
+                entry = SharedMemoryStore(config.shared_memory_path).change(body)
+                self.api.bus.publish()
+                self._send(200, {"ok": True, "entry": entry})
                 return
             elif setting == "stuck":
                 self._resolve_stuck(body)

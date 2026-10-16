@@ -180,8 +180,10 @@ class ChatTriage:
             f"Available options: {', '.join(proj_names)}. "
             "Reply with EXACTLY one project name from the list, or 'NONE' if no project matches."
         )
-        provider = self.config.chat_provider
-        model = self.config.chat_model
+        candidates = self.config.chat_candidates_for()
+        if not candidates:
+            return None
+        provider, model = candidates[0]
         cmd = self.config.chat_command(provider, model, prompt)
         working_dir = self.projects[0].working_directory
         res = runner.run(cmd, cwd=working_dir, timeout_seconds=10)

@@ -185,8 +185,11 @@ this by itself for scope files that name the same `workspace_id` (the first in t
 `--primary NAME` picks another): the others become repos with their verify command, GitHub repo and off-limits, their
 approvals (resuming in their own repo), decisions, preferences and schedules (gaining a `repo=<name>::` prefix) join
 the primary's store, their bots are retired, and their chat transcript and digests stay in the legacy store (the digests
-are already in MemTrace). A task works in one repo (`repo=<name>::<goal>`; none = primary); that repo's worktree and
-edit lock, verify command and off-limits apply, a read-only Claude role can read the other repos, and no role ever
-writes outside the task's repo.
+are already in MemTrace). A task can select one repo (`repo=<name>::<goal>`) or several
+(`repo=<name1>,<name2>::<goal>`; none = primary). Each selected repo gets its own worktree and its own verify
+command and off-limits checks. Only selected worktrees are writable; read-only profiles can inspect all configured
+repos regardless of provider, and the shared safety check watches every granted repo. Multi-repo tasks require
+committed Git checkouts. Once all repo checks and the goal check pass, the Harness preflights and merges each changed
+repo separately, preserving any branches not merged if a later merge fails.
 
 **Not supported:** two Harnesses on one MemTrace workspace — they would each scan the same backlog, tidy the same knowledge base and run tasks on it at once, with nothing to coordinate them. Declare the second repo instead.

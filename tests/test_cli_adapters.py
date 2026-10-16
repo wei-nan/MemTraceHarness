@@ -697,9 +697,18 @@ class ReadOnlyWriteDetectionTests(TestCase):
         (self.repo / "README.md").write_text("hello\n")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.repo, check=True)
+        self.other_repo_dir = TemporaryDirectory()
+        self.addCleanup(self.other_repo_dir.cleanup)
+        self.other_repo = Path(self.other_repo_dir.name)
+        subprocess.run(["git", "init", "-q"], cwd=self.other_repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b.com"], cwd=self.other_repo, check=True)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=self.other_repo, check=True)
+        (self.other_repo / "README.md").write_text("other repo\n")
+        subprocess.run(["git", "add", "."], cwd=self.other_repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.other_repo, check=True)
         self.task = TaskEnvelope(task_id="t1", workspace_id="ws_test", goal="audit only")
 
-    def _adapter(self, runner, *, permission: str) -> ClaudeCliAdapter:
+    def _adapter(self, runner, *, permission: str, read_directories=()) -> ClaudeCliAdapter:
         return ClaudeCliAdapter(
             adapter_id="review",
             role="Red Team",
@@ -710,6 +719,7 @@ class ReadOnlyWriteDetectionTests(TestCase):
             process_runner=runner,
             permission=permission,
             role_profile_id="review",
+            read_directories=tuple(read_directories),
         )
 
     def test_read_only_role_that_writes_fails_closed(self) -> None:
@@ -731,6 +741,19 @@ class ReadOnlyWriteDetectionTests(TestCase):
         response = self._adapter(CleanRunner(), permission="read-only").run(self.task, "trace1/attempt1")
         self.assertEqual(response.execution.status, "succeeded")
         self.assertIsNone(response.execution.error)
+
+    def test_read_only_role_that_writes_an_additional_repo_fails_closed(self) -> None:
+        class WritingRunner:
+            def run(inner_self, command, *, cwd, timeout_seconds, input_text=None):
+                (self.other_repo / "unexpected.txt").write_text("oops")
+                return process_result('{"type":"result","result":"{}","usage":{}}')
+
+        response = self._adapter(
+            WritingRunner(), permission="read-only", read_directories=(self.other_repo,)
+        ).run(self.task, "trace-read-other")
+        self.assertEqual(response.execution.status, "failed")
+        self.assertIn("safety violation", response.execution.error)
+        self.assertIn(str(self.other_repo), response.execution.error)
 
     def test_workspace_write_role_writing_is_not_flagged(self) -> None:
         class WritingRunner:

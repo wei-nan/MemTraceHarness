@@ -13,6 +13,181 @@ Status labels:
 If this file, the current code, and a resolved MemTrace decision disagree, stop and record the
 conflict. Do not silently select the most convenient source.
 
+## One primary agent and single-use confirmation (operator decision, 2026-10-15)
+
+This section supersedes the older split between a chat model and a snapshot-only Controller,
+and every older standing-permission or plan-wide-approval rule below.
+
+**ENFORCED** (`primary_agent.py`, service/CLI wiring, `tests/test_primary_agent.py`):
+
+- One primary agent owns dialogue, planning, progress decisions and goal checks. All use the
+  historical `HARNESS_CHAT_PROVIDER`, `HARNESS_CHAT_MODEL` and `HARNESS_CHAT_FALLBACKS` settings.
+  The status page shows one primary-agent model editor. A legacy controller-model edit targets
+  those same settings. Existing controller entries in roles files remain readable for low-level
+  replay, but service-owned runs and the loop CLI derive their effective primary profile from
+  the shared settings. An already-started task keeps the chain captured at its start.
+- The persisted profile id `controller` and stage ids remain compatible with checkpoints. They
+  identify structured decision turns of the primary agent, not another decision maker. Before
+  every such call the runtime rehydrates the current project conversation alongside the loop
+  snapshot. Explicit decisions and progress are recorded in that conversation. The continuation
+  is local durable context, not a shared provider-native session or private reasoning transfer.
+- Only develop holds workspace-write. Review receives its own gate evidence and never receives
+  the primary agent's conversation. Each skill remains a fresh CLI invocation.
+- A mixed step plan can invoke registered tools, declared jobs, develop, request_install and
+  propose_scope_change. Development waits for its durable task result; installs and scope changes
+  wait for their own confirmation/result; A2A questions and issue reports wait for the actual
+  remote result. Enqueuing a request is never success for that step. Job creation and execution
+  are separate steps in a plan. The next step runs only after the previous result is checked.
+- A development interrupted without a durable result is held for a human, never blindly replayed.
+  A stopped development can await its ordinary task clarification and consume the resumed result.
+  Cancelling a plan stops subsequent development calls and rejects its pending clarification;
+  an already-cancelled plan cannot be revived by a queued resume. In-flight A2A requests are
+  not remotely revoked by cancelling the local plan. Ordinary tool/operation plan failures
+  retain the existing retry/skip/cancel behavior.
+- Read-only exploration needs no tap. Every action that requires confirmation uses a fresh
+  request and tap. Neither an old allowed.json entry nor a persisted approve_all field grants
+  permission. Legacy permanent-approval and plan-wide-approval callbacks are refused at runtime.
+  A declared publish_job also queues a single-use confirmation rather than publishing automatically.
+  Double taps cannot execute twice; an expired request or a job whose command changed cannot run.
+- Goal checks must name every recorded criterion exactly once. Duplicates, substitutions, unmet
+  and unverified criteria cannot close a task as succeeded. This validates coverage, not the truth
+  of a model's evidence. A primary-agent development run must supply a usable goal plan.
+- Raw dialogue attempts, including failures and superseded turns, are kept in the local trace
+  store. Plain-text dialogue usage remains unavailable. No raw transcript is sent to MemTrace.
+- A dialogue candidate waits at most 180 seconds before the declared fallback is tried. After
+  30 seconds a still-pending attempt emits one wait notice; a fallback emits a transition notice.
+  These notices do not claim completed work and require no extra model call. Exact short progress
+  queries (for example `有在處理嗎？`) from the same audience while a dialogue call is pending are
+  answered locally and recorded, without cancelling that call. New instructions, quoted replies,
+  attachments and other audiences retain their normal handling. Development stage limits are separate.
+- Chat progress explains the intended work at each stage's start and its result at the end;
+  automatic checks and integration emit both boundaries too. Final development messages are short,
+  while the complete goal check and technical evidence stay in the local run record. Reports preserve
+  unrun checks, remaining gaps and partial integration, and use runtime delivery results rather than
+  a model's promise to merge. Scheduled notification policies remain unchanged.
+- Fresh structured CLI outputs include a nullable `user_summary` alongside their normal evidence.
+  The prompt requests one or two plain-language sentences; the renderer bounds the displayed length.
+  Older artifacts without the field still load and use bounded existing summaries. Generating the
+  short summary uses the existing call, with no additional model invocation.
+
+**POLICY_ONLY:** that the agent chooses sensible steps, explores alternatives before asking,
+revises development phases appropriately, and interprets new user steering correctly. A new
+message is available at the next decision boundary; it does not mutate or interrupt an in-flight
+skill. The model does not gain write access by being the primary agent.
+
+**PLANNED:** general automatic repair/replanning of operational plans, first-class remote
+capability inventory/job delegation, and content-hash approval of generated tools. The existing
+final gate and tool-install boundaries remain as detailed below. A job confirmation currently
+binds its command text; transitive script/dependency content binding is not implemented.
+
+## Proactive cross-Harness platform maintenance (operator decision, 2026-10-16)
+
+**ENFORCED** (`improvement.py`, `memtrace_services/observation.py`, API/runtime/web wiring):
+operator-enabled source Harnesses share bounded conversation, task-outcome and schedule evidence
+through their local main-token APIs. The status service relays only configured targets; a coordinator
+has a separate source allowlist and enabled/auto-development switches. Sources not sharing or not
+reachable are reported as such. No new evidence causes no model call; no new findings causes no
+notification. Findings require checked source IDs and verbatim quotes, remain draft local evidence
+and never approve/adopt an Improvement Loop proposal or change a MemTrace gate.
+
+This is a bounded exception to the older work-review proposal-only policy: the explicitly enabled
+coordinator may queue platform development through the existing governed worktree/test/delivery
+path, one automatic improvement at a time and at most three per rolling day. Other projects' business
+schedule/preference suggestions never dispatch automatically. Queued work rechecks enablement and
+source grants. The shared delivery policy, GitHub repo and verification command are prerequisites;
+the observer cannot approve a confirmation, lower a gate, or directly execute a generated operation.
+An in-flight task finishes under its existing boundaries; interrupted development is not replayed.
+
+**POLICY_ONLY:** diagnosis quality, whether the quoted evidence supports the suggested mechanism
+change, and preserving business intent in the generated fix. A verified quote proves provenance,
+not the interpretation. Existing nightly audit and `/review` keep their own prior scope. This does
+not add arbitrary access to remote chats or complete historical logs. See
+[proactive-improvement.md](proactive-improvement.md) for configuration, retention and limits.
+
+## Multiple CLI execution sources (operator decision, 2026-10-16)
+
+**ENFORCED** (`execution_sources.py`, config/factory/process/loop/admin/API/web wiring,
+`tests/test_execution_sources.py` and API/web tests):
+
+- Provider, execution source and model are separate identities. A source is an operator-managed local
+  executable/wrapper, never a provider HTTP client or credential. Multiple sources may use one adapter.
+  Sources and quota/capacity state are host-wide; per-Harness grants and source choices remain in its
+  `models.toml`/`roles.toml`. A global registration grants no workspace permission.
+- All model chains, primary-agent decisions and dialogue, background duties, utility calls, and skill
+  fallbacks can select named sources. Current provider-only settings retain their original commands.
+  Named sources require provider matching and per-Harness authorization, rechecked at launch. They
+  never change sandbox flags, repo roots or permission/context boundaries.
+- SQLite leases enforce cross-process concurrency per declared quota pool. Capacity failures cool that
+  pool; login/CLI failures cool only that source. Busy/disabled sources can advance only through the
+  configured fallback chain. Test failures and generic editing timeouts do not authorize account replay.
+  Named-source cooldown is managed globally, separately from legacy per-Harness availability records.
+- Traces preserve canonical provider, actual source ID, model and quota pool. Raw provider output remains
+  local, and usage completeness is preserved. Source configuration changes are revisioned; changing a
+  captured executable/binding cannot silently redirect an invocation. Revocation stops future calls,
+  and an in-flight call retains its original binding.
+
+**POLICY_ONLY:** that registered wrappers isolate actual accounts and faithfully `exec` the provider
+CLI; a different command name is not proof of a different login. **PLANNED:** automatic account/model
+inventory, authenticated quota discovery and distributed multi-host scheduling. Existing source-less
+commands are intentionally outside named-source concurrency management. Configuration, limits and
+examples are in [execution-sources.md](execution-sources.md).
+
+## Shared memory and automatic delivery (operator decision, 2026-10-16)
+
+This section supersedes older per-action confirmation and local-merge rules **only for this fixed,
+operator-enabled delivery workflow**. Unrelated tools, installations, scope changes and publish jobs
+still require their own confirmation.
+
+**ENFORCED** (`shared_memory.py`, `delivery.py`, service/loop/runtime and web wiring):
+
+- Private conversation, preferences and memory remain per Harness. Operator-authored shared notes live
+  in `~/.memtrace-harness/shared-memory.sqlite3` (`HARNESS_SHARED_MEMORY_DB` relocates it), outside the
+  Git repositories. Harnesses using that file read it at each new chat/task. No private memories are
+  automatically promoted. The global web section creates/edits/disables/removes notes through an
+  authenticated Harness API; services never open its database. Changes retain revisions and reject
+  stale edits. Review receives shared operator instructions, never the private chat transcript.
+- The first note carries the explicit `worktree-pr-ci-main` policy. Its switch also controls automatic
+  delivery; editing its prose does not change the runtime's fixed allowed operations. Ordinary notes
+  provide context only. An unreadable policy store never authorizes a fallback merge.
+- New development tasks use one isolated worktree per selected Git repo, even with one worker. Configured
+  GitHub repos start from fetched `origin/main`, preserving the operator's checkout and local changes.
+  An empty/non-Git workspace can still chat, but cannot develop in place under this policy. Each repo
+  needs `github_repo`, a matching GitHub origin, and a configured `verify_command` that actually passes.
+- Model goal planning/checks cover the complete local implementation request. Runtime-owned remote
+  delivery criteria are checked separately by code, never claimed by a model before execution. The
+  shared context tells every skill that the runtime owns remote writes and this bounded workflow
+  already has operator authorization. After the complete local goal check and final gate, the loop
+  returns `delivering`, never local success or
+  a local merge for changed code. All selected repos' final verification must report `passed`;
+  baseline failures, missing commands and unrun checks cannot authorize delivery. The runtime pushes
+  only task branches without force, reuses or creates a PR to `main`, checks its exact head commit,
+  CI and conflict state, then invokes `gh pr merge --merge --match-head-commit`. No admin bypass.
+- Every selected repo is preflighted before the first merge and checked again immediately before its
+  own merge. GitHub must actually report MERGED. Multi-repo remote merges are separate transactions:
+  a later failure preserves and reports earlier merges. No-CI, pending/unknown checks, skipped/neutral
+  checks without successful CI, pending review and unknown mergeability are not evidence of passing.
+- Failed CI or conflicts trigger a normal fetch/merge and a fresh governed repair run in the **same**
+  task worktrees, then local tests/gates and another non-force push. At most three repair attempts;
+  an interrupted repair is held for inspection rather than blindly replayed. Remote diagnostics are
+  untrusted data. Missing tools/auth, failed repairs or a one-hour CI/merge wait retain PRs/worktrees
+  and report the gap rather than declaring success.
+- After all selected repositories are merged, only explicitly associated task issues are closed and
+  confirmed CLOSED. Prose references to historical issues are not swept up. Worktrees are removed
+  without force only if clean and still at their verified commit. A clean local main is fast-forwarded
+  when possible; a dirty/diverged checkout is preserved. New work uses fetched remote main regardless.
+- Delivery intent and step results are durable in the private trace store. A restart resumes pending
+  remote delivery by rereading GitHub state, without replaying settled development. Disabling the
+  shared policy pauses subsequent operations and retains progress. Cancelling an owning plan also
+  pauses delivery. Only remote merge, issue closure and cleanup confirmation produce final success.
+- This implementation supports GitHub through the installed `git`/`gh` CLIs. GitLab MR delivery and
+  non-Git targets are not implemented. The low-level `loop` replay CLI refuses to bypass an enabled
+  shared delivery policy; submit such development through the running Harness instead.
+
+**POLICY_ONLY:** that a model correctly identifies every task issue when the user does not supply an
+explicit reference, and that follow-up problems are filed as new issues. The shared note instructs
+this behavior; the runtime never reopens an old issue as part of delivery. Multi-host distribution
+of the shared database and distributed transactions across repositories are not implemented.
+
 ## Harness and services (operator decision, 2026-10-09)
 
 The Harness is the model-based work of one project; transports and presentation are separate
@@ -47,17 +222,21 @@ that can read the workspace can read those files. Keeping service secrets (bot t
 is what protects them; the Harness's own secrets (MemTrace token, API token) rely on the allowlisted child
 environment and file mode.
 
-**Repos (operator decision, 2026-10-09).** One MemTrace workspace is one Harness; the other repos of the same product
-are `.harness/repos.toml` entries (`ProjectScope.repos`, `for_repo()`). **ENFORCED**: a task works in exactly one repo
-(`repo=<name>::` goal prefix, none = primary; an unknown name is refused before a slot is taken); that repo's directory,
-git worktree, verify command, setup command, GitHub repo and off-limits (added to the project's) apply; the Developer's
-working directory is only that repo; the edit lock is per repo (`<workspace>#<repo>`) while worker slots, the workspace
-lock, approvals, schedules and the conversation are the Harness's; a conversation's repo is recorded and a resumed run
-returns to it; scanner candidates from a repo's GitHub issues are proposed and worked in that repo. Read-only Claude
-roles are given the other repos' directories to read. **POLICY_ONLY**: the chat model decides which repo a task is for;
-a change that needs two repos is split into two tasks by the Controller/chat, nothing enforces the split or the order.
-**Not implemented:** one task editing two repos; read access to other repos for Codex/Antigravity roles; jobs and ops
-tools are the primary repo's only.
+**Repos (operator decision, 2026-10-09; multi-repo editing, 2026-10-16).** One MemTrace workspace is one Harness;
+the other repos of the same product are `.harness/repos.toml` entries (`ProjectScope.repos`, `for_repo()`).
+**ENFORCED**: `repo=<name>::` selects one repo; `repo=<name1>,<name2>::` selects several; no prefix selects the
+primary repo, and unknown names are refused before a slot is taken. Every selected repo gets its own task worktree and
+branch, configured verify command, setup command, GitHub repo and off-limits rules. Only `develop` receives those
+selected worktrees as writable roots; unselected repos are made available only to read-only profiles, and every CLI
+adapter maps the granted roots into its provider workspace flags. The read-only safety check snapshots all granted
+repos. Multi-repo tasks require every selected repo to be a Git checkout with a commit, so the Harness never falls
+back to editing multiple original checkouts in place. Each configured verify command and the final gate runs against
+its own repo. After the primary agent confirms all goal criteria, the Harness preflights every changed repo and merges
+the branches separately; if a later Git merge fails, it reports earlier merges and retains the remaining worktrees.
+Per-repo edit locks still apply when a task has to edit in place; worker slots, workspace lock, approvals, schedules
+and conversation remain Harness-wide. The selected repo set is recorded so approval resume returns to the same
+worktrees. Scanner candidates from GitHub issues continue to be proposed and worked in their owning repo. Jobs and ops
+tools still use the primary repo only.
 
 ## Model list key (operator decision, 2026-10-10)
 
@@ -138,6 +317,53 @@ side effect or that will run again: a script, a scheduled job, a skill, an MCP s
 the project's own loop definition. Ordinary code changes to the project are not tools; they go through the
 project's loop and its verification as usual.
 
+**Which path a piece of work takes (the interface; PLANNED).** The split is whether the product runs again by
+itself or has a side effect, not who wrote it. A new scheduled script is a tool even if it is one line; a change
+to a View or an API is ordinary code even if it is large.
+
+| Work | Who guides it | Harness check at the end |
+|---|---|---|
+| Ordinary project code (feature, fix, refactor) | the project's own loop; Harness adds no stage | none beyond the always-on envelope (worktree-only writes, no sudo/delete, no `.harness.env`); merge stays the Controller's/operator's decision |
+| A tool (script, job, skill, MCP, outbound call, loop definition) | the Controller/Developer | the one final gate (scope, safety, sensitivity), then the operator's content-hash confirmation |
+
+The Harness never inserts a review, plan or test-gating stage into the first row. Test results are information
+to the project's loop and the operator; whether a failing test blocks progress is the project's choice, not a
+Harness gate.
+
+**ENFORCED (2026-10-15): verification is information, and `loop_mode: lean`.** Two parts of the above are in code
+now; the tool gate, secret scan and declared-scope diff are still PLANNED.
+
+- `verify_command` is run by the Harness and its result is classified (`verification.py`): `passed`,
+  `could_not_run` (a `MISSING_TOOL:` line, exit 127, "SDK location not found", a timeout), `baseline_failing`
+  (in a task worktree the same command is run once on the main checkout; failing only tests that already fail
+  there) or `regression` (a failure the base does not have, or one that cannot be told apart from it). Only a
+  `regression` sends work back. The others are recorded and shown to the Developer, G2 and the operator, and are
+  never charged to the task.
+- `loop_mode: lean` in a project's `harness-scope.md` (default since 2026-10-15; `full` is the older plan/G1/develop/G2 loop, opt-in): the Harness adds no plan,
+  G1 or G2. A phase is develop, then the verification; a regression goes back to the Developer once, a second
+  one stops the task as `needs_human`; anything else proceeds, and the Controller's converge step sees the
+  recorded `verify` stage. The Controller is told to assign `develop` only.
+- **Final gate, first step (ENFORCED 2026-10-15, `final_gate.py`).** After the last phase and before the
+  Controller's converge step, the Harness checks what changed, by code, in every `loop_mode`:
+  - *Boundary* (stops the task): a file outside the working folder, the Harness's own files (`.harness`,
+    `.harness.env`), `.env*` (not `.env.example`), key files, or anything in the project's `off_limits`.
+  - *Scope* (stops the task): the Controller gives each `develop` phase `paths` (files or folders, globs allowed).
+    When every develop phase declared some, a change outside all of them stops the task; when any phase declared
+    none, only the boundary applies.
+  - *Secrets* (stop): private keys and common token formats in added lines. *Personal-data formats* (Taiwan ID and
+    mobile numbers) only warn. Excerpts are masked in every message and trace.
+  - *Source of the change:* with a task worktree, git (the diff against the starting commit plus new files, with
+    line numbers). Without git, or when a project is edited in place (a diff there would include the operator's own
+    uncommitted work), only the files the Developer reported are checked; a file changed but not reported is not
+    seen.
+  - A stop is `needs_human` with the exact findings and a fingerprint of those findings and contents. The operator
+    waives it by answering `放行 gate <fingerprint>`; any change to the content needs a new waiver. A model can add a
+    finding and cannot clear one. Still PLANNED: the tool check (a script, job, skill, MCP or loop definition needs
+    a content-hash confirmation), redaction before trace/MemTrace writes, entropy-based secret detection.
+- A fresh task worktree can be made usable by the project's `worktree_setup_command` (in `harness-scope.md`, or per
+  repo in `.harness/repos.toml`), e.g. copying a gitignored `local.properties`; `HARNESS_REPO_ROOT` is the main
+  checkout.
+
 - The tool declares what it reads, writes and connects to. The operator is shown the diff and that
   declaration, never only the model's summary.
 - Approval is bound to a hash of the content. Any change voids it and asks again, as the per-job command
@@ -171,6 +397,40 @@ envelope and sees what comes out (diff, trace, declared permissions), not how it
   the trace.
 - Migration order: new projects first; projects with uncommitted work in their folder (Beri,
   TWTradingStrategy) last, and never on a dirty checkout.
+
+**A project that finds a tool missing asks the Harness that has the machine (operator decision, 2026-10-14;
+PLANNED).** `kubectl` is the running example. A project's Harness (Beri's, say) reaches a step it cannot do
+because no allowed tool covers it, for instance restarting a service, and the following happens. Nothing
+below is built; the pieces it reuses (A2A `ask`/`collaborate`, `request_install`, declared jobs with
+command-hash allowlisting) are ENFORCED as described elsewhere in this contract.
+
+- **The signal is structured.** A verification or job that cannot run because something is absent reports a
+  `MISSING_TOOL: <name>` line (Beri's `.harness/verify.sh` already does), so "the tests failed" and "the tests
+  could not run here" are different outcomes.
+- **First tap, to ask.** The project's Harness asks the operator whether it may ask the machine's Harness
+  (`ask_peer`, which already needs a tap). The card says what is being asked: whether `kubectl` exists and
+  where, for what purpose. This consent is to ask, not to use anything.
+- **The inventory is read-only and narrow.** The machine's Harness checks only `PATH` and a short fixed list of
+  locations (`command -v`, `--version`) and reports path, version and whether a credentials file (for
+  `kubectl`, a kubeconfig) exists: present or absent, never its content. It does not search the disk. What it
+  says back is data to the receiver, never an instruction.
+- **Tool absent.** The answer is the install command, shown to the operator, who decides and runs it. For a
+  tool that reaches a cluster, the system or credentials the Harness gives the command and does not install;
+  an ordinary package may still go through `request_install`'s own tap. Installing a binary is not
+  configuring it: credentials are set up by the operator and the Harness never touches them. After installing,
+  the project asks again, and this becomes the next case.
+- **Tool present.** The machine's Harness does not hand the project's agent the binary's path. It proposes a
+  named, bounded **job**, for example `kubectl rollout restart deployment/l8s -n <namespace>`, and the second
+  tap shows the exact command and the context it will run against (for `kubectl`, the kube context). The
+  Harness runs the job itself, so credentials never pass through any agent; the project's agent receives a
+  job name and its result.
+- **Scope of the grant.** Default is this one run. The operator may choose "always allow this exact command",
+  bound to the command's hash and revocable. Verbs that destroy or expose (`delete`, `exec`, `drain`, reading
+  secrets) can never be made standing, whatever is tapped. `sudo` and deletion stay refused as everywhere
+  else in the envelope.
+- **Two taps, two meanings.** The first lets the project ask; the second grants one concrete command. Neither
+  stands in for the other, and a tap given before it is known whether the tool exists never carries over to a
+  grant.
 
 Unchanged: the Harness output stays draft evidence and cannot approve its own gate; CLI-only model
 execution; one editing provider per run; the permission rules in "Role contract".
@@ -230,6 +490,9 @@ every Harness, because it is how the shared code works, not a per-project settin
   anything enters MemTrace**: one memory node is one matter (a strategy rule, a bug, a decision, an
   open question), however the day's messages interleaved. A day with many subjects produces many
   nodes, never one node holding the day.
+- **Automatic memory archive switch** (`[archive].enabled` in `.harness/models.toml`, default `true`):
+  when off, the nightly pass skips topic filing and its scheduled weekly matter review/draft retirement.
+  Explicit `memory-topics`, `memory-rebuild` and `memory-reorg` commands remain available.
 - A node's **title is the matter itself**, in the words someone would search for — no date, turn
   number, project name or `Draft` prefix (the tags and the memory workspace say what and whose it is).
   Its **body is organised, not quoted**: a one-line current state first, then decisions, facts and
@@ -288,6 +551,9 @@ itself, in the digest window after the digest and the archive have filed the day
 what they want with the least repetition and round-tripping** — the Harness understands once and does
 the right thing.
 
+- **Automatic audit switch** (`[audit].enabled` in `.harness/models.toml`, default `true`): when off,
+  the scheduled nightly audit is skipped. An explicit `memory-audit` command still runs on request.
+
 - *Metrics are mechanical, not the model's opinion* (`compute_metrics`, recomputable for any past day, per
   ten operator messages): corrections ("我說的是…", "你誤會了"), restated messages, matters that came back on
   3+ of the last 14 days, matters that took 12+ turns in one day and are still open, and flaws in the
@@ -336,6 +602,10 @@ fresh and never pushed. Briefs are local drafts and never written to MemTrace by
 The model may push one chat message when it found a connection the human likely no longer
 has in mind. **PLANNED, not implemented:** a reverse index so the nightly digest can mark which
 older items a day's topics continued.
+
+- **Background recall switch** (`[recall].enabled` in `.harness/models.toml`, default `true`): when
+  off, incoming chat messages do not start topic-recall runs. Existing briefs remain available to
+  the chat model until they expire; explicit memory searches are unaffected.
 
 **Concurrent tasks per project (explicit operator decision, 2026-10-05).** A project runs up to
 `max_workers` governed tasks at once (`harness-scope.md`, default 3; 1 restores one-at-a-time).
@@ -854,6 +1124,10 @@ workspace; `ws_spec_plan` is not a universal default for every project.
 
 ## Role contract
 
+> **LEGACY, being retired.** This section and "Gate and adoption boundary" describe the loop the Harness runs
+> today. The target is in "Safety envelope and project-owned loops": no Harness-owned stages for ordinary
+> code, one final gate for tools. Until that ships, this is what runs; do not extend it.
+
 The Controller is the only role; plan, review and develop are skills it runs (see "One Controller, stage
 skills" in `docs/architecture.md`). **ENFORCED** packaged primary profiles (packaged defaults — see below for
 what's actually validated):
@@ -1007,6 +1281,8 @@ reserves `retry_after` and `reset_at`, but provider-specific five-hour/weekly re
 yet parsed into the availability ledger.
 
 ## Gate and adoption boundary
+
+> **LEGACY, being retired** (see the note under "Role contract").
 
 **POLICY_ONLY** (operator decision 2026-10-09): G1 and G2 are told to PASS unless the plan or change violates safety/security (secret or identifier exposure, unauthorized external side effect, destructive action, off-limits access, bypassed control); everything else is a low/medium finding on a PASS. They are told not to require a git repository or diff. Only the prompt carries this; the verdict stays the model's and the Harness does not override it. **Tiers** (same date): the Planner marks each acceptance criterion `[必要]` (essential) or `[建議]` (hardening) up front; G1 gates only `[必要]` and safety, and after the plan was revised once it rejects only for `security`. What G1 notices beyond that is returned as findings with severity `defer…` (or low/medium on a PASS); the Harness collects them (`deferred_findings`, max 12) and hands them to the Developer and G2 as a `deferred-notes` context item, which G2 must not reject over. Plan revisions fix only blocking findings and may not add scope. All prompt/convention based; no schema change.
 

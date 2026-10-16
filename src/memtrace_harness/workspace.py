@@ -39,9 +39,11 @@ MODEL_SETTINGS: dict[tuple[str, str], tuple[str, str]] = {
     ("archive", "provider"): ("HARNESS_ARCHIVE_PROVIDER", "str"),
     ("archive", "model"): ("HARNESS_ARCHIVE_MODEL", "str"),
     ("archive", "fallbacks"): ("HARNESS_ARCHIVE_FALLBACKS", "list"),
+    ("archive", "enabled"): ("HARNESS_ARCHIVE_ENABLED", "bool"),
     ("audit", "provider"): ("HARNESS_AUDIT_PROVIDER", "str"),
     ("audit", "model"): ("HARNESS_AUDIT_MODEL", "str"),
     ("audit", "fallbacks"): ("HARNESS_AUDIT_FALLBACKS", "list"),
+    ("audit", "enabled"): ("HARNESS_AUDIT_ENABLED", "bool"),
     ("recall", "enabled"): ("HARNESS_RECALL_ENABLED", "bool"),
     ("recall", "provider"): ("HARNESS_RECALL_PROVIDER", "str"),
     ("recall", "model"): ("HARNESS_RECALL_MODEL", "str"),
@@ -60,6 +62,14 @@ MODEL_SETTINGS: dict[tuple[str, str], tuple[str, str]] = {
     # or the folder's name. Unset: the project's name, lowercased.
     ("peers", "name"): ("HARNESS_PEER_NAME", "str"),
 }
+for _target in ("chat", "digest", "archive", "audit", "recall"):
+    MODEL_SETTINGS[(_target, "source")] = (f"HARNESS_{_target.upper()}_SOURCE", "str")
+MODEL_SETTINGS[("execution_sources", "allowed")] = ("HARNESS_EXECUTION_SOURCES_ALLOWED", "list")
+for _name in ("enabled", "auto_develop"):
+    MODEL_SETTINGS[("improvement", _name)] = (f"HARNESS_IMPROVEMENT_{_name.upper()}", "bool")
+MODEL_SETTINGS[("improvement", "sources")] = ("HARNESS_IMPROVEMENT_SOURCES", "list")
+MODEL_SETTINGS[("improvement", "interval_seconds")] = ("HARNESS_IMPROVEMENT_INTERVAL_SECONDS", "int")
+MODEL_SETTINGS[("observation", "share_enabled")] = ("HARNESS_OBSERVATION_SHARE_ENABLED", "bool")
 MODEL_ENV_VARS = {name: (table, key, kind) for (table, key), (name, kind) in MODEL_SETTINGS.items()}
 
 # Keys that identify a service's secret rather than the Harness's: if one of these shows up in a

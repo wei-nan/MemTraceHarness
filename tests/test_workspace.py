@@ -115,7 +115,7 @@ class WorkspaceTests(TestCase):
             self.assertEqual(config.chat_candidates_for("TestProj")[0][1], "plain")
 
     def test_a_model_setting_changed_at_runtime_is_seen_at_once(self) -> None:
-        with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"}) as (_, config):
+        with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku", "HARNESS_CHAT_FALLBACKS": ""}) as (_, config):
             self.assertEqual(config.chat_candidates_for(), (("claude", "haiku"),))
             with patch.dict(os.environ, {"HARNESS_CHAT_MODEL": "sonnet"}):
                 self.assertEqual(config.chat_candidates_for(), (("claude", "sonnet"),))

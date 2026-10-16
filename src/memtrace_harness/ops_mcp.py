@@ -242,7 +242,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "write from here, so use this instead. action: issue_create (repo, title, body, labels?), "
             "issue_close / issue_reopen (repo, number, comment?), issue_comment (repo, number, comment), "
             "issue_label (repo, number, labels? to add, remove_labels? to remove), pr_comment (repo, number, "
-            "comment). This does NOT do it: the user sees the exact action and a confirm button, and only a "
+            "comment), branch_push (repo, branch: `git push -u origin <branch>`, never force, never main), "
+            "pr_create (repo, branch, base? default main, title, body; push the branch first). This does NOT do it: the user sees the exact action and a confirm button, and only a "
             "tap runs it. Say that a confirmation is waiting; never say it is done."
         ),
         "inputSchema": {
@@ -251,7 +252,9 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "action": {"type": "string", "enum": list(ACTIONS)},
                 "repo": _string_param("owner/name of the repository"),
                 "number": _string_param("issue or pull request number"),
-                "title": _string_param("one-line title (issue_create)"),
+                "branch": _string_param("work branch name (branch_push, pr_create)"),
+                "base": _string_param("target branch of the PR (pr_create, default main)"),
+                "title": _string_param("one-line title (issue_create, pr_create)"),
                 "body": _string_param("markdown body (issue_create)"),
                 "comment": _string_param("comment text"),
                 "labels": {"type": "array", "items": {"type": "string"}, "description": "labels to add"},
@@ -276,6 +279,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
                 "target": {"type": "string", "enum": list(MODEL_TARGETS)},
                 "model": _string_param("model id, e.g. claude-opus-5-5, or provider/model"),
                 "provider": {"type": "string", "enum": ["claude", "codex", "antigravity", "cursor"]},
+                "source": _string_param("optional already-authorized execution source id; empty means the original CLI command"),
             },
             "required": ["target", "model"],
             "additionalProperties": False,

@@ -60,7 +60,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("❌ 2. b", text)
         self.assertIn("沒達到預期", text)
         ids = [b["id"] for row in keyboard for b in row]
-        self.assertEqual(ids, ["plan_retry:p", "plan_skip:p", "plan_approve_all:p", "plan_cancel:p"])
+        self.assertEqual(ids, ["plan_retry:p", "plan_skip:p", "plan_cancel:p"])
 
     def test_verdict(self) -> None:
         self.assertEqual(plans.verdict([{"status": plans.DONE}] * 2), "達成")

@@ -15,7 +15,7 @@ from memtrace_harness.model_override import infer_provider
 from memtrace_harness.role_profiles import canonical_profile_id
 
 PROVIDERS = ("claude", "codex", "antigravity", "cursor")
-ENV_TARGETS = {"chat": "對話", "digest": "夜間摘要", "archive": "記憶歸檔", "audit": "夜間稽核", "recall": "主題回想"}
+ENV_TARGETS = {"chat": "主代理（對話、規劃與驗收）", "digest": "夜間摘要", "archive": "記憶歸檔", "audit": "夜間稽核", "recall": "主題回想"}
 ROLE_TARGETS = {
     "controller": "Controller",
     "plan": "Plan skill",
@@ -29,23 +29,38 @@ _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,79}$")
 
 def validate_model_change(arguments: dict[str, Any]) -> dict[str, str]:
     target = canonical_profile_id(str(arguments.get("target") or "").strip())
+    if target in {"controller", "primary"}:
+        target = "chat"
     if target not in TARGETS:
         raise ValueError(f"target must be one of: {', '.join(TARGETS)}")
     model = str(arguments.get("model") or "").strip()
     provider = str(arguments.get("provider") or "").strip()
     if "/" in model:
         provider, _, model = model.rpartition("/")
+    from memtrace_harness.execution_sources import split_ref, ID
+    embedded = None
+    if "@" in provider:
+        provider, embedded = split_ref(provider)
     if not _MODEL.match(model):
         raise ValueError("model must be a plain model id such as claude-opus-5-5")
     provider = provider or infer_provider(model) or ""
     if provider not in PROVIDERS:
         raise ValueError(f"cannot tell the provider of {model!r}; give provider as one of {', '.join(PROVIDERS)}")
-    return {"target": target, "provider": provider, "model": model}
+    result = {"target": target, "provider": provider, "model": model}
+    if "source" in arguments or embedded:
+        if arguments.get("source") is not None and not isinstance(arguments.get("source"), str):
+            raise ValueError("invalid execution source id")
+        source = arguments.get("source", embedded) or None
+        if source is not None and (not isinstance(source, str) or not ID.fullmatch(source)):
+            raise ValueError("invalid execution source id")
+        result["source"] = source
+    return result
 
 
 def summarize(payload: dict[str, Any]) -> str:
     label = {**ENV_TARGETS, **ROLE_TARGETS}[payload["target"]]
-    return f"把「{label}」的主要模型永久改成 {payload['provider']}/{payload['model']}（備援與其他設定不變）"
+    source = ("，來源 " + (payload["source"] or "原本指令")) if "source" in payload else ""
+    return f"把「{label}」的主要模型永久改成 {payload['provider']}/{payload['model']}{source}（備援與其他設定不變）"
 
 
 def apply_model_change(config: Any, payload: dict[str, Any]) -> None:
@@ -56,14 +71,26 @@ def apply_model_change(config: Any, payload: dict[str, Any]) -> None:
 
     change = validate_model_change(payload)
     target, provider, model = change["target"], change["provider"], change["model"]
+    if "source" in change:
+        config.source_binding(provider, change["source"])
     if target in ENV_TARGETS:
         prefix = f"HARNESS_{target.upper()}"
         admin._check_model(provider, model)
-        admin._apply(config, {f"{prefix}_PROVIDER": provider, f"{prefix}_MODEL": model})
+        updates = {f"{prefix}_PROVIDER": provider, f"{prefix}_MODEL": model}
+        if "source" in change:
+            updates[f"{prefix}_SOURCE"] = change["source"] or ""
+        admin._apply(config, updates)
     else:
         path = config.role_profiles_file_for()
         before = path.read_text(encoding="utf-8") if path is not None and path.is_file() else None
-        admin.update_role_profile(config, target, provider, model)
+        if "source" in change:
+            profile = load_role_profiles(path)[target]
+            admin.update_role_profile_chain(config, target, [
+                {"provider": provider, "source": change["source"], "model": model, "reasoning_effort": profile.reasoning_effort},
+                *[item.to_dict() for item in profile.fallbacks],
+            ])
+        else:
+            admin.update_role_profile(config, target, provider, model)
         try:
             load_role_profiles(path)  # e.g. the role's reasoning effort may not exist for the new provider
         except ValueError as exc:

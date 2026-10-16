@@ -1,4 +1,4 @@
-var state = { data: null, query: "", prefDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview", invite: null };
+var state = { data: null, query: "", prefDrafts: {}, sharedDrafts: {}, sourceDrafts: {}, sourceAccessDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview", invite: null };
 var GLOBAL_TAB = "__global__";
 var PROJECT_TABS = [["overview", "總覽"], ["memory", "記憶"], ["schedules", "排程"], ["settings", "設定"]];
 
@@ -84,11 +84,28 @@ function effortOptions(provider, selected) {
   }).join("");
 }
 
-function chainRowHtml(c, withEffort, index) {
+function sourceStoreFor(project) {
+  return (state.data.execution_sources || []).filter(function (store) { return store.store_id === project.execution_sources_store_id; })[0];
+}
+
+function executionSourceOptions(provider, current, projectName) {
+  var project = (state.data.projects || []).filter(function (p) { return p.name === projectName; })[0] || {};
+  var store = sourceStoreFor(project) || {};
+  var allowed = project.execution_sources_allowed || [];
+  var entries = (store.entries || []).filter(function (entry) { return entry.provider === provider && allowed.indexOf(entry.id) !== -1; });
+  var html = '<option value="">原本指令</option>';
+  if (current && !entries.some(function (entry) { return entry.id === current; })) html += '<option selected value="' + esc(current) + '">' + esc(current) + '（未授權或來源不存在）</option>';
+  return html + entries.map(function (entry) {
+    return '<option value="' + esc(entry.id) + '"' + (entry.id === current ? ' selected' : '') + '>' + esc(entry.label) + (entry.enabled ? '' : '（停用）') + '</option>';
+  }).join('');
+}
+
+function chainRowHtml(c, withEffort, index, projectName) {
   var label = index === 0 ? "主模型" : "備援 " + index;
   return '<div class="rp-row chain-item">' +
     '<span class="hint chain-label">' + label + "</span>" +
     '<select class="rp-provider" onchange="onProviderSelectChange(this)">' + providerOptions(c.provider) + "</select>" +
+    '<select class="rp-source" aria-label="執行來源">' + executionSourceOptions(c.provider, c.source, projectName) + "</select>" +
     '<select class="rp-model-select" onchange="onModelSelectChange(this)">' + modelOptions(c.provider, c.model) + "</select>" +
     '<input class="rp-model-custom" type="text" value="' + esc(c.model || "") + '" placeholder="模型名稱" style="display:none">' +
     (withEffort ? '<select class="rp-effort" title="reasoning effort">' + effortOptions(c.provider, c.reasoning_effort) + "</select>" : "") +
@@ -108,7 +125,7 @@ function chainEditorInner(project, kind, chain, withEffort, profileId) {
   return '<div class="chain" data-kind="' + kind + '" data-project="' + esc(project.name) + '"' +
     (profileId ? ' data-profile="' + esc(profileId) + '"' : "") +
     (withEffort ? ' data-effort="1"' : "") + ">" +
-    '<div class="chain-items">' + list.map(function (c, i) { return chainRowHtml(c, withEffort, i); }).join("") + "</div>" +
+    '<div class="chain-items">' + list.map(function (c, i) { return chainRowHtml(c, withEffort, i, project.name); }).join("") + "</div>" +
     '<div class="rp-row"><button class="chain-add">＋ 新增備援</button>' +
     '<button class="chain-save">儲存</button><button class="chain-reset">還原</button>' +
     (kind === "role" ? '<button class="chain-apply">套用備援到其他角色…</button>' : "") +
@@ -119,7 +136,7 @@ function chainEditorInner(project, kind, chain, withEffort, profileId) {
 // "Apply to other roles": copies this editor's fallbacks (not its primary) onto the chosen roles,
 // each of which keeps its own primary model.
 function applyPanelHtml(project, profileId) {
-  var others = (project.role_profiles || []).filter(function (p) { return p.id !== profileId; });
+  var others = (project.role_profiles || []).filter(function (p) { return p.id !== profileId && p.id !== "controller"; });
   return '<div class="rp-row chain-apply-panel" style="display:none"><span class="hint">把目前這份備援順序套用到（會取代它們原有的備援，主模型不變）：</span>' +
     others.map(function (p) {
       return '<label><input type="checkbox" class="apply-target" value="' + esc(p.id) + '"> ' + esc(p.id) + "</label>";
@@ -155,7 +172,7 @@ function applyFallbacksToRoles(chainEl, btn) {
   targets.reduce(function (chain, id) {
     return chain.then(function () {
       var role = project.role_profiles.filter(function (p) { return p.id === id; })[0];
-      var primary = { provider: role.provider, model: role.model, reasoning_effort: role.reasoning_effort };
+      var primary = { provider: role.provider, source: role.source, model: role.model, reasoning_effort: role.reasoning_effort };
       return fetch("/api/role-profile-chain", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -177,6 +194,8 @@ function applyFallbacksToRoles(chainEl, btn) {
 function onProviderSelectChange(providerSelect) {
   var row = providerSelect.closest(".rp-row");
   row.querySelector(".rp-model-select").innerHTML = modelOptions(providerSelect.value, "");
+  var source = row.querySelector(".rp-source");
+  if (source) source.innerHTML = executionSourceOptions(providerSelect.value, null, row.closest(".chain").getAttribute("data-project"));
   var effort = row.querySelector(".rp-effort");
   if (effort) effort.innerHTML = effortOptions(providerSelect.value, "medium");
   syncCustomModelVisibility(row);
@@ -197,6 +216,7 @@ function readChainRow(row) {
   var effort = row.querySelector(".rp-effort");
   return {
     provider: row.querySelector(".rp-provider").value,
+    source: row.querySelector(".rp-source").value || null,
     model: (modelSelect.value === CUSTOM_MODEL_VALUE ? row.querySelector(".rp-model-custom").value : modelSelect.value).trim(),
     reasoning_effort: effort ? effort.value : ""
   };
@@ -209,13 +229,13 @@ function relabelChain(chainEl) {
 }
 
 function chainCandidates(list) {
-  return (list || []).map(function (c) { return { provider: c.provider, model: c.model, reasoning_effort: c.reasoning_effort || "medium" }; });
+  return (list || []).map(function (c) { return { provider: c.provider, source: c.source, model: c.model, reasoning_effort: c.reasoning_effort || "medium" }; });
 }
 
 function chainDisplay(list, emptyText) {
   if (!list || !list.length) return '<div class="empty">' + emptyText + "</div>";
   return '<div class="chips">' + list.map(function (c) {
-    return '<span class="chip">' + esc(c.provider) + "/" + esc(c.model || "(預設)") + "</span>";
+    return '<span class="chip">' + esc(c.provider + (c.source ? "@" + c.source : "")) + "/" + esc(c.model || "(預設)") + "</span>";
   }).join(" → ") + "</div>";
 }
 
@@ -229,8 +249,7 @@ function renderChatCandidates(project) {
 }
 
 function renderRecallCandidates(project) {
-  var note = project.recall_enabled === false ? "背景回想已停用（HARNESS_RECALL_ENABLED=false）。"
-    : (project.recall_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型。");
+  var note = project.recall_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型。";
   return renderChain(project, "recall", project.recall_candidates, "（未設定）", note);
 }
 
@@ -269,6 +288,14 @@ function renderAuditCandidates(project) {
     project.audit_is_own ? "" : "尚未獨立設定，目前沿用每日摘要模型；建議改用與摘要不同的供應商，稽核才更獨立。");
 }
 
+function renderMemoryFeature(project, feature, title, purpose, enabled, chain) {
+  return '<div class="memory-feature"><div class="memory-feature-head"><div>' +
+    '<div class="section-label">' + esc(title) + '</div><div class="hint">主要用途：' + esc(purpose) + '</div></div>' +
+    '<label class="memory-feature-toggle"><input type="checkbox" class="memory-feature-enabled" data-project="' +
+    esc(project.name) + '" data-feature="' + esc(feature) + '"' + (enabled ? " checked" : "") +
+    '> 啟用</label><span class="memory-feature-status rp-status"></span></div>' + chain + '</div>';
+}
+
 function renderAudit(project) {
   var a = project.audit || {};
   var head = '<div class="section-label">夜間稽核 · 北極星：' + esc(a.north_star || "") + "</div>";
@@ -296,8 +323,8 @@ function renderRoleProfiles(project) {
     "要先給它一份專屬設定檔才能在這裡調整。" +
     '<div class="rp-row"><button class="rp-independent" data-project="' + esc(project.name) + '">獨立出去</button>' +
     '<span class="rp-status"></span></div></div>';
-  var rows = (project.role_profiles || []).map(function (p) {
-    var chain = [{ provider: p.provider, model: p.model, reasoning_effort: p.reasoning_effort }].concat(p.fallbacks);
+  var rows = (project.role_profiles || []).filter(function (p) { return p.id !== "controller"; }).map(function (p) {
+    var chain = [{ provider: p.provider, source: p.source, model: p.model, reasoning_effort: p.reasoning_effort }].concat(p.fallbacks);
     var cell = chainDisplay(chain, "") ;
     if (editable) cell += chainEditorHtml(project, "role", chainCandidates(chain), true, p.id);
     return "<tr><td>" + esc(p.id) + "</td><td>" + cell + "</td></tr>";
@@ -330,7 +357,7 @@ document.addEventListener("click", function (e) {
   if (t.classList.contains("chain-add")) {
     var last = items.lastElementChild ? readChainRow(items.lastElementChild) : { provider: "claude", model: "", reasoning_effort: "medium" };
     var holder = document.createElement("div");
-    holder.innerHTML = chainRowHtml({ provider: last.provider, model: "", reasoning_effort: last.reasoning_effort || "medium" }, withEffort, items.children.length);
+    holder.innerHTML = chainRowHtml({ provider: last.provider, source: last.source, model: "", reasoning_effort: last.reasoning_effort || "medium" }, withEffort, items.children.length, chainEl.getAttribute("data-project"));
     var fresh = holder.firstChild;
     items.appendChild(fresh);
     fresh.querySelector(".rp-model-select").selectedIndex = 0;
@@ -362,7 +389,45 @@ document.addEventListener("click", function (e) {
 
 document.addEventListener("change", function (e) {
   if (e.target.closest && e.target.closest(".chain")) state.chainDirty = true;
+  if (e.target.classList && e.target.classList.contains("memory-feature-enabled")) {
+    saveMemoryFeature(e.target);
+  }
 });
+
+function saveMemoryFeature(input) {
+  var enabled = input.checked;
+  var status = input.closest(".memory-feature").querySelector(".memory-feature-status");
+  input.disabled = true;
+  status.className = "memory-feature-status rp-status";
+  status.textContent = "儲存中…";
+  fetch("/api/memory-feature-enabled", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project: input.getAttribute("data-project"),
+      feature: input.getAttribute("data-feature"),
+      enabled: enabled
+    })
+  })
+    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, body: d }; }); })
+    .then(function (res) {
+      input.disabled = false;
+      if (res.ok) {
+        status.className = "memory-feature-status rp-status ok";
+        status.textContent = enabled ? "已啟用" : "已停用";
+      } else {
+        input.checked = !enabled;
+        status.className = "memory-feature-status rp-status err";
+        status.textContent = res.body.error || "儲存失敗";
+      }
+    })
+    .catch(function () {
+      input.disabled = false;
+      input.checked = !enabled;
+      status.className = "memory-feature-status rp-status err";
+      status.textContent = "連線失敗，設定未變更";
+    });
+}
 
 function saveChain(chainEl, btn) {
   var kind = chainEl.getAttribute("data-kind");
@@ -684,7 +749,7 @@ function renderBacklog(project) {
 }
 
 var STAGE_LABELS = {
-  "control-start": "Controller",
+  "control-start": "主代理規劃",
   "plan": "Planner",
   "plan-escalation": "Planner (升級)",
   "plan-revision": "Planner (修正)",
@@ -716,10 +781,10 @@ function renderPipeline(pipeline, projectName) {
     var stateClass = t.state === "succeeded" ? "ok" : (t.state === "invalid_output" || t.state === "failed" || t.state === "unavailable" ? "bad" : "mid");
     var icon = STATE_ICON[t.state] || "•";
     var retryTag = t.attempt_index > 0 ? '<span class="chip">重試 #' + t.attempt_index + '</span>' : "";
-    return '<div class="step ' + stateClass + '" onclick="openStageDetail(' + t.turn_id + ',' + JSON.stringify(projectName).replace(/"/g, '&quot;') + ')" title="' + esc(t.provider + "/" + (t.model || "?")) + '">' +
+    return '<div class="step ' + stateClass + '" onclick="openStageDetail(' + t.turn_id + ',' + JSON.stringify(projectName).replace(/"/g, '&quot;') + ')" title="' + esc(t.provider + (t.execution_source_id ? "@" + t.execution_source_id : "") + "/" + (t.model || "?")) + '">' +
       '<div class="step-icon">' + icon + '</div>' +
       '<div class="step-label">' + esc(stageLabel(t.stage)) + '</div>' +
-      '<div class="step-meta">' + esc(t.provider + "/" + (t.model || "?")) + " " + retryTag + '</div>' +
+      '<div class="step-meta">' + esc(t.provider + (t.execution_source_id ? "@" + t.execution_source_id : "") + "/" + (t.model || "?")) + " " + retryTag + '</div>' +
       '</div>';
   });
   return '<div class="pipeline">' + steps.join('<div class="step-connector"></div>') + '</div>';
@@ -751,7 +816,7 @@ function openStageDetail(turnId, project) {
       if (!d) { body.innerHTML = '<div class="empty">找不到這個階段的紀錄</div>'; return; }
       var html = "";
       html += '<div class="detail-row"><b>' + esc(stageLabel(d.stage)) + '</b> — ' + esc(d.profile_id) + '</div>';
-      html += '<div class="detail-row meta">' + esc(d.provider + "/" + (d.model || "?")) + " — " + esc(d.state) + " — " + esc(d.created_at) + '</div>';
+      html += '<div class="detail-row meta">' + esc(d.provider + (d.execution_source_id ? "@" + d.execution_source_id : "") + "/" + (d.model || "?")) + " — " + esc(d.state) + " — " + esc(d.created_at) + '</div>';
       if (d.artifact) {
         html += '<div class="section-label">結構化輸出</div><pre class="detail-pre">' + esc(JSON.stringify(d.artifact, null, 2)) + '</pre>';
       }
@@ -836,6 +901,66 @@ function renderRetiredPreference(rule) {
     '<div class="meta">' + esc(rule.retire_reason || "") + "</div>" +
     '<div class="pref-actions"><button class="pref-btn restore" data-id="' + rule.uid + '" data-action="restore">恢復</button>' +
     '<span class="pref-status"></span></div></div>';
+}
+
+function renderExecutionSources() {
+  var stores = state.data.execution_sources || [];
+  var html = '<div class="memory-card"><h2>執行來源</h2><div class="hint">同一供應商可以登錄多個帳號指令。登入與帳號隔離由各 CLI wrapper 管理，這裡不儲存憑證。wrapper 須以 exec 呼叫真正 CLI，完整轉送參數、輸出與結束碼，不可在背景啟動後提早結束。同一帳號／額度池的來源請填相同額度池名稱，會共用併發上限與冷卻狀態。新增後須在各 Harness「設定」授權，再選入模型鏈。「原本指令」沿用舊設定，不納入具名來源的全域併發限制。</div>';
+  if (!stores.length) return html + '<div class="empty">目前沒有支援來源管理的 Harness 連線。</div></div>';
+  stores.forEach(function (store) {
+    function editor(entry) {
+      var key = store.store_id + ':' + (entry.id || 'new');
+      var value = Object.assign({ provider: 'codex', max_concurrency: 1 }, entry, state.sourceDrafts[key] || {});
+      function field(name, label, type) {
+        return '<label>' + label + '<input class="execution-source-input pref-text" data-field="' + name + '" type="' + (type || 'text') + '" value="' + esc(value[name] === undefined ? '' : value[name]) + '"' + (name === 'id' && entry.id ? ' disabled' : '') + '></label>';
+      }
+      return '<details class="execution-source-editor" data-key="' + esc(key) + '"' + detailsOpen(key) + '><summary>' + esc(entry.label || '＋ 新增執行來源') + (entry.id ? ' · ' + esc(entry.provider + '@' + entry.id) + (entry.enabled ? ' · 啟用' : ' · 停用') + ' · 額度池占用 ' + entry.active + (entry.cooldown ? ' · 冷卻：' + esc(entry.cooldown.category) : '') : '') + '</summary>' +
+        '<div class="execution-source-form" data-key="' + esc(key) + '" data-project="' + esc(store.harness) + '" data-id="' + esc(entry.id || '') + '" data-revision="' + (entry.revision || 0) + '" data-enabled="' + !!entry.enabled + '">' +
+        field('id', '來源 ID') + field('label', '顯示名稱') + '<label>供應商<select class="execution-source-input" data-field="provider"' + (entry.id ? ' disabled' : '') + '>' + providerOptions(value.provider) + '</select></label>' +
+        field('command', '執行檔／wrapper 絕對路徑') + field('quota_bucket', '額度池 ID（空白使用來源 ID）') + field('max_concurrency', '同額度池最大併發', 'number') +
+        '<div class="hint">同額度池採已啟用來源中最小的併發上限。冷卻是 Harness 的暫避時間，不代表供應商剩餘額度或登入有效。</div><div class="pref-actions"><button class="execution-source-button" data-action="save">儲存</button>' +
+        (entry.id ? '<button class="execution-source-button" data-action="toggle">' + (entry.enabled ? '停用' : '啟用') + '</button><button class="execution-source-button" data-action="reset">清除冷卻，下次重試</button>' : '') +
+        '<span class="execution-source-status"></span></div></div></details>';
+    }
+    html += (store.entries || []).map(editor).join('') + editor({});
+  });
+  return html + '</div>';
+}
+
+function renderExecutionSourceAccess(project) {
+  var store = sourceStoreFor(project);
+  if (!store || !(store.entries || []).length) return '';
+  var allowed = state.sourceAccessDrafts[project.name] || project.execution_sources_allowed || [];
+  return '<div class="memory-card source-access" data-project="' + esc(project.name) + '"><h2>允許使用的執行來源</h2>' +
+    '<div class="hint">授權後才會出現在模型的來源選單。取消授權會阻止後續呼叫；正在執行的 CLI 會保留到結束。</div>' +
+    store.entries.map(function (entry) { return '<label class="source-access-item"><input type="checkbox" class="source-allowed" value="' + esc(entry.id) + '"' + (allowed.indexOf(entry.id) !== -1 ? ' checked' : '') + '> ' + esc(entry.label + ' · ' + entry.provider + '@' + entry.id) + '</label>'; }).join('') +
+    '<button class="source-access-save">儲存來源授權</button><span class="execution-source-status"></span></div>';
+}
+
+function renderSharedMemory() {
+  var stores = state.data.shared_memory || [];
+  var html = '<div class="memory-card"><h2>🌐 共享記憶</h2>' +
+    '<div class="hint">由你明確設定，所有使用同一份共享記憶的 Harness 都會讀取。各專案的對話與偏好維持獨立；儲存後於下一次對話或任務載入。停用的記憶不再提供給模型。</div>';
+  if (!stores.length) return html + '<div class="empty">目前沒有可管理共享記憶的 Harness 連線。</div></div>';
+  stores.forEach(function (store) {
+    function editor(entry) {
+      var key = store.store_id + ":" + (entry.id || "new");
+      var draft = state.sharedDrafts[key] || {};
+      var title = draft.title !== undefined ? draft.title : entry.title || "";
+      var body = draft.body !== undefined ? draft.body : entry.body || "";
+      return '<div class="shared-memory pref" data-project="' + esc(store.harness) + '" data-key="' + esc(key) +
+        '" data-memory-id="' + esc(entry.id || "") + '" data-revision="' + (entry.revision || 0) + '" data-enabled="' + !!entry.enabled + '">' +
+        '<div class="meta">' + (entry.id ? (entry.enabled ? "已啟用 · 所有 Harness 共用" : "已停用") : "新增共享記憶") + '</div>' +
+        (entry.policy === "worktree-pr-ci-main" ? '<div class="hint">自動交付：worktree → PR → CI／衝突檢查 → main → 關單與清理。停用會暫停後續遠端操作；文字編輯不會改寫這套固定流程。</div>' : '') +
+        '<input class="shared-memory-input pref-text" data-field="title" maxlength="160" placeholder="記憶標題" value="' + esc(title) + '">' +
+        '<textarea class="shared-memory-input pref-text" data-field="body" maxlength="6000" rows="6" placeholder="所有 Harness 應記住的內容">' + esc(body) + '</textarea>' +
+        '<div class="pref-actions"><button class="shared-memory-btn" data-action="' + (entry.id ? "update" : "create") + '">儲存</button>' +
+        (entry.id ? '<button class="shared-memory-btn" data-action="toggle">' + (entry.enabled ? "停用" : "啟用") + '</button><button class="shared-memory-btn" data-action="remove">移除</button>' : "") +
+        '<span class="shared-memory-status"></span></div></div>';
+    }
+    html += (store.entries || []).map(editor).join("") + editor({});
+  });
+  return html + '</div>';
 }
 
 function renderMemory() {
@@ -1064,12 +1189,40 @@ function renderPeerDescription(project) {
 function renderModelSettings(project) {
   return '<div class="hint">每一處都可設定主模型與任意數量的備援（依序嘗試）；按「編輯」展開。清單包含各 CLI 目前提供的模型；'
     + '沒列出的選「— 自訂 —」輸入名稱，之後所有選單都會記住。 <button class="catalog-refresh" onclick="refreshModelCatalog(this)">重新抓取模型清單</button></div>' +
-    '<div class="section-label">聊天模型</div>' + renderChatCandidates(project) +
+    '<div class="section-label">主代理（對話、規劃、執行追蹤與驗收）</div>' + renderChatCandidates(project) +
     '<div class="section-label">每日摘要模型</div>' + renderDigestCandidates(project) +
-    '<div class="section-label">記憶整理模型（夜間分題、每週審查、重建）</div>' + renderArchiveCandidates(project) +
-    '<div class="section-label">夜間稽核模型</div>' + renderAuditCandidates(project) +
-    '<div class="section-label">背景回想模型</div>' + renderRecallCandidates(project) +
-    '<div class="section-label">Agent Loop 角色模型</div>' + renderRoleProfiles(project);
+    renderMemoryFeature(project, "archive", "記憶整理模型",
+      "夜間依主題整理對話、每週檢視記憶；也供手動重建使用。停用會暫停自動夜間整理。",
+      project.archive_enabled !== false, renderArchiveCandidates(project)) +
+    renderMemoryFeature(project, "audit", "夜間稽核模型",
+      "檢查重複溝通與操作摩擦，評估是否需要調整 Harness 的校正筆記。停用會暫停自動夜間稽核。",
+      project.audit_enabled !== false, renderAuditCandidates(project)) +
+    renderMemoryFeature(project, "recall", "背景回想模型",
+      "收到新訊息時搜尋相關舊對話與專案記憶，提供短效主題摘要。停用後聊天不會啟動背景回想。",
+      project.recall_enabled !== false, renderRecallCandidates(project)) +
+    '<div class="section-label">執行能力模型</div>' + renderRoleProfiles(project);
+}
+
+function renderImprovement(project) {
+  var o = project.improvement;
+  if (!o) return '';
+  var html = '<div class="memory-card improvement-settings" data-project="' + esc(project.name) + '"><h2>主動觀察與平台改善</h2>' +
+    '<div class="hint">每 ' + Math.round(o.interval_seconds / 60) + ' 分鐘收集已授權紀錄，有新內容才分析。平台修正走既有開發與交付，同時僅一件、每 24 小時最多三件；其他專案的業務排程、偏好只提出建議。無新問題不發通知。</div>';
+  [['share_enabled', '分享本 Harness 的對話、任務與排程紀錄供觀察'], ['enabled', '擔任改善協調者：觀察其他已授權 Harness'], ['auto_develop', '平台空閒時，自動開始有證據支持的修正']].forEach(function (row) {
+    html += '<label class="source-access-item"><input type="checkbox" class="improvement-toggle" data-setting="' + row[0] + '"' + (o[row[0]] ? ' checked' : '') + '> ' + row[1] + '</label>';
+  });
+  html += '<div class="hint">觀察來源：' + esc((o.sources || []).join('、') || '尚未設定；在 models.toml 的 [improvement].sources 指定 Harness 名稱') + '。待分析紀錄：' + o.pending_evidence + '</div>';
+  var coverage = { ok: '正常收集', sharing_disabled: '未開啟分享', unreachable: '目前無法連線', upgrade_required: '等待載入新版' };
+  var findingStates = { new: '已記錄', suggested: '保留建議', queued: '等待開始', running: '確認與修正中', delivering: '交付中', needs_human: '等待你決定', succeeded: '已完成交付', failed: '修正未完成', failed_to_start: '尚未開始', paused: '已暫停', cancelled: '已取消', interrupted: '已中斷，保留現場' };
+  (o.sources_state || []).forEach(function (source) { html += '<div class="meta">' + esc(source.source + ' · ' + (coverage[source.status] || source.status)) + '</div>'; });
+  if (o.enabled && o.auto_develop && (o.auto_requirements || []).length) html += '<div class="hint">自動修正尚待：' + esc(o.auto_requirements.join('、')) + '。觀察仍會持續。</div>';
+  if (o.last_error) html += '<div class="error">最近一次分析未完成，已保留紀錄等待重試。</div>';
+  (o.findings || []).forEach(function (f) {
+    html += '<details data-key="observation:' + esc(f.id) + '"' + detailsOpen('observation:' + f.id) + '><summary>' + esc(f.title + ' · ' + (f.state === 'historical' ? '歷史紀錄，不啟動修正' : findingStates[f.state] || f.state)) + '</summary><p>' + esc(f.summary || '') + '</p>';
+    (f.evidence || []).forEach(function (ref) { html += '<div class="hint">' + esc(ref.source + ' · ' + (ref.at || '時間未提供') + ' · ' + ref.id) + '</div><blockquote>' + esc(ref.quote) + '</blockquote>'; });
+    html += (f.conversation_id ? '<div class="meta">任務：' + esc(f.conversation_id) + '</div>' : '') + '</details>';
+  });
+  return html + '<span class="improvement-status"></span></div>';
 }
 
 function renderProject(project, q) {
@@ -1088,7 +1241,7 @@ function renderProject(project, q) {
       '<span class="chip' + (d.chat_model ? " on" : "") + '">chat: ' + (d.chat_model ? "已設定" : "預設") + "</span>" +
       '<span class="chip' + (d.memory ? " on" : "") + '">memory: ' + (d.memory ? "專屬" : "同專案") + "</span>" +
       '<span class="chip' + (d.role_profiles ? " on" : "") + '">role-profiles: ' + (d.role_profiles ? "自己的檔案" : "預設") + "</span>" +
-      "</div>" + renderPeerName(project) + renderPeerLinks(project) + renderPeerDescription(project) + renderModelSettings(project);
+      "</div>" + renderImprovement(project) + renderPeerName(project) + renderPeerLinks(project) + renderPeerDescription(project) + renderExecutionSourceAccess(project) + renderModelSettings(project);
   } else {
     var lock = running || (project.queue || []).length ? renderLock(project) : "";
     var pipelineSection = "";
@@ -1123,7 +1276,7 @@ function renderProject(project, q) {
 function renderGlobal() {
   return '<div class="project"><div class="project-head"><h2>全域</h2></div><div class="panel">' +
     '<div class="section-label">Harness 連線</div><div class="daemon-list">' + harnessLines(state.data.harnesses) + "</div>" +
-    renderMemory() + "</div></div>";
+    renderExecutionSources() + renderSharedMemory() + renderMemory() + "</div></div>";
 }
 
 function projectMatches(project) { return matchesQuery(project, state.query); }
@@ -1209,6 +1362,14 @@ document.addEventListener("toggle", function (e) {
 }, true);
 
 document.addEventListener("input", function (e) {
+  if (e.target.classList.contains("shared-memory-input")) {
+    var shared = e.target.closest(".shared-memory");
+    var key = shared.getAttribute("data-key");
+    var draft = state.sharedDrafts[key] || {};
+    draft[e.target.getAttribute("data-field")] = e.target.value;
+    state.sharedDrafts[key] = draft;
+    return;
+  }
   if (!e.target.classList.contains("pref-text")) return;
   var id = e.target.getAttribute("data-id");
   state.prefDrafts[id] = Object.assign(state.prefDrafts[id] || {}, { text: e.target.value });
@@ -1224,6 +1385,31 @@ document.addEventListener("focusout", function (e) {
   if (state.renderDeferred && e.target.classList && (e.target.classList.contains("pref-text") || e.target.classList.contains("pref-scope"))) {
     setTimeout(function () { if (!isEditingPreference()) render(); }, 0);
   }
+});
+
+document.addEventListener("click", function (e) {
+  if (!e.target.classList.contains("shared-memory-btn")) return;
+  var btn = e.target, box = btn.closest(".shared-memory");
+  var status = box.querySelector(".shared-memory-status");
+  var action = btn.getAttribute("data-action");
+  var body = { project: box.getAttribute("data-project"), action: action,
+    id: box.getAttribute("data-memory-id"), revision: Number(box.getAttribute("data-revision")) };
+  if (action === "create" || action === "update") {
+    body.title = box.querySelector('[data-field="title"]').value;
+    body.body = box.querySelector('[data-field="body"]').value;
+  }
+  if (action === "toggle") body.enabled = box.getAttribute("data-enabled") !== "true";
+  btn.disabled = true; status.textContent = "儲存中…";
+  fetch("/api/shared-memory", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json().then(function (data) { return { ok: r.ok, data: data }; }); })
+    .then(function (res) {
+      if (res.ok) {
+        delete state.sharedDrafts[box.getAttribute("data-key")];
+        status.textContent = "已儲存，所有 Harness 共同使用";
+      } else { status.textContent = res.data.error || "儲存失敗"; }
+      btn.disabled = false;
+    })
+    .catch(function () { btn.disabled = false; status.textContent = "連線失敗"; });
 });
 
 document.addEventListener("click", function (e) {
@@ -1282,3 +1468,52 @@ var es = new EventSource("/events");
 es.onopen = function () { dot.className = "live"; conn.textContent = "即時連線中"; };
 es.onerror = function () { dot.className = ""; conn.textContent = "連線中斷，重試中…"; };
 es.onmessage = function (evt) { state.data = JSON.parse(evt.data); render(); };
+
+function rememberSourceDraft(target) {
+  var box = target.closest('.execution-source-form');
+  if (!box) return;
+  var key = box.getAttribute('data-key');
+  var draft = state.sourceDrafts[key] || {};
+  draft[target.getAttribute('data-field')] = target.value;
+  state.sourceDrafts[key] = draft;
+}
+document.addEventListener('input', function (e) {
+  if (e.target.classList.contains('execution-source-input')) rememberSourceDraft(e.target);
+});
+document.addEventListener('change', function (e) {
+  if (e.target.classList.contains('improvement-toggle')) {
+    var improvementBox = e.target.closest('.improvement-settings');
+    var improvementBody = { project: improvementBox.getAttribute('data-project') };
+    improvementBody[e.target.getAttribute('data-setting')] = e.target.checked;
+    fetch('/api/improvement', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(improvementBody) })
+      .then(function (response) { return response.json().then(function (data) { improvementBox.querySelector('.improvement-status').textContent = response.ok ? '已儲存' : data.error || '儲存失敗'; }); })
+      .catch(function () { improvementBox.querySelector('.improvement-status').textContent = '連線失敗，請重新確認設定'; });
+  }
+  if (e.target.classList.contains('execution-source-input')) rememberSourceDraft(e.target);
+  if (e.target.classList.contains('source-allowed')) {
+    var box = e.target.closest('.source-access');
+    state.sourceAccessDrafts[box.getAttribute('data-project')] = Array.prototype.map.call(box.querySelectorAll('.source-allowed:checked'), function (input) { return input.value; });
+  }
+});
+document.addEventListener('click', function (e) {
+  var btn = e.target;
+  if (!btn.classList.contains('execution-source-button') && !btn.classList.contains('source-access-save')) return;
+  var access = btn.classList.contains('source-access-save');
+  var box = btn.closest(access ? '.source-access' : '.execution-source-form');
+  var status = box.querySelector('.execution-source-status');
+  var body = { project: box.getAttribute('data-project') };
+  if (access) body.allowed = Array.prototype.map.call(box.querySelectorAll('.source-allowed:checked'), function (input) { return input.value; });
+  else {
+    body.action = btn.getAttribute('data-action'); body.id = box.getAttribute('data-id'); body.revision = Number(box.getAttribute('data-revision'));
+    if (body.action === 'save') box.querySelectorAll('[data-field]').forEach(function (input) { body[input.getAttribute('data-field')] = input.getAttribute('data-field') === 'max_concurrency' ? Number(input.value) : input.value; });
+    if (body.action === 'toggle') body.enabled = box.getAttribute('data-enabled') !== 'true';
+  }
+  btn.disabled = true; status.textContent = '儲存中…';
+  fetch(access ? '/api/execution-source-allowlist' : '/api/execution-source', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (response) { return response.json().then(function (data) { return { ok: response.ok, data: data }; }); })
+    .then(function (response) {
+      btn.disabled = false; status.textContent = response.ok ? '已儲存，下次呼叫生效' : response.data.error || '儲存失敗';
+      if (response.ok && !access) delete state.sourceDrafts[box.getAttribute('data-key')];
+      if (response.ok && access) delete state.sourceAccessDrafts[box.getAttribute('data-project')];
+    }).catch(function () { btn.disabled = false; status.textContent = '連線失敗'; });
+});

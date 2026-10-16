@@ -1,21 +1,9 @@
-"""Multi-step requests (operator decision, 2026-10-12): the plan a chat reply can start, and how it is judged and shown.
+"""The primary agent's step plans: validation, expectations and progress rendering.
 
-A chat model that sees a request needs more than one action ends its reply with ``HARNESS_PLAN::<one-line JSON>``::
-
-    {"goal": "重啟其他專案的 Harness並確認都起來了",
-     "steps": [{"title": "重啟 Beri", "tool": "run_job", "args": {"name": "restart_beri"},
-                "expect": {"kind": "ok"}},
-               {"title": "確認 Beri 在跑", "tool": "system_status",
-                "args": {"kind": "launchd_list", "argument": "Beri"},
-                "expect": {"kind": "regex", "value": "^\\d+\\s+0\\s+com\\.memtraceharness\\.Beri$"}}]}
-
-The Harness then runs the steps in order (plan_runner.py), shows one progress message it edits in place, checks each
-step's result against ``expect`` and reports whether the goal was reached. This module is the pure part: parsing,
-validation, the expectation check and the rendering.
-
-**Never in a plan:** changing code (that goes through the Agent Loop, ``HARNESS_TASK_START::``), or any tool that is not
-registered. A step's tier is its tool's tier (tool_registry.py): ``read`` runs at once; ``run_job`` and ``change`` tools
-wait for the user's tap or an allowed-list match exactly as they do outside a plan.
+HARNESS_PLAN carries a goal and ordered steps. Each step names a capability,
+arguments and an expectation. PlanRunner executes read/change tools, declared
+jobs, governed development, install proposals and scope proposals sequentially.
+Every operation needing approval waits for its own single-use confirmation.
 """
 
 from __future__ import annotations
@@ -135,8 +123,6 @@ def render_progress(plan: dict, steps: list[dict]) -> tuple[str, list[list[dict[
         lines.append(f"{_ICON.get(step['status'], '⬜')} {number}. {step['title']}{_WAITING.get(step['status'], '')}")
         if step["status"] == FAILED and step.get("note"):
             lines.append(f"    ↳ {step['note']}")
-    if plan.get("approve_all") and plan["status"] == P_RUNNING:
-        lines += ["", "🔓 已核准這個計畫列出的所有步驟（禁止類指令仍不會執行）。"]
     keyboard: list[list[dict[str, str]]] = []
     pid = plan["plan_id"]
     if plan["status"] == P_ATTENTION:
@@ -147,8 +133,6 @@ def render_progress(plan: dict, steps: list[dict]) -> tuple[str, list[list[dict[
                 {"label": "⏭ 略過這一步", "id": f"plan_skip:{pid}"},
             ])
     if plan["status"] in {P_RUNNING, P_ATTENTION}:
-        if not plan.get("approve_all") and any(s["status"] == PENDING or s["status"] == AWAITING for s in steps):
-            keyboard.append([{"label": "✅ 核准這個計畫的所有步驟", "id": f"plan_approve_all:{pid}"}])
         keyboard.append([{"label": "🛑 取消計畫", "id": f"plan_cancel:{pid}"}])
     return "\n".join(lines), keyboard
 

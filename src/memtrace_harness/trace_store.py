@@ -74,6 +74,15 @@ class TraceStore:
             raise ValueError(f"Unknown conversation: {conversation_id}")
         return str(row[0])
 
+    def conversation_outcome(self, conversation_id: str) -> dict | None:
+        """The latest durable local result; never evidence of a MemTrace state change."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT r.summary_json FROM conversations c JOIN runs r ON r.id = c.active_run_id WHERE c.id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+
     def create_run(
         self, task: TaskEnvelope, *, conversation_id: str | None = None
     ) -> str:
@@ -530,12 +539,12 @@ class TraceStore:
                 started_at, completed_at, duration_ms, stage, profile_id,
                 requested_model, resolved_model, reasoning_effort, permission,
                 context_policy, cli_version, sequence, attempt_index, quota_bucket,
-                fallback_index, failure_category, retry_after, reset_at
+                fallback_index, failure_category, retry_after, reset_at, execution_source_id
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -567,6 +576,7 @@ class TraceStore:
                 execution.failure_category,
                 execution.retry_after,
                 execution.reset_at,
+                execution.execution_source_id,
             ),
         )
 
@@ -591,6 +601,7 @@ class TraceStore:
     def _add_missing_columns(conn: sqlite3.Connection) -> None:
         """The peer tables gained columns the day they were made; a database that already has the older shape keeps its rows."""
         for table, column, ddl in (
+            ("cli_executions", "execution_source_id", "TEXT"),
             ("peer_requests", "fix_job_id", "TEXT"),
             ("peer_outbound", "skill", "TEXT NOT NULL DEFAULT 'ask'"),
             ("peer_directory", "collaborate", "INTEGER NOT NULL DEFAULT 0"),
@@ -667,6 +678,7 @@ class TraceStore:
                     failure_category TEXT NOT NULL DEFAULT 'none',
                     retry_after TEXT,
                     reset_at TEXT,
+                    execution_source_id TEXT,
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
 
@@ -948,6 +960,18 @@ class TraceStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS conversation_repo_worktrees (
+                    conversation_id TEXT NOT NULL,
+                    repo TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    base_branch TEXT,
+                    base_commit TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (conversation_id, repo)
+                );
+
                 CREATE TABLE IF NOT EXISTS order_intents (
                     intent_id TEXT PRIMARY KEY,
                     project TEXT NOT NULL,
@@ -1088,6 +1112,26 @@ class TraceStore:
                     delivery_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(delivered_at, id);
+
+
+                CREATE TABLE IF NOT EXISTS observation_sources (
+                    source TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0,
+                    collected_at REAL NOT NULL, status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS observation_evidence (
+                    id TEXT PRIMARY KEY, source TEXT NOT NULL, kind TEXT NOT NULL, at TEXT,
+                    text TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0, received_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS improvement_findings (
+                    id TEXT PRIMARY KEY, finding_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                    detail_json TEXT NOT NULL, state TEXT NOT NULL, conversation_id TEXT,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS improvement_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), next_analysis REAL NOT NULL DEFAULT 0,
+                    owner_pid INTEGER, last_analysis REAL, last_error TEXT
+                );
+                INSERT OR IGNORE INTO improvement_state(id) VALUES (1);
 
                 CREATE TABLE IF NOT EXISTS schedules (
                     id TEXT PRIMARY KEY,
@@ -3302,6 +3346,43 @@ class TraceStore:
                 "DELETE FROM conversation_worktrees WHERE conversation_id = ?", (conversation_id,)
             )
 
+    def record_conversation_repo_worktree(
+        self, conversation_id: str, repo: str, *, workspace_id: str, path: str,
+        branch: str, base_branch: str | None, base_commit: str | None,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO conversation_repo_worktrees "
+                "(conversation_id, repo, workspace_id, path, branch, base_branch, base_commit, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (conversation_id, repo, workspace_id, path, branch, base_branch, base_commit, utc_now_iso()),
+            )
+
+    def get_conversation_repo_worktrees(self, conversation_id: str) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT conversation_id, repo, workspace_id, path, branch, base_branch, base_commit "
+                "FROM conversation_repo_worktrees WHERE conversation_id = ? ORDER BY rowid",
+                (conversation_id,),
+            ).fetchall()
+        return [dict(zip(
+            ("conversation_id", "repo", "workspace_id", "path", "branch", "base_branch", "base_commit"),
+            row,
+        )) for row in rows]
+
+    def delete_conversation_repo_worktrees(self, conversation_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM conversation_repo_worktrees WHERE conversation_id = ?", (conversation_id,)
+            )
+
+    def delete_conversation_repo_worktree(self, conversation_id: str, repo: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM conversation_repo_worktrees WHERE conversation_id = ? AND repo = ?",
+                (conversation_id, repo),
+            )
+
     # ---- order intents: a trade the model proposed, waiting for the human's button.
     # Status flow: pending -> awaiting (delivered to the operator) -> confirming -> submitted|failed,
     # or awaiting -> cancelled|expired. Every move is a compare-and-set so a double tap or a
@@ -4221,7 +4302,9 @@ class TraceStore:
                 return []
             rows = conn.execute(
                 "SELECT id, sequence, stage, profile_id, provider, model, state, "
-                "attempt_index, created_at FROM turns WHERE conversation_id = ? AND run_id = ? "
+                "attempt_index, created_at, (SELECT execution_source_id FROM cli_executions e "
+                "WHERE e.run_id=turns.run_id AND e.sequence=turns.sequence AND e.attempt_index=turns.attempt_index LIMIT 1) "
+                "FROM turns WHERE conversation_id = ? AND run_id = ? "
                 "ORDER BY sequence ASC, attempt_index ASC",
                 (conversation_id, latest_run[0]),
             ).fetchall()
@@ -4236,6 +4319,7 @@ class TraceStore:
                 "state": row[6],
                 "attempt_index": row[7],
                 "created_at": row[8],
+                "execution_source_id": row[9],
             }
             for row in rows
         ]
@@ -4262,9 +4346,12 @@ class TraceStore:
                 (turn[2], turn[3], turn[6]),
             ).fetchone()
         final_text = None
+        execution_source_id = None
         if response_row:
             try:
-                final_text = json.loads(response_row[0]).get("final_text")
+                response_data = json.loads(response_row[0])
+                final_text = response_data.get("final_text")
+                execution_source_id = response_data.get("execution", {}).get("execution_source_id")
             except (json.JSONDecodeError, AttributeError):
                 final_text = None
         artifact = None
@@ -4287,6 +4374,7 @@ class TraceStore:
             "artifact": artifact,
             "final_text": final_text,
             "created_at": turn[11],
+            "execution_source_id": execution_source_id,
         }
 
     def get_workspace_lock(self, workspace_id: str) -> dict | None:

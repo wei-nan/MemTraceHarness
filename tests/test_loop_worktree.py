@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from memtrace_harness.loop import AgentLoopRunner, controller_task
 from memtrace_harness.schemas import TaskEnvelope
 from memtrace_harness.trace_store import TraceStore
-from memtrace_harness.worktrees import IntegrationReport, WorktreeManager
+from memtrace_harness.worktrees import IntegrationReport, RepoTaskWorkspace, WorktreeManager
 from tests.test_loop import (
     QueueAdapter,
     completed_development,
@@ -44,7 +44,7 @@ class WorktreeLoopTests(TestCase):
             task_id="t", workspace_id="ws", goal="Add a file", risk_level="medium"
         )
 
-    def _run(self, converge: dict, files: dict[str, str], worktree=None):
+    def _run(self, converge: dict, files: dict[str, str], worktree=None, progress_callback=None, **runner_options):
         worktree = worktree or self.manager.create(self.repo, "proj", "chat_1")
         adapters = {
             "controller": QueueAdapter(
@@ -62,8 +62,59 @@ class WorktreeLoopTests(TestCase):
             worktree=worktree,
             worktree_manager=self.manager,
             repo_root=self.repo,
+            progress_callback=progress_callback,
+            **runner_options,
         )
         return runner.run(self.task, conversation_id="chat_1"), adapters, worktree
+
+    def test_remote_delivery_never_merges_locally_and_requires_real_passing_tests(self):
+        summary, _, worktree = self._run(
+            {"action": "merge", "reason": "ready"}, {"new.txt": "hello"},
+            remote_delivery=True, verify_command="true")
+        self.assertEqual(summary.status, "delivering")
+        self.assertEqual(summary.delivery["state"], "pending")
+        self.assertFalse((self.repo / "new.txt").exists())
+        self.assertTrue(worktree.path.exists())
+
+    def test_remote_delivery_cannot_treat_missing_tests_as_passed(self):
+        summary, _, _ = self._run(
+            {"action": "merge", "reason": "ready"}, {"new.txt": "hello"}, remote_delivery=True)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertFalse((self.repo / "new.txt").exists())
+
+    def _remote_routed(self, action, developer=None, worktree=None):
+        adapters = {
+            "controller": QueueAdapter("controller", "codex", "m", [{"action": action, "reason": "test"}]),
+            "plan": QueueAdapter("plan", "claude", "m", []),
+            "plan-escalation": QueueAdapter("plan-escalation", "claude", "m", []),
+            "review": QueueAdapter("review", "codex", "m", []),
+            "develop": developer or QueueAdapter("develop", "codex", "m", [completed_development()]),
+        }
+        runner = AgentLoopRunner(adapters=adapters, trace_store=self.store,
+            working_directory=worktree.path if worktree else self.root,
+            worktree=worktree, repo_root=self.repo if worktree else None,
+            worktree_manager=self.manager if worktree else None, remote_delivery=True)
+        return runner.run(self.task), adapters
+
+    def test_shared_policy_blocks_development_without_worktree_before_any_editing_call(self):
+        result, adapters = self._remote_routed("run_planner")
+        self.assertEqual(result.status, "needs_human")
+        self.assertIn("Git worktree", result.recommendation)
+        self.assertEqual(adapters["develop"].calls, [])
+
+    def test_shared_policy_keeps_non_git_operational_requests_available(self):
+        result, adapters = self._remote_routed("run_operational_action")
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(len(adapters["develop"].calls), 1)
+        self.assertEqual(adapters["plan"].calls, [])
+
+    def test_operational_route_cannot_bypass_delivery_with_unverified_code_changes(self):
+        worktree = self.manager.create(self.repo, "proj", "ops")
+        result, _ = self._remote_routed("run_operational_action",
+            developer=WritingDeveloper(worktree.path, {"new.txt": "code"}), worktree=worktree)
+        self.assertEqual(result.status, "needs_human")
+        self.assertTrue(worktree.path.exists())
+        self.assertFalse((self.repo / "new.txt").exists())
 
     def test_controller_is_told_about_the_pending_merge_and_may_merge_it(self) -> None:
         summary, adapters, worktree = self._run(
@@ -79,6 +130,18 @@ class WorktreeLoopTests(TestCase):
         self.assertIn('"integration"', snapshot.body)
         self.assertIn("harness/chat_1", snapshot.body)
         self.assertIn("new.txt", snapshot.body)
+
+    def test_actual_check_and_merge_boundaries_report_before_and_after_the_work(self) -> None:
+        events = []
+        summary, _, _ = self._run(
+            {"action": "merge", "reason": "clean change"}, {"new.txt": "hi\n"},
+            progress_callback=lambda stage, state, artifact: events.append((stage, state, artifact)),
+        )
+        for name in ("final-gate", "integrate"):
+            self.assertEqual([state for stage, state, artifact in events if stage == name], ["running", "succeeded"])
+        self.assertEqual(summary.delivery["state"], "merged")
+        stored = self.store.conversation_outcome("chat_1")
+        self.assertEqual(stored["delivery"]["state"], "merged")
 
     def test_finish_leaves_the_branch_unmerged_and_says_so(self) -> None:
         summary, _, worktree = self._run(
@@ -120,6 +183,71 @@ class WorktreeLoopTests(TestCase):
     def test_without_a_worktree_the_converge_stage_is_unchanged(self) -> None:
         task = controller_task(self.task, stage="converge", stages=[])
         self.assertIn("['finish', 'ask_human']", task.goal)
+
+    def test_multi_repo_merge_preflights_every_checkout_then_merges_each_branch(self) -> None:
+        (self.root / "second").mkdir()
+        second = make_repo(self.root / "second")
+        first_worktree = self.manager.create(self.repo, "proj-primary", "chat_multi")
+        second_worktree = self.manager.create(second, "proj-android", "chat_multi")
+        (first_worktree.path / "first.txt").write_text("first\n")
+        (second_worktree.path / "second.txt").write_text("second\n")
+        targets = (
+            RepoTaskWorkspace("primary", self.repo, first_worktree.path, None, 1200, (), first_worktree),
+            RepoTaskWorkspace("android", second, second_worktree.path, None, 1200, (), second_worktree),
+        )
+        runner = AgentLoopRunner(
+            adapters={"controller": QueueAdapter("controller", "codex", "m", []),
+                      "plan": QueueAdapter("plan", "claude", "m", []),
+                      "plan-escalation": QueueAdapter("plan-escalation", "claude", "m", []),
+                      "review": QueueAdapter("review", "codex", "m", []),
+                      "develop": QueueAdapter("develop", "codex", "m", [])},
+            trace_store=self.store, worktree_manager=self.manager,
+            working_directory=first_worktree.path, worktree=first_worktree,
+            repo_root=self.repo, repo_workspaces=targets,
+        )
+        (second / "a.txt").write_text("operator change\n")
+        report = runner._prepare_integration(self.task)
+        self.assertEqual([row["repo"] for row in report], ["primary", "android"])
+        blocked = runner._merge_worktree(self.task)
+        self.assertFalse(blocked.ok)
+        self.assertFalse((self.repo / "first.txt").exists())  # no partial merge before all preflights pass
+        (second / "a.txt").write_text("one\n")
+        report = runner._prepare_integration(self.task)
+        merged = runner._merge_worktree(self.task)
+        self.assertTrue(merged.ok, merged.detail)
+        self.assertIn("primary, android", merged.detail)
+        self.assertTrue((self.repo / "first.txt").exists())
+        self.assertTrue((second / "second.txt").exists())
+
+    def test_multi_repo_verification_runs_each_configured_command_and_blocks_on_one_regression(self) -> None:
+        (self.root / "second").mkdir()
+        second = make_repo(self.root / "second")
+        first_worktree = self.manager.create(self.repo, "proj-primary", "chat_verify")
+        second_worktree = self.manager.create(second, "proj-android", "chat_verify")
+        targets = (
+            RepoTaskWorkspace("primary", self.repo, first_worktree.path, "pytest -q", 90, (), first_worktree),
+            RepoTaskWorkspace("android", second, second_worktree.path, "./gradlew test", 180, (), second_worktree),
+        )
+        runner = AgentLoopRunner(
+            adapters={"controller": QueueAdapter("controller", "codex", "m", []),
+                      "plan": QueueAdapter("plan", "claude", "m", []),
+                      "plan-escalation": QueueAdapter("plan-escalation", "claude", "m", []),
+                      "review": QueueAdapter("review", "codex", "m", []),
+                      "develop": QueueAdapter("develop", "codex", "m", [])},
+            trace_store=self.store, working_directory=first_worktree.path,
+            verify_command="pytest -q", repo_workspaces=targets,
+        )
+        passed = {"command": "x", "exit_code": 0, "passed": True, "duration_seconds": 1,
+                  "stdout_tail": "", "stderr_tail": ""}
+        failed = {"command": "x", "exit_code": 1, "passed": False, "duration_seconds": 2,
+                  "stdout_tail": "FAILED test_login", "stderr_tail": ""}
+        with patch.object(runner, "_run_deterministic_verification", side_effect=[passed, failed, passed]) as verify:
+            result = runner._verify()
+        self.assertEqual([call.args[0] for call in verify.call_args_list], [
+            first_worktree.path, second_worktree.path, second,
+        ])
+        self.assertEqual(result["status"], "regression")
+        self.assertEqual([row["repo"] for row in result["repos"]], ["primary", "android"])
 
 
 class SharedFolderEditLockTests(TestCase):

@@ -176,6 +176,7 @@ class ChatCommandTests(TestCase):
 
         config = MagicMock(spec=HarnessConfig)
         config.command_for.side_effect = lambda p: f"/bin/{p}"
+        config.source_command.side_effect = lambda p: [config.command_for(p)]
         config.trace_db_path = Path("/tmp/harness-test.sqlite3")
         return config
 
