@@ -101,7 +101,7 @@ class ScheduleReportGatewayTests(TestCase):
 
     def test_a_chat_task_that_needs_a_human_is_reported_as_before(self) -> None:
         text = self._run(None)
-        self.assertIn("✅", text)
+        self.assertIn("⚠️", text)
         self.assertNotIn("這只是通知", text)
 
     def test_only_schedule_runs_are_told_not_to_open_approvals(self) -> None:

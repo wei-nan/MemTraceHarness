@@ -183,13 +183,13 @@ class FixFlowTests(CollabCase):
         self.assertEqual(self.started, [])
         self.assertEqual(self.state(task_id)["status"]["state"], "TASK_STATE_CANCELED")
 
-    def test_always_allow_makes_the_next_report_start_without_a_card(self) -> None:
+    def test_each_peer_fix_requires_its_own_confirmation(self) -> None:
         first = self.report()
         card_id, _ = self.card()
         self.b.service.process_job_requests()
         labels = [b["label"] for e in self.b.service.fetch_events(limit=50, wait_seconds=0) for row in e.get("actions") or [] for b in row]
-        self.assertTrue(any("之後這個 Harness 回報的修復都直接開工" in label for label in labels), labels)
-        self.b.service._resolve_job_action("job_confirm_always", card_id, 1, 77)
+        self.assertFalse(any("之後都允許" in label for label in labels), labels)
+        self.b.service._resolve_job_action("job_confirm", card_id, 1, 77)
         for thread in [t for t in threading.enumerate() if t.name == f"job-{card_id}"]:
             thread.join(10)
         self.assertEqual(len(self.started), 1)
@@ -201,7 +201,9 @@ class FixFlowTests(CollabCase):
         newest = self.card()[0]
         for thread in [t for t in threading.enumerate() if t.name == f"job-{newest}"]:
             thread.join(10)
-        self.assertEqual(len(self.started), 2)  # no tap
+        self.assertEqual(len(self.started), 1)
+        self.tap("job_confirm", newest)
+        self.assertEqual(len(self.started), 2)
         self.wait_state(second, "TASK_STATE_WORKING")
 
 

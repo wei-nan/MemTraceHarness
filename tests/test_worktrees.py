@@ -127,3 +127,26 @@ class WorktreeManagerTests(TestCase):
         self.assertEqual((wt.path / "root.txt").read_text().strip(), str(self.repo))
         with self.assertRaises(RuntimeError):
             self.manager.run_setup_command(wt, self.repo, "exit 3", 10)
+
+
+class RemoteMainWorktreeTests(TestCase):
+    def test_delivery_starts_from_latest_remote_main_and_preserves_dirty_local_checkout(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = make_repo(root)
+            origin = root / 'origin.git'
+            git(root, 'clone', '--bare', str(repo), str(origin))
+            git(repo, 'remote', 'add', 'origin', str(origin))
+            updater = root / 'updater'
+            git(root, 'clone', str(origin), str(updater))
+            (updater / 'remote.txt').write_text('remote change')
+            git(updater, 'add', '-A')
+            git(updater, 'commit', '-m', 'remote update')
+            git(updater, 'push', 'origin', 'main')
+            (repo / 'a.txt').write_text('operator work')
+            manager = WorktreeManager(root / 'worktrees')
+            worktree = manager.create(repo, 'proj', 'new_task', remote_main=True)
+            self.assertEqual((worktree.path / 'remote.txt').read_text(), 'remote change')
+            self.assertEqual((worktree.path / 'a.txt').read_text(), 'one\n')
+            self.assertEqual((repo / 'a.txt').read_text(), 'operator work')
+            self.assertFalse((repo / 'remote.txt').exists())

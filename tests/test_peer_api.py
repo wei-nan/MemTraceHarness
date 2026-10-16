@@ -136,7 +136,7 @@ class RefusalTests(PeerApiCase):
         self.assertEqual((body["request"]["state"], body["request"]["reason"]), ("rejected", "unsupported skill"))
 
     def test_the_hop_limit_refuses_without_calling_a_model(self) -> None:
-        with patch("memtrace_harness.peer.CliProcessRunner.run") as run:
+        with patch("memtrace_harness.peer.CliProcessRunner.run", return_value=reply("ok")) as run:
             _, ok = self.ask(hops=MAX_HOPS - 1)
             self.wait_for(ok["request"]["request_id"])
             _, body = self.ask(hops=MAX_HOPS)

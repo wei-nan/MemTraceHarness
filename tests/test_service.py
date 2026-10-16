@@ -456,6 +456,87 @@ class HarnessServiceTests(TestCase):
         gateway._start_or_queue_task.assert_not_called()
         self.assertEqual(store.get_job_request("job_1")["status"], "cancelled")
 
+    def test_slow_dialogue_reports_wait_and_cannot_report_after_completion(self) -> None:
+        from unittest.mock import patch
+
+        gateway, _, _ = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        timer = MagicMock()
+        callbacks = []
+
+        def make_timer(seconds, callback):
+            self.assertEqual(seconds, 30)
+            callbacks.append(callback)
+            return timer
+
+        def run(*args, **kwargs):
+            self.assertEqual(kwargs["timeout_seconds"], 180)
+            callbacks[0]()
+            return "result"
+
+        with patch("memtrace_harness.service.threading.Timer", side_effect=make_timer), patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run", side_effect=run,
+        ):
+            self.assertEqual(gateway._run_dialogue_attempt(["cli"], gateway.projects[0], "tg:1"), "result")
+        timer.cancel.assert_called_once()
+        gateway.send_message.assert_called_once()
+        self.assertIn("尚未取得結果", gateway.send_message.call_args.args[1])
+        callbacks[0]()
+        gateway.send_message.assert_called_once()
+
+    def test_quick_or_exceptional_dialogue_cancels_its_wait_notice(self) -> None:
+        from unittest.mock import patch
+
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                gateway, _, _ = self._gateway_for_report_outcome_tests()
+                gateway.send_message = MagicMock()
+                timer = MagicMock()
+                callbacks = []
+
+                def make_timer(seconds, callback):
+                    callbacks.append(callback)
+                    return timer
+
+                with patch("memtrace_harness.service.threading.Timer", side_effect=make_timer), patch(
+                    "memtrace_harness.cli_process.CliProcessRunner.run", side_effect=RuntimeError("failed") if failure else None,
+                ):
+                    if failure:
+                        with self.assertRaises(RuntimeError):
+                            gateway._run_dialogue_attempt(["cli"], gateway.projects[0], "tg:1")
+                    else:
+                        gateway._run_dialogue_attempt(["cli"], gateway.projects[0], "tg:1")
+                callbacks[0]()
+                timer.cancel.assert_called_once()
+                gateway.send_message.assert_not_called()
+
+    def test_dialogue_timeout_announces_fallback_before_the_successful_answer(self) -> None:
+        from unittest.mock import patch
+        from memtrace_harness.cli_process import ProcessResult
+
+        gateway, _, _ = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        failed = ProcessResult(command=[], return_code=-15, stdout="", stderr="", started_at="s", completed_at="e", duration_ms=180000, timed_out=True)
+        passed = ProcessResult(command=[], return_code=0, stdout="已查到結果", stderr="", started_at="s", completed_at="e", duration_ms=1)
+        with patch.object(gateway.primary_agent, "candidates", return_value=(("claude", "haiku"), ("codex", "model"))), patch(
+            "memtrace_harness.cli_process.CliProcessRunner.run", side_effect=[failed, passed],
+        ) as run:
+            gateway._chat_reply_and_maybe_start_task(gateway.projects[0], "tg:1", "觀察對話紀錄")
+        self.assertEqual([call.kwargs["timeout_seconds"] for call in run.call_args_list], [180, 180])
+        messages = [call.args[1] for call in gateway.send_message.call_args_list]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("改用已設定的備援", messages[0])
+        self.assertIn("已查到結果", messages[1])
+
+    def test_progress_query_is_kept_in_the_project_conversation(self) -> None:
+        gateway, _, store = self._gateway_for_report_outcome_tests()
+        gateway.send_message = MagicMock()
+        gateway.report_chat_wait("有在處理嗎？", "tg:1")
+        turns = store.get_primary_session_turns(gateway.primary_session_mgr.primary_session_id_for_project(gateway.projects[0].name))
+        self.assertEqual([t["speaker"] for t in turns], ["user", "assistant"])
+        self.assertEqual(turns[0]["content"], "有在處理嗎？")
+        gateway.send_message.assert_called_once_with("tg:1", turns[1]["content"])
+
     def test_the_redo_records_only_the_new_words_but_the_model_sees_both(self) -> None:
         from unittest.mock import MagicMock, patch
 
@@ -614,37 +695,22 @@ class HarnessServiceTests(TestCase):
         for thread in [t for t in threading.enumerate() if t.name == f"job-{request_id}"]:
             thread.join(10)
 
-    def test_always_allow_runs_the_same_command_without_asking_but_not_a_changed_one(self) -> None:
+    def test_every_job_requires_a_fresh_tap_even_with_a_legacy_allowlist(self) -> None:
         gateway, scope, store = self._job_gateway("echo ran-it")
-        store.create_job_request(
-            request_id="job_1", project=scope.name, job_name="hello", command="echo ran-it",
-            expires_at="2999-01-01T00:00:00+00:00",
-        )
-        gateway.process_job_requests()
-        labels = [b["label"] for row in gateway.send_message_with_keyboard.call_args.args[2] for b in row]
-        self.assertTrue(any("之後都允許" in label for label in labels))
-        gateway._resolve_job_action("job_confirm_always", "job_1", 12345, 77)
-        self._join_job("job_1")
-        self.assertTrue(gateway.allowlist.is_allowed(scope.name, "hello", "echo ran-it"))
-
-        gateway.send_message_with_keyboard.reset_mock()
-        store.create_job_request(
-            request_id="job_2", project=scope.name, job_name="hello", command="echo ran-it",
-            expires_at="2999-01-01T00:00:00+00:00",
-        )
-        gateway.process_job_requests()
-        self._join_job("job_2")
-        gateway.send_message_with_keyboard.assert_not_called()  # no tap needed
-        self.assertEqual(store.get_job_request("job_2")["status"], "done")
-
-        scope.jobs = {"hello": "echo something-else"}  # the command changed: ask again
-        store.create_job_request(
-            request_id="job_3", project=scope.name, job_name="hello", command="echo something-else",
-            expires_at="2999-01-01T00:00:00+00:00",
-        )
-        gateway.process_job_requests()
-        self.assertEqual(gateway.send_message_with_keyboard.call_count, 1)
-        self.assertEqual(store.get_job_request("job_3")["status"], "awaiting")
+        gateway.allowlist.add(scope.name, "hello", "echo ran-it")
+        for number in (1, 2):
+            rid = f"job_{number}"
+            store.create_job_request(request_id=rid, project=scope.name, job_name="hello",
+                                     command="echo ran-it", expires_at="2999-01-01T00:00:00+00:00")
+            gateway.process_job_requests()
+            self.assertEqual(store.get_job_request(rid)["status"], "awaiting")
+            buttons = gateway.send_message_with_keyboard.call_args.args[2]
+            self.assertFalse(any("之後都允許" in b["label"] for row in buttons for b in row))
+            self.assertIn("單次確認", gateway._resolve_job_action("job_confirm_always", rid, 12345, 77))
+            self.assertEqual(store.get_job_request(rid)["status"], "awaiting")
+            gateway._resolve_job_action("job_confirm", rid, 12345, 77)
+            self._join_job(rid)
+            self.assertEqual(store.get_job_request(rid)["status"], "done")
 
     def test_a_job_whose_output_is_not_valid_utf8_still_reports_its_result(self) -> None:
         gateway, scope, store = self._job_gateway("printf 'ok \\357 bad\\n'; exit 3")
@@ -750,7 +816,7 @@ class HarnessServiceTests(TestCase):
             count = conn.execute("SELECT COUNT(*) FROM job_requests WHERE kind = 'job'").fetchone()[0]
         self.assertEqual(count, 0)
 
-    def test_github_scope_and_model_requests_can_be_always_allowed_too(self) -> None:
+    def test_existing_external_action_grants_do_not_bypass_single_confirmation(self) -> None:
         from unittest.mock import MagicMock
 
         gateway, scope, store = self._job_gateway("echo x")
@@ -762,7 +828,7 @@ class HarnessServiceTests(TestCase):
         )
         gateway.process_job_requests()
         keyboard = gateway.send_message_with_keyboard.call_args.args[2]
-        self.assertTrue(any("同一 repo 的同類操作" in b["label"] for row in keyboard for b in row))
+        self.assertFalse(any("之後都允許" in b["label"] for row in keyboard for b in row))
         gateway._resolve_job_action.assert_not_called()  # first time: asks
 
         gateway.allowlist.add_rule(scope.name, "external_action", payload)
@@ -772,10 +838,11 @@ class HarnessServiceTests(TestCase):
             payload={**payload, "number": 8, "comment": "another"}, expires_at="2999-01-01T00:00:00+00:00",
         )
         gateway.process_job_requests()
-        gateway.send_message_with_keyboard.assert_not_called()
-        gateway._resolve_job_action.assert_called_once_with("job_confirm", "act_2", None, None)
+        gateway.send_message_with_keyboard.assert_called_once()
+        gateway._resolve_job_action.assert_not_called()
+        self.assertEqual(store.get_job_request("act_2")["status"], "awaiting")
 
-    def test_a_change_tool_call_asks_then_can_be_always_allowed_and_an_unknown_kind_fails_closed(self) -> None:
+    def test_each_change_tool_call_requires_its_own_confirmation_and_an_unknown_kind_fails_closed(self) -> None:
         from memtrace_harness import tool_registry
 
         ran: list[dict] = []
@@ -791,9 +858,9 @@ class HarnessServiceTests(TestCase):
         )
         gateway.process_job_requests()
         keyboard = gateway.send_message_with_keyboard.call_args.args[2]
-        self.assertTrue(any("同一個工具" in b["label"] for row in keyboard for b in row))
+        self.assertFalse(any("之後都允許" in b["label"] for row in keyboard for b in row))
         self.assertEqual(ran, [])  # nothing ran before the tap
-        gateway._resolve_job_action("job_confirm_always", "tool_1", 12345, 77)
+        gateway._resolve_job_action("job_confirm", "tool_1", 12345, 77)
         self._join_job("tool_1")
         self.assertEqual(ran, [{"a": 1}])
 
@@ -804,8 +871,12 @@ class HarnessServiceTests(TestCase):
         )
         gateway.process_job_requests()
         self._join_job("tool_2")
-        gateway.send_message_with_keyboard.assert_not_called()
+        gateway.send_message_with_keyboard.assert_called_once()
+        self.assertEqual(ran, [{"a": 1}])
+        gateway._resolve_job_action("job_confirm", "tool_2", 12345, 77)
+        self._join_job("tool_2")
         self.assertEqual(ran, [{"a": 1}, {"a": 1}])
+        gateway.send_message_with_keyboard.reset_mock()
         # different arguments: asks again
         store.create_tool_call_request(
             request_id="tool_3", project=scope.name, tool="t_click", arguments={"a": 2}, summary="click b",
@@ -880,23 +951,23 @@ class HarnessServiceTests(TestCase):
         final = [c.args[1] for c in gateway.send_message.call_args_list if "計畫結束：達成" in str(c.args[1:])]
         self.assertTrue(final)
 
-    def test_plan_wide_approval_answers_the_confirm_cards_of_its_own_steps(self) -> None:
+    def test_plan_wide_approval_and_persisted_approval_cannot_bypass_a_tap(self) -> None:
         gateway, scope, store, _calls, _out = self._plan_gateway()
         gateway.plan_runner.create(scope, 12345, self.PLAN)
         plan_id = store.list_active_plans()[0]["plan_id"]
-        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
-        self._drive(gateway, store, 6)  # no taps at all
+        self.assertIn("單次確認", gateway.plan_runner.handle_action("plan_approve_all", plan_id))
+        store.update_plan(plan_id, approve_all=True)  # old checkpoints do not grant permission
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.list_plan_steps(plan_id)[0]["status"], "awaiting")
+        self._drive(gateway, store, 6, confirm=True)
         self.assertEqual(store.get_plan(plan_id)["status"], "done")
-        cards = [c for c in gateway.send_message_with_keyboard.call_args_list if "待確認重跑工作" in c.args[1]]
-        self.assertEqual(cards, [])
 
     def test_a_step_that_misses_its_expectation_stops_the_plan_and_the_user_can_retry_skip_or_cancel(self) -> None:
         gateway, scope, store, calls, out = self._plan_gateway()
         out["text"] = "not running"
         gateway.plan_runner.create(scope, 12345, self.PLAN)
         plan_id = store.list_active_plans()[0]["plan_id"]
-        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
-        self._drive(gateway, store, 6)
+        self._drive(gateway, store, 6, confirm=True)
         self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
         failed = store.list_plan_steps(plan_id)[1]
         self.assertEqual(failed["status"], "failed")
@@ -912,8 +983,7 @@ class HarnessServiceTests(TestCase):
         out["text"] = "nope"
         gateway.plan_runner.create(scope, 12345, self.PLAN)
         plan_id = store.list_active_plans()[0]["plan_id"]
-        gateway.plan_runner.handle_action("plan_approve_all", plan_id)
-        self._drive(gateway, store, 6)
+        self._drive(gateway, store, 6, confirm=True)
         gateway.plan_runner.handle_action("plan_skip", plan_id)
         self._drive(gateway, store, 3)
         self.assertEqual(store.get_plan(plan_id)["status"], "done")
@@ -1039,7 +1109,9 @@ class HarnessServiceTests(TestCase):
         self.assertEqual([b["label"] for row in keyboard for b in row], ["✅ 確認安裝", "❌ 取消"])  # no always-allow
         self.assertFalse(gateway.allowlist.is_rule_allowed(scope.name, "install", payload))
         with patch("memtrace_harness.capabilities.run_install", return_value=(True, "ok", {})) as run:
-            gateway._resolve_job_action("job_confirm_always", "inst_1", 12345, 77)  # even a forged "always" tap is just a confirm
+            gateway._resolve_job_action("job_confirm_always", "inst_1", 12345, 77)
+            run.assert_not_called()
+            gateway._resolve_job_action("job_confirm", "inst_1", 12345, 77)
             self._join_job("inst_1")
         run.assert_called_once()
         self.assertEqual(store.get_job_request("inst_1")["status"], "done")
@@ -1226,7 +1298,7 @@ class HarnessServiceTests(TestCase):
         gateway._resolve_job_action("job_cancel", "job_a", 12345, None)
         self.assertEqual(store.get_job_request("job_a")["status"], "cancelled")
         gateway._resolve_job_action("job_confirm", "job_b", 12345, None)  # no longer declared
-        self.assertEqual(store.get_job_request("job_b")["status"], "failed")
+        self.assertEqual(store.get_job_request("job_b")["status"], "cancelled")
 
     def test_expire_stale_approvals_closes_old_pending_only(self) -> None:
         from datetime import datetime, timedelta, timezone
@@ -2081,19 +2153,19 @@ class NotificationFormatAndLiteralNewlineTests(TestCase):
         self.assertFalse(any("狀態：succeeded" in t for t in sent_messages))
         self.assertFalse(any(r"\n" in t for t in sent_messages))
 
-    def test_scheduled_failure_notification_preserves_prefix(self) -> None:
+    def test_scheduled_failure_notification_uses_plain_status(self) -> None:
         rec = r"檢查失敗：\n連線逾時"
         self._run_task(schedule_id="sched_fail", status="failed", recommendation=rec)
 
         sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
-        self.assertTrue(any("✅「test_proj」的任務已完成。狀態：failed。檢查失敗：\n連線逾時" in t for t in sent_messages))
+        self.assertTrue(any("⚠️「test_proj」這次工作未完成。\n檢查失敗：\n連線逾時" in t for t in sent_messages))
 
-    def test_nonscheduled_task_preserves_prefix(self) -> None:
+    def test_nonscheduled_task_uses_plain_status_and_preserves_short_result(self) -> None:
         rec = r"完成新功能實作：\n已更新 2 個檔案"
         self._run_task(schedule_id=None, status="succeeded", recommendation=rec)
 
         sent_messages = [c.args[1] for c in self.gateway.send_message.call_args_list]
-        self.assertTrue(any("✅「test_proj」的任務已完成。狀態：succeeded。完成新功能實作：\n已更新 2 個檔案" in t for t in sent_messages))
+        self.assertTrue(any("✅「test_proj」這次工作已完成。\n完成新功能實作：\n已更新 2 個檔案" in t for t in sent_messages))
 
     def test_scheduled_needs_human_notification_unescapes_newlines(self) -> None:
         rec = r"請確認：\n1. 停損門檻觸發"

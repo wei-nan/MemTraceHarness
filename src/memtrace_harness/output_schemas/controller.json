@@ -1,6 +1,11 @@
 {
   "type": "object",
   "properties": {
+    "user_summary": {
+      "type": ["string", "null"],
+      "maxLength": 180,
+      "description": "One or two short sentences for the operator in plain language: what this step actually did or decided, its result and any remaining limitation. No internal stage names, commands, file paths, or unsupported completion claims."
+    },
     "action": {
       "type": "string",
       "enum": [
@@ -225,13 +230,22 @@
                   "type": "string",
                   "maxLength": 600
                 }
+              },
+              "paths": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                  "type": "string",
+                  "maxLength": 200
+                }
               }
             },
             "required": [
               "title",
               "purpose",
               "skills",
-              "acceptance"
+              "acceptance",
+              "paths"
             ],
             "additionalProperties": false
           }
@@ -342,19 +356,29 @@
               "type": "string",
               "maxLength": 600
             }
+          },
+          "paths": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "string",
+              "maxLength": 200
+            }
           }
         },
         "required": [
           "title",
           "purpose",
           "skills",
-          "acceptance"
+          "acceptance",
+          "paths"
         ],
         "additionalProperties": false
       }
     }
   },
   "required": [
+    "user_summary",
     "action",
     "reason",
     "searched_history",

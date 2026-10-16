@@ -31,7 +31,7 @@ def check_dict(*statuses: str, verdict: str = "met", remaining: list[str] | None
     return {
         "verdict": verdict,
         "criteria": [
-            {"criterion": f"criterion {index}", "status": status, "evidence": "seen in the stage results"}
+            {"criterion": ("button exports CSV", "README explains it")[index - 1], "status": status, "evidence": "seen in the stage results"}
             for index, status in enumerate(statuses, 1)
         ],
         "remaining": remaining or [],
@@ -92,7 +92,7 @@ class JudgeGoalCheckTests(TestCase):
     def test_one_unmet_criterion_blocks_finishing_and_is_named(self) -> None:
         verdict = judge_goal_check(self.plan, check_dict("met", "unmet", verdict="partly_met"))
         self.assertFalse(verdict.complete)
-        self.assertEqual(verdict.unmet, ("criterion 2",))
+        self.assertEqual(verdict.unmet, ("README explains it",))
 
     def test_a_met_verdict_cannot_override_an_unmet_criterion(self) -> None:
         self.assertFalse(judge_goal_check(self.plan, check_dict("met", "unmet", verdict="met")).complete)
@@ -107,10 +107,10 @@ class JudgeGoalCheckTests(TestCase):
         self.assertFalse(verdict.complete)
         self.assertIn("2", verdict.problem)
 
-    def test_unverified_criteria_may_finish_but_are_reported(self) -> None:
+    def test_unverified_criteria_block_completion_and_are_reported(self) -> None:
         verdict = judge_goal_check(self.plan, check_dict("met", "unverified"))
-        self.assertTrue(verdict.complete)
-        self.assertEqual(verdict.unverified, ("criterion 2",))
+        self.assertFalse(verdict.complete)
+        self.assertEqual(verdict.unverified, ("README explains it",))
 
     def test_a_missing_check_blocks_finishing_only_when_criteria_were_written(self) -> None:
         self.assertFalse(judge_goal_check(self.plan, None).complete)
@@ -131,8 +131,8 @@ class RenderGoalReportTests(TestCase):
         check = check_dict("met", "unverified")
         text = render_goal_report(plan, check, judge_goal_check(plan, check))
         self.assertIn("目標：add the export button and document it", text)
-        self.assertIn("✅ criterion 1（seen in the stage results）", text)
-        self.assertIn("❔ criterion 2", text)
+        self.assertIn("✅ button exports CSV（seen in the stage results）", text)
+        self.assertIn("❔ README explains it", text)
         self.assertIn("沒有被獨立驗證", text)
 
     def test_nothing_to_report_without_a_check(self) -> None:

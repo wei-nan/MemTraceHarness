@@ -83,6 +83,8 @@ def build_harness(config: HarnessConfig, scope: ProjectScope) -> HarnessParts:
     service = HarnessService(
         config, approval_mgr, ChatTriage(projects), primary_session_mgr, projects, memtrace_client
     )
+    from memtrace_harness.improvement import ImprovementDuty
+    service.improvement_duty = ImprovementDuty(service, scope)
 
     def record_push(project: str, text: str) -> None:
         primary_session_mgr.record_turn(project=project, speaker="assistant", turn_type="chat", content=text)
@@ -95,7 +97,9 @@ def build_harness(config: HarnessConfig, scope: ProjectScope) -> HarnessParts:
         send=service.send_message,
         record_push=record_push,
     )
-    service.review_caller_factory = lambda project: make_review_caller(config, project)
+    service.review_caller_factory = lambda project: make_review_caller(
+        config, project, context=lambda: service._identity_context(scope),
+    )
 
     def start(target, name: str, **kwargs):
         def go(scope_: ProjectScope, audience: str | None) -> None:
@@ -123,7 +127,7 @@ def build_harness(config: HarnessConfig, scope: ProjectScope) -> HarnessParts:
         service,
         approval_mgr,
         record_push=record_push,
-        review_caller_factory=lambda project: make_review_caller(config, project),
+        review_caller_factory=service.review_caller_factory,
     )
     return HarnessParts(
         config, scope, trace_store, approval_mgr, memtrace_client, primary_session_mgr, service, scanner
@@ -251,11 +255,13 @@ def serve(
         # restart; shows orders the model proposed and jobs it asked to re-run (buttons now, the
         # action only after a tap) and closes the ones nobody answered.
         for duty, label in (
+            (service.drain_deliveries, "resuming remote delivery"),
             (service.drain_task_queues, "draining the task queue"),
             (service.process_order_intents, "processing proposed orders"),
             (service.process_job_requests, "processing job requests"),
             (service.plan_runner.tick, "advancing plans"),
             (service.report_long_running, "reporting long-running tasks"),
+            (service.improvement_duty.tick, "observing platform improvements"),
         ):
             try:
                 duty()

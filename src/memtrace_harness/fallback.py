@@ -6,11 +6,13 @@ from memtrace_harness.schemas import CliExecution, FailureCategory
 
 
 CROSS_PROVIDER_FALLBACK_CATEGORIES: frozenset[FailureCategory] = frozenset(
-    {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable", "authentication"}
+    {"quota_exhausted", "rate_limit", "provider_overloaded", "cli_unavailable", "authentication", "source_busy", "source_unavailable"}
 )
 
 
 def classify_execution_failure(execution: CliExecution) -> FailureCategory:
+    if execution.failure_category in {"source_busy", "source_unavailable", "quota_exhausted", "rate_limit", "provider_overloaded", "authentication"}:
+        return execution.failure_category
     if execution.status == "succeeded":
         return "none"
     if execution.status == "timed_out":

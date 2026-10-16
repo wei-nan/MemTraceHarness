@@ -27,11 +27,14 @@ def build_provider_adapter(
     fallback_index: int = 0,
     cli_version: str | None = None,
     read_directories: tuple[Path, ...] = (),
+    write_directories: tuple[Path, ...] = (),
 ) -> ModelAdapter:
     if candidate is not None and profile is None:
         raise ValueError("A model candidate requires a role profile")
     effective_provider = candidate.provider if candidate else provider
     commands = provider_commands(config)
+    source = candidate.source if candidate else profile.source if profile else None
+    binding = config.source_binding(effective_provider, source, require_allowed=False)
     effective_directory = working_directory
     if profile and profile.context_policy == "loop-snapshot":
         effective_directory = (config.trace_root / "controller-workspace").resolve()
@@ -39,7 +42,8 @@ def build_provider_adapter(
     common = {
         "adapter_id": adapter_id or (profile.profile_id if profile else provider),
         "role": profile.role if profile else "Implementation Agent",
-        "executable": commands[effective_provider],
+        "executable": binding.command if binding else commands[effective_provider],
+        "execution_source": binding,
         "working_directory": effective_directory,
         "trace_root": config.trace_root,
         "timeout_seconds": (
@@ -60,7 +64,7 @@ def build_provider_adapter(
         ),
         "cli_version": cli_version,
         "output_schema_path": output_schema_path(profile.profile_id) if profile else None,
-        "quota_bucket": (
+        "quota_bucket": binding.quota_bucket if binding else (
             candidate.quota_bucket
             if candidate
             else profile.quota_bucket
@@ -71,6 +75,11 @@ def build_provider_adapter(
         "reply_language": config.reply_language,
         "memtrace_mcp_url": config.memtrace_mcp_url,
         "read_directories": read_directories if (profile is None or profile.permission == "read-only") else (),
+        "write_directories": (
+            write_directories
+            if profile is None or profile.permission == "workspace-write"
+            else ()
+        ),
     }
     if effective_provider == "claude":
         return ClaudeCliAdapter(**common)
@@ -113,6 +122,7 @@ def build_role_adapter_candidates(
     working_directory: Path,
     timeout_seconds: int,
     read_directories: tuple[Path, ...] = (),
+    write_directories: tuple[Path, ...] = (),
 ) -> dict[str, list[ModelAdapter]]:
     versions = probe_cli_versions(
         config=config,
@@ -136,8 +146,9 @@ def build_role_adapter_candidates(
                 config=config,
                 working_directory=working_directory,
                 timeout_seconds=timeout_seconds,
-                cli_version=versions.get(candidate.provider),
+                cli_version=versions.get(candidate.provider) if not candidate.source else None,
                 read_directories=read_directories,
+                write_directories=write_directories,
             )
             for index, candidate in enumerate(profile.candidates)
         ]

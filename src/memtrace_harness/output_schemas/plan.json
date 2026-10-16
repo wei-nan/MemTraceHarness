@@ -1,6 +1,11 @@
 {
   "type": "object",
   "properties": {
+    "user_summary": {
+      "type": ["string", "null"],
+      "maxLength": 180,
+      "description": "One or two short sentences for the operator in plain language: what this step actually did or decided, its result and any remaining limitation. No internal stage names, commands, file paths, or unsupported completion claims."
+    },
     "status": {
       "type": "string",
       "enum": [
@@ -108,6 +113,7 @@
     }
   },
   "required": [
+    "user_summary",
     "status",
     "plan",
     "acceptance_criteria",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import argparse
 import json
 import logging
@@ -18,6 +20,8 @@ from memtrace_harness.adapters import ModelAdapter
 from memtrace_harness.cli_process import CliProcessRunner
 from memtrace_harness.config import HarnessConfig
 from memtrace_harness.loop import AgentLoopRunner
+from memtrace_harness.primary_agent import PrimaryAgent
+from memtrace_harness.primary_session import PrimarySessionManager
 from memtrace_harness.memory_digest import AUTO_CATCH_UP_DAYS
 from memtrace_harness.memtrace_client import MemTraceClient
 from memtrace_harness.role_profiles import load_role_profiles
@@ -307,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     allowed_parser = subparsers.add_parser(
-        "allowed", help="Jobs you told the Harness to always allow (.harness/allowed.json): list or revoke"
+        "allowed", help="Historical approval records (inactive): list or revoke"
     )
     allowed_sub = allowed_parser.add_subparsers(dest="allowed_action", required=True)
     allowed_sub.add_parser("list", help="Show the allowed jobs and when each was approved")
@@ -505,12 +509,33 @@ def loop_command(args: argparse.Namespace) -> int:
 
     memtrace_client = _memtrace_client(args, config)
     task = _task_from_args(args, memtrace_client)
-    profiles = load_role_profiles(args.profiles_file)
+    from memtrace_harness.shared_memory import SharedMemoryStore
+    if config.shared_memory_path:
+        shared = SharedMemoryStore(config.shared_memory_path)
+        if shared.delivery_enabled():
+            raise ValueError("共享自動交付已啟用；請透過執行中的 Harness 提交任務，才能使用隔離 worktree 與可接續的 PR／CI 交付流程。低階 loop CLI 不會繞過此規則。")
+        context = shared.context()
+        if context:
+            from memtrace_harness.schemas import ContextItem
+            task = replace(task, context_items=[*task.context_items, ContextItem(ref="harness:shared-memory", title="Operator-managed shared memory", body=context, content_type="context", source="operator")])
+    project = config.workspace_root.name if config.workspace_root else task.workspace_id
+    store = TraceStore(config.trace_db_path)
+    session = PrimarySessionManager(store)
+    agent = PrimaryAgent(config)
+    profiles = agent.profiles(load_role_profiles(args.profiles_file or config.role_profiles_file_for()), project)
     candidate_adapters = build_role_adapter_candidates(
         profiles=profiles,
         config=config,
         working_directory=working_directory,
         timeout_seconds=timeout_seconds,
+    )
+    candidate_adapters = agent.bind(
+        candidate_adapters, context=lambda: session.get_rehydration_context(project),
+        record=lambda content, response: session.record_turn(
+            project=project, speaker="assistant", turn_type="agent_decision", content=content,
+            provider=response.execution.provider, model=response.execution.requested_model,
+            source_work_conversation_id=args.conversation_id,
+        ),
     )
     summary = AgentLoopRunner(
         adapters={profile_id: items[0] for profile_id, items in candidate_adapters.items()},
@@ -518,7 +543,7 @@ def loop_command(args: argparse.Namespace) -> int:
             profile_id: items[1:] for profile_id, items in candidate_adapters.items()
         },
         role_profiles=profiles,
-        trace_store=TraceStore(config.trace_db_path),
+        trace_store=store,
         memtrace_client=memtrace_client,
         max_total_tokens=args.max_total_tokens,
         working_directory=working_directory,
@@ -886,7 +911,7 @@ def doctor_command(args: argparse.Namespace) -> int:
 
 
 def allowed_command(args: argparse.Namespace) -> int:
-    """List or revoke the jobs the user said "always allow" (allowlist.py). Adding happens only from the chat's button."""
+    """List or revoke historical approval records; these no longer authorize execution."""
     from memtrace_harness.allowlist import AllowList
 
     config, scope = _config_and_scope()
@@ -896,11 +921,11 @@ def allowed_command(args: argparse.Namespace) -> int:
         for entry in entries:
             print(f"{entry.get('project')}: {entry.get('job') or entry.get('label')}  sha256={str(entry.get('sha256'))[:12]}  approved {entry.get('approved_at')}")
         if not entries:
-            print("(nothing is always-allowed)")
+            print("(no historical approval records; every operation needs its own confirmation)")
         return 0
     if not allowlist.remove(scope.name, args.job):
         raise ValueError(f"{args.job!r} is not in the allowed list")
-    print(f"revoked {args.job}: it will ask for a tap again")
+    print(f"removed historical record {args.job}; operations always need their own confirmation")
     return 0
 
 

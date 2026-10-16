@@ -421,13 +421,15 @@ def run_memory_digests(
         if dry_run:
             for d in dates:
                 log(f"[{scope.name}] would digest {d}")
-            for d in (
-                [only_date] if only_date is not None
-                else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
-            ):
-                log(f"[{scope.name}] would archive {d} into matters")
-            for d in ([only_date] if only_date is not None else due_audit_dates(trace_store, scope.name, session_id, tz, now)):
-                log(f"[{scope.name}] would audit {d}")
+            if config.archive_enabled:
+                for d in (
+                    [only_date] if only_date is not None
+                    else due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
+                ):
+                    log(f"[{scope.name}] would archive {d} into matters")
+            if config.audit_enabled:
+                for d in ([only_date] if only_date is not None else due_audit_dates(trace_store, scope.name, session_id, tz, now)):
+                    log(f"[{scope.name}] would audit {d}")
             continue
         call_model = make_digest_model_caller(config, scope.name)
         for d in dates:
@@ -466,27 +468,29 @@ def run_memory_digests(
                 f"({outcome.provider}/{outcome.model})"
             )
         workspace_id = config.memory_workspace_id_for(scope.name, scope.workspace_id)
-        if only_date is not None:
-            topic_dates = [only_date]
-        else:
-            # Not limited to max_days_back: the matters have no catch-up window, only a per-night cap.
-            topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
-        call_archive = make_archive_model_caller(config, scope.name)
-        archive_topics(
-            trace_store, memtrace_client, scope, workspace_id, tz, call_archive, topic_dates,
-            respect_retry_backoff=respect_retry_backoff, log=log,
-        )
-        if memtrace_client is not None and only_date is None:
-            _reorganise(
-                trace_store, memtrace_client, scope, workspace_id, tz, call_archive,
-                respect_retry_backoff=respect_retry_backoff, log=log, reorg_out=reorg_out,
+        if config.archive_enabled:
+            if only_date is not None:
+                topic_dates = [only_date]
+            else:
+                # Not limited to max_days_back: the matters have no catch-up window, only a per-night cap.
+                topic_dates = due_topic_dates(trace_store, scope.name, session_id, tz, now, max_days_back=None)[:MAX_DAYS_PER_PASS]
+            call_archive = make_archive_model_caller(config, scope.name)
+            archive_topics(
+                trace_store, memtrace_client, scope, workspace_id, tz, call_archive, topic_dates,
+                respect_retry_backoff=respect_retry_backoff, log=log,
             )
-        outcomes = audit_night(
-            config, trace_store, scope, workspace_id, tz, now,
-            only_date=only_date, respect_retry_backoff=respect_retry_backoff, log=log,
-        )
-        if audit_out is not None:
-            audit_out.extend(outcomes)
+            if memtrace_client is not None and only_date is None:
+                _reorganise(
+                    trace_store, memtrace_client, scope, workspace_id, tz, call_archive,
+                    respect_retry_backoff=respect_retry_backoff, log=log, reorg_out=reorg_out,
+                )
+        if config.audit_enabled:
+            outcomes = audit_night(
+                config, trace_store, scope, workspace_id, tz, now,
+                only_date=only_date, respect_retry_backoff=respect_retry_backoff, log=log,
+            )
+            if audit_out is not None:
+                audit_out.extend(outcomes)
         if memtrace_client is not None:
             try:
                 synced = sync_digests_to_memtrace(trace_store, memtrace_client, scope.name, workspace_id, tz)

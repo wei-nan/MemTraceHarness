@@ -217,6 +217,9 @@ class EndToEndTests(TestCase):
         deadline = time.time() + 8
         while time.time() < deadline and self.a.store.count_peer_outbound_unfinished():
             time.sleep(0.05)
+        for thread in threading.enumerate():
+            if thread.name.startswith("ask-"):
+                thread.join(2)
 
     def test_a_question_travels_and_the_answer_lands_in_the_chat(self) -> None:
         self.carrier.sync_directory()
@@ -270,6 +273,23 @@ class EndToEndTests(TestCase):
         self.assertIn("peer unreachable", text)
         self.assertIn("no such peer configured", text)
 
+    def test_a_slow_peer_is_polled_not_held_open_past_the_call_timeout(self) -> None:
+        sent = []
+        task = {"id": "t1", "status": {"state": "TASK_STATE_WORKING"}}
+        done = {"id": "t1", "status": {"state": "TASK_STATE_COMPLETED"}, "artifacts": [{"parts": [{"text": "答覆"}]}]}
+
+        def rpc(method, params):
+            sent.append((method, params))
+            return {"task": task} if method == "SendMessage" else done
+
+        client = PeerClient(OutboundPeer("beri", "http://127.0.0.1:1", "t"), sleep=lambda s: None)
+        with patch.object(client, "_rpc", side_effect=rpc):
+            self.assertEqual(client.ask("q", "c", 0, "collaborate"), ("completed", "答覆", None))
+        # The peer would otherwise block SendMessage for up to 50s, past the client's 30s timeout.
+        self.assertEqual(sent[0][0], "SendMessage")
+        self.assertTrue(sent[0][1]["configuration"]["returnImmediately"])
+        self.assertEqual(sent[1][0], "GetTask")
+
     def test_a_peer_that_redirects_is_not_followed(self) -> None:
         client = PeerClient(OutboundPeer("beri", "http://127.0.0.1:1", "t"))
         with patch("memtrace_services.a2a.client._OPENER.open", side_effect=urllib.error.HTTPError("u", 302, "Found", {}, None)):
@@ -277,8 +297,8 @@ class EndToEndTests(TestCase):
                 client.ask("q", "c", 0)
 
 
-class StandingPermissionTests(TestCase):
-    """One tap with 'always allow' lets that peer be asked again without a tap; another peer still asks."""
+class SinglePermissionTests(TestCase):
+    """Every peer question requires its own confirmation."""
 
     def setUp(self) -> None:
         self.a = Side(self, "a")
@@ -296,31 +316,35 @@ class StandingPermissionTests(TestCase):
             rows = conn.execute("SELECT request_id, status FROM job_requests WHERE kind = 'tool_call' ORDER BY created_at").fetchall()
         return rows[-1][0]
 
-    def test_always_allow_covers_the_peer_not_the_question_and_says_so(self) -> None:
+    def test_each_question_to_the_same_peer_still_needs_a_tap(self) -> None:
         call_tool(self.a.ctx(), "ask_peer", {"peer": "beri", "question": "第一個問題"})
         self.a.service.process_job_requests()
         card = self.cards()[-1]
         labels = [b["label"] for row in card["actions"] for b in row]
-        self.assertTrue(any("之後問這個 Harness 的任何問題" in label for label in labels), labels)
+        self.assertFalse(any("之後都允許" in label for label in labels), labels)
         self.assertIn("向 Harness「beri」提問：第一個問題", card["text"])
         request_id = self.first_request_id()
-        self.a.service._resolve_job_action("job_confirm_always", request_id, 12345, 77)
+        self.a.service._resolve_job_action("job_confirm", request_id, 12345, 77)
         self.join(request_id)
         self.assertEqual(self.a.store.count_peer_outbound_unfinished("beri"), 1)  # queued after the tap
 
-        # A different question to the same peer now runs with no card.
+        # A different question to the same peer needs a new confirmation.
         before = len(self.cards())
         call_tool(self.a.ctx(), "ask_peer", {"peer": "beri", "question": "完全不同的第二題"})
         self.a.service.process_job_requests()
         newest = self.first_request_id()
         self.join(newest)
-        self.assertEqual(len(self.cards()), before)
+        self.assertEqual(len(self.cards()), before + 1)
+        self.assertEqual(self.a.store.count_peer_outbound_unfinished("beri"), 1)
+        self.a.service._resolve_job_action("job_confirm", newest, 12345, 77)
+        self.join(newest)
         self.assertEqual(self.a.store.count_peer_outbound_unfinished("beri"), 2)
 
         # Another peer is not covered.
         call_tool(self.a.ctx(), "ask_peer", {"peer": "ops", "question": "第三題"})
         self.a.service.process_job_requests()
-        self.assertEqual(len(self.cards()), before + 1)
+        self.assertTrue(any("ops" in card["text"] for card in self.cards()))
+        self.assertEqual(self.a.store.get_job_request(self.first_request_id())["status"], "awaiting")
         self.assertEqual(self.a.store.count_peer_outbound_unfinished("ops"), 0)
 
 

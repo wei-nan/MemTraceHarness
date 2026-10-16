@@ -4,15 +4,18 @@ from unittest import TestCase
 
 from memtrace_harness.role_profiles import load_role_profiles
 
+# Stable inputs for parser/permission tests; packaged choices are asserted separately below.
+PROFILE_FIXTURE = Path(__file__).parent / "fixtures" / "role-profiles.toml"
+
 
 class RoleProfileTests(TestCase):
     def test_default_profiles_match_the_accepted_role_policy(self) -> None:
         profiles = load_role_profiles()
 
         self.assertEqual(profiles["controller"].model, "gpt-5.6-luna")
-        self.assertEqual(profiles["plan"].model, "sonnet")
-        self.assertEqual(profiles["plan-escalation"].model, "opus")
-        self.assertEqual(profiles["review"].model, "gpt-5.6-sol")
+        self.assertEqual(profiles["plan"].model, "gemini-3.8-flash-high")
+        self.assertEqual(profiles["plan-escalation"].model, "claude-opus-5-5-medium")
+        self.assertEqual(profiles["review"].model, "gemini-3.8-flash-medium")
         self.assertTrue(profiles["develop"].model.startswith("gemini-"))
         self.assertEqual(
             [(item.provider, item.model) for item in profiles["controller"].fallbacks],
@@ -21,8 +24,8 @@ class RoleProfileTests(TestCase):
                 ("antigravity", "gemini-3.8-flash-high"),
             ],
         )
-        self.assertEqual(profiles["review"].fallbacks, ())
-        self.assertEqual(profiles["plan-escalation"].fallbacks, ())
+        self.assertEqual([(c.provider, c.model) for c in profiles["review"].fallbacks], [("codex", "gpt-5.6-sol"), ("claude", "opus")])
+        self.assertEqual([(c.provider, c.model) for c in profiles["plan-escalation"].fallbacks], [("claude", "opus"), ("codex", "gpt-6.1-sol")])
         self.assertEqual(
             [
                 profile.profile_id
@@ -45,12 +48,7 @@ class RoleProfileTests(TestCase):
     def test_custom_profile_cannot_grant_controller_write_access(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             text = original.read_text(encoding="utf-8").replace(
                 'permission = "read-only"',
                 'permission = "workspace-write"',
@@ -68,12 +66,7 @@ class RoleProfileTests(TestCase):
         # provider/model for Red Team.
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             text = original.read_text(encoding="utf-8").replace(
                 '[profiles.review]\nrole = "Review"\nprovider = "codex"\nmodel = "gpt-5.6-sol"',
                 '[profiles.review]\nrole = "Review"\nprovider = "antigravity"\n'
@@ -92,12 +85,7 @@ class RoleProfileTests(TestCase):
         # The vendor/model relaxation must not have loosened the write-access guarantee.
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             text = original.read_text(encoding="utf-8").replace(
                 '[profiles.review]\nrole = "Review"\nprovider = "codex"\nmodel = "gpt-5.6-sol"\n'
                 'reasoning_effort = "high"\npermission = "read-only"',
@@ -116,12 +104,7 @@ class RoleProfileTests(TestCase):
         # is the permission/context_policy shape, not any particular vendor.
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             text = (
                 original.read_text(encoding="utf-8")
                 .replace(
@@ -159,12 +142,7 @@ class RoleProfileTests(TestCase):
         # became visible in the completion summary — no longer a silent downgrade.
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             # [profiles.review] is redefined below — tomllib rejects duplicate
             # tables, so strip the original block first rather than appending.
             import re
@@ -231,9 +209,7 @@ class RoleProfileTests(TestCase):
     def test_plan_skill_escalation_subtable_becomes_the_escalation_profile(self) -> None:
         import re
 
-        text = (
-            Path(__file__).parents[1] / "src" / "memtrace_harness" / "default-role-profiles.toml"
-        ).read_text(encoding="utf-8")
+        text = PROFILE_FIXTURE.read_text(encoding="utf-8")
         text = re.sub(r"\[profiles\.plan-escalation\]\n(?:(?!\n\[).)*\n?", "", text, count=1, flags=re.DOTALL)
         text = text.replace(
             "[profiles.review]",
@@ -253,12 +229,7 @@ class RoleProfileTests(TestCase):
     def test_custom_profile_can_pin_a_full_sonnet_model_id(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.toml"
-            original = (
-                Path(__file__).parents[1]
-                / "src"
-                / "memtrace_harness"
-                / "default-role-profiles.toml"
-            )
+            original = PROFILE_FIXTURE
             text = original.read_text(encoding="utf-8").replace(
                 '[profiles.plan]\nrole = "Plan"\nprovider = "claude"\nmodel = "sonnet"',
                 '[profiles.plan]\nrole = "Plan"\nprovider = "claude"\n'

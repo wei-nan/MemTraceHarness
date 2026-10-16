@@ -15,6 +15,16 @@ draft-only writeback; it is not a model transport.
 
 ## What the harness owns
 
+The project has one primary agent for conversation, planning, task decisions and goal checks.
+Its model is configured once under the historical `HARNESS_CHAT_*` settings (shown as 主代理 on
+the status page). Development, review and other skills are execution capabilities it invokes.
+Each task decision sees the current project conversation and execution results.
+
+Multi-step plans run tools, development, installations and A2A requests in order and report
+progress. Each action requiring approval asks separately; standing and plan-wide grants no
+longer bypass confirmation. An asynchronous request waits for its actual result. General
+automatic replanning of failed operational steps remains planned.
+
 - normalized task envelopes and explicit provider selection
 - validated role profiles and a bounded multi-stage Agent Loop
 - non-interactive CLI execution with `shell=False`, cwd, timeout, and exit status
@@ -369,13 +379,14 @@ folder, the others are declared in `.harness/repos.toml` (`memtrace-harness repo
 [--github owner/repo] [--setup ...] [--off-limits ...]`, see `examples/repos.toml`). There is one bot, one
 conversation, one scanner and one nightly tidy for all of them.
 
-A task works in exactly one repo: the chat model aims it with a `repo=<name>::` prefix on the task (the same
-prefix works in a schedule's task text); no prefix means the primary repo. The task runs in that repo's git
-worktree with that repo's verify command, setup command and off-limits, and only that repo is writable — a
-read-only role (planner, reviewer) may also read the project's other repos (Claude roles only). A change that
-needs two repos is two tasks, one per repo, in the order the plan says. Scanner proposals from a repo's GitHub
-issues are worked in that repo, and a resumed conversation goes back to the repo it was in. Two repos are edited
-side by side; one repo is edited by one Developer at a time.
+A task can select one repo with `repo=<name>::` or several with `repo=<name1>,<name2>::` (the same prefix works
+in a schedule's task text); no prefix means the primary repo. Each selected repo gets its own task worktree,
+verify command, setup command and off-limits rules. Only those selected worktrees are writable; read-only roles
+can inspect all configured repos regardless of provider. Multi-repo tasks require committed Git checkouts. The
+Harness verifies and runs the final gate in every selected repo, preflights all changed branches, then merges
+them separately after the goal check passes. If a later merge fails, earlier merges are reported and remaining
+worktrees are kept for recovery. Scanner proposals from a repo's GitHub issues are worked in that repo, and a
+resumed conversation returns to the same selected repo set. Concurrent tasks still use separate worktrees.
 
 ### Several projects
 
@@ -410,6 +421,11 @@ SQLite stores task/run metadata, conversations, turns, provider sessions, stage/
 attribution, checkpoints, quota availability, normalized usage, local outcome status, and trace
 references. The raw provider stream stays in the trace directory so parser changes can be replayed
 without expanding the MemTrace knowledge graph.
+
+See [`docs/execution-sources.md`](docs/execution-sources.md) for multiple CLI accounts, per-Harness source grants, shared capacity and account-aware fallback.
+
+See [`docs/proactive-improvement.md`](docs/proactive-improvement.md) for opt-in observation of
+other Harness conversations, task outcomes and schedules, and governed automatic platform fixes.
 
 See [`docs/operating-contract.md`](docs/operating-contract.md) for behavioral status and
 [`docs/architecture.md`](docs/architecture.md) for adapter and usage contracts.

@@ -120,7 +120,10 @@ class PeerClient:
             "messageId": uuid.uuid4().hex, "contextId": context_id, "role": "ROLE_USER",
             "parts": [{"text": question}], "metadata": {HOPS_KEY: hops, SKILL_KEY: skill},
         }
-        task = self._rpc("SendMessage", {"message": message}).get("task")
+        # Without returnImmediately the peer holds SendMessage open for up to BLOCK_SECONDS (50), longer than this
+        # client's per-call timeout, so a request that took over `timeout` seconds was reported "peer unreachable"
+        # while the peer was still working on it. Ask for the task at once and poll GetTask instead.
+        task = self._rpc("SendMessage", {"message": message, "configuration": {"returnImmediately": True}}).get("task")
         if not isinstance(task, dict):
             raise PeerCallError("peer did not return a task")
         started = time.monotonic()

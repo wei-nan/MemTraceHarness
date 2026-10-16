@@ -45,11 +45,13 @@ class HarnessConfig:
     archive_provider: str | None = None
     archive_model: str | None = None
     archive_fallbacks: tuple[tuple[str, str], ...] = ()
+    archive_enabled: bool = True
     # Nightly audit (memory_audit.py): an independent model that judges how the day went. Unset ->
     # the digest chain; setting a different vendor makes the auditor more independent of what it audits.
     audit_provider: str | None = None
     audit_model: str | None = None
     audit_fallbacks: tuple[tuple[str, str], ...] = ()
+    audit_enabled: bool = True
     # Topic recall (the slow path behind chat: topic judgement + cold-memory exploration
     # -> short-lived briefs, topic_recall.py). Unset -> the digest chain, so it gets the
     # stronger model without any extra setting.
@@ -59,6 +61,9 @@ class HarnessConfig:
     recall_fallbacks: tuple[tuple[str, str], ...] = ()
     recall_ttl_hours: int = 72
     operator_preference_workspace_id: str | None = None
+    shared_memory_path: Path | None = None
+    execution_sources_path: Path | None = None
+    execution_source_allowlist: tuple[str, ...] = ()
     # The Harness's local HTTP API, the only door services use (api.py). Loopback by default; the
     # token is what stops any other local process from posting as the operator.
     api_host: str = "127.0.0.1"
@@ -106,7 +111,9 @@ class HarnessConfig:
         with a usage error), so until 2026-10-02 picking Codex as a chat model silently
         failed on every message and fell back. Codex answers through `codex exec`,
         read-only and ephemeral, printing only the final message on stdout."""
-        command = [self.command_for(provider)]
+        from memtrace_harness.execution_sources import split_ref
+        command = self.source_command(provider)
+        provider, _ = split_ref(provider)
         # The read-only TaiwanTrade proxy (taiwantrade_mcp.py) is an MCP server, which the
         # CLI spawns outside its tool sandbox — the only way a sandboxed chat model can
         # reach 127.0.0.1:8000. Opt-in, and only for the chat reply (taiwantrade=True):
@@ -191,7 +198,50 @@ class HarnessConfig:
             command += ["--model", model]
         return command + ["--print", prompt]
 
+    def allowed_execution_sources(self) -> list[str]:
+        if self.workspace_root:
+            from memtrace_harness.workspace import models_file, read_model_settings
+            value = read_model_settings(models_file(self.workspace_root)).get("HARNESS_EXECUTION_SOURCES_ALLOWED", "")
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return list(self.execution_source_allowlist)
+
+    def source_binding(self, provider: str, source: str | None = None, *, require_allowed: bool = True):
+        from memtrace_harness.execution_sources import SourceBinding, SourceStore, SourceUnavailable, split_ref
+        base, embedded = split_ref(provider)
+        source = source or embedded
+        if source is None:
+            return None
+        authorized = source in self.allowed_execution_sources()
+        if self.execution_sources_path is None or (require_allowed and not authorized):
+            raise ValueError(f"execution source {source!r} is not allowed for this Harness")
+        try:
+            row = SourceStore(self.execution_sources_path).get(source)
+        except SourceUnavailable:
+            if require_allowed:
+                raise
+            row = {"provider": base, "command": "missing-execution-source", "quota_bucket": source, "revision": 0}
+        if require_allowed and row["provider"] != base:
+            raise ValueError("execution source does not match the selected provider")
+        return SourceBinding(Path(self.execution_sources_path), source, base, row["command"], row["quota_bucket"], row["revision"], self.workspace_root / ".harness" / "models.toml" if self.workspace_root else None, authorized)
+
+    def source_command(self, provider: str):
+        from memtrace_harness.execution_sources import SourceCommand
+        binding = self.source_binding(provider, require_allowed=False)
+        return SourceCommand([binding.command], binding) if binding else [self.command_for(provider)]
+
+    def _source_candidates(self, target: str, pairs):
+        from memtrace_harness.execution_sources import provider_ref
+        source = os.getenv(f"HARNESS_{target.upper()}_SOURCE", "").strip()
+        if self.workspace_root:
+            from memtrace_harness.workspace import models_file, read_model_settings
+            source = read_model_settings(models_file(self.workspace_root)).get(f"HARNESS_{target.upper()}_SOURCE", "")
+        return ((provider_ref(pairs[0][0], source or None), pairs[0][1]), *pairs[1:]) if pairs else ()
+
     def command_for(self, provider: str) -> str:
+        from memtrace_harness.execution_sources import split_ref
+        provider, source = split_ref(provider)
+        if source:
+            return self.source_binding(provider, source).command
         if provider == "claude":
             return self.claude_command
         if provider == "codex":
@@ -214,9 +264,11 @@ class HarnessConfig:
         return os.getenv("HARNESS_PEER_DESCRIPTION", self.peer_description or "").strip()
 
     def chat_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
-        """Ordered (provider, model) list for the quick chat reply. Chat is cheap and
-        low-stakes (no repo writes), so unlike Agent Loop roles a workspace just picks whichever
-        model is good enough and cheapest — no vendor lock."""
+        """The primary agent's model chain for dialogue, planning and goal checks.
+
+        ``HARNESS_CHAT_*`` remains the backwards-compatible setting name. Skills
+        and background duties may have independent models; the owner of a task does not.
+        """
         provider = os.getenv("HARNESS_CHAT_PROVIDER") or self.chat_provider
         model = os.getenv("HARNESS_CHAT_MODEL", self.chat_model)
         fallbacks_override = os.getenv("HARNESS_CHAT_FALLBACKS")
@@ -227,7 +279,7 @@ class HarnessConfig:
         )
         if not provider:
             return ()
-        return ((provider, model), *fallbacks)
+        return self._source_candidates("chat", ((provider, model), *fallbacks))
 
     def digest_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for the nightly memory digest. When no digest provider
@@ -244,7 +296,7 @@ class HarnessConfig:
             if fallbacks_override is not None
             else self.digest_fallbacks
         )
-        return ((provider, model or ""), *fallbacks)
+        return self._source_candidates("digest", ((provider, model or ""), *fallbacks))
 
     def archive_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for the memory archive work (matters, review, rebuild).
@@ -260,7 +312,7 @@ class HarnessConfig:
             if fallbacks_override is not None
             else self.archive_fallbacks
         )
-        return ((provider, model or ""), *fallbacks)
+        return self._source_candidates("archive", ((provider, model or ""), *fallbacks))
 
     def audit_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for the nightly audit; with none configured it uses the
@@ -275,7 +327,7 @@ class HarnessConfig:
             if fallbacks_override is not None
             else self.audit_fallbacks
         )
-        return ((provider, model or ""), *fallbacks)
+        return self._source_candidates("audit", ((provider, model or ""), *fallbacks))
 
     def recall_candidates_for(self, project_name: str | None = None) -> tuple[tuple[str, str], ...]:
         """Ordered (provider, model) list for topic recall; with none configured it uses the
@@ -291,7 +343,7 @@ class HarnessConfig:
             if fallbacks_override is not None
             else self.recall_fallbacks
         )
-        return ((provider, model or ""), *fallbacks)
+        return self._source_candidates("recall", ((provider, model or ""), *fallbacks))
 
     def role_profiles_file_for(self, project_name: str | None = None) -> Path | None:
         """This workspace's role-profile override (e.g. a different fallback order), kept in
@@ -333,6 +385,8 @@ class HarnessConfig:
             memtrace_api_token=os.getenv("MEMTRACE_API_TOKEN"),
             trace_db_path=Path(trace_path),
             trace_root=Path(trace_root),
+            shared_memory_path=Path(os.getenv("HARNESS_SHARED_MEMORY_DB") or str(Path.home() / ".memtrace-harness" / "shared-memory.sqlite3")).expanduser(),
+            execution_sources_path=Path(os.getenv("HARNESS_EXECUTION_SOURCES_DB") or str(Path.home() / ".memtrace-harness" / "execution-sources.sqlite3")).expanduser(),
             claude_command=os.getenv("HARNESS_CLAUDE_COMMAND", "claude"),
             codex_command=os.getenv("HARNESS_CODEX_COMMAND", "codex"),
             antigravity_command=os.getenv("HARNESS_ANTIGRAVITY_COMMAND", "agy"),
@@ -342,25 +396,37 @@ class HarnessConfig:
             ),
             cli_timeout_seconds=_positive_int(os.getenv("HARNESS_CLI_TIMEOUT_SECONDS"), 900),
             transcribe_command=os.getenv("HARNESS_TRANSCRIBE_COMMAND") or None,
-            chat_provider=os.getenv("HARNESS_CHAT_PROVIDER", "claude"),
-            chat_model=os.getenv("HARNESS_CHAT_MODEL", "haiku"),
+            chat_provider=os.getenv("HARNESS_CHAT_PROVIDER", "antigravity"),
+            chat_model=os.getenv("HARNESS_CHAT_MODEL", "gemini-3.8-flash-medium"),
             unattended_write_requires_approval=unattended_approval_str not in {"false", "0", "no"},
             harness_memory_workspace_id=os.getenv("HARNESS_MEMORY_WORKSPACE_ID"),
-            chat_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_CHAT_FALLBACKS", "")),
-            digest_provider=os.getenv("HARNESS_DIGEST_PROVIDER") or None,
-            digest_model=os.getenv("HARNESS_DIGEST_MODEL") or None,
-            digest_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_DIGEST_FALLBACKS", "")),
-            archive_provider=os.getenv("HARNESS_ARCHIVE_PROVIDER") or None,
-            archive_model=os.getenv("HARNESS_ARCHIVE_MODEL") or None,
-            archive_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_ARCHIVE_FALLBACKS", "")),
+            chat_fallbacks=_parse_chat_fallbacks(
+                os.getenv("HARNESS_CHAT_FALLBACKS", "codex/gpt-6-luna,claude/haiku")
+            ),
+            digest_provider=os.getenv("HARNESS_DIGEST_PROVIDER", "claude"),
+            digest_model=os.getenv("HARNESS_DIGEST_MODEL", "claude-sonnet-5-5"),
+            digest_fallbacks=_parse_chat_fallbacks(
+                os.getenv("HARNESS_DIGEST_FALLBACKS", "codex/gpt-6.1-sol")
+            ),
+            archive_provider=os.getenv("HARNESS_ARCHIVE_PROVIDER", "antigravity"),
+            archive_model=os.getenv("HARNESS_ARCHIVE_MODEL", "claude-opus-5-5-medium"),
+            archive_fallbacks=_parse_chat_fallbacks(
+                os.getenv("HARNESS_ARCHIVE_FALLBACKS", "codex/gpt-6.1-sol,claude/opus")
+            ),
+            archive_enabled=os.getenv("HARNESS_ARCHIVE_ENABLED", "true").lower()
+            not in {"false", "0", "no", "off"},
             audit_provider=os.getenv("HARNESS_AUDIT_PROVIDER") or None,
             audit_model=os.getenv("HARNESS_AUDIT_MODEL") or None,
             audit_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_AUDIT_FALLBACKS", "")),
+            audit_enabled=os.getenv("HARNESS_AUDIT_ENABLED", "true").lower()
+            not in {"false", "0", "no", "off"},
             recall_enabled=os.getenv("HARNESS_RECALL_ENABLED", "true").lower()
-            not in {"false", "0", "no"},
-            recall_provider=os.getenv("HARNESS_RECALL_PROVIDER") or None,
-            recall_model=os.getenv("HARNESS_RECALL_MODEL") or None,
-            recall_fallbacks=_parse_chat_fallbacks(os.getenv("HARNESS_RECALL_FALLBACKS", "")),
+            not in {"false", "0", "no", "off"},
+            recall_provider=os.getenv("HARNESS_RECALL_PROVIDER", "codex"),
+            recall_model=os.getenv("HARNESS_RECALL_MODEL", "gpt-5.6-sol"),
+            recall_fallbacks=_parse_chat_fallbacks(
+                os.getenv("HARNESS_RECALL_FALLBACKS", "antigravity/gemini-3.8-flash-high")
+            ),
             recall_ttl_hours=_positive_int(os.getenv("HARNESS_RECALL_TTL_HOURS"), 72),
             operator_preference_workspace_id=os.getenv("HARNESS_OPERATOR_PREFERENCE_WORKSPACE_ID"),
             api_host=os.getenv("HARNESS_API_HOST", "127.0.0.1"),

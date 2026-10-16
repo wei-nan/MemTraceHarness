@@ -24,6 +24,7 @@ from typing import Any
 MAX_PHASES = 6
 MAX_CRITERIA = 8
 MAX_TEXT = 600
+MAX_PATHS = 20
 PHASE_SKILL_SETS = (("plan", "develop"), ("plan",), ("develop",))
 CHECK_VERDICTS = ("met", "partly_met", "not_met")
 CRITERION_STATES = ("met", "unmet", "unverified")
@@ -35,6 +36,9 @@ class Phase:
     purpose: str
     skills: tuple[str, ...]
     acceptance: tuple[str, ...] = ()
+    # Files or folders (globs allowed, relative to the project folder) this phase is expected to change. The final
+    # gate stops the task when a change lands outside every declared path; empty = the Controller declared none.
+    paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +46,7 @@ class Phase:
             "purpose": self.purpose,
             "skills": list(self.skills),
             "acceptance": list(self.acceptance),
+            "paths": list(self.paths),
         }
 
 
@@ -95,11 +100,12 @@ def parse_phases(value: Any, *, limit: int = MAX_PHASES) -> tuple[Phase, ...] | 
         title, purpose = _text(raw.get("title"), 120), _text(raw.get("purpose"))
         skills = raw.get("skills")
         acceptance = _text_list(raw.get("acceptance", []), 6)
-        if not title or not purpose or acceptance is None:
+        paths = _text_list(raw.get("paths", []), MAX_PATHS, 200)
+        if not title or not purpose or acceptance is None or paths is None:
             return None
         if not isinstance(skills, list) or tuple(skills) not in PHASE_SKILL_SETS:
             return None
-        phases.append(Phase(title=title, purpose=purpose, skills=tuple(skills), acceptance=acceptance))
+        phases.append(Phase(title=title, purpose=purpose, skills=tuple(skills), acceptance=acceptance, paths=paths))
     return tuple(phases)
 
 
@@ -110,6 +116,8 @@ def parse_goal_plan(value: Any) -> GoalPlan | None:
     criteria = _text_list(value.get("success_criteria"), MAX_CRITERIA)
     phases = parse_phases(value.get("phases"))
     if not restated or not criteria or phases is None:
+        return None
+    if len(set(criteria)) != len(criteria):
         return None
     return GoalPlan(restated_goal=restated, success_criteria=criteria, phases=phases)
 
@@ -154,11 +162,15 @@ def judge_goal_check(plan: GoalPlan | None, check: Any) -> GoalVerdict:
     unmet: list[str] = []
     unverified: list[str] = []
     answered = 0
+    names: set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict) or entry.get("status") not in CRITERION_STATES:
             return GoalVerdict(False, problem="Controller 回報的目標完成度格式不對")
         answered += 1
         name = str(entry.get("criterion") or "").strip() or "(未命名的條件)"
+        if name in names:
+            return GoalVerdict(False, problem=f"成功條件重複回報：{name}")
+        names.add(name)
         if entry["status"] == "unmet":
             unmet.append(name)
         elif entry["status"] == "unverified":
@@ -173,6 +185,10 @@ def judge_goal_check(plan: GoalPlan | None, check: Any) -> GoalVerdict:
             tuple(unverified),
             f"目標有 {required} 個成功條件，Controller 只回報了 {answered} 個",
         )
+    if plan and required and names != set(plan.success_criteria):
+        return GoalVerdict(False, problem="完成檢查沒有逐項對應原始成功條件")
+    if unverified:
+        return GoalVerdict(False, tuple(unmet), tuple(unverified), "成功條件仍有未驗證項目")
     if verdict != "met" or unmet:
         return GoalVerdict(False, tuple(unmet), tuple(unverified), "目標還沒有完全達成")
     return GoalVerdict(True, (), tuple(unverified))

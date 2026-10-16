@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import closing
 from dataclasses import replace
+from memtrace_harness.final_gate import WAIVER_PREFIX
 import json
 from pathlib import Path
 import sqlite3
@@ -597,15 +598,146 @@ class AgentLoopRunnerTests(TestCase):
 
     def test_verify_command_success_still_lets_g2_model_review(self) -> None:
         adapters = self._adapters()
+        events = []
         summary = AgentLoopRunner(
             adapters=adapters,
             trace_store=TraceStore(self.db_path),
             working_directory=self.root,
             verify_command="exit 0",
+            progress_callback=lambda stage, state, artifact: events.append((stage, state, artifact)),
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
         self.assertEqual(len(adapters["review"].calls), 2)
+        self.assertEqual([state for stage, state, artifact in events if stage == "verify"], ["running", "succeeded"])
+
+    def _verify_runner(self, adapters, command, *, loop_mode="full", extra=False):
+        base = self.root / "base"
+        work = self.root / "work"
+        base.mkdir(exist_ok=True)
+        work.mkdir(exist_ok=True)
+        if extra:
+            (work / "extra").write_text("x")
+        return AgentLoopRunner(
+            adapters=adapters,
+            trace_store=TraceStore(self.db_path),
+            working_directory=work,
+            repo_root=base,
+            verify_command=command,
+            loop_mode=loop_mode,
+        )
+
+    def test_verification_that_could_not_run_is_reported_not_made_a_reject(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, 'echo "MISSING_TOOL: java"; exit 1').run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["develop"].calls), 1)
+        self.assertNotIn("develop-revision", [stage.stage for stage in summary.stages])
+        self.assertEqual(len(adapters["review"].calls), 2)  # G2's model still reviews
+
+    def test_a_failure_the_base_checkout_already_has_does_not_block(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, 'echo "Foo > old FAILED"; exit 1').run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["develop"].calls), 1)
+
+    def test_a_new_failure_beyond_the_base_still_forces_a_revision(self) -> None:
+        adapters = self._adapters()
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high", [completed_development(), completed_development()]
+        )
+        command = 'echo "Foo > old FAILED"; if [ -f extra ]; then echo "Foo > new FAILED"; fi; exit 1'
+        summary = self._verify_runner(adapters, command, extra=True).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertEqual(len(adapters["develop"].calls), 2)
+        self.assertIn("Foo > new", summary.recommendation)
+
+    def test_lean_mode_runs_develop_and_verification_with_no_plan_or_review_stage(self) -> None:
+        adapters = self._adapters()
+        summary = self._verify_runner(adapters, "exit 0", loop_mode="lean").run(self.task)
+
+        self.assertEqual(summary.status, "succeeded")
+        self.assertEqual(len(adapters["plan"].calls), 0)
+        self.assertEqual(len(adapters["review"].calls), 0)
+        self.assertEqual(len(adapters["develop"].calls), 1)
+        names = [stage.stage for stage in summary.stages]
+        self.assertIn("verify", names)
+        self.assertNotIn("g1", names)
+        self.assertNotIn("g2", names)
+
+    def test_lean_mode_does_not_stop_for_an_environment_or_baseline_failure(self) -> None:
+        for command in ('echo "MISSING_TOOL: java"; exit 1', 'echo "Foo > old FAILED"; exit 1'):
+            adapters = self._adapters()
+            summary = self._verify_runner(adapters, command, loop_mode="lean").run(self.task)
+            self.assertEqual(summary.status, "succeeded", command)
+            self.assertEqual(len(adapters["develop"].calls), 1)
+
+    def test_lean_mode_sends_a_new_failure_back_once_then_stops(self) -> None:
+        adapters = self._adapters()
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high", [completed_development(), completed_development()]
+        )
+        command = 'if [ -f extra ]; then echo "Foo > new FAILED"; exit 1; fi'
+        summary = self._verify_runner(adapters, command, loop_mode="lean", extra=True).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertEqual(len(adapters["develop"].calls), 2)
+        self.assertEqual(len(adapters["review"].calls), 0)
+
+    def _gate_runner(self, adapters, files, *, loop_mode="lean", off_limits=None):
+        work = self.root / "gatework"
+        work.mkdir(exist_ok=True)
+        for name, text in files.items():
+            (work / name).parent.mkdir(parents=True, exist_ok=True)
+            (work / name).write_text(text)
+        adapters["develop"] = QueueAdapter(
+            "develop", "antigravity", "gemini-3.1-pro-high",
+            [{**completed_development(), "changed_files": list(files)}],
+        )
+        return AgentLoopRunner(
+            adapters=adapters, trace_store=TraceStore(self.db_path), working_directory=work,
+            loop_mode=loop_mode, off_limits=off_limits,
+        )
+
+    def test_final_gate_stops_a_task_whose_change_carries_a_secret_and_a_waiver_releases_it(self) -> None:
+        key = "AKIA" + "ABCDEFGHIJKLMNOP"
+        files = {"src/example.py": f"KEY = '{key}'\n"}
+        summary = self._gate_runner(self._adapters(), files).run(self.task)
+
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("final-gate", [stage.stage for stage in summary.stages])
+        self.assertIn("最終 gate", summary.recommendation)
+        self.assertNotIn(key, summary.recommendation)
+        fingerprint = next(s for s in summary.stages if s.stage == "final-gate").artifact["fingerprint"]
+
+        waived = replace(self.task, goal=f"{self.task.goal}\n{WAIVER_PREFIX}{fingerprint}")
+        again = self._gate_runner(self._adapters(), files).run(waived)
+        self.assertEqual(again.status, "succeeded")
+
+    def test_final_gate_blocks_off_limits_files_even_when_the_loop_is_lean(self) -> None:
+        summary = self._gate_runner(
+            self._adapters(), {"private/notes.txt": "x"}, off_limits=["private/"]
+        ).run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("off-limits", summary.recommendation)
+
+    def test_final_gate_checks_the_paths_the_controller_declared(self) -> None:
+        adapters = self._adapters()
+        plan = {
+            "restated_goal": "x", "success_criteria": ["done"],
+            "phases": [{"title": "t", "purpose": "p", "skills": ["develop"], "acceptance": [], "paths": ["src/"]}],
+        }
+        adapters["controller"] = QueueAdapter(
+            "controller", "codex", "gpt-5.6-luna",
+            [{"action": "run_planner", "reason": "r", "goal_plan": plan}, {"action": "finish", "reason": "ok"}],
+        )
+        summary = self._gate_runner(adapters, {"src/a.py": "1", "docs/b.md": "2"}).run(self.task)
+        self.assertEqual(summary.status, "needs_human")
+        self.assertIn("docs/b.md", summary.recommendation)
+        self.assertNotIn("src/a.py", summary.recommendation)
 
     def test_resume_reuses_settled_stages_and_only_reruns_from_the_stop_point(
         self,
@@ -1360,6 +1492,12 @@ class _FakeChatConfig:
     def __init__(self, provider: str | None = "claude", model: str | None = "haiku") -> None:
         self.chat_provider = provider
         self.chat_model = model
+
+    def chat_candidates_for(self):
+        return ((self.chat_provider, self.chat_model),)
+
+    def source_command(self, provider):
+        return [self.command_for(provider)]
 
     def command_for(self, provider: str) -> str:
         return provider
