@@ -578,7 +578,7 @@ class CliAdapterTests(TestCase):
         self.assertNotIn("plan", command)
         self.assertEqual(command[command.index("--model") + 1], "auto")
         self.assertEqual(command[command.index("--workspace") + 1], str(self.root))
-        self.assertEqual(command[-1], "PROMPT")
+        self.assertNotIn("PROMPT", command)
 
     def test_cursor_develop_role_gets_force_so_it_can_run_tests_and_git(self) -> None:
         adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result("")), permission="workspace-write")
@@ -592,8 +592,15 @@ class CliAdapterTests(TestCase):
         )
         command = adapter.build_command("PROMPT")
         self.assertNotIn("--json-schema", command)
-        self.assertTrue(command[-1].startswith("PROMPT"))
-        self.assertIn("JSON Schema", command[-1])
+        prompt = adapter.finalize_prompt("PROMPT")
+        self.assertTrue(prompt.startswith("PROMPT"))
+        self.assertIn("JSON Schema", prompt)
+
+    def test_cursor_prompt_goes_over_stdin_not_argv_to_stay_under_the_windows_limit(self) -> None:
+        adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result("")))
+        command = adapter.build_command("PROMPT")
+        self.assertNotIn("PROMPT", command)
+        self.assertTrue(adapter.prompt_via_stdin)
 
     def test_cursor_stream_is_parsed_with_partial_usage_and_resolved_model(self) -> None:
         adapter = self._adapter(CursorCliAdapter, StaticProcessRunner(process_result(self._cursor_stream())))

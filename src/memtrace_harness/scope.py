@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tomllib
 
@@ -406,6 +408,18 @@ SCRIPT_RULE_HINT = (
 )
 
 
+def _usable_bash() -> str | None:
+    """A bash that can parse scripts. On Windows the first `bash` on PATH is often the WSL launcher in System32,
+    which fails ("execvpe(/bin/bash) failed") when no distribution is installed; skip it and use Git for Windows'."""
+    if os.name != "nt":
+        return "bash"
+    wsl = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "bash.exe"
+    for found in (shutil.which("bash"), "C:/Program Files/Git/bin/bash.exe", "C:/Program Files/Git/usr/bin/bash.exe"):
+        if found and Path(found).is_file() and Path(found).resolve() != wsl.resolve():
+            return found
+    return None
+
+
 def check_job_command(command: str, working_directory: Path) -> None:
     """Raise ValueError when a new job is not a short, parseable call: no inline interpreter code, no more than
     MAX_NEW_JOB_COMMAND_CHARS, balanced quoting, valid shell syntax, and any script it runs exists, parses and
@@ -418,8 +432,12 @@ def check_job_command(command: str, working_directory: Path) -> None:
         tokens = shlex.split(command)
     except ValueError as exc:
         raise ValueError(f"job command has unbalanced quotes ({exc}). {SCRIPT_RULE_HINT}") from exc
+    bash = _usable_bash()
     try:
-        result = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True, timeout=5, check=False)
+        result = (
+            subprocess.run([bash, "-n", "-c", command], capture_output=True, text=True, timeout=5, check=False)
+            if bash else None
+        )
     except (OSError, subprocess.TimeoutExpired):
         result = None
     if result is not None and result.returncode != 0:
@@ -441,8 +459,11 @@ def check_job_command(command: str, working_directory: Path) -> None:
             except SyntaxError as exc:
                 raise ValueError(f"{token} has a syntax error: {exc}") from exc
         else:
-            check = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True, timeout=5, check=False)
-            if check.returncode != 0:
+            check = (
+                subprocess.run([bash, "-n", str(path)], capture_output=True, text=True, timeout=5, check=False)
+                if bash else None
+            )
+            if check is not None and check.returncode != 0:
                 raise ValueError(f"{token} has a shell syntax error: {check.stderr.strip()[:300]}")
         for number, line in enumerate(source.splitlines(), 1):
             reason = forbidden_reason(line.strip()) if line.strip() and not line.lstrip().startswith("#") else None

@@ -82,7 +82,9 @@ class CliModelAdapter(ModelAdapter):
         self.write_directories = tuple(write_directories)
 
     def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
-        prompt = render_agent_prompt(task, self.role, reply_language=self.reply_language)
+        prompt = self.finalize_prompt(
+            render_agent_prompt(task, self.role, reply_language=self.reply_language)
+        )
         command = self.build_command(prompt)
         if self.execution_source:
             from memtrace_harness.execution_sources import SourceCommand
@@ -181,6 +183,10 @@ class CliModelAdapter(ModelAdapter):
             except (OSError, sqlite3.Error):
                 pass  # retain the authoritative provider output even if the shared status store fails
         return replace(response, execution=execution)
+
+    def finalize_prompt(self, prompt: str) -> str:
+        """Last provider-specific edit to the rendered prompt, applied wherever it is delivered."""
+        return prompt
 
     @abstractmethod
     def build_command(self, prompt: str) -> list[str]:

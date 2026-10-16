@@ -175,14 +175,15 @@ class PlanRunner:
                     row = self.store.get_job_request(rid) or self.store.find_active_job_request(scope.name, f"install:{summary}")
                 else:
                     from memtrace_harness.scope import validate_scope_change, describe_scope_change
-                    if step["args"].get("run_after"):
-                        raise ValueError("計畫請把新增 job 與執行 job 列為兩個步驟，分別確認。")
+                    # In a plan, running the job is its own `run_job` step with its own confirm, so a
+                    # `run_after` the model set here is dropped rather than failing the plan or running it twice.
+                    args = {key: value for key, value in step["args"].items() if key != "run_after"}
                     change = validate_scope_change(
-                        scope.working_directory, str(step["args"].get("kind", "")),
-                        step["args"].get("value"), step["args"].get("name"), step["args"].get("command"),
+                        scope.working_directory, str(args.get("kind", "")),
+                        args.get("value"), args.get("name"), args.get("command"),
                     )
                     summary = describe_scope_change(change)
-                    propose_scope_change(ops_context_for_scope(scope, self.store), step["args"])
+                    propose_scope_change(ops_context_for_scope(scope, self.store), args)
                     row = self.store.find_active_job_request(scope.name, f"scope:{summary}")
             except (ValueError, tool_registry.OpsError) as exc:
                 self._fail(step, str(exc))

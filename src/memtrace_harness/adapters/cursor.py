@@ -25,6 +25,9 @@ class CursorCliAdapter(CliModelAdapter):
     with nothing on stdout; a model-side one is a ``result`` event with ``is_error`` true."""
 
     provider = "cursor"
+    # The prompt travels on stdin, not argv: a Controller prompt exceeds Windows' ~32K command-line
+    # limit (WinError 206). `cursor-agent --print` reads it from stdin when no positional prompt is given.
+    prompt_via_stdin = True
 
     def __init__(self, *, executable: str = "cursor-agent", **kwargs: Any) -> None:
         super().__init__(executable=executable, **kwargs)
@@ -53,11 +56,9 @@ class CursorCliAdapter(CliModelAdapter):
         else:
             for directory in self.write_directories:
                 command.extend(["--add-dir", str(directory)])
-        # The prompt stays last: redact_command() in cli.py scrubs the last element from traces.
-        command.append(self._with_output_schema(prompt))
         return command
 
-    def _with_output_schema(self, prompt: str) -> str:
+    def finalize_prompt(self, prompt: str) -> str:
         if not self.output_schema_path:
             return prompt
         try:

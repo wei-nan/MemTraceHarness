@@ -236,6 +236,17 @@ class MixedPlanTests(TestCase):
         self.assertEqual(self.store.get_job_request(step["request_id"])["kind"], "install")
         self.assertEqual(self.store.list_plan_steps(pid)[1]["status"], "pending")
 
+    def test_run_after_on_an_added_job_step_is_dropped_so_the_plan_does_not_stop(self):
+        pid = self.create([
+            {"title": "add", "tool": "propose_scope_change",
+             "args": {"kind": "job", "name": "say", "command": "echo hi", "run_after": True}},
+            {"title": "run", "tool": "run_job", "args": {"name": "say"}},
+        ])
+        self.gateway.plan_runner.tick()
+        step = self.step(pid)
+        self.assertEqual(step["status"], "awaiting")
+        self.assertNotIn("run_after", self.store.get_job_request(step["request_id"])["payload"])
+
     def test_a2a_waits_through_carriage_and_uses_the_remote_result(self):
         self.store.replace_peer_directory([{"name": "peer", "description": "other", "collaborate": False}])
         pid = self.create([{"title": "ask", "tool": "ask_peer", "args": {"peer": "peer", "question": "q"},
