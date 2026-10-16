@@ -1346,6 +1346,7 @@ class TraceStore:
             self._ensure_column(conn, "schedules", "audience", "TEXT")
             self._ensure_column(conn, "task_queue", "audience", "TEXT")
             self._ensure_column(conn, "approval_requests", "message_ref", "TEXT")
+            self._ensure_column(conn, "approval_requests", "reminded_at", "TEXT")
             self._ensure_column(conn, "order_intents", "message_ref", "TEXT")
             self._ensure_column(conn, "job_requests", "message_ref", "TEXT")
             self._ensure_column(conn, "job_requests", "kind", "TEXT NOT NULL DEFAULT 'job'")
@@ -2989,6 +2990,39 @@ class TraceStore:
                 (older_than_iso, *sorted(workspaces)),
             ).fetchall()
         return [d for d in (self.get_approval_request(r[0]) for r in rows) if d]
+
+    def remind_due_approval_requests(
+        self, workspaces: set[str], now_iso: str, *, first_after_seconds: int, repeat_after_seconds: int
+    ) -> list[dict]:
+        """Claim delivered pending approvals for their first reminder or next reminder interval."""
+        if not workspaces:
+            return []
+        now = datetime.fromisoformat(now_iso)
+        first_cutoff = (now - timedelta(seconds=first_after_seconds)).isoformat()
+        repeat_cutoff = (now - timedelta(seconds=repeat_after_seconds)).isoformat()
+        placeholders = ",".join("?" for _ in workspaces)
+        params = (*sorted(workspaces), first_cutoff, repeat_cutoff)
+        with self._connection() as conn:
+            ids = [
+                row[0]
+                for row in conn.execute(
+                    f"SELECT id FROM approval_requests WHERE status = 'pending' AND message_ref IS NOT NULL "
+                    f"AND workspace IN ({placeholders}) AND "
+                    "((reminded_at IS NULL AND created_at <= ?) OR reminded_at <= ?) "
+                    "ORDER BY created_at LIMIT 50",
+                    params,
+                )
+            ]
+            due = []
+            for request_id in ids:
+                changed = conn.execute(
+                    "UPDATE approval_requests SET reminded_at = ? WHERE id = ? AND status = 'pending' "
+                    "AND ((reminded_at IS NULL AND created_at <= ?) OR reminded_at <= ?)",
+                    (now_iso, request_id, first_cutoff, repeat_cutoff),
+                ).rowcount
+                if changed:
+                    due.append(request_id)
+        return [request for request in (self.get_approval_request(i) for i in due) if request]
 
     _APPROVAL_COLUMNS = (
         "id, conversation_id, workspace, working_directory, stage_ref, reason, proposed_action, "

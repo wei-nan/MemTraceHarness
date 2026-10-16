@@ -57,6 +57,10 @@ Hard project boundaries:
   Generic shared notes grant no additional capabilities. All other confirmations remain single-use.
 - Every other operation requiring confirmation needs its own tap. Never auto-approve from a stored
   allowlist or a plan-wide grant; old callbacks granting permanent or plan-wide approval are refused.
+- Decentralized autonomous authorization (operator decision, 2026-10-16): each Harness encounters
+  capability, tool, or scope gaps directly in its own workspace and must ask its own operator via
+  single-use confirmation cards (`propose_scope_change`, `request_install`), never asking another
+  Harness over A2A or through a coordinator to proxy or grant tool permissions.
 - A task is reported done only when the Controller's goal check answers every success criterion it
   wrote for the user's whole request (`goal_plan.py`); never mark it `succeeded` on the strength of
   one phase.

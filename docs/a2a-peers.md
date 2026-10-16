@@ -23,8 +23,10 @@ Decisions already made (operator, 2026-10-14):
 - Wire protocol is **A2A**, JSON-RPC 2.0 binding over HTTP (SSE for streaming). No gRPC.
 - First version binds **loopback** only, with scoped per-peer tokens. TLS/mTLS is a later upgrade (see
   "Upgrading beyond loopback").
-- **Read-only requests first.** Work that writes (delegation) comes second and always stops at the
-  receiving operator's tap.
+- **Read-only requests only.** Cross-Harness tool capability delegation or proxying permissions is repealed
+  (operator decision, 2026-10-16). Each Harness requests capabilities (`propose_scope_change`, `request_install`)
+  directly from its own operator. A2A communication is strictly for read-only questions (`ask_peer`) and platform
+  issue reports (`report_issue`).
 - Intent is judged by the Harness front door (a new "ask a peer" intent layered over the existing marker
   lines — not a rewrite of them).
 

@@ -75,10 +75,11 @@ revises development phases appropriately, and interprets new user steering corre
 message is available at the next decision boundary; it does not mutate or interrupt an in-flight
 skill. The model does not gain write access by being the primary agent.
 
-**PLANNED:** general automatic repair/replanning of operational plans, first-class remote
-capability inventory/job delegation, and content-hash approval of generated tools. The existing
-final gate and tool-install boundaries remain as detailed below. A job confirmation currently
-binds its command text; transitive script/dependency content binding is not implemented.
+**PLANNED:** general automatic repair/replanning of operational plans and content-hash approval
+of generated tools (remote capability inventory and cross-Harness tool delegation are repealed in favor
+of decentralized direct consent; see below). The existing final gate and tool-install boundaries remain
+as detailed below. A job confirmation currently binds its command text; transitive script/dependency
+content binding is not implemented.
 
 ## Proactive cross-Harness platform maintenance (operator decision, 2026-10-16)
 
@@ -265,8 +266,8 @@ Another Harness may ask this one a read-only question over A2A (`memtrace_servic
 - Read-only: only the `ask` skill exists. The model gets MemTrace's read tools in an empty scratch folder;
   no ops tools, trading proxy, attachments, operator identity or preferences. The peer's words are quoted to it
   as data, and every `HARNESS_*` directive line in its reply is dropped, so nothing a peer says can start a
-  task, schedule, note, install or approval. Delegation is not offered; when it is, it will stop at the
-  receiving operator's tap.
+  task, schedule, note, install or approval. Cross-Harness tool delegation is repealed; A2A communication
+  is strictly restricted to read-only inquiries (`ask_peer`) and platform issue reports (`report_issue`).
 - Limits: a request that has passed through 2 Harnesses is rejected (`hops`, cooperative); a global cap of
   `HARNESS_PEER_MAX_CONCURRENT` (default 2) unfinished requests, then `rejected: busy`; per-peer rate and
   concurrency limits in `a2a.toml`.
@@ -398,39 +399,34 @@ envelope and sees what comes out (diff, trace, declared permissions), not how it
 - Migration order: new projects first; projects with uncommitted work in their folder (Beri,
   TWTradingStrategy) last, and never on a dirty checkout.
 
-**A project that finds a tool missing asks the Harness that has the machine (operator decision, 2026-10-14;
-PLANNED).** `kubectl` is the running example. A project's Harness (Beri's, say) reaches a step it cannot do
-because no allowed tool covers it, for instance restarting a service, and the following happens. Nothing
-below is built; the pieces it reuses (A2A `ask`/`collaborate`, `request_install`, declared jobs with
-command-hash allowlisting) are ENFORCED as described elsewhere in this contract.
+**Decentralized autonomous authorization and capability requests (operator decision, 2026-10-16; ENFORCED / POLICY).**
+The earlier planned design (2026-10-14) where a Harness lacking a tool would route through A2A to a central
+coordinator or another Harness ("the Harness that has the machine") to inventory and proxy-grant tool permissions is
+**REPEALED and ABOLISHED**. Centralized delegation created multi-hop failure modes (HTTP 429, missing peers,
+unreachable coordinators), operational latency, and blurred per-workspace security boundaries.
 
-- **The signal is structured.** A verification or job that cannot run because something is absent reports a
-  `MISSING_TOOL: <name>` line (Beri's `.harness/verify.sh` already does), so "the tests failed" and "the tests
-  could not run here" are different outcomes.
-- **First tap, to ask.** The project's Harness asks the operator whether it may ask the machine's Harness
-  (`ask_peer`, which already needs a tap). The card says what is being asked: whether `kubectl` exists and
-  where, for what purpose. This consent is to ask, not to use anything.
-- **The inventory is read-only and narrow.** The machine's Harness checks only `PATH` and a short fixed list of
-  locations (`command -v`, `--version`) and reports path, version and whether a credentials file (for
-  `kubectl`, a kubeconfig) exists: present or absent, never its content. It does not search the disk. What it
-  says back is data to the receiver, never an instruction.
-- **Tool absent.** The answer is the install command, shown to the operator, who decides and runs it. For a
-  tool that reaches a cluster, the system or credentials the Harness gives the command and does not install;
-  an ordinary package may still go through `request_install`'s own tap. Installing a binary is not
-  configuring it: credentials are set up by the operator and the Harness never touches them. After installing,
-  the project asks again, and this becomes the next case.
-- **Tool present.** The machine's Harness does not hand the project's agent the binary's path. It proposes a
-  named, bounded **job**, for example `kubectl rollout restart deployment/l8s -n <namespace>`, and the second
-  tap shows the exact command and the context it will run against (for `kubectl`, the kube context). The
-  Harness runs the job itself, so credentials never pass through any agent; the project's agent receives a
-  job name and its result.
-- **Scope of the grant.** Default is this one run. The operator may choose "always allow this exact command",
-  bound to the command's hash and revocable. Verbs that destroy or expose (`delete`, `exec`, `drain`, reading
-  secrets) can never be made standing, whatever is tapped. `sudo` and deletion stay refused as everywhere
-  else in the envelope.
-- **Two taps, two meanings.** The first lets the project ask; the second grants one concrete command. Neither
-  stands in for the other, and a tap given before it is known whether the tool exists never carries over to a
-  grant.
+Instead, the architecture returns strictly to **Decentralized Direct Consent**: every Harness directly asks
+its own operator for single-use confirmation whenever it encounters capability, tool, or scope gaps:
+
+- **The signal remains structured.** A verification or job that cannot run because something is absent reports a
+  `MISSING_TOOL: <name>` line (e.g. Beri's `.harness/verify.sh`), so "the tests failed" and "the tests could not
+  run here" remain distinct outcomes.
+- **Direct operator proposal tools.** When any capability or tool is missing, the project's Harness directly
+  presents a single-use confirmation card to its own operator using its native proposal tools:
+  - `propose_scope_change`: when a probe host, project log file, or bounded shell job is required. The operator
+    sees the exact hostname, relative path, or single-line command (`run_after=true` supported for add-and-run).
+  - `request_install`: when a package (`pip`, `npm`, `brew`), model file, shell script, git clone, or `SKILL.md`
+    is missing. Shows the exact source, version, command, and rationale. Sudo and system-level destructive changes
+    remain strictly refused; commands needing sudo are provided for the operator to run manually in a terminal.
+  - `propose_github_action`: when a repository write (issue, branch push, PR creation) is requested.
+- **No cross-Harness tool proxying or delegation.** A Harness never asks another Harness (such as David or a
+  machine Harness) to open tool permissions, proxy commands, or grant access on its behalf. A2A communication
+  remains strictly restricted to read-only project knowledge questions (`ask_peer`) and platform issue reports
+  (`report_issue`).
+- **Single-use confirmation and least privilege.** Every grant requires its own explicit operator tap in that
+  project's chat or status page. No plan-wide grants, permanent cross-project allowlists, or auto-approvals.
+  Workspace writing remains restricted to the `develop` skill within an isolated task worktree; all other skills,
+  chat sandboxes, and peer handlers remain strictly `read-only`.
 
 Unchanged: the Harness output stays draft evidence and cannot approve its own gate; CLI-only model
 execution; one editing provider per run; the permission rules in "Role contract".
@@ -900,6 +896,11 @@ with why. Whether the workspace is held is read live from the lock table (never 
 the in-flight tracker shows no running thread for it, says scans are being skipped because of it. **Not enforced:** the
 10-minute and 7-day thresholds are display heuristics; a stale "interrupted" mark can still appear for work that
 ended without updating its conversation.
+
+**Pending approval reminders (operator decision, 2026-10-16).** A delivered approval that remains pending gets a
+Telegram reminder after one hour, then every four hours until it is answered or expires under the normal approval
+TTL. The reminder includes the request ID and the appropriate way to answer; it does not resolve the request or
+change its confirmation requirements.
 
 **GitHub writes from the chat (operator decision, 2026-10-10).** A chat model's own GitHub connector cannot write:
 `codex exec` runs with approval `never`, so every write tool call is refused (an issue could be neither opened nor
