@@ -261,6 +261,7 @@ def serve(
             (service.process_job_requests, "processing job requests"),
             (service.plan_runner.tick, "advancing plans"),
             (service.report_long_running, "reporting long-running tasks"),
+            (service.remind_pending_approvals, "reminding pending approvals"),
             (service.improvement_duty.tick, "observing platform improvements"),
         ):
             try:
