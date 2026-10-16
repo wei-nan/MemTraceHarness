@@ -1985,6 +1985,8 @@ class HarnessService:
 
     LONG_RUN_FIRST_SECONDS = 600
     LONG_RUN_REPEAT_SECONDS = 1200
+    APPROVAL_REMINDER_FIRST_SECONDS = 3600
+    APPROVAL_REMINDER_REPEAT_SECONDS = 14400
     _STAGE_LABELS = {
         "control-start": "主代理規劃", "plan": "plan", "plan-revision": "plan（修訂）",
         "plan-escalation": "plan（升級）", "g1": "review G1", "g1-rescope": "review G1（重審）",
@@ -2048,6 +2050,42 @@ class HarnessService:
             )
             sent += 1
         return sent
+
+    def remind_pending_approvals(self, now: datetime | None = None) -> int:
+        """Remind the operator about delivered approvals that are still pending.
+
+        Reminders are informational only: they do not resolve the request or change its
+        confirmation requirements. The first reminder is sent after an hour, then every
+        four hours until the request is answered or expires.
+        """
+        now = now or datetime.now(timezone.utc)
+        now_iso = now.astimezone(timezone.utc).isoformat()
+        workspace_ids = {scope.workspace_id for scope in self.projects}
+        due = self.approval_manager.trace_store.remind_due_approval_requests(
+            workspace_ids,
+            now_iso,
+            first_after_seconds=self.APPROVAL_REMINDER_FIRST_SECONDS,
+            repeat_after_seconds=self.APPROVAL_REMINDER_REPEAT_SECONDS,
+        )
+        projects = {scope.workspace_id: scope.name for scope in self.projects}
+        for request in due:
+            request_id = request["id"]
+            reason = request.get("reason")
+            if reason in INFO_NEEDED_REASONS:
+                action = f"請回覆 /clarify {request_id} <你的具體答案>，或在原始 Telegram 訊息上直接回覆；也可在網頁回答。"
+            elif reason == "config_change_required":
+                action = f"請先調整專案設定，再按原始訊息的「放棄」按鈕或在網頁略過這筆請求。"
+            else:
+                action = f"請在 Telegram 按原始訊息的按鈕，或使用 /approve {request_id}、/reject {request_id}；網頁也可處理。"
+            detail = str(request.get("proposed_action") or "").strip()
+            if len(detail) > 500:
+                detail = detail[:500] + "…"
+            project = projects.get(request.get("workspace"), "此專案")
+            self.notify_operator(
+                f"⏰ {project} 有一筆核准請求仍在等待你：{request_id}\n"
+                f"{detail}\n{action}"
+            )
+        return len(due)
 
     DEAD_LOCK_GRACE_SECONDS = 120
 

@@ -901,6 +901,11 @@ the in-flight tracker shows no running thread for it, says scans are being skipp
 10-minute and 7-day thresholds are display heuristics; a stale "interrupted" mark can still appear for work that
 ended without updating its conversation.
 
+**Pending approval reminders (operator decision, 2026-10-16).** A delivered approval that remains pending gets a
+Telegram reminder after one hour, then every four hours until it is answered or expires under the normal approval
+TTL. The reminder includes the request ID and the appropriate way to answer; it does not resolve the request or
+change its confirmation requirements.
+
 **GitHub writes from the chat (operator decision, 2026-10-10).** A chat model's own GitHub connector cannot write:
 `codex exec` runs with approval `never`, so every write tool call is refused (an issue could be neither opened nor
 closed that way). The chat instead calls `propose_github_action`, which only records a `job_requests` row of kind
