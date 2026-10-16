@@ -7,7 +7,12 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
-from memtrace_harness.adapters.claude import ClaudeCliAdapter
+from memtrace_harness.adapters import (
+    AntigravityCliAdapter,
+    ClaudeCliAdapter,
+    CodexCliAdapter,
+    CursorCliAdapter,
+)
 from memtrace_harness.cli import main
 from memtrace_harness.scanner import UnattendedScanner
 from memtrace_harness.scope import (
@@ -50,6 +55,7 @@ class ScopeTests(TestCase):
         self.assertEqual(split_repo_goal("repo=android::第一行\n第二行"), ("android", "第一行\n第二行"))
         self.assertEqual(split_repo_goal("加上登入頁"), (None, "加上登入頁"))
         self.assertEqual(split_repo_goal("repo=bad name::x"), (None, "repo=bad name::x"))
+        self.assertEqual(split_repo_goal("repo=primary,android::跨 repo 修改"), ("primary,android", "跨 repo 修改"))
 
     def test_the_project_name_and_primary_mean_the_primary_repo_and_unknown_names_are_refused(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -73,6 +79,9 @@ class ScopeTests(TestCase):
             # asking a view for another repo, or for the primary, starts from the project again
             self.assertIs(view.for_repo(None), scope)
             self.assertEqual(view.for_repo("android").working_directory, view.working_directory)
+            selected = scope.for_repos(scope.resolve_repos("primary,android"))
+            self.assertEqual(selected.selected_repos, (None, "android"))
+            self.assertEqual([r.verify_command for r in selected.task_repo_scopes()], ["pytest -q", "./gradlew test"])
             # the primary's own view is untouched
             self.assertEqual((scope.working_directory.name, scope.verify_command), ("beri", "pytest -q"))
 
@@ -107,6 +116,21 @@ class StoreTests(TestCase):
             self.assertEqual((store.get_conversation_repo("c1"), store.get_conversation_repo("c2")), ("android", None))
             store.set_conversation_repo("c1", "ios")
             self.assertEqual(store.get_conversation_repo("c1"), "ios")
+
+    def test_repo_worktrees_are_persisted_per_conversation_and_repo(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = TraceStore(Path(tmp) / "t.sqlite3")
+            store.record_conversation_repo_worktree(
+                "c", "primary", workspace_id="ws", path="/tmp/main-wt", branch="harness/c",
+                base_branch="main", base_commit="abc",
+            )
+            store.record_conversation_repo_worktree(
+                "c", "android", workspace_id="ws", path="/tmp/android-wt", branch="harness/c",
+                base_branch="main", base_commit="def",
+            )
+            self.assertEqual([r["repo"] for r in store.get_conversation_repo_worktrees("c")], ["primary", "android"])
+            store.delete_conversation_repo_worktrees("c")
+            self.assertEqual(store.get_conversation_repo_worktrees("c"), [])
 
 
 class RunInTheRightRepoTests(TestCase):
@@ -158,6 +182,13 @@ class RunInTheRightRepoTests(TestCase):
                 result = gateway._start_or_queue_task(scope, "repo=ios::x", "tg:1")
             launch.assert_not_called()
             self.assertIn("no repo named 'ios'", result)
+            self.assertEqual(store.list_workspace_locks("ws_beri"), [])
+
+    def test_multi_repo_task_requires_every_repo_to_support_worktrees_before_taking_a_slot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            gateway, store, scope = self._gateway(tmp)
+            result = gateway._start_or_queue_task(scope, "repo=primary,android::跨 repo 修改", "tg:1")
+            self.assertIn("multi-repo task needs a Git checkout with a commit", result)
             self.assertEqual(store.list_workspace_locks("ws_beri"), [])
 
     def test_a_resumed_conversation_goes_back_to_its_repo(self) -> None:
@@ -233,10 +264,25 @@ class AdapterTests(TestCase):
             read_directories=(Path("/other-repo"),),
         )
 
-    def test_only_a_read_only_claude_role_may_look_at_the_other_repos(self) -> None:
-        read_only = self._adapter("read-only").build_command("p")
-        self.assertEqual(read_only[read_only.index("--add-dir") + 1], "/other-repo")
-        self.assertNotIn("--add-dir", self._adapter("workspace-write").build_command("p"))
+    def test_every_provider_exposes_other_repos_to_read_only_profiles_only(self) -> None:
+        adapters = (ClaudeCliAdapter, CodexCliAdapter, CursorCliAdapter, AntigravityCliAdapter)
+        for adapter_class in adapters:
+            with self.subTest(provider=adapter_class.provider):
+                common = dict(
+                    adapter_id="review", role="Review", executable="agent",
+                    working_directory=Path("/work"), trace_root=Path("/traces"),
+                    timeout_seconds=10, read_directories=(Path("/other-repo"),),
+                )
+                readonly = adapter_class(permission="read-only", **common).build_command("p")
+                writable = adapter_class(
+                    permission="workspace-write", write_directories=(Path("/other-write-repo"),), **common
+                ).build_command("p")
+                self.assertIn("/other-repo", readonly)
+                self.assertNotIn("/other-repo", writable)
+                self.assertIn("/other-write-repo", writable)
+
+                if adapter_class is CodexCliAdapter:
+                    self.assertEqual(readonly[readonly.index("--sandbox") + 1], "read-only")
 
 
 class RepoCommandTests(TestCase):

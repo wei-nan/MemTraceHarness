@@ -52,12 +52,22 @@ from memtrace_harness.schemas import (
     utc_now_iso,
 )
 from memtrace_harness.trace_store import TraceStore
-from memtrace_harness.worktrees import IntegrationReport, TaskWorktree, WorktreeManager
+from memtrace_harness.worktrees import IntegrationReport, RepoTaskWorkspace, TaskWorktree, WorktreeManager
 
 if TYPE_CHECKING:
     from memtrace_harness.config import HarnessConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _integration_has_changes(integration: IntegrationReport | list[dict[str, Any]] | None) -> bool:
+    if isinstance(integration, list):
+        return any(int(row.get("commits_ahead") or 0) > 0 for row in integration)
+    return bool(integration and integration.has_changes)
+
+class RunCancelled(Exception):
+    def __init__(self, trace_id, stages):
+        self.trace_id, self.stages = trace_id, stages
 
 
 class AgentLoopRunner:
@@ -81,14 +91,19 @@ class AgentLoopRunner:
         loop_mode: str = "full",
         off_limits: list[str] | None = None,
         alert_callback: Callable[[str], None] | None = None,
+        progress_callback: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
         worktree: TaskWorktree | None = None,
         worktree_manager: WorktreeManager | None = None,
         repo_root: Path | None = None,
+        repo_workspaces: tuple[RepoTaskWorkspace, ...] = (),
         create_approvals: bool = True,
         edit_lock: tuple[Callable[[], bool], Callable[[], None]] | None = None,
         edit_lock_wait_seconds: float = 3600.0,
         edit_lock_poll_seconds: float = 5.0,
         model_override_profiles: frozenset[str] = frozenset(),
+        remote_delivery: bool = False,
+        delivery_handoff: Callable[[LoopSummary], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         # (acquire, release) for a project whose tasks share one folder (no worktree): the
@@ -114,14 +129,22 @@ class AgentLoopRunner:
         self.worktree = worktree
         self.worktree_manager = worktree_manager
         self.repo_root = repo_root
-        self.integration: IntegrationReport | None = None
+        self.repo_workspaces = tuple(repo_workspaces)
+        self.remote_delivery = remote_delivery
+        self.delivery_handoff = delivery_handoff
+        self.delivery: dict[str, Any] | None = None
+        self.integration: IntegrationReport | list[dict[str, Any]] | None = None
         # Operator-facing out-of-band alert (the Harness wires this to the operator's chat) for
         # infrastructure faults the operator must fix — currently only a provider CLI
         # that cannot be launched at all, see _alert_cli_unavailable().
         self.alert_callback = alert_callback
+        self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
         self.adapters = adapters
         self.fallback_adapters = fallback_adapters or {}
         self.role_profiles = role_profiles or {}
+        controller_profile = self.role_profiles.get("controller")
+        self.primary_agent = bool(controller_profile and controller_profile.context_policy == "primary-session")
         self.trace_store = trace_store
         self.memtrace_client = memtrace_client
         self.max_total_tokens = max_total_tokens
@@ -157,6 +180,10 @@ class AgentLoopRunner:
     ) -> LoopSummary:
         try:
             return self._run(task, writeback=writeback, conversation_id=conversation_id)
+        except RunCancelled as stopped:
+            return self._persist(self._summary(
+                task, stopped.trace_id, stopped.stages, "failed", "任務已取消，已停止後續步驟並保留現有工作。",
+            ), writeback=writeback)
         finally:
             self._release_edit_lock()
 
@@ -241,6 +268,7 @@ class AgentLoopRunner:
                 agent_loop_enabled=self.agent_loop_enabled,
                 loop_mode=self.loop_mode,
                 previous_goal_plan=previous_goal_plan,
+                primary_agent=self.primary_agent,
             ),
             trace_id=trace_id,
             stages=stages,
@@ -283,11 +311,15 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
+        if action == "run_planner" and self.remote_delivery and self.worktree is None:
+            return self._persist(self._summary(task, trace_id, stages, "needs_human",
+                "共享交付流程要求 Git worktree；請先授權有 commit 的 Git repo，不能在原目錄直接修改。"), writeback=writeback)
         if action == "run_operational_action":
-            return self._persist(
-                self._run_operational_action(task, trace_id, stages),
-                writeback=writeback,
-            )
+            result = self._run_operational_action(task, trace_id, stages)
+            if self.remote_delivery and _integration_has_changes(self._prepare_integration(task)):
+                result = self._summary(task, trace_id, stages, "needs_human",
+                    "這次操作產生程式變更，須改走開發、測試與 PR 交付流程；已保留 worktree，尚未推送或合併。")
+            return self._persist(result, writeback=writeback)
         if action == "no_action_needed":
             # The goal is already met or needs nothing done (typically right after the operator answered
             # "the current state is acceptable"). This ends the task; routing it through needs_human
@@ -315,7 +347,11 @@ class AgentLoopRunner:
                 writeback=writeback,
             )
 
-        goal_plan = parse_goal_plan(controller_artifact.get("goal_plan")) or default_goal_plan(task.goal)
+        goal_plan = parse_goal_plan(controller_artifact.get("goal_plan"))
+        if self.primary_agent and goal_plan is None:
+            return self._persist(self._summary(task, trace_id, stages, "needs_human",
+                "主代理沒有提供可驗收的目標與步驟，任務尚未開始。"), writeback=writeback)
+        goal_plan = goal_plan or default_goal_plan(task.goal)
         reconstructed, stale = self._reusable_for_plan(reconstructed, previous_goal_plan, goal_plan)
         if stale:
             stale_ids = {id(item) for item in stale}
@@ -349,6 +385,7 @@ class AgentLoopRunner:
                         stages=stages,
                         goal_plan=GoalPlan(goal_plan.restated_goal, goal_plan.success_criteria, tuple(phases)),
                         phases_done=done,
+                        primary_agent=self.primary_agent,
                     ),
                     trace_id=trace_id,
                     stages=stages,
@@ -398,7 +435,7 @@ class AgentLoopRunner:
             integration = self._prepare_integration(task)
             can_revise = len(phases) < MAX_PHASES
             converge_actions = {"finish", "ask_human"} | (
-                {"merge"} if integration is not None and integration.has_changes else set()
+                {"merge"} if _integration_has_changes(integration) else set()
             ) | ({"revise_phases"} if can_revise else set())
             converge_round += 1
             current_plan = GoalPlan(goal_plan.restated_goal, goal_plan.success_criteria, tuple(phases))
@@ -411,6 +448,7 @@ class AgentLoopRunner:
                     goal_plan=current_plan,
                     phases_done=done,
                     can_revise=can_revise,
+                    primary_agent=self.primary_agent,
                 ),
                 trace_id=trace_id,
                 stages=stages,
@@ -470,8 +508,33 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
-        if converge_action == "merge":
+        if self.remote_delivery and converge_action in {"finish", "merge"}:
+            if integration is None:
+                return self._persist(self._summary(task, trace_id, stages, "needs_human",
+                    "無法確認 worktree 的整合狀態，停止交付並保留內容。"), writeback=writeback)
+            if _integration_has_changes(integration):
+                # Recheck the final files after all phases/gates. Baseline failures and unrun tests
+                # are information in ordinary loops, but cannot authorize automatic delivery.
+                configured = all(item.verify_command for item in self.repo_workspaces) if self.repo_workspaces else bool(self.verify_command)
+                verification = self._verify() if configured else None
+                passed = verification and verification.get("status") == "passed" and all(
+                    row.get("status") == "passed" for row in verification.get("repos", []))
+                if not passed:
+                    return self._persist(self._summary(task, trace_id, stages, "needs_human",
+                        "自動交付需要各 repo 的 verify_command 實際通過；目前缺少測試或仍有未通過的測試，保留 worktree。"), writeback=writeback)
+                self.delivery = {"state": "pending", "integration": integration if isinstance(integration, list) else [integration.to_dict()]}
+                return self._persist(self._summary(task, trace_id, stages, "delivering",
+                    (report + "\n\n" if report else "") + "本機開發與驗證通過，接著推送 PR、確認 CI 與衝突，再合併遠端 main。"), writeback=writeback)
+            # No changes means no branch to deliver and no remote merge to claim.
+            return self._persist(self._summary(task, trace_id, stages, "succeeded",
+                (report + "\n" if report else "") + "已檢查目標；沒有需要推送的程式變更。"), writeback=writeback)
+        if converge_action == "merge" or (
+            isinstance(integration, list) and converge_action == "finish"
+            and _integration_has_changes(integration)
+        ):
+            self._report_progress("integrate", "running", None)
             merged = self._merge_worktree(task)
+            self._report_progress("integrate", "succeeded" if merged.ok else "failed", {"delivery": self.delivery})
             if not merged.ok:
                 return self._persist(
                     self._summary(task, trace_id, stages, "needs_human", merged.detail),
@@ -491,12 +554,15 @@ class AgentLoopRunner:
                 ),
                 writeback=writeback,
             )
-        elif integration is not None and integration.has_changes:
-            merge_note = (
-                f" The task's changes are on branch '{integration.branch}' in "
-                f"{self.working_directory} and have NOT been merged into "
-                f"'{integration.base_branch}'."
-            )
+        elif _integration_has_changes(integration):
+            if isinstance(integration, list):
+                merge_note = " 變更仍留在各 repo 的獨立分支，尚未合併。"
+            else:
+                merge_note = (
+                    f" The task's changes are on branch '{integration.branch}' in "
+                    f"{self.working_directory} and have NOT been merged into "
+                    f"'{integration.base_branch}'."
+                )
         return self._persist(
             self._summary(
                 task,
@@ -834,9 +900,29 @@ class AgentLoopRunner:
                 )
         return None
 
-    def _prepare_integration(self, task: TaskEnvelope) -> IntegrationReport | None:
+    def _prepare_integration(self, task: TaskEnvelope) -> IntegrationReport | list[dict[str, Any]] | None:
         """Commit what Developer left in the task's worktree and work out what merging
         it back would involve. None when this task is not running in a worktree."""
+        if len(self.repo_workspaces) > 1:
+            if not self.worktree_manager:
+                return None
+            reports: list[dict[str, Any]] = []
+            try:
+                for item in self.repo_workspaces:
+                    if not item.worktree:
+                        return None
+                    self.worktree_manager.commit_all(
+                        item.worktree, f"harness: {task.goal.strip().splitlines()[0][:72]}"
+                    )
+                    report = self.worktree_manager.integration_report(item.repo_root, item.worktree)
+                    reports.append({"repo": item.name, **report.to_dict()})
+            except Exception:
+                logger.exception("could not prepare multi-repo integration reports")
+                return None
+            self.integration = reports
+            if _integration_has_changes(reports):
+                self.delivery = {"state": "unmerged"}
+            return reports
         if not (self.worktree and self.worktree_manager and self.repo_root):
             return None
         try:
@@ -846,6 +932,8 @@ class AgentLoopRunner:
             self.integration = self.worktree_manager.integration_report(
                 self.repo_root, self.worktree
             )
+            if self.integration.has_changes:
+                self.delivery = {"state": "unmerged"}
         except Exception:
             logger.exception("could not prepare the worktree integration report")
             return None
@@ -854,13 +942,49 @@ class AgentLoopRunner:
     def _merge_worktree(self, task: TaskEnvelope):
         from memtrace_harness.worktrees import MergeResult
 
+        if len(self.repo_workspaces) > 1:
+            if not self.worktree_manager:
+                self.delivery = {"state": "blocked"}
+                return MergeResult(False, "Multi-repo merge has no worktree manager.", [])
+            reports = self.integration if isinstance(self.integration, list) else []
+            blocked = [r for r in reports if r.get("commits_ahead", 0) and (
+                not r.get("main_checkout_clean") or r.get("merges_cleanly") is not True
+            )]
+            if blocked:
+                self.delivery = {"state": "blocked"}
+                names = ", ".join(str(row.get("repo")) for row in blocked)
+                return MergeResult(False, f"尚未合併任何 repo；整合前檢查未通過：{names}。", [])
+            merged: list[str] = []
+            for item in self.repo_workspaces:
+                if not item.worktree:
+                    continue
+                report = next((r for r in reports if r.get("repo") == item.name), {})
+                if not report.get("commits_ahead", 0):
+                    continue
+                result = self.worktree_manager.merge(
+                    item.repo_root, item.worktree,
+                    f"Merge {item.worktree.branch}: {task.goal.strip().splitlines()[0][:72]}",
+                )
+                if not result.ok:
+                    self.delivery = {
+                        "state": "partial" if merged else "blocked", "merged_repos": list(merged),
+                        "pending_repos": [r["repo"] for r in reports if r.get("commits_ahead", 0) and r["repo"] not in merged],
+                    }
+                    detail = result.detail + (" Already merged: " + ", ".join(merged) + "." if merged else "")
+                    return MergeResult(False, detail, result.conflicts)
+                merged.append(item.name)
+            self.delivery = {"state": "merged", "repos": merged}
+            return MergeResult(True, "已分別合併 repo：" + (", ".join(merged) if merged else "沒有待合併變更") + "。", [])
+
         if not (self.worktree and self.worktree_manager and self.repo_root):
+            self.delivery = {"state": "blocked"}
             return MergeResult(False, "Controller chose merge, but this task has no worktree.", [])
         result = self.worktree_manager.merge(
             self.repo_root,
             self.worktree,
             f"Merge {self.worktree.branch}: {task.goal.strip().splitlines()[0][:72]}",
         )
+        self.delivery = {"state": "merged" if result.ok else "blocked", "target_branch": self.worktree.base_branch}
         if result.ok or not result.conflicts:
             return result
         return MergeResult(
@@ -917,6 +1041,17 @@ class AgentLoopRunner:
         stage: str,
         profile_id: str,
     ) -> LoopStageResult:
+        self._check_cancelled(trace_id, stages)
+        intent = None
+        for item in task.context_items:
+            if item.ref == "harness:phase" and item.body:
+                try:
+                    phase = json.loads(item.body)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(phase, dict):
+                    intent = {"phase": phase}
+        self._report_progress(stage, "running", intent)
         candidates = [
             self.adapters[profile_id],
             *self.fallback_adapters.get(profile_id, []),
@@ -927,7 +1062,7 @@ class AgentLoopRunner:
 
         for attempt_index, adapter in enumerate(candidates):
             quota_bucket = _adapter_quota_bucket(adapter)
-            if not self.trace_store.quota_bucket_available(quota_bucket):
+            if not getattr(adapter, "execution_source_id", None) and not self.trace_store.quota_bucket_available(quota_bucket):
                 last_result = self._record_quota_cooldown(
                     task=effective_task,
                     trace_id=trace_id,
@@ -1026,6 +1161,7 @@ class AgentLoopRunner:
                 run_id=trace_id,
                 result=result,
             )
+            self._report_progress(stage, state, artifact)
             envelope = self._checkpoint(
                 task=effective_task,
                 trace_id=trace_id,
@@ -1039,17 +1175,18 @@ class AgentLoopRunner:
                 ),
                 checkpoint_id=checkpoint_id,
             )
-            self.trace_store.record_provider_availability(
-                provider=response.execution.provider,
-                model=response.execution.resolved_model
-                or response.execution.requested_model,
-                quota_bucket=quota_bucket,
-                failure_category=response.execution.failure_category,
-                error_signature=error_signature(response.execution),
-                cooldown_seconds=self._fallback_cooldown_seconds(profile_id),
-            )
+            if not getattr(adapter, "execution_source_id", None):
+                self.trace_store.record_provider_availability(
+                    provider=response.execution.provider,
+                    model=response.execution.resolved_model or response.execution.requested_model,
+                    quota_bucket=quota_bucket,
+                    failure_category=response.execution.failure_category,
+                    error_signature=error_signature(response.execution),
+                    cooldown_seconds=self._fallback_cooldown_seconds(profile_id),
+                )
             self._active_checkpoint_id = envelope.checkpoint_id
             last_result = result
+            self._check_cancelled(trace_id, stages)
 
             if response.execution.status == "succeeded":
                 return result
@@ -1109,7 +1246,10 @@ class AgentLoopRunner:
         )
         from memtrace_harness.cli_process import CliProcessRunner
 
-        command = self.config.chat_command(self.config.chat_provider, self.config.chat_model, prompt)
+        selected = self.config.chat_candidates_for()
+        if not selected:
+            return None
+        command = self.config.chat_command(*selected[0], prompt)
         try:
             result = CliProcessRunner().run(
                 command,
@@ -1282,7 +1422,10 @@ class AgentLoopRunner:
             )
         return found
 
-    def _run_deterministic_verification(self, directory: Path | None = None) -> dict[str, Any] | None:
+    def _run_deterministic_verification(
+        self, directory: Path | None = None, *, command: str | None = None,
+        timeout_seconds: int | None = None,
+    ) -> dict[str, Any] | None:
         """Ground G2's review in a real build/test result instead of relying solely
         on the Developer's own self-reported evidence. A model claiming "I compiled
         this" (or a model that couldn't get tool permission to try) is not the same
@@ -1292,17 +1435,18 @@ class AgentLoopRunner:
         configured; otherwise runs it directly via the harness, not the model, so its
         exit code is a hard precondition, not something an LLM can talk its way past."""
         directory = directory or self.working_directory
-        if not self.verify_command or not directory:
+        command = self.verify_command if command is None else command
+        if not command or not directory:
             return None
         started = time.monotonic()
         timed_out = False
         try:
             completed = subprocess.run(
-                ["/bin/sh", "-c", self.verify_command],
+                ["/bin/sh", "-c", command],
                 cwd=directory,
                 capture_output=True,
                 text=True,
-                timeout=self.verify_timeout_seconds,
+                timeout=timeout_seconds or self.verify_timeout_seconds,
                 env=child_env(),
             )
             exit_code: int | None = completed.returncode
@@ -1313,7 +1457,7 @@ class AgentLoopRunner:
             stderr = exc.stderr or ""
             timed_out = True
         return {
-            "command": self.verify_command,
+            "command": command,
             "exit_code": exit_code,
             "timed_out": timed_out,
             "passed": exit_code == 0,
@@ -1334,6 +1478,56 @@ class AgentLoopRunner:
         """The final gate (final_gate.py), run by code once the work is done: off-limits and outside-the-folder
         writes, files outside the paths the Controller declared, secrets in what was added. Returns the persisted
         stop, or None to go on."""
+        if self.working_directory is not None or len(self.repo_workspaces) > 1:
+            self._report_progress("final-gate", "running", None)
+        if len(self.repo_workspaces) > 1:
+            developing = [phase for phase in phases if "develop" in phase.skills]
+            declared_by_repo: dict[str, list[str]] = {}
+            any_paths = bool(developing and all(phase.paths for phase in developing))
+            if any_paths:
+                for phase in developing:
+                    for declared_path in phase.paths:
+                        if "::" in declared_path:
+                            name, path = declared_path.split("::", 1)
+                            declared_by_repo.setdefault(name, []).append(path)
+                        else:
+                            declared_by_repo.setdefault(self.repo_workspaces[0].name, []).append(declared_path)
+            all_findings: list[str] = []
+            any_changes = False
+            any_blocked = False
+            for item in self.repo_workspaces:
+                reported = [
+                    str(name) for result in stages
+                    if "develop" in result.stage and isinstance(result.artifact, dict)
+                    for name in result.artifact.get("changed_files") or []
+                ]
+                changes = (
+                    final_gate.collect_git_changes(item.working_directory, item.worktree.base_commit)
+                    if item.worktree and item.worktree.base_commit else None
+                )
+                if changes is None:
+                    changes = final_gate.collect_reported_changes(item.working_directory, reported)
+                if not changes.files:
+                    continue
+                any_changes = True
+                result = final_gate.check(
+                    changes, directory=item.working_directory, off_limits=list(item.off_limits),
+                    declared_paths=declared_by_repo.get(item.name) if any_paths else None,
+                )
+                any_blocked = any_blocked or (result.blocked and not final_gate.waived(task.goal, result))
+                all_findings.extend(f"{item.name}: {finding.render()}" for finding in result.findings)
+            if not any_changes:
+                self._report_progress("final-gate", "succeeded", {"status": "skipped"})
+                return None
+            blocked = any_blocked
+            self._record_harness_stage(
+                stages=stages, trace_id=trace_id, stage="final-gate", profile_id="review",
+                verification={"command": "final-gate-multi-repo", "exit_code": 1 if blocked else 0, "duration_seconds": 0},
+                artifact={"verdict": "REJECT" if blocked else "PASS", "findings": [{"description": x} for x in all_findings], "confidence": 1.0},
+            )
+            if blocked:
+                return self._persist(self._summary(task, trace_id, stages, "needs_human", "多 repo final gate 擋下變更：\n" + "\n".join(all_findings)), writeback=writeback)
+            return None
         directory = self.working_directory
         if directory is None:
             return None
@@ -1348,6 +1542,7 @@ class AgentLoopRunner:
             changes = final_gate.collect_git_changes(Path(directory), self.worktree.base_commit)
         if changes is None:
             if not reported:
+                self._report_progress("final-gate", "succeeded", {"status": "skipped"})
                 return None
             changes = final_gate.collect_reported_changes(Path(directory), reported)
         developing = [phase for phase in phases if "develop" in phase.skills]
@@ -1357,6 +1552,7 @@ class AgentLoopRunner:
         )
         result = final_gate.check(changes, directory=Path(directory), off_limits=self.off_limits, declared_paths=declared)
         if not changes.files:
+            self._report_progress("final-gate", "succeeded", {"status": "skipped"})
             return None
         artifact = result.to_dict()
         self._record_harness_stage(
@@ -1371,9 +1567,58 @@ class AgentLoopRunner:
             )
         return None
 
-    def _verify(self) -> dict[str, Any] | None:
+    def _verify(self, *, progress_stage: str = "verify", notify_completion: bool = True) -> dict[str, Any] | None:
+        configured = (
+            any(item.verify_command for item in self.repo_workspaces)
+            if len(self.repo_workspaces) > 1 else bool(self.verify_command and self.working_directory)
+        )
+        if not configured:
+            return None
+        self._report_progress(progress_stage, "running", None)
+        result = self._verify_result()
+        if result is not None and notify_completion:
+            self._report_progress(progress_stage, "succeeded", {
+                "verification_status": result["status"],
+                "repo_verifications": [{"repo": row["repo"], "status": row["status"]} for row in result.get("repos", [])],
+            })
+        return result
+
+    def _verify_result(self) -> dict[str, Any] | None:
         """The verify_command result, classified (see verification.py). When it fails in a task worktree, the same
         command is run once on the main checkout, so a failure the base already has is not charged to the task."""
+        if len(self.repo_workspaces) > 1:
+            results: list[dict[str, Any]] = []
+            for item in self.repo_workspaces:
+                if not item.verify_command:
+                    continue
+                result = self._run_deterministic_verification(
+                    item.working_directory, command=item.verify_command,
+                    timeout_seconds=item.verify_timeout_seconds,
+                )
+                if result is None:
+                    continue
+                baseline = None
+                if (not result["passed"] and not verify_result.could_not_run(result)
+                        and item.worktree and item.repo_root.resolve() != item.working_directory.resolve()):
+                    baseline = self._run_deterministic_verification(
+                        item.repo_root, command=item.verify_command,
+                        timeout_seconds=item.verify_timeout_seconds,
+                    )
+                results.append({"repo": item.name, **verify_result.classify(result, baseline)})
+            if not results:
+                return None
+            blocking = [row for row in results if row.get("status") in verify_result.BLOCKING]
+            descriptions = [f"{row['repo']}: {verify_result.describe(row)}" for row in results]
+            return {
+                "command": "verify each selected repo",
+                "exit_code": 1 if blocking else 0,
+                "passed": not blocking,
+                "status": "regression" if blocking else "passed",
+                "duration_seconds": sum(float(row.get("duration_seconds") or 0) for row in results),
+                "stdout_tail": "\n".join(descriptions)[-4000:],
+                "stderr_tail": "",
+                "repos": results,
+            }
         result = self._run_deterministic_verification()
         if result is None:
             return None
@@ -1396,13 +1641,19 @@ class AgentLoopRunner:
         """Record a lean-mode verification as a stage: REJECT for a regression, otherwise PASS with the plain
         description as a finding, so the Controller's converge step and the operator can see it."""
         blocking = verification["status"] in verify_result.BLOCKING
+        descriptions = (
+            [f"{item['repo']}: {verify_result.describe(item)}" for item in verification["repos"]]
+            if isinstance(verification.get("repos"), list)
+            else [verify_result.describe(verification)]
+        )
         artifact = {
             "verdict": "REJECT" if blocking else "PASS",
             "reason_code": "test_gap" if blocking else "none",
-            "findings": [{"description": verify_result.describe(verification)}],
+            "findings": [{"description": item} for item in descriptions],
             "unverified_items": [],
             "confidence": 1.0,
             "verification_status": verification["status"],
+            "repo_verifications": [{"repo": row["repo"], "status": row["status"]} for row in verification.get("repos", [])],
         }
         return self._record_harness_stage(stages=stages, trace_id=trace_id, stage=stage, profile_id="review",
                                           verification=verification, artifact=artifact)
@@ -1421,7 +1672,7 @@ class AgentLoopRunner:
         """Lean mode, after develop: run the project's verify_command and tell the Developer what it found. No
         model reviews the change. A regression goes back to the Developer once; a second one stops the task for a
         person. A command that could not run, or a failure the base already has, is recorded and the work goes on."""
-        verification = self._verify()
+        verification = self._verify(progress_stage=self._stage(index, "verify"), notify_completion=False)
         if verification is None:
             return None
         result = self._verification_stage(
@@ -1439,7 +1690,7 @@ class AgentLoopRunner:
         stopped = self._stop_after_execution(task, trace_id, stages, development)
         if stopped:
             return self._persist(stopped, writeback=writeback)
-        recheck = self._verify()
+        recheck = self._verify(progress_stage=self._stage(index, "verify-recheck"), notify_completion=False)
         if recheck is None:
             return None
         again = self._verification_stage(
@@ -1528,7 +1779,19 @@ class AgentLoopRunner:
             run_id=trace_id,
             result=result,
         )
+        self._report_progress(stage, "succeeded", artifact)
         return result
+
+    def _report_progress(self, stage: str, state: str, artifact: dict[str, Any] | None) -> None:
+        if self.progress_callback is not None:
+            try:
+                self.progress_callback(stage, state, artifact)
+            except Exception:
+                logger.exception("could not deliver stage progress")
+
+    def _check_cancelled(self, trace_id: str, stages: list[LoopStageResult]) -> None:
+        if self.cancel_check is not None and self.cancel_check():
+            raise RunCancelled(trace_id, stages)
 
     def _checkpoint(
         self,
@@ -1584,7 +1847,7 @@ class AgentLoopRunner:
         # never evaluated the request at all.
         if (
             profile is not None
-            and category not in {"cli_unavailable", "authentication"}
+            and category not in {"cli_unavailable", "authentication", "source_busy", "source_unavailable"}
             and not timed_out_read_only
             and category not in profile.fallback_on
         ):
@@ -1610,7 +1873,8 @@ class AgentLoopRunner:
         an alert failure must never change the loop's own outcome."""
         if self.alert_callback is None:
             return
-        failed = f"{getattr(adapter, 'provider', 'unknown')}/{getattr(adapter, 'model', None) or 'provider-default'}"
+        source = getattr(adapter, "execution_source_id", None)
+        failed = f"{getattr(adapter, 'provider', 'unknown')}" + (f"@{source}" if source else "") + f"/{getattr(adapter, 'model', None) or 'provider-default'}"
         if next_adapter is not None:
             follow_up = (
                 f"已自動改用備援 {getattr(next_adapter, 'provider', 'unknown')}/"
@@ -1708,9 +1972,12 @@ class AgentLoopRunner:
             total_usage=aggregate_usage(stages),
             conversation_id=self._conversation_id,
             active_checkpoint_id=self._active_checkpoint_id,
+            delivery=self.delivery,
         )
 
     def _persist(self, summary: LoopSummary, *, writeback: bool) -> LoopSummary:
+        if summary.status == "delivering" and self.delivery_handoff:
+            self.delivery_handoff(summary)
         self.trace_store.save_loop_summary(summary)
         if (
             summary.status in {"needs_human", "budget_exhausted"}
@@ -1850,7 +2117,7 @@ _GOAL_CHECK_PROGRESS = (
     "for a real decision the operator must make.\n"
 )
 _GOAL_CHECK_CONVERGE = (
-    "Choose finish or merge only if `verdict` is 'met' and no criterion is 'unmet': the harness refuses to close "
+    "Copy each original criterion exactly once. Choose finish or merge only if every criterion is 'met' with evidence: the harness refuses to close "
     "a task otherwise and reports it to the operator as only partly done. If something is unmet and plan or "
     "develop can still do it, choose revise_phases and give those phases in `phases`; if it needs the operator, "
     "choose ask_human.\n"
@@ -1914,11 +2181,12 @@ def controller_task(
     stages: list[LoopStageResult],
     agent_loop_enabled: bool = True,
     loop_mode: str = "full",
-    integration: IntegrationReport | None = None,
+    integration: IntegrationReport | list[dict[str, Any]] | None = None,
     goal_plan: GoalPlan | None = None,
     previous_goal_plan: GoalPlan | None = None,
     phases_done: int = 0,
     can_revise: bool = False,
+    primary_agent: bool = False,
 ) -> TaskEnvelope:
     snapshot: dict[str, Any] = {
         "task_id": task.task_id,
@@ -1949,7 +2217,7 @@ def controller_task(
         allowed = ["next_phase", "revise_phases", "finish", "ask_human"]
     else:
         allowed = ["finish", "ask_human"]
-        if integration is not None and integration.has_changes:
+        if _integration_has_changes(integration):
             allowed.insert(1, "merge")
         if can_revise:
             allowed.append("revise_phases")
@@ -2005,8 +2273,10 @@ def controller_task(
             "ask_human or stop to wait for it. Ask again only about something the answer did not cover.\n"
         )
     integration_notice = ""
-    if integration is not None and integration.has_changes:
-        snapshot["integration"] = integration.to_dict()
+    if _integration_has_changes(integration):
+        snapshot["integration"] = (
+            integration if isinstance(integration, list) else integration.to_dict()
+        )
         integration_notice = (
             "This task ran in its own git worktree, so its changes are NOT in the project's "
             "main checkout yet: they sit on the branch described by `integration` in the "
@@ -2017,6 +2287,14 @@ def controller_task(
             "unmerged on its branch; choose \"ask_human\" if `merges_cleanly` is false or "
             "you doubt the change should land. Say in `reason` why.\n"
         )
+        if isinstance(integration, list):
+            integration_notice = (
+                "This task has isolated worktrees for several repos. Every repo has been verified and preflighted. "
+                "Once the goal check is complete, the harness merges each changed repo separately; the Controller "
+                "does not need to choose a repo or request parallel editing. The harness checks all repos before the first merge. "
+                "If a later Git operation fails after an earlier repo merged, it reports exactly which repos landed "
+                "and leaves the remaining branches intact.\n"
+            )
     # Opt-in read-only market-data proxy (see taiwantrade_mcp.py); without this sentence the
     # "no other tool" rule below would stop Controller from ever using it.
     taiwantrade_tools = (
@@ -2042,26 +2320,47 @@ def controller_task(
         else "\nkb_updates must be null at this stage.\n"
     )
     goal_notice = _goal_plan_notice(stage, agent_loop_enabled, goal_plan, previous_goal_plan, loop_mode)
+    repo_scope_notice = ""
+    repo_context = next((item for item in task.context_items if item.ref == "harness:repo-workspaces"), None)
+    if repo_context and repo_context.body:
+        try:
+            selected_repos = json.loads(repo_context.body)
+        except (TypeError, json.JSONDecodeError):
+            selected_repos = []
+        if isinstance(selected_repos, list) and len(selected_repos) > 1:
+            names = [str(item.get("repo")) for item in selected_repos if isinstance(item, dict)]
+            repo_scope_notice = (
+                "This task may edit only these selected repo worktrees: " + ", ".join(names) + ". "
+                "For every plan phase, qualify each `paths` entry as `<repo>::<relative path>` "
+                "(for example `android::app/src/Main.kt`) so the final gate applies the right scope to each repo. "
+                "Do not plan writes in any unselected repo.\n"
+            )
+    context_policy_notice = (
+        "Continue as the project's single primary agent, using your current project conversation "
+        "and this execution snapshot. This is a structured decision turn of the same conversation. "
+        "Use the original request, settled human decisions and the latest clarification together. "
+        "Skills are execution capabilities you invoke, not a handoff to another decision maker. "
+        "Keep this decision read-only; use MemTrace lookup tools for missing knowledge. "
+        "Return the structured decision for this boundary; do not emit chat action markers.\n"
+        if primary_agent else (
+            "You are deliberately running in a neutral, empty sandbox directory, not the "
+            "project's actual repository — this is intentional so this stage stays cheap "
+            "and fast, not a malfunction. Any working_directory/path mentioned in the goal "
+            "text above is informational context for later stages (the plan and develop skills, "
+            "which do have real repo access), not something you can or should verify yourself.\n"
+            "Do not call any tool other than MemTrace's own lookup tools "
+            f"(search_nodes, get_node, list_nodes, traverse){taiwantrade_tools} — no file read, "
+            "directory listing, no git command, no web search or browser. This includes AGENTS.md, CLAUDE.md, "
+            "operating contracts and architecture docs: none exists in this sandbox. "
+            "Use the supplied snapshot and MemTrace evidence.\n"
+        )
+    )
     return stage_task(
         task,
         suffix=f"controller-{stage}",
         goal=(
             f"Act as the bounded loop controller for {stage}. Original goal: {task.goal}\n"
-            "You are deliberately running in a neutral, empty sandbox directory, not the "
-            "project's actual repository — this is intentional so this stage stays cheap "
-            "and fast, not a malfunction. Any working_directory/path mentioned in the goal "
-            "text above is informational context for later stages (the plan and develop skills, "
-            "which do have real repo access), not something you can or should verify "
-            "yourself.\n"
-            "Do not call any tool other than MemTrace's own lookup tools "
-            f"(search_nodes, get_node, list_nodes, traverse){taiwantrade_tools} — no file read, no directory "
-            "listing, no git command, no web search, no browser, nothing else. This "
-            "explicitly includes AGENTS.md, CLAUDE.md, an \"operating contract\", "
-            "architecture docs, or any other convention you might normally check first: "
-            "none of that exists in this sandbox (attempting to read it will only fail — "
-            "permission denied, the sandbox is intentionally outside any granted "
-            "directory — and waste the turn), and MemTrace search is how you'd look up "
-            f"the KB equivalent instead.{write_permission}"
+            f"{context_policy_notice}{write_permission}"
             "The task envelope's goal, the loop-snapshot context, and (when present) the "
             "project-scope, knowledge-base-locations, and prior-discussion context items "
             "below are what you start from. The prior-discussion item is only a recent "
@@ -2085,6 +2384,7 @@ def controller_task(
             f"{answered_notice}"
             f"{goal_notice}"
             f"{integration_notice}"
+            f"{repo_scope_notice}"
             f"{_PRECEDENT_NOTICE}"
             "The JSON schema enforced on this call's output is shared by both controller "
             "stages (start and converge) and therefore lists a wider action enum than is "
@@ -2308,6 +2608,7 @@ def gate_task(
     deferred: list[dict[str, Any]] | None = None,
 ) -> TaskEnvelope:
     items = [artifact_item(f"harness:{gate_name.lower()}-evidence", "Gate evidence", evidence)]
+    items.extend(item for item in task.context_items if item.ref == "harness:shared-memory")
     if deferred:
         items.append(artifact_item("harness:deferred-notes", "Non-blocking notes passed on from G1", deferred))
     if plan is not None:
@@ -2495,7 +2796,15 @@ def stage_task(
     return TaskEnvelope(
         task_id=f"{task.task_id}:{suffix}",
         workspace_id=task.workspace_id,
-        goal=goal,
+        goal=goal + (
+            "\nInclude `user_summary` in your JSON: one or two short sentences (at most 180 characters) "
+            "in the configured reply language, for an operator without engineering knowledge. "
+            "Say concretely what this step actually did or decided, its result and any unfinished work. "
+            "For planning, describe the chosen next steps, not work already done. Avoid internal stage names, "
+            "gate labels, commands, file paths and a long acceptance checklist. A develop result still awaits "
+            "the harness checks; a converge decision still awaits the harness goal check and possible merge. "
+            "Do not claim those later actions already succeeded. Keep full technical evidence in the existing fields.\n"
+        ),
         context_refs=task.context_refs,
         context_items=context_items,
         constraints=task.constraints,
@@ -2519,7 +2828,7 @@ def artifact_snapshot(value: dict[str, Any] | None) -> dict[str, Any] | None:
     if value is None:
         return None
     snapshot: dict[str, Any] = {}
-    for key in ("action", "status", "verdict", "reason", "reason_code", "summary"):
+    for key in ("action", "status", "verdict", "reason", "reason_code", "summary", "user_summary"):
         item = value.get(key)
         if isinstance(item, str):
             snapshot[key] = item[:500]

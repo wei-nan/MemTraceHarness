@@ -10,7 +10,7 @@ RunMode = Literal["cli_run", "cli_run_draft_write", "agent_loop", "agent_loop_dr
 ProviderId = Literal["claude", "codex", "antigravity", "cursor"]
 ExecutionStatus = Literal["succeeded", "failed", "timed_out", "unavailable"]
 UsageCompleteness = Literal["complete", "partial", "unavailable"]
-LoopStatus = Literal["succeeded", "failed", "needs_human", "budget_exhausted"]
+LoopStatus = Literal["succeeded", "failed", "needs_human", "budget_exhausted", "delivering"]
 FailureCategory = Literal[
     "none",
     "quota_exhausted",
@@ -26,6 +26,8 @@ FailureCategory = Literal[
     "schema",
     "safety",
     "unknown",
+    "source_busy",
+    "source_unavailable",
 ]
 
 
@@ -117,6 +119,7 @@ class CliExecution:
     failure_category: FailureCategory = "none"
     retry_after: str | None = None
     reset_at: str | None = None
+    execution_source_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -232,6 +235,7 @@ class LoopSummary:
     writeback_node_id: str | None = None
     conversation_id: str | None = None
     active_checkpoint_id: str | None = None
+    delivery: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -245,4 +249,5 @@ class LoopSummary:
             "writeback_node_id": self.writeback_node_id,
             "conversation_id": self.conversation_id,
             "active_checkpoint_id": self.active_checkpoint_id,
+            "delivery": self.delivery,
         }

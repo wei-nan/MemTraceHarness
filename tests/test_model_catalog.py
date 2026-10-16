@@ -155,24 +155,24 @@ class ModelChainTests(TestCase):
             roles = Path(tmp) / "roles.toml"
             shutil.copy(Path(role_profiles.__file__).with_name("default-role-profiles.toml"), roles)
             config = SimpleNamespace(role_profiles_file_for=lambda *a: roles, workspace_root=Path(tmp))
-            admin.update_role_profile_chain(config, "controller", [
+            admin.update_role_profile_chain(config, "review", [
                 {"provider": "claude", "model": "claude-sonnet-5-5"},
                 {"provider": "codex", "model": "gpt-5.6-luna"},
                 {"provider": "antigravity", "model": "gemini-3.8-flash-high", "reasoning_effort": "high"},
                 {"provider": "claude", "model": "claude-haiku-5-5"},
             ])
-            profile = role_profiles.load_role_profiles(roles)["controller"]
+            profile = role_profiles.load_role_profiles(roles)["review"]
             self.assertEqual(
                 [(c.provider, c.model) for c in profile.candidates],
                 [("claude", "claude-sonnet-5-5"), ("codex", "gpt-5.6-luna"),
                  ("antigravity", "gemini-3.8-flash-high"), ("claude", "claude-haiku-5-5")],
             )
-            self.assertEqual(role_profiles.load_role_profiles(roles)["plan"].model, "sonnet")
+            self.assertEqual(role_profiles.load_role_profiles(roles)["plan"].model, role_profiles.load_role_profiles()["plan"].model)
             with self.assertRaises(ValueError):
-                admin.update_role_profile_chain(config, "controller", [
+                admin.update_role_profile_chain(config, "review", [
                     {"provider": "claude", "model": "m", "reasoning_effort": "bogus"}])
-            admin.update_role_profile_chain(config, "controller", [{"provider": "codex", "model": "x"}])
-            self.assertEqual(role_profiles.load_role_profiles(roles)["controller"].fallbacks, ())
+            admin.update_role_profile_chain(config, "review", [{"provider": "codex", "model": "x"}])
+            self.assertEqual(role_profiles.load_role_profiles(roles)["review"].fallbacks, ())
 
 
 class ModelListKeyTests(TestCase):

@@ -15,8 +15,10 @@ DEFAULT_MAX_WORKERS = 3
 
 
 REPO_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-# A goal that starts `repo=<name>::` is for that repo (a chat task marker, a schedule, a scanner proposal).
-REPO_GOAL_PREFIX = re.compile(r"^repo=([A-Za-z0-9_-]{1,40})::(.*)$", re.DOTALL)
+# A goal that starts `repo=<name>[,<name>...]::` selects one or more repos for this task.
+REPO_GOAL_PREFIX = re.compile(
+    r"^repo=([A-Za-z0-9_-]{1,40}(?:,[A-Za-z0-9_-]{1,40})*)::(.*)$", re.DOTALL
+)
 
 
 # A one-off model for this task only: `model=<model>::` or `model=<provider>/<model>::`.
@@ -170,6 +172,9 @@ class ProjectScope:
     repos: dict[str, RepoScope] = field(default_factory=dict)
     # Which repo this view of the scope is for: None = the primary one. See for_repo().
     repo: str | None = None
+    # A task may work in several repos. `repo` and working_directory identify the first
+    # selected repo for legacy single-repo consumers; this tuple is the full selection.
+    selected_repos: tuple[str | None, ...] = ()
     base: "ProjectScope | None" = field(default=None, repr=False, compare=False)
 
     def resolve_repo(self, name: str | None) -> str | None:
@@ -206,7 +211,34 @@ class ProjectScope:
             worktree_setup_command=repo.worktree_setup_command,
             github_repo=repo.github_repo,
             off_limits=[*(base.off_limits or []), *[o for o in repo.off_limits if o not in (base.off_limits or [])]],
+            selected_repos=(resolved,),
         )
+
+    def resolve_repos(self, names: str | None) -> tuple[str | None, ...]:
+        """Resolve a comma-separated `repo=` directive; None selects the primary repo."""
+        if names is None:
+            return (None,)
+        result: list[str | None] = []
+        for item in names.split(","):
+            resolved = self.resolve_repo(item.strip())
+            if resolved not in result:
+                result.append(resolved)
+        if not result:
+            raise ValueError("repo= must name at least one repo")
+        return tuple(result)
+
+    def for_repos(self, names: tuple[str | None, ...] | list[str | None]) -> "ProjectScope":
+        """View the task through its first repo while retaining the full set it may edit."""
+        base = self.base or self
+        selected = tuple(dict.fromkeys(base.resolve_repo(name) for name in names)) or (None,)
+        first = base.for_repo(selected[0])
+        return replace(first, selected_repos=selected)
+
+    def task_repo_scopes(self) -> tuple["ProjectScope", ...]:
+        """The selected repo views in task order (primary first if selected)."""
+        base = self.base or self
+        selected = self.selected_repos or (self.repo,)
+        return tuple(base.for_repo(name) for name in selected)
 
     @property
     def lock_key(self) -> str:
@@ -215,6 +247,8 @@ class ProjectScope:
         return self.workspace_id if self.repo is None else f"{self.workspace_id}#{self.repo}"
 
     def repo_label(self) -> str:
+        if len(self.selected_repos) > 1:
+            return ", ".join(self.name if item is None else item for item in self.selected_repos)
         return self.name if self.repo is None else self.repo
 
     @classmethod

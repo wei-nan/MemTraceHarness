@@ -50,5 +50,10 @@ def workspace(env: dict[str, str] | None = None, *, scope: str | None = SCOPE):
         with patch.dict(os.environ, {}, clear=False):
             for key in _CLEAR:
                 os.environ.pop(key, None)
+            os.environ["HARNESS_SHARED_MEMORY_DB"] = str(Path(tmp) / "shared-memory.sqlite3")
+            os.environ["HARNESS_EXECUTION_SOURCES_DB"] = str(Path(tmp) / "execution-sources.sqlite3")
+            for target in ("CHAT", "DIGEST", "ARCHIVE", "AUDIT", "RECALL"):
+                os.environ.pop(f"HARNESS_{target}_SOURCE", None)
+            os.environ.pop("HARNESS_EXECUTION_SOURCES_ALLOWED", None)
             load_workspace(root)
             yield root, HarnessConfig.from_env()

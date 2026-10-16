@@ -16,6 +16,7 @@ class FakeService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None, str | None, str]] = []
         self.finished: list[str] = []
+        self.progress: list[tuple[str, str]] = []
         self.chat_superseded = lambda: False
         self.chat_generating = False
         self.release = threading.Event()
@@ -46,6 +47,9 @@ class FakeService:
 
     def send_message(self, audience, text):
         pass
+
+    def report_chat_wait(self, text, audience):
+        self.progress.append((text, audience))
 
 
 class MessageWorkerTests(TestCase):
@@ -87,6 +91,48 @@ class MessageWorkerTests(TestCase):
         service.release.set()
         self.assertTrue(self._wait(lambda: len(service.finished) == 2))
         self.assertEqual([c[0] for c in service.calls], ["一般訊息", "/status"])
+
+    def test_a_progress_only_follow_up_does_not_restart_the_lookup(self) -> None:
+        from unittest.mock import patch
+
+        worker, service = self._worker()
+        worker.submit({"text": "觀察對話紀錄", "audience": "tg:1"})
+        self.assertTrue(self._wait(lambda: service.chat_generating))
+        with patch("memtrace_harness.api.kill_process_for_thread") as kill:
+            worker.submit({"text": "有在處理嗎？", "audience": "tg:1"})
+        kill.assert_not_called()
+        self.assertEqual(service.progress, [("有在處理嗎？", "tg:1")])
+        self.assertFalse(service.chat_superseded())
+        service.release.set()
+        self.assertTrue(self._wait(lambda: service.finished == ["|觀察對話紀錄"]))
+        self.assertEqual(len(service.calls), 1)
+
+    def test_a_progress_question_with_new_instructions_still_reaches_the_model(self) -> None:
+        worker, service = self._worker()
+        worker.submit({"text": "先看一下", "audience": "tg:1"})
+        self.assertTrue(self._wait(lambda: service.chat_generating))
+        worker.submit({"text": "有在處理嗎？順便看 Eric", "audience": "tg:1"})
+        service.release.set()
+        self.assertTrue(self._wait(lambda: service.finished))
+        self.assertEqual(service.progress, [])
+        self.assertIn("順便看 Eric", service.calls[-1][0])
+
+    def test_another_audience_progress_query_does_not_expose_the_current_lookup(self) -> None:
+        worker, service = self._worker()
+        worker.submit({"text": "先看一下", "audience": "tg:1"})
+        self.assertTrue(self._wait(lambda: service.chat_generating))
+        worker.submit({"text": "有在處理嗎？", "audience": "tg:2"})
+        self.assertEqual(service.progress, [])
+        self.assertFalse(service.chat_superseded())
+        service.release.set()
+        self.assertTrue(self._wait(lambda: len(service.finished) == 2))
+
+    def test_a_progress_query_while_idle_remains_a_normal_message(self) -> None:
+        worker, service = self._worker()
+        service.hold = False
+        worker.submit({"text": "有在處理嗎？", "audience": "tg:1"})
+        self.assertTrue(self._wait(lambda: service.finished == ["|有在處理嗎？"]))
+        self.assertEqual(service.progress, [])
 
     def test_a_reply_to_a_message_and_another_audience_are_not_merged(self) -> None:
         worker, service = self._worker()

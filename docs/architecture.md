@@ -32,6 +32,43 @@ authoritative replay source.
 Provider API clients, API endpoints, and provider API-key configuration are outside the design.
 `MemTraceClient` speaks MCP JSON-RPC to MemTrace only and cannot execute a model.
 
+## One primary agent (2026-10-15)
+
+The project has one primary agent across conversation and task execution. `primary_agent.py`
+owns the shared model chain (the backwards-compatible `HARNESS_CHAT_*` settings), common
+instructions and conversation continuation. Service-owned runs, resumes and the loop CLI replace
+the old controller model with this chain; skills keep their independent profiles and permissions.
+Unattended trigger decisions use the same primary chain and project context as well.
+
+The `controller` profile/stage identifiers remain in stored checkpoints and structured schemas.
+They now represent decision turns of the primary agent. The effective context policy is
+`primary-session`: the current conversation is rehydrated at every decision alongside the execution
+snapshot. Review and other skills do not inherit that conversation. Provider-native sessions are
+still fresh calls, and raw provider output remains local.
+
+`PlanRunner` can sequence operational tools, a governed develop invocation, capability installation,
+scope proposals and A2A requests in one durable plan. Asynchronous operations wait for actual
+completion before checking expectations. A failed operation still stops for retry/skip/cancel;
+general automatic replanning is not yet implemented. Development's goal-plan phases can be revised
+by the primary agent through the existing progress/converge protocol.
+
+Every confirmation is single-use. Stored allowlists and plan-wide approvals do not bypass a tap,
+including from old callbacks. Read tools still execute freely. Progress and decisions return to
+the same project transcript, and task stages are reported as they run.
+
+The older controller/snapshot descriptions below document the low-level loop and historical
+profiles. The operating contract's "One primary agent and single-use confirmation" section takes
+precedence for current service and CLI behavior.
+
+## Background memory switches
+
+The status page can pause automatic topic archiving, nightly audit, and per-message topic recall
+independently. Their `[archive].enabled`, `[audit].enabled`, and `[recall].enabled` values live in
+the workspace's `.harness/models.toml`, default to `true`, and take effect immediately through the
+Harness admin API. Pausing archiving skips the automatic nightly filing and scheduled review;
+explicit archive, rebuild, reorganization and audit commands remain available. Pausing recall
+prevents new recall runs while leaving existing short-lived briefs available until expiry.
+
 ## Adapter contract
 
 Every provider adapter must:
@@ -89,9 +126,9 @@ check it), so a Cursor role has no MemTrace lookups unless the operator register
 ## Failure and safety semantics
 
 - The single-run command requires exactly one provider. The bounded loop runs multiple read-only
-  roles serially but grants write access only to the Gemini developer. Cross-provider replay or
-  parallel editing inside one run still requires isolated worktrees; concurrent *tasks* of one project
-  already run in separate per-task git worktrees (see the operating contract).
+  roles serially and grants write access only to `develop`. A task selecting multiple repos gets one
+  isolated worktree per repo; each repo is verified and final-gated separately, and all merge
+  preflights pass before branches are merged into their respective checkouts (see the operating contract).
 - `probe` calls only `--version` and does not send a model prompt.
 - The harness never uses `shell=True` or injects credentials into argv.
 - Cursor takes the prompt as its last argument (redacted from SQLite command metadata like Antigravity's).
@@ -160,8 +197,61 @@ Controller is given the user's own words (`user_request`), not only the chat mod
 reports a per-criterion `goal_check`. The Harness refuses to finish while the check is missing, skips a
 criterion, or lists anything unmet: the task stops as `needs_human` and says it is only partly done. The
 Controller can instead choose `revise_phases` to add more work (at most six phases in all). The final
-message carries the criterion-by-criterion report. Stages of phase N>1 are recorded as `pN-…`; a resumed
+trace retains the criterion-by-criterion report; chat shows a short plain-language outcome instead.
+`task_reporting.py` describes each stage's intent at its start and its actual result at the end, using
+the model artifact's `user_summary` when available. Model calls return that summary alongside their
+normal evidence; reporting adds no extra model call. Checks and integration also emit start/end updates.
+Runtime-owned delivery metadata distinguishes merged, pending and partially merged work. Stages of phase N>1 are recorded as `pN-…`; a resumed
 run reuses a settled phase only while it and every phase before it keep the same title and skills.
+
+Dialogue attempts use a 180-second candidate limit and one 30-second wait notice (`service.py`).
+`MessageWorker` answers a small exact set of progress-only follow-ups locally while the same
+audience's dialogue call is running, preserving the original call. Other substantive follow-ups
+still supersede the unsent reply. Wait timers are cancelled and serialized with completion so a
+late notice cannot appear after the final response. Fallback transitions are reported before the
+next candidate is invoked; these operational notices add no model calls.
+
+## Proactive platform maintenance
+
+Proactive platform maintenance uses `improvement.py`: opted-in source exports and an authorized
+coordinator inbox over the local API, relayed by `memtrace_services/observation.py` inside the status
+service. The service holds endpoint credentials; the Harness holds only evidence/cursors/findings.
+The primary agent analyzes changed evidence with checked quotes; runtime transactionally queues
+eligible platform fixes into the existing task/worktree/delivery path. Other-project suggestions
+stay suggestions. Switches, source grants, deduplication, task result updates and limits are described
+in [proactive-improvement.md](proactive-improvement.md). No Improvement Loop adoption is automated.
+
+## Execution sources
+
+`execution_sources.py` separates provider protocol, operator-managed CLI identity and model selection.
+A host-wide SQLite registry stores non-secret executable definitions, revisions, leases and cooldowns;
+each Harness separately grants source IDs in its model settings. `ModelCandidate.source` covers skill
+chains. Plain-call candidates carry `provider@source` references; command construction resolves these
+to canonical provider flags and attaches out-of-band routing metadata. The process runner acquires a
+shared lease before launching, preserves the source binding for the subprocess lifetime, and releases
+it afterward. Structured adapters additionally classify provider-protocol errors for shared cooldowns.
+Per-workspace traces keep canonical provider and `execution_source_id` separately. The web service
+aggregates registry views by store identity and routes changes over the authenticated Harness API.
+Source identity never changes permission, repo scope or context policy. Existing source-less calls
+retain their original command and availability behavior. See [execution-sources.md](execution-sources.md).
+
+## Shared memory and remote delivery
+
+`shared_memory.py` stores explicit operator notes outside per-workspace stores. The status service
+aggregates notes by store identity and proxies edits through a live Harness API. Chat and task
+context load the same enabled notes; review receives only these instructions plus its gate evidence.
+Private chat/preferences are not copied into shared memory.
+
+The enabled `worktree-pr-ci-main` policy switches service-owned development to isolated worktrees
+from fetched remote main. `AgentLoopRunner` completes goal checks, final gate and strict local
+verification, persists a delivery intent and returns `delivering`. `delivery.py` then owns push,
+PR creation/reuse, exact-head CI/conflict checks, bounded repair runs in those same worktrees,
+remote merge, explicit issue closure and clean worktree removal. Models never assert remote success.
+Per-repo progress and original draft evidence survive restart in `task_deliveries`; the runtime
+resumes pending remote steps, while an interrupted model repair is held for inspection. Plan
+steps wait for actual delivery completion. Independent repo merges can partially succeed and are
+reported as such. This path currently supports GitHub through git/gh; see the operating contract
+for required verification, stop conditions and the bounded confirmation exception.
 
 ## Role-profile loop
 

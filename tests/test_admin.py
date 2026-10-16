@@ -45,14 +45,13 @@ class UpdateRoleProfileTests(TestCase):
             os.environ.update(with_roles(root))
         return root, config
 
-    def test_updates_provider_and_model_preserving_comments_and_fallback(self) -> None:
+    def test_legacy_controller_edit_updates_the_primary_agent_and_preserves_roles_file(self) -> None:
         root, config = self._config(own_file=True)
+        path = root / ".harness" / "roles.toml"
+        before = path.read_text(encoding="utf-8")
         admin.update_role_profile(config, "controller", "claude", "opus")
-        text = (root / ".harness" / "roles.toml").read_text(encoding="utf-8")
-        self.assertIn('provider = "claude"\nmodel = "opus"', text)
-        self.assertIn("# A decision-rationale comment that must survive the edit untouched.", text)
-        self.assertIn('[[profiles.controller.fallbacks]]\nprovider = "claude"\nmodel = "sonnet"', text)
-        self.assertIn('[profiles.plan]\nrole = "Plan"\nprovider = "claude"\nmodel = "sonnet"', text)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(config.chat_candidates_for()[0], ("claude", "opus"))
 
     def test_rejects_unknown_provider_and_a_model_with_a_quote(self) -> None:
         _, config = self._config(own_file=True)
@@ -61,11 +60,10 @@ class UpdateRoleProfileTests(TestCase):
         with self.assertRaises(ValueError):
             admin.update_role_profile(config, "controller", "claude", 'sonnet"; x=1')
 
-    def test_refuses_a_workspace_still_on_the_shared_default(self) -> None:
+    def test_primary_agent_edit_also_works_without_a_custom_roles_file(self) -> None:
         _, config = self._config(own_file=False)
-        with self.assertRaises(ValueError) as caught:
-            admin.update_role_profile(config, "controller", "claude", "opus")
-        self.assertIn("shared by every Harness", str(caught.exception))
+        admin.update_role_profile(config, "controller", "claude", "opus")
+        self.assertEqual(config.chat_candidates_for()[0], ("claude", "opus"))
 
     def test_rejects_unknown_profile_id(self) -> None:
         _, config = self._config(own_file=True)
@@ -108,7 +106,7 @@ class ModelSettingTests(TestCase):
             self.assertEqual(config.recall_candidates_for()[0], ("claude", "claude-sonnet-5-5"))
 
     def test_the_memory_archive_has_its_own_chain_that_defaults_to_the_digest_chain(self) -> None:
-        with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"}) as (root, config):
+        with workspace({"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku", "HARNESS_ARCHIVE_PROVIDER": "", "HARNESS_ARCHIVE_MODEL": "", "HARNESS_ARCHIVE_FALLBACKS": ""}) as (root, config):
             admin.update_digest_model(config, "claude", "sonnet")
             self.assertEqual(config.archive_candidates_for()[0], ("claude", "sonnet"))  # nothing of its own yet
 
@@ -154,7 +152,7 @@ class ModelSettingTests(TestCase):
 
 class StatusDataTests(TestCase):
     def test_known_models_collects_every_configured_pair(self) -> None:
-        env = {"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "gemini-3.8-flash-high"}
+        env = {"HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "gemini-3.8-flash-high", "HARNESS_ARCHIVE_PROVIDER": "", "HARNESS_ARCHIVE_MODEL": "", "HARNESS_ARCHIVE_FALLBACKS": ""}
         with workspace(env) as (root, config):
             # the real packaged default is a known-good example of the five-role shape
             default = Path(__file__).parent.parent / "src/memtrace_harness/default-role-profiles.toml"
@@ -164,7 +162,9 @@ class StatusDataTests(TestCase):
             # No real CLI in unit tests: the provider catalog (agy models, Codex's cache) is stubbed.
             with patch("memtrace_harness.model_catalog.provider_models", return_value={}):
                 data = admin.collect_status_data(config, scope)
-        self.assertIn("gpt-5.6-luna", data["known_models"]["codex"])
+        self.assertNotIn("gpt-5.6-luna", data["known_models"]["codex"])
+        primary = next(p for p in data["projects"][0]["role_profiles"] if p["id"] == "controller")
+        self.assertEqual(primary["model"], "gemini-3.8-flash-high")
         self.assertIn("sonnet", data["known_models"]["claude"])
         self.assertIn("gemini-3.8-flash-high", data["known_models"]["antigravity"])
         self.assertEqual(set(data["known_models"]), {"claude", "codex", "antigravity", "cursor"})

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
 import shutil
 import signal
+import sqlite3
+import logging
 import subprocess
 import threading
 import time
 from time import monotonic
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now_iso() -> str:
@@ -80,6 +85,9 @@ class ProcessResult:
     unavailable: bool = False
     cancelled: bool = False
     error: str | None = None
+    execution_source_id: str | None = None
+    quota_bucket: str | None = None
+    source_failure: str | None = None
 
 
 # Keyed by threading.get_ident(), not by any caller-supplied id: each Agent Loop
@@ -180,12 +188,19 @@ def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
 
     For abandoning a task: its worktree is the only handle left on a CLI that outlived the Harness thread that
     was waiting for it. **Enforced narrowing:** only a process group whose *leader* is a provider CLI
-    (codex / claude / agy / antigravity / gemini / cursor-agent) and has its working directory inside `directory` is signalled,
+    (codex / claude / agy / antigravity / gemini / cursor-agent), or a leased registered wrapper,
+    and has its working directory inside `directory` is signalled,
     never this process or its group, so a person's own shell sitting in the folder is left alone.
     Returns the group ids signalled."""
     root = os.path.realpath(str(directory))
     own_pgid = os.getpgid(0)
     groups: dict[int, None] = {}
+    try:
+        from memtrace_harness.execution_sources import SourceStore
+        source_path = Path(os.getenv("HARNESS_EXECUTION_SOURCES_DB") or str(Path.home() / ".memtrace-harness" / "execution-sources.sqlite3"))
+        leased = SourceStore(source_path).leased_commands()
+    except (OSError, sqlite3.Error):
+        leased = {}
     for pid, cwd in _lsof_cwds():
         real = os.path.realpath(cwd)
         if real != root and not real.startswith(root + os.sep):
@@ -196,7 +211,10 @@ def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
             continue
         if pgid in (0, 1, own_pgid) or pgid in groups:
             continue
-        if _PROVIDER_CLI.search(_command_of(pgid)):
+        leader = _command_of(pgid)
+        wrapper = leased.get(pgid)
+        known_source = bool(wrapper and re.search(r"(^|[/\s])" + re.escape(Path(wrapper).name) + r"(\s|$)", leader))
+        if _PROVIDER_CLI.search(leader) or known_source:
             groups[pgid] = None
     for pgid in groups:
         try:
@@ -234,6 +252,40 @@ class CliProcessRunner:
         timeout_seconds: float,
         input_text: str | None = None,
     ) -> ProcessResult:
+        binding = getattr(command, "execution_source", None)
+        if binding is None:
+            return self._run_process(command, cwd=cwd, timeout_seconds=timeout_seconds, input_text=input_text)
+        from memtrace_harness.execution_sources import SourceStore, SourceUnavailable
+        store = SourceStore(binding.path)
+        try:
+            lease = store.acquire(binding, timeout_seconds)
+        except (SourceUnavailable, OSError, sqlite3.Error) as exc:
+            result = self._unavailable(list(command), utc_now_iso(), monotonic(), str(exc))
+            return replace(result, execution_source_id=binding.source_id, quota_bucket=binding.quota_bucket,
+                           source_failure=getattr(exc, "category", "source_unavailable"))
+        try:
+            result = self._run_process(command, cwd=cwd, timeout_seconds=timeout_seconds,
+                input_text=input_text, on_start=lambda pid: store.attach(lease, pid))
+            from memtrace_harness.schemas import CliExecution
+            from memtrace_harness.fallback import classify_execution_failure
+            failure = classify_execution_failure(CliExecution(
+                provider=binding.provider, status="unavailable" if result.unavailable else "timed_out" if result.timed_out else "succeeded" if result.return_code == 0 else "failed",
+                command=[], exit_code=result.return_code, started_at=result.started_at,
+                completed_at=result.completed_at, duration_ms=result.duration_ms,
+                error=result.error or result.stderr))
+            try:
+                store.record(binding, failure)
+            except (OSError, sqlite3.Error):
+                logger.warning("could not persist execution source cooldown")
+            return replace(result, execution_source_id=binding.source_id, quota_bucket=binding.quota_bucket)
+        finally:
+            try:
+                store.release(lease)
+            except (OSError, sqlite3.Error):
+                logger.warning("could not release execution source lease; expiry will retain live children")
+
+    def _run_process(self, command: list[str], *, cwd: Path, timeout_seconds: float,
+                     input_text: str | None = None, on_start=None) -> ProcessResult:
         started_at = utc_now_iso()
         started = monotonic()
         resolved = resolve_executable(command[0])
@@ -269,6 +321,15 @@ class CliProcessRunner:
 
         thread_ident = _register_process(process)
         try:
+            if on_start:
+                try:
+                    on_start(process.pid)
+                except (OSError, sqlite3.Error):
+                    self._terminate_process_group(process)
+                    stdout, stderr = process.communicate(timeout=5)
+                    return ProcessResult(command=argv, return_code=process.returncode, stdout=stdout, stderr=stderr,
+                        started_at=started_at, completed_at=utc_now_iso(), duration_ms=int((monotonic()-started)*1000),
+                        error="Execution source lease registration failed; the CLI was stopped. Inspect the worktree before retrying.")
             try:
                 stdout, stderr = process.communicate(input=input_text, timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
@@ -301,6 +362,11 @@ class CliProcessRunner:
                 cancelled=cancelled,
                 error="CLI process was cancelled (harness shutdown)" if cancelled else None,
             )
+        except BaseException:
+            # Never release a named-source capacity lease while an exceptional pipe/decoder
+            # failure has left its subprocess running. The caller retains the failed task.
+            self._terminate_process_group(process)
+            raise
         finally:
             _unregister_process(thread_ident)
 

@@ -8,6 +8,11 @@ ALLOWED = ["wei-nan/Beri", "wei-nan/beri-android"]
 
 
 class GithubActionTests(TestCase):
+    def test_push_refuses_main_and_option_like_branches(self) -> None:
+        for branch in ("main", "master", "-f", "a..b", "x y", ""):
+            with self.subTest(branch=branch), self.assertRaises(ValueError):
+                validate_action(ALLOWED, "branch_push", {"repo": "wei-nan/Beri", "branch": branch})
+
     def test_every_action_builds_a_gh_argument_list(self) -> None:
         cases = {
             "issue_create": ({"repo": "wei-nan/Beri", "title": "T", "body": "B", "labels": ["a", "b"]},
@@ -21,6 +26,10 @@ class GithubActionTests(TestCase):
                               ["gh", "issue", "comment", "5", "--repo", "wei-nan/Beri", "--body", "hi"]),
             "issue_label": ({"repo": "wei-nan/Beri", "number": 5, "labels": ["x"], "remove_labels": ["y"]},
                             ["gh", "issue", "edit", "5", "--repo", "wei-nan/Beri", "--add-label", "x", "--remove-label", "y"]),
+            "branch_push": ({"repo": "wei-nan/Beri", "branch": "feat/x"}, ["git", "push", "-u", "origin", "feat/x"]),
+            "pr_create": ({"repo": "wei-nan/Beri", "branch": "feat/x", "title": "T", "body": "B"},
+                          ["gh", "pr", "create", "--repo", "wei-nan/Beri", "--head", "feat/x", "--base", "main",
+                           "--title", "T", "--body", "B"]),
             "pr_comment": ({"repo": "wei-nan/Beri", "number": 7, "comment": "lgtm"},
                            ["gh", "pr", "comment", "7", "--repo", "wei-nan/Beri", "--body", "lgtm"]),
         }

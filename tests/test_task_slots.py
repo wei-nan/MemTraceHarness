@@ -414,6 +414,8 @@ class TaiwanTradeChatNoticeTests(TestCase):
             notice = HarnessService._taiwantrade_notice()
         self.assertIn("get_balance", notice)
         self.assertIn("不要用 shell/curl", notice)
+        self.assertIn("get_stock_intraday", notice)
+        self.assertIn("data_status", notice)
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(HarnessService._taiwantrade_notice(), "")
 

@@ -50,6 +50,15 @@ class AntigravityCliAdapter(CliModelAdapter):
         # manual verification this session omitted it, and it's undetermined whether it
         # contributed to the workdir/prompt-delivery failures seen before this fix.
         command.extend(["--add-dir", str(self.working_directory)])
+        # Repo access follows the role permission, not the selected model. The shared
+        # CliModelAdapter snapshots every granted repo around read-only calls and fails
+        # closed if this CLI changes any of them.
+        if self.permission == "read-only":
+            for directory in self.read_directories:
+                command.extend(["--add-dir", str(directory)])
+        else:
+            for directory in self.write_directories:
+                command.extend(["--add-dir", str(directory)])
         # --prompt "<text>" (the flag's own value) must come last: `--print` (bare) with
         # the prompt as a trailing positional does not reliably deliver it to the model
         # (verified empirically, 2026-08-12 — it fell back to answering generic questions

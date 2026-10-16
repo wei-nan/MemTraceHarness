@@ -8,6 +8,7 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
 from memtrace_harness.api import HarnessApi
 from memtrace_harness.runtime import build_harness
@@ -21,11 +22,13 @@ from tests.workspace_support import workspace
 
 
 class WebServiceTests(TestCase):
-    def _harness(self, name: str, token: str):
+    def _harness(self, name: str, token: str, shared_path=None, sources_path=None):
         ctx = workspace({"HARNESS_API_TOKEN": token, "HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku"})
         root, config = ctx.__enter__()
         self.addCleanup(ctx.__exit__, None, None, None)
-        config = replace(config, api_port=0)
+        config = replace(config, api_port=0, **({"shared_memory_path": shared_path} if shared_path else {}))
+        if sources_path:
+            config = replace(config, execution_sources_path=sources_path)
         scope = replace(ProjectScope.from_file(root / "harness-scope.md"), name=name)
         parts = build_harness(config, scope)
         api = HarnessApi(parts.service, config, scope)
@@ -51,6 +54,41 @@ class WebServiceTests(TestCase):
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             return exc.code, json.loads(raw) if raw else {}
+
+    @patch("memtrace_harness.admin.merge_model_catalog", return_value={})
+    def test_shared_memory_has_one_global_editor_and_is_live_in_two_harnesses(self, _catalog):
+        with TemporaryDirectory() as tmp:
+            shared = Path(tmp) / "shared.sqlite3"
+            _, a_parts, a = self._harness("alpha", "ta", shared)
+            _, b_parts, b = self._harness("beta", "tb", shared)
+            aggregator, base = self._web([a, b])
+            self.assertEqual(len(aggregator.collect()["shared_memory"]), 1)
+            status, result = self._post(base, "/api/shared-memory", {
+                "project": "alpha", "action": "create", "title": "共享規則", "body": "使用 worktree"})
+            self.assertEqual(status, 200)
+            self.assertIn("使用 worktree", a_parts.service._shared_memory_context())
+            self.assertIn("使用 worktree", b_parts.service._shared_memory_context())
+            self.assertEqual(aggregator.collect()["shared_memory"][0]["entries"][0]["id"], result["entry"]["id"])
+
+    @patch("memtrace_harness.admin.merge_model_catalog", return_value={})
+    def test_global_sources_are_shared_but_each_harness_has_separate_grants(self, _catalog):
+        with TemporaryDirectory() as tmp:
+            sources = Path(tmp) / "sources.sqlite3"
+            _, alpha, a = self._harness("alpha", "ta", sources_path=sources)
+            _, beta, b = self._harness("beta", "tb", sources_path=sources)
+            aggregator, base = self._web([a, b])
+            self.assertEqual(len(aggregator.collect()["execution_sources"]), 1)
+            status, result = self._post(base, "/api/execution-source", dict(
+                project="alpha", action="save", id="work", provider="codex", label="工作", command="codex-work"))
+            self.assertEqual(status, 200)
+            self.assertEqual(len(aggregator.collect()["execution_sources"][0]["entries"]), 1)
+            status, _ = self._post(base, "/api/execution-source-allowlist", dict(project="alpha", allowed=["work"]))
+            self.assertEqual(status, 200)
+            self.assertEqual(alpha.service.config.allowed_execution_sources(), ["work"])
+            self.assertEqual(beta.service.config.allowed_execution_sources(), [])
+            self.assertEqual(self._post(base, "/api/chat-chain", dict(project="beta", chain=[dict(provider="codex", source="work", model="model-a")]))[0], 400)
+            self.assertEqual(self._post(base, "/api/chat-chain", dict(project="alpha", chain=[dict(provider="codex", source="work", model="model-a")]))[0], 200)
+            self.assertNotIn("@", beta.service.config.chat_candidates_for()[0][0])
 
     def test_several_harnesses_appear_on_one_page_and_a_down_one_is_flagged(self) -> None:
         _, _, a = self._harness("alpha", "ta")
@@ -137,6 +175,10 @@ class WebServiceTests(TestCase):
     def test_a_save_is_visible_at_once_not_after_the_cached_answer_expires(self) -> None:
         # The POST looks up the project's Harness (which caches the page's data for a second), then
         # announces the change; what the page is pushed next must already show the save.
+        import os
+        archive_settings = patch.dict(os.environ, {"HARNESS_ARCHIVE_PROVIDER": "", "HARNESS_ARCHIVE_MODEL": "", "HARNESS_ARCHIVE_FALLBACKS": ""})
+        archive_settings.start()
+        self.addCleanup(archive_settings.stop)
         _, _, a = self._harness("alpha", "ta")
         aggregator, base = self._web([a])
         before = aggregator.collect()["projects"][0]

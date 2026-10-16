@@ -82,6 +82,11 @@
     font-size: 0.78rem; max-height: 28rem; overflow-y: auto;
   }
   .section-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; margin: 0.6rem 0 0.3rem; }
+  .memory-feature { border-top: 1px solid var(--border); padding: 0.25rem 0 0.4rem; }
+  .memory-feature-head { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem; flex-wrap: wrap; }
+  .memory-feature-toggle { color: var(--text); font-size: 0.78rem; white-space: nowrap; cursor: pointer; }
+  .memory-feature-toggle input { accent-color: var(--live); vertical-align: middle; }
+  .memory-feature-status { font-size: 0.72rem; }
   .turn { padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
   .turn:last-child { border-bottom: none; }
   .turn .meta { color: var(--muted); font-size: 0.72rem; }
@@ -221,3 +226,14 @@ details.chain-edit summary { cursor: pointer; color: var(--accent); font-size: 0
 .peer-links .pl-row { margin: 0.3rem 0; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .peer-links code { font-size: 0.75rem; }
 .peer-links textarea { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font: inherit; min-width: 20rem; }
+
+.shared-memory { padding: 0.75rem 0; border-bottom: 1px solid var(--border); }
+.shared-memory input.shared-memory-input { display: block; width: 100%; box-sizing: border-box; margin: 0.4rem 0; padding: 0.5rem; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.3rem; font: inherit; }
+.shared-memory textarea.shared-memory-input { display: block; width: 100%; box-sizing: border-box; min-height: 9rem; line-height: 1.6; }
+
+.execution-source-editor { margin: 0.6rem 0; padding: 0.6rem; border: 1px solid var(--border); border-radius: 0.3rem; }
+.execution-source-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 0.5rem; margin-top: 0.6rem; }
+.execution-source-form label { display: flex; flex-direction: column; gap: 0.25rem; }
+.execution-source-form input, .execution-source-form select { box-sizing: border-box; width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.3rem; padding: 0.4rem; font: inherit; }
+.execution-source-form .hint, .execution-source-form .pref-actions { grid-column: 1 / -1; }
+.source-access-item { display: block; margin: 0.4rem 0; }

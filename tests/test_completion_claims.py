@@ -284,21 +284,25 @@ class GatewayClaimTests(TestCase):
         self.assertEqual(self.store.get_completion_claim(claim_id)["status"], "accepted")
         self.assertEqual(len(self.store.list_decision_records("test_proj", kind="task_claim")), 1)
 
-    def test_a_declared_publish_job_runs_by_itself_and_its_output_joins_the_report(self) -> None:
+    def test_a_declared_publish_job_waits_for_its_own_confirmation(self) -> None:
         gateway = self._gateway()
         gateway.projects[0].jobs = {"preview_start": "echo https://example.test/preview"}
         gateway.projects[0].publish_job = "preview_start"
+        gateway._exec_job_command = MagicMock(return_value=("done", 0, "https://example.test/preview"))
         _, text = self._file(gateway)
-        self.assertIn("已自動發佈", text)
-        self.assertIn("https://example.test/preview", text)
+        self.assertIn("等待這次確認", text)
+        gateway._exec_job_command.assert_not_called()
+        gateway.process_job_requests()
+        with self.store._connection() as conn:
+            rid = conn.execute("SELECT request_id FROM job_requests WHERE job_name = 'preview_start'").fetchone()[0]
+        self.assertEqual(self.store.get_job_request(rid)["status"], "awaiting")
+        gateway._resolve_job_action("job_confirm", rid, None, None)
+        import threading
+        for thread in threading.enumerate():
+            if thread.name == f"job-{rid}":
+                thread.join(5)
+        self.assertEqual(self.store.get_job_request(rid)["status"], "done")
         self.assertIn("https://example.test/preview", gateway._status_notice(gateway.projects[0]))
-
-    def test_a_failing_publish_job_is_reported_and_does_not_block_the_report(self) -> None:
-        gateway = self._gateway()
-        gateway.projects[0].jobs = {"preview_start": "echo boom; exit 3"}
-        gateway.projects[0].publish_job = "preview_start"
-        _, text = self._file(gateway)
-        self.assertIn("自動發佈失敗（結束碼 3）", text)
 
     def test_a_dead_edit_lock_holder_is_released_and_the_operator_told(self) -> None:
         gateway = self._gateway()

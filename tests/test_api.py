@@ -322,3 +322,43 @@ class ClientTests(TestCase):
     def test_a_harness_that_is_not_running_is_unavailable_not_an_error_status(self) -> None:
         with self.assertRaises(HarnessUnavailable):
             HarnessClient("http://127.0.0.1:1", "t", timeout=1).health()
+
+
+class SharedMemoryApiTests(ApiTestCase):
+    def test_only_operator_can_manage_shared_memory_and_stale_edits_are_refused(self):
+        path = '/v1/admin/shared-memory'
+        body = {'action': 'create', 'title': '共用', 'body': 'worktree'}
+        self.assertEqual(self._raw('POST', path, body, token=None)[0], 401)
+        self.assertEqual(self._raw('POST', path, body, token='peer-token')[0], 401)
+        status, result = self._raw('POST', path, body)
+        self.assertEqual(status, 200)
+        entry = result['entry']
+        from unittest.mock import patch
+        with patch('memtrace_harness.admin.merge_model_catalog', return_value={}):
+            status, page = self._raw('GET', '/v1/status')
+        self.assertEqual(page['shared_memory']['entries'][0]['id'], entry['id'])
+        self.assertEqual(self._raw('POST', path, dict(action='toggle', id=entry['id'], revision=1, enabled=False))[0], 200)
+        self.assertEqual(self._raw('POST', path, dict(action='toggle', id=entry['id'], revision=1, enabled=True))[0], 400)
+        self.assertEqual(self._raw('POST', path, dict(action='remove', id={}, revision=2))[0], 400)
+
+
+class ExecutionSourceApiTests(ApiTestCase):
+    def test_registry_and_per_harness_grants_are_operator_only_and_model_chain_keeps_source(self):
+        from unittest.mock import patch
+        body = dict(action='save', id='work', provider='codex', label='工作帳號', command='/opt/wrappers/work', quota_bucket='work-account', max_concurrency=2)
+        route = '/v1/admin/execution-source'
+        self.assertEqual(self._raw('POST', route, body, token=None)[0], 401)
+        self.assertEqual(self._raw('POST', route, body, token='peer-token')[0], 401)
+        status, result = self._raw('POST', route, body)
+        self.assertEqual(status, 200)
+        chain = dict(chain=[dict(provider='codex', source='work', model='model-a')])
+        self.assertEqual(self._raw('POST', '/v1/admin/chat-chain', chain)[0], 400)
+        self.assertEqual(self._raw('POST', '/v1/admin/execution-source-allowlist', dict(allowed=['work']))[0], 200)
+        self.assertEqual(self._raw('POST', '/v1/admin/chat-chain', chain)[0], 200)
+        with patch('memtrace_harness.admin.merge_model_catalog', return_value={}):
+            status, page = self._raw('GET', '/v1/status')
+        self.assertEqual(page['projects'][0]['chat_candidates'][0], dict(provider='codex', source='work', model='model-a'))
+        self.assertEqual(page['execution_sources']['entries'][0]['id'], 'work')
+        self.assertEqual(self._raw('POST', route, dict(action='toggle', id='work', revision=0, enabled=False))[0], 400)
+        self.assertEqual(self._raw('POST', route, dict(action='toggle', id='work', revision=1, enabled=False))[0], 200)
+        self.assertEqual(self._raw('POST', '/v1/admin/chat-chain', dict(chain=[dict(provider='codex', source=[], model='model-a')]))[0], 400)

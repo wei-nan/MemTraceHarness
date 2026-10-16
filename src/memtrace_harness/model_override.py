@@ -47,6 +47,10 @@ def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessCon
     (with text for the operator) when the provider cannot be told."""
     provider, _, model = spec.rpartition("/")
     provider = provider or (infer_provider(model, config) or "")
+    from memtrace_harness.execution_sources import split_ref
+    provider, source = split_ref(provider)
+    source = source or (developer.source if developer.provider == provider else None)
+    config.source_binding(provider, source)
     if provider not in PROVIDERS:
         raise ValueError(
             f"認不出模型「{spec}」屬於哪個供應商；請寫成 claude/<模型>、codex/<模型>、antigravity/<模型> 或 cursor/<模型>。"
@@ -61,6 +65,7 @@ def resolve_model_override(spec: str, developer: RoleProfile, config: HarnessCon
         model=model,
         reasoning_effort=effort,
         quota_bucket=f"{provider}-account",
+        source=source,
     )
 
 
@@ -96,6 +101,7 @@ def with_skill_override(
             model=developer.model,
             reasoning_effort=developer.reasoning_effort,
             quota_bucket=developer.quota_bucket or f"{developer.provider}-account",
+            source=developer.source,
         ),
         *developer.fallbacks[: developer.max_fallback_hops],
     )
@@ -105,6 +111,7 @@ def with_skill_override(
         model=candidate.model,
         reasoning_effort=candidate.reasoning_effort,
         quota_bucket=candidate.quota_bucket,
+        source=candidate.source,
         fallbacks=chain,
         fallback_on=developer.fallback_on or ("quota_exhausted", "rate_limit", "provider_overloaded"),
         max_fallback_hops=len(chain),
@@ -113,4 +120,4 @@ def with_skill_override(
 
 
 def describe(candidate: ModelCandidate) -> str:
-    return f"{candidate.provider}/{candidate.model}"
+    return f"{candidate.provider}" + (f"@{candidate.source}" if candidate.source else "") + f"/{candidate.model}"
