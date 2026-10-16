@@ -290,12 +290,11 @@ function renderAuditCandidates(project) {
 
 function renderMemoryFeature(project, feature, title, purpose, enabled, chain) {
   var brief = { archive: project.archive_candidates, audit: project.audit_candidates, recall: project.recall_candidates }[feature];
-  return fold("model:" + feature + ":" + project.name, esc(title), (enabled ? "啟用 · " : "停用 · ") + chainBrief(brief),
-    '<div class="memory-feature"><div class="memory-feature-head"><div>' +
-    '<div class="hint">主要用途：' + esc(purpose) + '</div></div>' +
-    '<label class="memory-feature-toggle"><input type="checkbox" class="memory-feature-enabled" data-project="' +
+  var toggle = '<span class="fold-switch"><label class="memory-feature-toggle"><input type="checkbox" class="memory-feature-enabled" data-project="' +
     esc(project.name) + '" data-feature="' + esc(feature) + '"' + (enabled ? " checked" : "") +
-    '> 啟用</label><span class="memory-feature-status rp-status"></span></div>' + chain + '</div>');
+    '> 啟用</label><span class="memory-feature-status rp-status"></span></span>';
+  return fold("model:" + feature + ":" + project.name, esc(title), chainBrief(brief),
+    '<div class="hint">主要用途：' + esc(purpose) + "</div>" + chain, false, { cls: "memory-feature", extra: toggle });
 }
 
 function renderAudit(project) {
@@ -849,11 +848,15 @@ function detailsOpen(key) {
 
 // One section, collapsed to a single readable line (title + short status) until opened, so a page
 // shows what exists first and the detail on demand. `title` and `summary` are already-escaped HTML.
-function fold(key, title, summary, body, defaultOpen) {
+// `opts.cls` adds a class to the <details>; `opts.extra` is raw HTML (a switch, say) shown on the
+// summary line itself, so it stays reachable while the section is collapsed.
+function fold(key, title, summary, body, defaultOpen, opts) {
+  opts = opts || {};
   var open = Object.prototype.hasOwnProperty.call(state.openDetails, key) ? state.openDetails[key] : !!defaultOpen;
-  return '<details class="fold" data-key="' + esc(key) + '"' + (open ? " open" : "") + '><summary>' +
+  return '<details class="fold' + (opts.cls ? " " + opts.cls : "") + '" data-key="' + esc(key) + '"' + (open ? " open" : "") + '><summary>' +
     '<span class="fold-title">' + title + "</span>" +
     (summary ? '<span class="fold-sum">' + summary + "</span>" : "") +
+    (opts.extra || "") +
     '</summary><div class="fold-body">' + body + "</div></details>";
 }
 
