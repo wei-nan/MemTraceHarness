@@ -46,7 +46,7 @@ def _probe_memtrace_key(config_path: Path = AGY_MCP_CONFIG) -> str | None:
     line when the server rejects them, None when accepted or when the probe itself cannot
     run (no config / network) — an unreachable server is not evidence of a bad key."""
     try:
-        entry = json.loads(config_path.read_text())["mcpServers"]["memtrace"]
+        entry = json.loads(config_path.read_text(encoding="utf-8"))["mcpServers"]["memtrace"]
         url = entry.get("serverUrl") or entry["url"]
         headers = {**entry.get("headers", {}), "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         request = urllib.request.Request(url, json.dumps(_INITIALIZE).encode(), headers)
@@ -64,8 +64,16 @@ def _probe_memtrace_key(config_path: Path = AGY_MCP_CONFIG) -> str | None:
 
 
 def _run_agy_list(executable: str) -> str:
+    from memtrace_harness.cli_process import resolve_executable
+
     result = subprocess.run(
-        [executable, "mcp", "list"], capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS, check=False
+        [resolve_executable(executable) or executable, "mcp", "list"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=CHECK_TIMEOUT_SECONDS,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip()[:200] or f"exit {result.returncode}")
