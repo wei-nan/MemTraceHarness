@@ -57,13 +57,19 @@ class BoundaryTests(TestCase):
 
         environ = {
             "PATH": "/bin", "HOME": "/h", "LANG": "C", "LC_ALL": "C", "CODEX_HOME": "/c",
+            "SystemRoot": "C:\\Windows", "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local",
             "MEMTRACE_API_TOKEN": "mt-secret", "HARNESS_API_TOKEN": "api-secret",
             "TELEGRAM_BOT_TOKEN": "bot-secret", "HARNESS_PASSTHROUGH_ENV": "KEEP_ME", "KEEP_ME": "yes",
             "AWS_SECRET_ACCESS_KEY": "aws-secret",
         }
         env = child_env(["claude", "--print", "x"], environ)
         self.assertEqual(
-            env, {"PATH": "/bin", "HOME": "/h", "LANG": "C", "LC_ALL": "C", "CODEX_HOME": "/c", "KEEP_ME": "yes"}
+            env,
+            {
+                "PATH": "/bin", "HOME": "/h", "LANG": "C", "LC_ALL": "C", "CODEX_HOME": "/c",
+                "SystemRoot": "C:\\Windows", "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local",
+                "KEEP_ME": "yes",
+            },
         )
 
     def test_only_a_child_wired_to_the_memtrace_server_gets_its_token(self) -> None:
