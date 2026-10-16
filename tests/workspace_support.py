@@ -35,7 +35,7 @@ def workspace(env: dict[str, str] | None = None, *, scope: str | None = SCOPE):
     """Yields (root, config): an initialised workspace, loaded into a private copy of the
     environment. `env` is given by environment-variable name; the preferences among it (models,
     memory workspace, behaviour) go into `.harness/models.toml`, the rest into `.harness.env`."""
-    with TemporaryDirectory() as tmp:
+    with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         root = Path(tmp) / "ws"
         paths = init_workspace(root)
         if scope is not None:

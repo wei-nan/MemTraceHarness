@@ -143,16 +143,22 @@ class AttachmentStore:
 
 
 def _run(argv: list[str], timeout: int) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    if os.name != "nt":
+        extra = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        env["PATH"] = f"{extra}:{env.get('PATH', '')}" if env.get("PATH") else extra
+        env["LC_ALL"] = "en_US.UTF-8"
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-        env={"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(Path.home()), "LC_ALL": "en_US.UTF-8"},
+        env=env,
     )
 
 
 def default_transcribe_command(model_dirs: list[Path] | None = None) -> str | None:
     """The whisper CLI, only when a model is already on disk (in `model_dirs`, where an approved install put it, or in
     whisper's own cache): the Harness never starts a model download by itself — it asks, and the user taps."""
-    if shutil.which("whisper", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin") is None:
+    search_path = None if os.name == "nt" else f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:{os.environ.get('PATH', '')}"
+    if shutil.which("whisper", path=search_path) is None:
         return None
     for directory in [*(model_dirs or []), Path.home() / ".cache" / "whisper"]:
         for model in ("small", "medium", "base", "large-v3", "turbo"):

@@ -34,6 +34,8 @@ def load_env_file(path: Path | None, prefixes: tuple[str, ...] = ("TELEGRAM_", "
 
 def file_mode_problem(path: Path) -> str | None:
     """A file holding a token should be for its owner only."""
+    if os.name == "nt":
+        return None
     try:
         mode = path.stat().st_mode
     except OSError:

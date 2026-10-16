@@ -151,9 +151,10 @@ class SourceStore:
                     raise ValueError('source label needs 1–80 characters')
                 if not isinstance(command, str) or not command or len(command) > 1024 or any(ord(c) < 32 for c in command):
                     raise ValueError('command must be one executable path, without arguments or credentials')
-                if Path(command).expanduser().is_absolute() and re.search(r'\s', command) and not Path(command).expanduser().is_file():
+                is_abs = Path(command).expanduser().is_absolute() or command.startswith(("/", "\\"))
+                if is_abs and re.search(r'\s', command) and not Path(command).expanduser().is_file():
                     raise ValueError('command must be an executable path, without shell arguments')
-                if not (Path(command).expanduser().is_absolute() or re.fullmatch(r'[A-Za-z0-9_.-]+', command)):
+                if not (is_abs or re.fullmatch(r'[A-Za-z0-9_.-]+', command)):
                     raise ValueError('use an absolute executable path or a binary name; shell aliases/arguments are unsupported')
                 if not isinstance(bucket, str) or not ID.fullmatch(bucket):
                     raise ValueError('invalid quota bucket id')

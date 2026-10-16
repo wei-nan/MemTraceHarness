@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import tempfile
@@ -109,14 +110,16 @@ class RunTests(unittest.TestCase):
     def test_a_sudo_shim_is_first_on_the_path_of_everything_it_runs(self) -> None:
         run = FakeRun()
         cap.run_install(cap.validate_install({"kind": "brew", "name": "ffmpeg", "reason": "r"}), self.state, runner=run)
-        first = run.calls[0][1]["env"]["PATH"].split(":")[0]
+        first = run.calls[0][1]["env"]["PATH"].split(os.pathsep)[0]
         self.assertTrue(first.startswith(tempfile.gettempdir()) or "harness-shim" in first)
         # the shim itself refuses
         shim = cap._sudo_shim_dir()
         try:
-            done = subprocess.run([str(shim / "sudo"), "ls"], capture_output=True, text=True)
+            cmd = str(shim / ("sudo.cmd" if os.name == "nt" else "sudo"))
+            done = subprocess.run([cmd, "ls"], capture_output=True, text=True, shell=(os.name == "nt"))
             self.assertEqual(done.returncode, 1)
-            self.assertTrue((shim / "sudo").stat().st_mode & stat.S_IXUSR)
+            if os.name != "nt":
+                self.assertTrue((shim / "sudo").stat().st_mode & stat.S_IXUSR)
         finally:
             import shutil
 

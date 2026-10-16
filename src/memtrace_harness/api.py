@@ -769,8 +769,15 @@ class HarnessApi:
         handler = type("BoundHandler", (_Handler,), {"api": self})
         server = ThreadingHTTPServer((self.config.api_host, self.config.api_port), handler)
         server.daemon_threads = True  # long-polls must not keep the process alive at shutdown
+
+        def _serve() -> None:
+            try:
+                server.serve_forever(poll_interval=0.1)
+            except (OSError, ValueError):
+                pass
+
         threading.Thread(
-            target=server.serve_forever, kwargs={"poll_interval": 0.1}, name="harness-api", daemon=True
+            target=_serve, name="harness-api", daemon=True
         ).start()
         self._server = server
         logger.info(f"Harness API listening on http://{self.config.api_host}:{self.config.api_port}")
@@ -779,4 +786,5 @@ class HarnessApi:
     def stop(self) -> None:
         if self._server is not None:
             self._server.shutdown()
+            self._server.server_close()
         self.worker.stop()

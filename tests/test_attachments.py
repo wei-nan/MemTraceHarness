@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -48,8 +49,9 @@ class StoreTests(unittest.TestCase):
         saved = store.save("../evil.txt", "text/plain", b"x")
         path = Path(saved["path"])
         self.assertEqual(path.parent, store.inbox)
-        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
-        self.assertEqual(oct(store.inbox.stat().st_mode & 0o777), "0o700")
+        if os.name != "nt":
+            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+            self.assertEqual(oct(store.inbox.stat().st_mode & 0o777), "0o700")
         self.assertEqual(store.prune(), 0)
         old = time.time() - 8 * 86400
         os.utime(path, (old, old))
@@ -75,7 +77,8 @@ class PrepareTests(unittest.TestCase):
 
     def test_audio_is_transcribed_by_the_configured_command(self) -> None:
         saved = self.store.save("v.ogg", "audio/ogg", "你好世界".encode())
-        item = att.prepare(saved, transcribe_command="cat {input}")
+        cmd = f'"{sys.executable}" -c "import sys; sys.stdout.write(open(sys.argv[1], encoding=\'utf-8\').read())" {{input}}'
+        item = att.prepare(saved, transcribe_command=cmd)
         self.assertEqual(item.text, "你好世界")
         self.assertIn("逐字稿", att.prompt_notice([item]))
 

@@ -222,7 +222,13 @@ def _sudo_shim_dir() -> Path:
     for name in ("sudo", "doas"):
         path = shim / name
         path.write_text("#!/bin/sh\necho 'sudo is never run by the Harness' >&2\nexit 1\n")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        try:
+            path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        except OSError:
+            pass
+        if os.name == "nt":
+            cmd_path = shim / f"{name}.cmd"
+            cmd_path.write_text("@echo sudo is never run by the Harness >&2\r\n@exit /b 1\r\n")
     return shim
 
 
@@ -231,8 +237,9 @@ def capabilities_env(env: dict[str, str], state_dir: Path) -> dict[str, str]:
     caps = caps_dir(state_dir)
     paths = [str(caps / "node" / "node_modules" / ".bin"), str(caps / "python" / "bin"), str(caps / "bin")]
     out = dict(env)
-    out["PATH"] = ":".join([*paths, out.get("PATH") or "/usr/bin:/bin"])
-    out["PYTHONPATH"] = ":".join(filter(None, [str(caps / "python"), out.get("PYTHONPATH", "")]))
+    default_path = "" if os.name == "nt" else "/usr/bin:/bin"
+    out["PATH"] = os.pathsep.join([*paths, out.get("PATH") or default_path])
+    out["PYTHONPATH"] = os.pathsep.join(filter(None, [str(caps / "python"), out.get("PYTHONPATH", "")]))
     return out
 
 

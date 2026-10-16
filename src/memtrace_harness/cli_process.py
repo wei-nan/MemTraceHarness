@@ -207,6 +207,8 @@ def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
     and has its working directory inside `directory` is signalled,
     never this process or its group, so a person's own shell sitting in the folder is left alone.
     Returns the group ids signalled."""
+    if os.name == "nt":
+        return []
     root = os.path.realpath(str(directory))
     own_pgid = os.getpgid(0)
     groups: dict[int, None] = {}
@@ -249,6 +251,8 @@ def kill_provider_clis_in_directory(directory: str | Path) -> list[int]:
 
 
 def _group_alive(pgid: int) -> bool:
+    if os.name == "nt":
+        return False
     try:
         os.killpg(pgid, 0)
     except OSError:

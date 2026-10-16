@@ -118,13 +118,13 @@ class CliTests(TestCase):
 
     def test_serve_takes_the_workspace_as_a_global_option(self) -> None:
         args = build_parser().parse_args(["-C", "/some/workspace", "serve", "--scan-interval-seconds", "600"])
-        self.assertEqual((args.command, str(args.workspace_dir), args.scan_interval_seconds), ("serve", "/some/workspace", 600))
+        self.assertEqual((args.command, args.workspace_dir.as_posix(), args.scan_interval_seconds), ("serve", "/some/workspace", 600))
 
     def test_init_workspace_accepts_an_empty_folder_and_flags(self) -> None:
         args = build_parser().parse_args(
             ["init-workspace", "/tmp/new-ws", "--memtrace-workspace", "ws_abc", "--non-interactive"]
         )
-        self.assertEqual((args.command, str(args.directory), args.memtrace_workspace), ("init-workspace", "/tmp/new-ws", "ws_abc"))
+        self.assertEqual((args.command, args.directory.as_posix(), args.memtrace_workspace), ("init-workspace", "/tmp/new-ws", "ws_abc"))
 
     def test_the_gateway_and_project_index_commands_are_gone(self) -> None:
         for removed in ("gateway", "init-project", "remove-project"):
