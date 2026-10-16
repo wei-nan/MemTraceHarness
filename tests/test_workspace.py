@@ -124,7 +124,8 @@ class WorkspaceTests(TestCase):
         with workspace({"TELEGRAM_BOT_TOKEN": "x", "HARNESS_TELEGRAM_ALLOWED_CHAT_IDS": "1"}) as (root, _):
             os.chmod(root / ENV_FILE_NAME, 0o644)
             problems = " ".join(env_file_problems(root))
-            self.assertIn("chmod 600", problems)
+            if os.name != "nt":
+                self.assertIn("chmod 600", problems)
             self.assertIn("TELEGRAM_BOT_TOKEN belongs in the Telegram service", problems)
             self.assertIn("HARNESS_TELEGRAM_ALLOWED_CHAT_IDS belongs", problems)
 
