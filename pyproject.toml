@@ -8,7 +8,7 @@ version = "0.5.0"
 description = "CLI-only execution and token measurement harness for MemTrace workflows, with its Telegram and web services"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["tzdata; sys_platform == 'win32'"]
 
 [project.scripts]
 memtrace-harness = "memtrace_harness.cli:main"
