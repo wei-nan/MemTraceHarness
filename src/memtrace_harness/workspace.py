@@ -297,7 +297,7 @@ def global_secrets_problems() -> list[str]:
     if not path.is_file():
         return []
     problems = []
-    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if os.name != "nt" and path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         problems.append(f"{path} is readable by other users; run: chmod 600 {path}")
     for key in parse_env_file(path):
         if key != MODEL_LIST_KEY_VAR:
@@ -311,7 +311,7 @@ def env_file_problems(root: Path) -> list[str]:
     problems: list[str] = []
     if not env_file.is_file():
         return [f"{env_file} does not exist"]
-    if env_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+    if os.name != "nt" and env_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         problems.append(f"{env_file} is readable by other users; run: chmod 600 {env_file}")
     keys = parse_env_file(env_file)
     for key in keys:

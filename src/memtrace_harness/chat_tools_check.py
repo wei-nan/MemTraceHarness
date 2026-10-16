@@ -18,8 +18,16 @@ CHECK_TIMEOUT_SECONDS = 30
 
 
 def _run_claude_mcp_list(executable: str) -> str:
+    from memtrace_harness.cli_process import resolve_executable
+
     result = subprocess.run(
-        [executable, "mcp", "list"], capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS, check=False
+        [resolve_executable(executable) or executable, "mcp", "list"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=CHECK_TIMEOUT_SECONDS,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip()[:200] or f"exit {result.returncode}")
