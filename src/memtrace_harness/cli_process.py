@@ -29,6 +29,12 @@ _CHILD_ENV_EXACT = frozenset(
         "no_proxy", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS", "VIRTUAL_ENV", "PYTHONPATH", "PYTHONUNBUFFERED",
         "CODEX_HOME", "GH_TOKEN", "GITHUB_TOKEN",
+        # Standard Windows OS/user profile paths required by cmd.exe and Node-based CLIs
+        # (claude.cmd, cursor-agent.cmd) to initialize Winsock, crypto, and local app data.
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+        "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+        "TEMP", "TMP", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)", "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432",
     }
 )
 _CHILD_ENV_PREFIXES = ("LC_", "XDG_", "CLAUDE_", "ANTHROPIC_", "GEMINI_", "GOOGLE_", "AGY_", "CODEX_", "OPENAI_")
@@ -42,11 +48,14 @@ def child_env(
     """The environment a child process gets: the allowlist above, plus MEMTRACE_API_TOKEN only when
     the command wires the MemTrace MCP server to read it (Codex's bearer_token_env_var)."""
     source = os.environ if environ is None else environ
-    extra = {n.strip() for n in source.get("HARNESS_PASSTHROUGH_ENV", "").split(",") if n.strip()}
+    extra = {n.strip().upper() for n in source.get("HARNESS_PASSTHROUGH_ENV", "").split(",") if n.strip()}
     env = {
         key: value
         for key, value in source.items()
-        if key in _CHILD_ENV_EXACT or key in extra or key.startswith(_CHILD_ENV_PREFIXES)
+        if key in _CHILD_ENV_EXACT
+        or key.upper() in _CHILD_ENV_EXACT
+        or key.upper() in extra
+        or key.startswith(_CHILD_ENV_PREFIXES)
     }
     if (
         command
