@@ -23,6 +23,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import resource
+
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if _soft < 4096:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, _hard), _hard))
+except Exception:
+    pass
+
 MAX_FILE_BYTES = 200_000
 MAX_FILES = 300
 WAIVER_PREFIX = "放行 gate "
@@ -168,6 +177,30 @@ def collect_reported_changes(directory: Path, reported: list[str]) -> Changes:
     return changes
 
 
+def _pattern_to_regex(pattern: str) -> str:
+    s = pattern
+    while "***" in s:
+        s = s.replace("***", "**")
+    while "/**/**" in s:
+        s = s.replace("/**/**", "/**")
+    if s.endswith("/**/"):
+        s = s[:-1]
+    while "/**/" in s:
+        s = s.replace("/**/", "_MT_SLASH_GLOBSTAR_SLASH_")
+    if s.startswith("**/"):
+        s = "_MT_GLOBSTAR_SLASH_" + s[3:]
+    if s.endswith("/**"):
+        s = s[:-3] + "_MT_SLASH_GLOBSTAR_"
+    s = s.replace("**", "_MT_GLOBSTAR_")
+
+    regex = fnmatch.translate(s)
+    regex = regex.replace("_MT_SLASH_GLOBSTAR_SLASH_", r"/(?:.+/)?")
+    regex = regex.replace("_MT_GLOBSTAR_SLASH_", r"(?:.+/)?")
+    regex = regex.replace("_MT_SLASH_GLOBSTAR_", r"(?:/.*)?")
+    regex = regex.replace("_MT_GLOBSTAR_", r".*")
+    return regex.replace(r".*.*", ".*")
+
+
 def _matches(path: str, pattern: str) -> bool:
     pattern = pattern.strip()
     while pattern.startswith("./"):
@@ -179,7 +212,7 @@ def _matches(path: str, pattern: str) -> bool:
         return path.startswith(pattern) or f"/{pattern}" in f"/{path}"
     if not any(ch in pattern for ch in "*?["):
         return path == pattern or path.startswith(pattern + "/") or base == pattern
-    regex = fnmatch.translate(pattern).replace(r".*.*", ".*")
+    regex = _pattern_to_regex(pattern)
     return bool(re.match(regex, path)) or bool(re.match(fnmatch.translate(pattern), base))
 
 
