@@ -133,6 +133,21 @@ def kill_process_for_thread(thread_ident: int) -> bool:
             return False
         entry["cancelled"] = True
         process: subprocess.Popen = entry["process"]
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if process.returncode is not None and process.returncode >= 0:
+            process.returncode = -signal.SIGTERM
+        return True
     try:
         pgid = os.getpgid(process.pid)
     except ProcessLookupError:
@@ -288,8 +303,8 @@ class CliProcessRunner:
                      input_text: str | None = None, on_start=None) -> ProcessResult:
         started_at = utc_now_iso()
         started = monotonic()
-        resolved = resolve_executable(command[0])
-        if not resolved:
+        argv = resolve_command_argv(command)
+        if not argv:
             return self._unavailable(
                 command,
                 started_at,
@@ -297,7 +312,6 @@ class CliProcessRunner:
                 f"CLI executable not found: {command[0]}",
             )
 
-        argv = [resolved, *command[1:]]
         try:
             process = subprocess.Popen(
                 argv,
@@ -377,9 +391,29 @@ class CliProcessRunner:
 
     @staticmethod
     def _terminate_process_group(process: subprocess.Popen) -> None:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            if process.returncode is not None and process.returncode >= 0:
+                process.returncode = -signal.SIGTERM
+            return
         try:
             pgid = os.getpgid(process.pid)
-        except ProcessLookupError:
+        except (ProcessLookupError, AttributeError):
             return
         try:
             os.killpg(pgid, signal.SIGTERM)
@@ -415,3 +449,39 @@ def resolve_executable(executable: str) -> str | None:
     if candidate.is_absolute() or candidate.parent != Path("."):
         return str(candidate.resolve()) if candidate.exists() else None
     return shutil.which(executable)
+
+
+def resolve_command_argv(command: list[str]) -> list[str] | None:
+    if not command:
+        return None
+    resolved = resolve_executable(command[0])
+    if not resolved:
+        return None
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        resolved_path = Path(resolved)
+        stem = resolved_path.stem.lower()
+        if stem == "claude":
+            claude_exe = (
+                resolved_path.parent
+                / "node_modules"
+                / "@anthropic-ai"
+                / "claude-code"
+                / "bin"
+                / "claude.exe"
+            )
+            if claude_exe.is_file():
+                return [str(claude_exe), *command[1:]]
+        elif stem in ("cursor-agent", "agent"):
+            versions_dir = resolved_path.parent / "versions"
+            if versions_dir.is_dir():
+                subdirs = sorted(
+                    [d for d in versions_dir.iterdir() if d.is_dir()],
+                    key=lambda d: d.name,
+                    reverse=True,
+                )
+                for vdir in subdirs:
+                    node_exe = vdir / "node.exe"
+                    index_js = vdir / "index.js"
+                    if node_exe.is_file() and index_js.is_file():
+                        return [str(node_exe), str(index_js), *command[1:]]
+    return [resolved, *command[1:]]
