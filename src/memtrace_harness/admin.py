@@ -9,6 +9,7 @@ the next call already uses them).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -23,6 +24,9 @@ from memtrace_harness.memory_digest import PREFERENCE_CATEGORY_LABELS
 from memtrace_harness.role_profiles import load_role_profiles
 from memtrace_harness.scope import ProjectScope
 from memtrace_harness.trace_store import TraceStore
+from memtrace_harness.shared_memory import shared_status
+from memtrace_harness.execution_sources import SourceStore, source_status, split_ref, provider_ref
+from memtrace_harness.improvement import ImprovementStore
 from memtrace_harness.workspace import STATE_DIR_NAME, models_file, update_model_settings
 
 logger = logging.getLogger(__name__)
@@ -161,6 +165,7 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         "outbox_backlog": trace_store.outbox_backlog(),
     }
 
+    source_state = source_status(config)
     project_entries = []
     # Built up across every project below: every (provider, model) pair actually
     # configured anywhere in this harness (role profiles, their fallbacks, chat
@@ -217,14 +222,17 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         role_profiles_error: str | None = None
         try:
             role_profiles = load_role_profiles(config.role_profiles_file_for(scope.name))
+            from memtrace_harness.primary_agent import PrimaryAgent
+            role_profiles = PrimaryAgent(config).profiles(role_profiles, scope.name)
             role_profiles_entries = [
                 {
                     "id": profile_id,
                     "provider": profile.provider,
+                    "source": profile.source,
                     "model": profile.model,
                     "reasoning_effort": profile.reasoning_effort,
                     "fallbacks": [
-                        {"provider": f.provider, "model": f.model, "reasoning_effort": f.reasoning_effort}
+                        {"provider": f.provider, "source": f.source, "model": f.model, "reasoning_effort": f.reasoning_effort}
                         for f in profile.fallbacks
                     ],
                 }
@@ -233,7 +241,10 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         except Exception as exc:
             role_profiles_error = str(exc)
 
-        for provider, model in (*chat_candidates, *digest_candidates, *archive_candidates, *recall_candidates):
+        for provider, model in (
+            *chat_candidates, *digest_candidates, *archive_candidates, *audit_candidates, *recall_candidates
+        ):
+            provider = split_ref(provider)[0]
             if provider in known_models and model:
                 known_models[provider].add(model)
         for entry in role_profiles_entries or []:
@@ -246,8 +257,11 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
         project_entries.append(
             {
                 "name": scope.name,
+                "improvement": ImprovementStore(trace_store).public(config, scope),
                 "workspace_id": scope.workspace_id,
                 "working_directory": str(scope.working_directory),
+                "execution_sources_allowed": config.allowed_execution_sources(),
+                "execution_sources_store_id": source_state.get("store_id"),
                 "repos": [
                     {"name": scope.name, "primary": True, "path": str(scope.working_directory),
                      "exists": scope.working_directory.is_dir(), "verify_command": scope.verify_command,
@@ -268,23 +282,25 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
                     "role_profiles": config.role_profiles_file_for(scope.name) is not None,
                 },
                 "chat_candidates": [
-                    {"provider": p, "model": m or None} for p, m in chat_candidates
+                    {"provider": split_ref(p)[0], "source": split_ref(p)[1], "model": m or None} for p, m in chat_candidates
                 ],
                 "digest_candidates": [
-                    {"provider": p, "model": m or None} for p, m in digest_candidates
+                    {"provider": split_ref(p)[0], "source": split_ref(p)[1], "model": m or None} for p, m in digest_candidates
                 ],
                 "digest_is_own": digest_is_own,
                 "archive_candidates": [
-                    {"provider": p, "model": m or None} for p, m in archive_candidates
+                    {"provider": split_ref(p)[0], "source": split_ref(p)[1], "model": m or None} for p, m in archive_candidates
                 ],
                 "archive_is_own": archive_is_own,
+                "archive_enabled": config.archive_enabled,
                 "audit_candidates": [
-                    {"provider": p, "model": m or None} for p, m in audit_candidates
+                    {"provider": split_ref(p)[0], "source": split_ref(p)[1], "model": m or None} for p, m in audit_candidates
                 ],
                 "audit_is_own": audit_is_own,
+                "audit_enabled": config.audit_enabled,
                 "audit": audit_status(trace_store, scope.name),
                 "recall_candidates": [
-                    {"provider": p, "model": m or None} for p, m in recall_candidates
+                    {"provider": split_ref(p)[0], "source": split_ref(p)[1], "model": m or None} for p, m in recall_candidates
                 ],
                 "recall_is_own": recall_is_own,
                 "recall_enabled": config.recall_enabled,
@@ -397,6 +413,8 @@ def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: 
             "retired": recently_retired,
             "category_labels": PREFERENCE_CATEGORY_LABELS,
         },
+        "shared_memory": shared_status(config),
+        "execution_sources": source_state,
         "known_models": merge_model_catalog(config, known_models),
     }
 
@@ -410,6 +428,16 @@ def _apply(config: HarnessConfig, updates: dict[str, str]) -> None:
     had bounced back."""
     if config.workspace_root is None:
         raise ValueError("this Harness was not started from a workspace; there is no models.toml to change")
+    # A provider-only edit cannot carry a source belonging to the previous provider.
+    from memtrace_harness.workspace import read_model_settings
+    current = read_model_settings(models_file(config.workspace_root))
+    updates = dict(updates)
+    for target in ("CHAT", "DIGEST", "ARCHIVE", "AUDIT", "RECALL"):
+        provider_key, source_key = f"HARNESS_{target}_PROVIDER", f"HARNESS_{target}_SOURCE"
+        if provider_key in updates and source_key not in updates and current.get(source_key):
+            previous = current.get(provider_key) or os.getenv(provider_key)
+            if previous != updates[provider_key]:
+                updates[source_key] = ""
     update_model_settings(models_file(config.workspace_root), updates)
     os.environ.update(updates)
 
@@ -417,8 +445,8 @@ def _apply(config: HarnessConfig, updates: dict[str, str]) -> None:
 def _check_model(provider: str, model: str) -> None:
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
-    if not model.strip():
-        raise ValueError("model must be a non-empty string")
+    if not model.strip() or '"' in model or "\n" in model:
+        raise ValueError("model must be non-empty and contain no quotes or newlines")
 
 
 def _check_fallbacks(fallbacks: str) -> str:
@@ -432,8 +460,7 @@ def _check_fallbacks(fallbacks: str) -> str:
 
 
 def update_chat_model(config: HarnessConfig, provider: str, model: str) -> None:
-    """Set the quick-chat model (the cheap call behind ordinary conversation, not an Agent Loop
-    role). Only the primary candidate is touched, never HARNESS_CHAT_FALLBACKS."""
+    """Set the primary agent's model for dialogue and task decisions; keep its fallbacks."""
     _check_model(provider, model)
     _apply(config, {"HARNESS_CHAT_PROVIDER": provider, "HARNESS_CHAT_MODEL": model})
 
@@ -454,6 +481,18 @@ def update_recall_model(config: HarnessConfig, provider: str, model: str) -> Non
     """Same as update_digest_model(), for the background topic-recall model."""
     _check_model(provider, model)
     _apply(config, {"HARNESS_RECALL_PROVIDER": provider, "HARNESS_RECALL_MODEL": model})
+
+
+def update_automation_enabled(config: HarnessConfig, feature: str, enabled: object) -> None:
+    """Enable or pause one automatic memory duty; explicitly requested CLI actions remain available."""
+    if feature not in {"archive", "audit", "recall"}:
+        raise ValueError(f"unknown memory feature {feature!r}")
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    _apply(config, {f"HARNESS_{feature.upper()}_ENABLED": "true" if enabled else "false"})
+    # HarnessConfig is frozen because its construction settings are otherwise immutable. These three
+    # live switches are intentionally mutable at the admin boundary and take effect immediately.
+    object.__setattr__(config, f"{feature}_enabled", enabled)
 
 
 PEER_DESCRIPTION_MAX_CHARS = 600
@@ -537,6 +576,9 @@ def update_role_profile(config: HarnessConfig, profile_id: str, provider: str, m
 
     Only a workspace that already has its own roles file can be edited: the packaged default is
     shared by every Harness, and editing it in place would change all of them."""
+    if profile_id == "controller":
+        update_chat_model(config, provider, model)
+        return
     if provider not in PROVIDERS:
         raise ValueError(f"unknown provider {provider!r} (expected one of {PROVIDERS})")
     if not model.strip() or '"' in model or "\n" in model:
@@ -566,6 +608,9 @@ def update_role_profile(config: HarnessConfig, profile_id: str, provider: str, m
     body_end = body_start + next_header.start() if next_header else len(text)
     block = text[body_start:body_end]
 
+    old_provider = re.search(r'(?m)^provider\s*=\s*"([^\"]*)"', block)
+    if old_provider and old_provider[1] != provider:
+        block = re.sub(r'(?m)^source\s*=.*\n?', "", block)
     new_block, replaced_provider = re.subn(
         r'(?m)^provider\s*=\s*"[^"]*"', f'provider = "{provider}"', block, count=1
     )
@@ -588,10 +633,12 @@ def _check_chain(chain: object) -> list[dict]:
         if not isinstance(item, dict):
             raise ValueError("malformed chain entry")
         provider, model = str(item.get("provider", "")), str(item.get("model", "")).strip()
+        if item.get("source") is not None and not isinstance(item.get("source"), str):
+            raise ValueError("execution source must be text or null")
         _check_model(provider, model)
         if '"' in model or "\n" in model:
             raise ValueError("model must have no quotes or newlines")
-        out.append({"provider": provider, "model": model, "reasoning_effort": str(item.get("reasoning_effort") or "")})
+        out.append({"provider": provider, "source": split_ref(provider_ref(provider, item.get("source") or None))[1], "model": model, "reasoning_effort": str(item.get("reasoning_effort") or "")})
     return out
 
 
@@ -607,11 +654,15 @@ def update_model_chain(config: HarnessConfig, target: str, chain: object) -> Non
     if target not in ("chat", "digest", "archive", "audit", "recall"):
         raise ValueError(f"unknown model target {target!r}")
     entries = _check_chain(chain)
+    for entry in entries:
+        if entry["source"]:
+            config.source_binding(entry["provider"], entry["source"])
     prefix = f"HARNESS_{target.upper()}"
-    fallbacks = ",".join(f"{c['provider']}/{c['model']}" for c in entries[1:])
+    fallbacks = ",".join(f"{provider_ref(c['provider'], c['source'])}/{c['model']}" for c in entries[1:])
     _apply(config, {
         f"{prefix}_PROVIDER": entries[0]["provider"],
         f"{prefix}_MODEL": entries[0]["model"],
+        f"{prefix}_SOURCE": entries[0]["source"] or "",
         f"{prefix}_FALLBACKS": fallbacks,
     })
     _remember(config, entries)
@@ -625,7 +676,13 @@ def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: obj
 
     from memtrace_harness.role_profiles import _validate_provider_effort, load_role_profiles
 
+    if profile_id == "controller":
+        update_model_chain(config, "chat", chain)
+        return
     entries = _check_chain(chain)
+    for entry in entries:
+        if entry["source"]:
+            config.source_binding(entry["provider"], entry["source"])
     path = config.role_profiles_file_for()
     if path is None:
         raise ValueError(
@@ -664,6 +721,9 @@ def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: obj
         primary, n = re.subn(rf'(?m)^{key}\s*=\s*"[^"]*"', f'{key} = "{value}"', primary, count=1)
         if not n:
             raise ValueError(f"profile {profile_id!r} has no {key} line to update")
+    primary = re.sub(r'(?m)^source\s*=.*\n?', "", primary)
+    if first["source"]:
+        primary = primary.rstrip("\n") + "\nsource = " + json.dumps(first["source"]) + "\n"
     # The primary's quota bucket follows its provider unless it names something unrelated.
     primary = re.sub(
         r'(?m)^quota_bucket\s*=\s*"[^"]*"',
@@ -684,9 +744,10 @@ def update_role_profile_chain(config: HarnessConfig, profile_id: str, chain: obj
         keep = next((o for o in old_fallbacks if o.get("provider") == fb["provider"]), {})
         fb_effort = fb["reasoning_effort"] or str(keep.get("reasoning_effort") or "medium")
         _validate_provider_effort(f"{profile_id}.fallbacks[{index}]", fb["provider"], fb_effort)
+        source_line = ("source = " + json.dumps(fb["source"]) + "\n") if fb["source"] else ""
         blocks += (
             f'\n{fb_header}\nprovider = "{fb["provider"]}"\nmodel = "{fb["model"]}"\n'
-            f'reasoning_effort = "{fb_effort}"\nquota_bucket = "{fb["provider"]}-account"\n'
+            f'reasoning_effort = "{fb_effort}"\nquota_bucket = "{fb["provider"]}-account"\n' + source_line
         )
     primary = primary.rstrip("\n") + "\n"
     candidate = text[:body_start] + primary + blocks + (("\n" + text[end:]) if end < len(text) else "")
@@ -823,3 +884,20 @@ def collect_turn_detail(config: HarnessConfig, turn_id: int) -> dict | None:
     page's on-demand "click a stage" view — deliberately not part of collect_status_data(), since
     artifact/final_text bodies can be large and most stages in a pipeline are never clicked."""
     return TraceStore(config.trace_db_path).get_turn_detail(turn_id)
+
+
+def execution_source_action(config: HarnessConfig, body: dict) -> dict:
+    if config.execution_sources_path is None:
+        raise ValueError("execution sources are not configured")
+    return SourceStore(config.execution_sources_path).change(body)
+
+
+def update_execution_source_allowlist(config: HarnessConfig, allowed: object) -> None:
+    if not isinstance(allowed, list) or len(allowed) > 64 or any(not isinstance(item, str) for item in allowed):
+        raise ValueError("allowed must be a list of execution source ids")
+    if config.execution_sources_path is None:
+        raise ValueError("execution sources are not configured")
+    store = SourceStore(config.execution_sources_path)
+    for source in allowed:
+        store.get(source)
+    _apply(config, {"HARNESS_EXECUTION_SOURCES_ALLOWED": ",".join(dict.fromkeys(allowed))})

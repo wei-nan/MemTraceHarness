@@ -46,6 +46,15 @@ class CodexCliAdapter(CliModelAdapter):
         if self.output_schema_path:
             command.extend(["--output-schema", str(self.output_schema_path)])
         command.extend(["--sandbox", self.permission])
+        # Additional repositories are passed only to read-only profiles (adapter_factory
+        # filters this by permission). Keep Codex's own read-only sandbox in force; these
+        # roots are context for review/planning, never additional develop workspaces.
+        if self.permission == "read-only":
+            for directory in self.read_directories:
+                command.extend(["--add-dir", str(directory)])
+        else:
+            for directory in self.write_directories:
+                command.extend(["--add-dir", str(directory)])
         # Read-only TaiwanTrade proxy: Codex spawns MCP servers outside its sandbox, so
         # the agent can query 127.0.0.1:8000 without the sandbox gaining network access.
         taiwantrade = mcp_server_spec()

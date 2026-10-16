@@ -78,6 +78,8 @@ class Aggregator:
         harnesses: list[dict] = []
         projects: list[dict] = []
         preferences: dict[str, list] = {"pending": [], "adopted": [], "retired": []}
+        shared_stores: dict[str, dict] = {}
+        execution_stores: dict[str, dict] = {}
         category_labels: dict = {}
         known: dict[str, list[str]] = {}
         for target in self.targets:
@@ -87,6 +89,12 @@ class Aggregator:
                 harnesses.append({"name": target.name, "up": False, "error": str(exc)})
                 continue
             info = status.get("harness", {})
+            sources = status.get("execution_sources", {})
+            if sources.get("available") and sources.get("store_id") not in execution_stores:
+                execution_stores[sources["store_id"]] = {**sources, "harness": target.name}
+            shared = status.get("shared_memory", {})
+            if shared.get("available") and shared.get("store_id") not in shared_stores:
+                shared_stores[shared["store_id"]] = {**shared, "harness": target.name}
             harnesses.append({"name": target.name, "up": True, "error": None, **info})
             projects += [{**p, "harness": target.name} for p in status.get("projects", [])]
             prefs = status.get("preferences", {})
@@ -101,6 +109,8 @@ class Aggregator:
             "harnesses": harnesses,
             "projects": projects,
             "preferences": {**preferences, "category_labels": category_labels},
+            "shared_memory": list(shared_stores.values()),
+            "execution_sources": list(execution_stores.values()),
             "known_models": known,
         }
 

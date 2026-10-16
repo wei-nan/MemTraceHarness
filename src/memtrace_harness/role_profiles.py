@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 Permission = Literal["read-only", "workspace-write"]
 ContextPolicy = Literal[
+    "primary-session",
     "loop-snapshot",
     "task-and-targeted-evidence",
     "gate-evidence-only",
@@ -53,6 +54,7 @@ class ModelCandidate:
     model: str
     reasoning_effort: str
     quota_bucket: str
+    source: str | None = None
 
     @classmethod
     def from_mapping(
@@ -75,6 +77,7 @@ class ModelCandidate:
             model=model,
             reasoning_effort=reasoning_effort,
             quota_bucket=quota_bucket,
+            source=_source(data.get("source")),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -83,6 +86,7 @@ class ModelCandidate:
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "quota_bucket": self.quota_bucket,
+            "source": self.source,
         }
 
 
@@ -105,6 +109,7 @@ class RoleProfile:
     # HARNESS_CLI_TIMEOUT_SECONDS. Long-running roles (Developer running backtests)
     # need more than the short routing/review stages should be allowed to hang for.
     timeout_seconds: int | None = None
+    source: str | None = None
 
     @classmethod
     def from_mapping(cls, profile_id: str, data: Mapping[str, object]) -> "RoleProfile":
@@ -129,6 +134,7 @@ class RoleProfile:
             )
         context_policy = str(data["context_policy"])
         allowed_context = {
+            "primary-session",
             "loop-snapshot",
             "task-and-targeted-evidence",
             "gate-evidence-only",
@@ -203,6 +209,7 @@ class RoleProfile:
             max_fallback_hops=max_fallback_hops,
             fallback_cooldown_seconds=cooldown,
             timeout_seconds=timeout_seconds,
+            source=_source(data.get("source")),
         )
 
     @property
@@ -212,6 +219,7 @@ class RoleProfile:
             model=self.model,
             reasoning_effort=self.reasoning_effort,
             quota_bucket=self.quota_bucket or f"{self.provider}-account",
+            source=self.source,
         )
         return (primary, *self.fallbacks[: self.max_fallback_hops])
 
@@ -231,6 +239,7 @@ class RoleProfile:
             "max_fallback_hops": self.max_fallback_hops,
             "fallback_cooldown_seconds": self.fallback_cooldown_seconds,
             "timeout_seconds": self.timeout_seconds,
+            "source": self.source,
         }
 
 
@@ -296,7 +305,7 @@ def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
     - each profile's permission level (only `develop` may hold workspace-write; the Controller
       and every other skill stay read-only);
     - each profile's context_policy (how much of the repo/evidence it is allowed to see:
-      the Controller only ever gets a loop snapshot, `review` only gate-scoped evidence,
+      the primary agent gets conversation plus snapshot, legacy controllers a snapshot, and review gate-scoped evidence,
       regardless of which model is behind it).
 
     `review` and `plan-escalation` may carry a fallback chain too. The original concern was a
@@ -312,7 +321,10 @@ def _validate_role_boundaries(profiles: Mapping[str, RoleProfile]) -> None:
     }
     for profile_id, (permission, context_policy) in expected_shape.items():
         profile = profiles[profile_id]
-        if profile.permission != permission or profile.context_policy != context_policy:
+        allowed_contexts = {context_policy}
+        if profile_id == "controller":
+            allowed_contexts.add("primary-session")
+        if profile.permission != permission or profile.context_policy not in allowed_contexts:
             raise ValueError(
                 f"Role profile {profile_id!r} must remain {permission}/{context_policy}"
             )
@@ -347,3 +359,12 @@ def _validate_provider_effort(label: str, provider: str, reasoning_effort: str) 
         raise ValueError(
             f"Model candidate {label!r} has invalid {provider} effort: {reasoning_effort}"
         )
+
+
+def _source(value) -> str | None:
+    if value in (None, ""):
+        return None
+    from memtrace_harness.execution_sources import ID
+    if not isinstance(value, str) or not ID.fullmatch(value):
+        raise ValueError("invalid execution source id")
+    return value

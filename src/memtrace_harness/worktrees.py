@@ -34,6 +34,19 @@ class TaskWorktree:
 
 
 @dataclass(frozen=True)
+class RepoTaskWorkspace:
+    """One explicitly selected repository and this task's isolated editing directory."""
+
+    name: str
+    repo_root: Path
+    working_directory: Path
+    verify_command: str | None
+    verify_timeout_seconds: int
+    off_limits: tuple[str, ...]
+    worktree: TaskWorktree | None
+
+
+@dataclass(frozen=True)
 class IntegrationReport:
     """What a finished task would bring back into the project's main checkout — shown
     to Controller so it can decide to merge, and re-computed when it does."""
@@ -111,11 +124,15 @@ class WorktreeManager:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def create(self, repo: Path, project: str, conversation_id: str) -> TaskWorktree:
+    def create(self, repo: Path, project: str, conversation_id: str, *, remote_main: bool = False) -> TaskWorktree:
         path = (self.root / _safe_name(project) / conversation_id).resolve()
         branch = f"harness/{conversation_id}"
-        base_branch = self.current_branch(repo)
-        head = _git(repo, "rev-parse", "HEAD")
+        base_branch = "main" if remote_main else self.current_branch(repo)
+        if remote_main:
+            fetched = _git(repo, "fetch", "origin", "refs/heads/main:refs/remotes/origin/main")
+            if fetched.returncode != 0:
+                raise RuntimeError("cannot fetch origin/main for an isolated delivery task")
+        head = _git(repo, "rev-parse", "origin/main" if remote_main else "HEAD")
         if head.returncode != 0:
             raise RuntimeError(f"cannot read HEAD of {repo}: {head.stderr.strip()}")
         base_commit = head.stdout.strip()
@@ -170,6 +187,13 @@ class WorktreeManager:
             return int(result.stdout.strip()) if result.returncode == 0 else 0
         except ValueError:
             return 0
+
+    @staticmethod
+    def is_merged(repo: Path, worktree: TaskWorktree) -> bool:
+        target = worktree.base_branch
+        if not target:
+            return False
+        return _git(repo, "merge-base", "--is-ancestor", worktree.branch, target, timeout=15).returncode == 0
 
     def has_uncommitted(self, worktree: TaskWorktree) -> bool:
         status = _git(worktree.path, "status", "--porcelain", "--untracked-files=all")

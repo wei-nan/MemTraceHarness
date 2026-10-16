@@ -1,20 +1,12 @@
-"""The one place a chat-model tool declares how much trust it needs (operator decision, 2026-10-12).
+"""Registry of the primary agent's tools and their authority tiers.
 
-Every tool the chat model can call through the ops server is a ``ToolSpec`` with a **tier**:
+read runs immediately; propose records a request; change creates a single-use
+confirmation and runs its handler only after that tap. An unregistered tool or
+unknown tier is refused. change is the default. Commands forbidden by the
+command policy remain forbidden regardless of confirmation.
 
-- ``read``    — looks, changes nothing; runs at once, no confirm tap (files, databases, launchd, a web page).
-- ``propose`` — only records a request for something else (a job, a GitHub action, a setting); that request has its
-  own confirm card (service.py) and may be put on the allowed list.
-- ``change``  — would change something itself; the model's call is turned into a ``tool_call`` request, the user sees
-  the exact tool and arguments on a confirm card, and the handler runs only after the tap. It may be put on the allowed
-  list ("確認並之後都允許"), bound to ``rule`` (default: the exact tool and arguments).
-
-**``change`` is the default tier**: a tool registered without saying anything about its tier is asked about, never run
-silently. A tool that is not registered cannot be called at all. Commands the command policy forbids (sudo, deletion,
-system or security settings) are not a tier — no tool, tap or allowlist entry can run them (command_policy.py).
-
-Adding a tool is adding one ``register(ToolSpec(...))``; the confirm card, expiry, double-tap guard, allowed list,
-notification and the contract's wording do not change.
+Rule/always_note metadata remains readable for historical audit and migration;
+the runtime never treats it or a stored allowlist as permission to execute.
 """
 
 from __future__ import annotations

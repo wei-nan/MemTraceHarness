@@ -47,8 +47,12 @@ class CursorCliAdapter(CliModelAdapter):
             command.extend(["--mode", "ask"])
         else:
             command.append("--force")
-        for directory in self.read_directories:
-            command.extend(["--add-dir", str(directory)])
+        if self.permission == "read-only":
+            for directory in self.read_directories:
+                command.extend(["--add-dir", str(directory)])
+        else:
+            for directory in self.write_directories:
+                command.extend(["--add-dir", str(directory)])
         # The prompt stays last: redact_command() in cli.py scrubs the last element from traces.
         command.append(self._with_output_schema(prompt))
         return command

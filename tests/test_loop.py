@@ -598,15 +598,18 @@ class AgentLoopRunnerTests(TestCase):
 
     def test_verify_command_success_still_lets_g2_model_review(self) -> None:
         adapters = self._adapters()
+        events = []
         summary = AgentLoopRunner(
             adapters=adapters,
             trace_store=TraceStore(self.db_path),
             working_directory=self.root,
             verify_command="exit 0",
+            progress_callback=lambda stage, state, artifact: events.append((stage, state, artifact)),
         ).run(self.task)
 
         self.assertEqual(summary.status, "succeeded")
         self.assertEqual(len(adapters["review"].calls), 2)
+        self.assertEqual([state for stage, state, artifact in events if stage == "verify"], ["running", "succeeded"])
 
     def _verify_runner(self, adapters, command, *, loop_mode="full", extra=False):
         base = self.root / "base"
@@ -1489,6 +1492,12 @@ class _FakeChatConfig:
     def __init__(self, provider: str | None = "claude", model: str | None = "haiku") -> None:
         self.chat_provider = provider
         self.chat_model = model
+
+    def chat_candidates_for(self):
+        return ((self.chat_provider, self.chat_model),)
+
+    def source_command(self, provider):
+        return [self.command_for(provider)]
 
     def command_for(self, provider: str) -> str:
         return provider

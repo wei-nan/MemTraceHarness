@@ -8,7 +8,7 @@ Adding an action is adding one ``ActionSpec`` to ``ACTIONS``: how its fields are
 how it is shown. The request/confirm/expiry/double-tap plumbing is shared and does not change.
 
 Enforced here: the repo must be one of the project's own (``github_issue_repos``); every field is bounded; the
-argv is a list, never a shell string. Deliberately not offered: merging a PR, deleting or editing an issue,
+argv is a list, never a shell string. Deliberately not offered: force push, pushing main/master, merging a PR, deleting or editing an issue,
 changing repo settings.
 """
 
@@ -121,6 +121,33 @@ def _issue_label(allowed: list[str], a: dict[str, Any]) -> dict[str, Any]:
     return {"repo": _repo(allowed, a.get("repo")), "number": _number(a.get("number")), "labels": add, "remove_labels": remove}
 
 
+_BRANCH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}$")
+_PROTECTED = {"main", "master"}
+
+
+def _branch(value: object, name: str, *, allow_protected: bool) -> str:
+    text = str(value or "").strip()
+    if not _BRANCH.match(text) or ".." in text or text.endswith((".lock", "/", ".")):
+        raise ValueError(f"{name} is not a valid branch name")
+    if not allow_protected and text in _PROTECTED:
+        raise ValueError(f"{name}: pushing directly to {text} is not offered; push a work branch and open a PR")
+    return text
+
+
+def _branch_push(allowed: list[str], a: dict[str, Any]) -> dict[str, Any]:
+    return {"repo": _repo(allowed, a.get("repo")), "branch": _branch(a.get("branch"), "branch", allow_protected=False)}
+
+
+def _pr_create(allowed: list[str], a: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "repo": _repo(allowed, a.get("repo")),
+        "branch": _branch(a.get("branch"), "branch", allow_protected=False),
+        "base": _branch(a.get("base") or "main", "base", allow_protected=True),
+        "title": _line(a.get("title"), "title", MAX_TITLE_CHARS),
+        "body": _text(a.get("body"), "body", MAX_BODY_CHARS, required=True),
+    }
+
+
 def _with_comment(base: list[str], p: dict[str, Any]) -> list[str]:
     return [*base, "--comment", p["comment"]] if p.get("comment") else base
 
@@ -165,6 +192,19 @@ ACTIONS: dict[str, ActionSpec] = {
             lambda p: f"調整 {_ref(p)} 的標籤", view="issue",
         ),
         ActionSpec(
+            "branch_push", "推送", _branch_push,
+            lambda p: ["git", "push", "-u", "origin", p["branch"]],
+            lambda p: f"推送分支 {p['branch']} 到 {p['repo']}（不強制、不推 main）",
+        ),
+        ActionSpec(
+            "pr_create", "建立 PR", _pr_create,
+            lambda p: [
+                "gh", "pr", "create", "--repo", p["repo"], "--head", p["branch"], "--base", p["base"],
+                "--title", p["title"], "--body", p["body"],
+            ],
+            lambda p: f"{p['repo']}：PR {p['branch']} → {p['base']}：{p['title']}",
+        ),
+        ActionSpec(
             "pr_comment", "留言", _number_comment(True),
             lambda p: ["gh", "pr", "comment", str(p["number"]), "--repo", p["repo"], "--body", p["comment"]],
             lambda p: f"在 PR {_ref(p)} 留言", view="pr",
@@ -192,7 +232,7 @@ def summarize(payload: dict[str, Any]) -> str:
 def detail_lines(payload: dict[str, Any]) -> list[str]:
     """What the operator should see besides the summary: every free-text field in full."""
     lines: list[str] = []
-    for key, label in (("title", "標題"), ("labels", "加上標籤"), ("remove_labels", "移除標籤"), ("comment", "留言"), ("body", "內文")):
+    for key, label in (("branch", "分支"), ("base", "目標分支"), ("title", "標題"), ("labels", "加上標籤"), ("remove_labels", "移除標籤"), ("comment", "留言"), ("body", "內文")):
         value = payload.get(key)
         if value:
             lines.append(f"{label}：{', '.join(value) if isinstance(value, list) else value}")

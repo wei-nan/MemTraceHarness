@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sqlite3
 from typing import Any
 
 from memtrace_harness.adapters.base import ModelAdapter
@@ -47,9 +48,13 @@ class CliModelAdapter(ModelAdapter):
         reply_language: str | None = None,
         memtrace_mcp_url: str | None = None,
         read_directories: tuple[Path, ...] = (),
+        write_directories: tuple[Path, ...] = (),
+        execution_source=None,
     ) -> None:
         self.adapter_id = adapter_id
         self.role = role
+        self.execution_source = execution_source
+        self.execution_source_id = execution_source.source_id if execution_source else None
         self.executable = executable
         self.working_directory = working_directory
         self.trace_root = trace_root
@@ -68,12 +73,20 @@ class CliModelAdapter(ModelAdapter):
         # Where the read-only MemTrace lookup tools are reachable, for providers that cannot
         # pick them up from the user's own CLI configuration (see CodexCliAdapter).
         self.memtrace_mcp_url = memtrace_mcp_url
-        # Other repos of the same project a read-only role may look at (only Claude can be told to; see its adapter).
+        # Other repos of the same project a read-only role may inspect. Each provider adapter
+        # maps these to its CLI's workspace/sandbox flags; role permission, not provider, decides
+        # whether the roots are passed.
         self.read_directories = tuple(read_directories)
+        # Additional repos selected for this task. Only the develop profile receives
+        # these roots, alongside its primary working directory.
+        self.write_directories = tuple(write_directories)
 
     def run(self, task: TaskEnvelope, trace_id: str) -> ModelResponse:
         prompt = render_agent_prompt(task, self.role, reply_language=self.reply_language)
         command = self.build_command(prompt)
+        if self.execution_source:
+            from memtrace_harness.execution_sources import SourceCommand
+            command = SourceCommand(command, self.execution_source)
         # For a read-only role, this is the one independent check that doesn't trust
         # the CLI's own mode gate — some providers (Antigravity's --mode plan) can't
         # complete headlessly, and the only way to still use them for a read-only role
@@ -81,7 +94,12 @@ class CliModelAdapter(ModelAdapter):
         # git state before/after means a write is caught and fails closed even if the
         # CLI-level permission gate was bypassed or never enforced it in the first
         # place — see the antigravity-headless-command-permission memory note.
-        before_snapshot = _git_status_snapshot(self.working_directory) if self.permission == "read-only" else None
+        protected_directories = tuple(dict.fromkeys((self.working_directory, *self.read_directories)))
+        before_snapshots = (
+            {directory: _git_status_snapshot(directory) for directory in protected_directories}
+            if self.permission == "read-only"
+            else None
+        )
         process = self.process_runner.run(
             command,
             cwd=self.working_directory,
@@ -105,15 +123,21 @@ class CliModelAdapter(ModelAdapter):
             # adapters/antigravity.py's _last_error()). If the adapter's own
             # parse_response() surfaced an error, trust that over a clean exit code.
             else "failed"
-            if response.execution.error
+            if process.error or response.execution.error
             else "succeeded"
             if process.return_code == 0
             else "failed"
         )
         error = process.error or response.execution.error or _stderr_error(process)
-        if before_snapshot is not None:
-            after_snapshot = _git_status_snapshot(self.working_directory)
-            if after_snapshot is not None and after_snapshot != before_snapshot:
+        if before_snapshots is not None:
+            changed = [
+                directory
+                for directory, before in before_snapshots.items()
+                if before is not None
+                and (after := _git_status_snapshot(directory)) is not None
+                and after != before
+            ]
+            if changed:
                 # Fail closed, don't try to auto-revert: an automatic git cleanup here
                 # could itself destroy legitimate uncommitted work if this check ever
                 # has a bug. Surfacing it loudly and stopping is the safe choice; a
@@ -121,10 +145,10 @@ class CliModelAdapter(ModelAdapter):
                 status = "failed"
                 error = (
                     f"safety violation: a read-only role ({self.role_profile_id or self.role}) "
-                    "modified the working directory despite permission=read-only. Working "
-                    "tree state changed during this call — treating the result as untrusted "
-                    "and stopping instead of using it. Inspect `git status`/`git diff` in "
-                    f"{self.working_directory} before deciding how to proceed."
+                    "modified a protected repository despite permission=read-only. "
+                    "The result is untrusted and the run stopped. Affected repositories: "
+                    + ", ".join(str(directory) for directory in changed)
+                    + ". Inspect their git status/diff before deciding how to proceed."
                 )
         execution = replace(
             response.execution,
@@ -146,7 +170,16 @@ class CliModelAdapter(ModelAdapter):
             # is empty, which would otherwise silently win and discard the real message.
             error=error,
             parse_warnings=[*response.execution.parse_warnings, *parse_warnings],
+            execution_source_id=self.execution_source_id,
+            failure_category=process.source_failure or response.execution.failure_category,
         )
+        if self.execution_source and not process.source_failure:
+            from memtrace_harness.execution_sources import SourceStore
+            from memtrace_harness.fallback import classify_execution_failure
+            try:
+                SourceStore(self.execution_source.path).record(self.execution_source, classify_execution_failure(execution))
+            except (OSError, sqlite3.Error):
+                pass  # retain the authoritative provider output even if the shared status store fails
         return replace(response, execution=execution)
 
     @abstractmethod

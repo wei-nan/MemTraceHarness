@@ -9,3 +9,5 @@
 
 - job: harness_services_status = for l in $(launchctl list | awk '/com.memtraceharness/{print $3}'); do printf "%s  %s\n" "$(launchctl list | awk -v l=$l '$3==l{print "pid="$1" exit="$2}')" "$l"; done
 - read_roots: ~/.config/memtraceharness, ~/Library/LaunchAgents, ~/Workspace/Beri, ~/Workspace/MemTrace, ~/Workspace/ProjectA, ~/Workspace/TWTradingStrategy, ~/Workspace/project-c, ~/Workspace/beri-android
+- github_repo: wei-nan/MemTraceHarness
+- verify_command: PYTHONPATH=src python3 -m unittest discover -s tests

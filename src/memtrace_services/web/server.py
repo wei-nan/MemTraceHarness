@@ -26,6 +26,7 @@ ADMIN_ROUTES = {
     "/api/archive-chain": "archive-chain",
     "/api/audit-chain": "audit-chain",
     "/api/recall-chain": "recall-chain",
+    "/api/memory-feature-enabled": "memory-feature-enabled",
     "/api/model-catalog-refresh": "model-catalog-refresh",
     "/api/chat-model": "chat-model",
     "/api/recall-model": "recall-model",
@@ -36,6 +37,10 @@ ADMIN_ROUTES = {
     "/api/stuck": "stuck",
     "/api/chat-question": "chat-question",
     "/api/preference": "preference",
+    "/api/shared-memory": "shared-memory",
+    "/api/execution-source": "execution-source",
+    "/api/execution-source-allowlist": "execution-source-allowlist",
+    "/api/improvement": "improvement",
     "/api/peer-description": "peer-description",
     "/api/peer-name": "peer-name",
     # Pairing is not here: making a link returns its token, which must not reach the browser (pairing.py does both halves).

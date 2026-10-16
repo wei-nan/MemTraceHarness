@@ -135,6 +135,7 @@ def _dump_dom(url: str) -> str:
         argv = [
             chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--disable-background-networking", "--mute-audio",
+            "--use-mock-keychain", "--password-store=basic",  # never touch (or prompt for) the macOS keychain
             f"--user-data-dir={profile}", "--virtual-time-budget=8000", "--dump-dom", url,
         ]
         try:

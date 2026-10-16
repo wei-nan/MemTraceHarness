@@ -1,3 +1,5 @@
+# The controller table is retained for low-level replay. Runtime primary-agent
+# model selection comes from HARNESS_CHAT_*; skills below keep their own profiles.
 [profiles.controller]
 role = "Controller"
 provider = "codex"
@@ -19,43 +21,79 @@ provider = "claude"
 model = "sonnet"
 reasoning_effort = "medium"
 quota_bucket = "claude-account"
-
 [[profiles.controller.fallbacks]]
 provider = "antigravity"
 model = "gemini-3.8-flash-high"
 reasoning_effort = "high"
 quota_bucket = "antigravity-account"
-
 [profiles.plan]
 role = "Plan"
+provider = "antigravity"
+model = "gemini-3.8-flash-high"
+reasoning_effort = "high"
+permission = "read-only"
+context_policy = "task-and-targeted-evidence"
+max_attempts = 1
+quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 3
+[[profiles.plan.fallbacks]]
+provider = "antigravity"
+model = "claude-sonnet-5-5-medium"
+reasoning_effort = "medium"
+quota_bucket = "antigravity-account"
+[[profiles.plan.fallbacks]]
+provider = "codex"
+model = "gpt-6-sol"
+reasoning_effort = "medium"
+quota_bucket = "codex-account"
+[[profiles.plan.fallbacks]]
 provider = "claude"
 model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"
+[profiles.plan-escalation]
+role = "Plan Escalation"
+provider = "antigravity"
+model = "claude-opus-5-5-medium"
 reasoning_effort = "medium"
 permission = "read-only"
 context_policy = "task-and-targeted-evidence"
 max_attempts = 1
-quota_bucket = "claude-account"
-
-[profiles.plan-escalation]
-role = "Plan Escalation"
+quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+[[profiles.plan-escalation.fallbacks]]
 provider = "claude"
 model = "opus"
 reasoning_effort = "high"
-permission = "read-only"
-context_policy = "task-and-targeted-evidence"
-max_attempts = 1
 quota_bucket = "claude-account"
-
+[[profiles.plan-escalation.fallbacks]]
+provider = "codex"
+model = "gpt-6.1-sol"
+reasoning_effort = "high"
+quota_bucket = "codex-account"
 [profiles.review]
 role = "Review"
-provider = "codex"
-model = "gpt-5.6-sol"
-reasoning_effort = "high"
+provider = "antigravity"
+model = "gemini-3.8-flash-medium"
+reasoning_effort = "medium"
 permission = "read-only"
 context_policy = "gate-evidence-only"
 max_attempts = 1
+quota_bucket = "antigravity-account"
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+[[profiles.review.fallbacks]]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
 quota_bucket = "codex-account"
-
+[[profiles.review.fallbacks]]
+provider = "claude"
+model = "opus"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"
 [profiles.develop]
 role = "Develop"
 provider = "antigravity"
@@ -69,3 +107,15 @@ quota_bucket = "antigravity-account"
 # and re-running a full-market backtest (248 steps); backtest work routinely needs
 # well over 15 minutes. Only this role gets the longer limit.
 timeout_seconds = 3600
+fallback_on = ["quota_exhausted", "rate_limit", "provider_overloaded"]
+max_fallback_hops = 2
+[[profiles.develop.fallbacks]]
+provider = "codex"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
+quota_bucket = "codex-account"
+[[profiles.develop.fallbacks]]
+provider = "claude"
+model = "sonnet"
+reasoning_effort = "medium"
+quota_bucket = "claude-account"
