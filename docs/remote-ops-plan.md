@@ -61,8 +61,8 @@ project's own markdown file rather than duplicated into a central config. Exampl
 finalized by whoever implements it):
 
 ```text
-<workspace>\MemTraceHarness\harness-scope.md
-<workspace>\MemTrace\harness-scope.md
+<path-to-MemTraceHarness>\harness-scope.md
+<your-project>\harness-scope.md
 ```
 
 Flow: inbound message → **chat model** (see §5) classifies intent (which project, what's being asked,

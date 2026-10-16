@@ -12,3 +12,6 @@ build/
 .DS_Store
 projects.index.txt
 instances/
+
+# Local, per-machine Harness scope (see examples/harness-scope.md)
+/harness-scope.md

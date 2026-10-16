@@ -50,7 +50,7 @@ Install and authenticate the CLIs you intend to use:
 Run a capability check without spending model quota:
 
 ```powershell
-cd <workspace>\MemTraceHarness
+cd <path-to-MemTraceHarness>
 .\.venv\Scripts\python -m memtrace_harness probe --json
 ```
 
@@ -60,7 +60,7 @@ unavailable. `probe` never submits a model prompt.
 ## Install
 
 ```powershell
-cd <workspace>\MemTraceHarness
+cd <path-to-MemTraceHarness>
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e .
 ```
@@ -76,7 +76,7 @@ working tree and makes token attribution reproducible:
 ```powershell
 .\.venv\Scripts\python -m memtrace_harness run `
   --workspace ws_spec_plan `
-  --working-directory <workspace>\MemTrace `
+  --working-directory <your-project> `
   --goal "Review the current Agent Loop token attribution" `
   --context-ref mem_f2e46f6a `
   --agent codex `
@@ -110,7 +110,7 @@ $env:HARNESS_CODEX_COMMAND = Join-Path `
 
 .\.venv\Scripts\python -m memtrace_harness loop `
   --workspace ws_spec_plan `
-  --working-directory <workspace>\MemTrace `
+  --working-directory <your-project> `
   --goal "Implement the accepted Agent Loop change" `
   --risk-level high `
   --max-total-tokens 120000 `
@@ -123,7 +123,7 @@ latest durable `ResumeEnvelope`:
 ```powershell
 .\.venv\Scripts\python -m memtrace_harness loop `
   --workspace ws_spec_plan `
-  --working-directory <workspace>\MemTrace `
+  --working-directory <your-project> `
   --goal "Continue the accepted Agent Loop change" `
   --conversation-id conv_example123 `
   --json
@@ -189,7 +189,7 @@ $env:MEMTRACE_API_TOKEN = "<MemTrace token>"
 
 .\.venv\Scripts\python -m memtrace_harness run `
   --workspace ws_spec_plan `
-  --working-directory <workspace>\MemTrace `
+  --working-directory <your-project> `
   --goal "Review the harness boundary" `
   --context-ref mem_f2e46f6a `
   --hydrate-context `
