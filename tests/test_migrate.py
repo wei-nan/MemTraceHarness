@@ -3,6 +3,7 @@ import json
 import sqlite3
 import stat
 import tomllib
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -65,25 +66,26 @@ class MigrationFixture(TestCase):
                 project=project, scope=scope, category="x", text=text, evidence=[], explicit=True,
                 source_digest_date=None, status="adopted", adopted_by="operator",
             )
-        with sqlite3.connect(self.db) as conn:
-            for project, ws in (("alpha", "ws_alpha"), ("beta-project", "ws_beta")):
-                run = f"run_{project[:3]}"
-                conn.execute("INSERT INTO runs (id, workspace_id, goal, task_json, created_at) VALUES (?, ?, 'g', '{}', 't')", (run, ws))
-                conn.execute(
-                    "INSERT INTO conversations (id, task_id, workspace_id, state, created_at, updated_at, last_activity_at) "
-                    "VALUES (?, 't', ?, 'succeeded', 't', 't', 't')", (f"chat_{project[:3]}", ws),
-                )
-                conn.execute(
-                    "INSERT INTO turns (conversation_id, run_id, sequence, stage, profile_id, provider, state, usage_json, "
-                    "raw_trace_ref, created_at) VALUES (?, ?, 1, 'plan', 'p', 'claude', 'succeeded', '{}', ?, 't')",
-                    (f"chat_{project[:3]}", run, f"{self.traces}/{run}/out.log"),
-                )
-                conn.execute(
-                    "INSERT INTO primary_sessions_hot_log (primary_session_id, project, turn_seq, created_at, speaker, turn_type, content) "
-                    "VALUES (?, ?, 1, 't', 'user', 'chat', ?)", (f"psess_{project}", project, f"hello {project}"),
-                )
-                (self.traces / run).mkdir(parents=True)
-                (self.traces / run / "out.log").write_text(f"trace of {project}", encoding="utf-8")
+        with closing(sqlite3.connect(self.db)) as conn:
+            with conn:
+                for project, ws in (("alpha", "ws_alpha"), ("beta-project", "ws_beta")):
+                    run = f"run_{project[:3]}"
+                    conn.execute("INSERT INTO runs (id, workspace_id, goal, task_json, created_at) VALUES (?, ?, 'g', '{}', 't')", (run, ws))
+                    conn.execute(
+                        "INSERT INTO conversations (id, task_id, workspace_id, state, created_at, updated_at, last_activity_at) "
+                        "VALUES (?, 't', ?, 'succeeded', 't', 't', 't')", (f"chat_{project[:3]}", ws),
+                    )
+                    conn.execute(
+                        "INSERT INTO turns (conversation_id, run_id, sequence, stage, profile_id, provider, state, usage_json, "
+                        "raw_trace_ref, created_at) VALUES (?, ?, 1, 'plan', 'p', 'claude', 'succeeded', '{}', ?, 't')",
+                        (f"chat_{project[:3]}", run, f"{self.traces}/{run}/out.log"),
+                    )
+                    conn.execute(
+                        "INSERT INTO primary_sessions_hot_log (primary_session_id, project, turn_seq, created_at, speaker, turn_type, content) "
+                        "VALUES (?, ?, 1, 't', 'user', 'chat', ?)", (f"psess_{project}", project, f"hello {project}"),
+                    )
+                    (self.traces / run).mkdir(parents=True)
+                    (self.traces / run / "out.log").write_text(f"trace of {project}", encoding="utf-8")
             conn.execute("CREATE TABLE telegram_gateway_state (bot_token_hash TEXT PRIMARY KEY, last_offset INTEGER NOT NULL)")
             import hashlib
 
@@ -264,22 +266,23 @@ class SharedKnowledgeBaseTests(MigrationFixture):
             "- off_limits: google-services.json\n",
             encoding="utf-8",
         )
-        with sqlite3.connect(self.db) as conn:
-            for table in ("runs", "conversations"):  # the second project's work was recorded against the shared workspace
-                conn.execute(f"UPDATE {table} SET workspace_id = 'ws_alpha' WHERE workspace_id = 'ws_beta'")
-            conn.execute(
-                "INSERT INTO schedules (id, project, workspace_id, goal, kind, active, created_at, next_run_at) "
-                "VALUES ('sched_beta', 'beta-project', 'ws_alpha', '每天跑測試', 'daily', 1, 't', 't')"
-            )
-            conn.execute(
-                "INSERT INTO approval_requests (id, conversation_id, workspace, working_directory, reason, proposed_action, "
-                "status, created_at) VALUES ('appr_beta', 'chat_bet', 'ws_alpha', ?, 'git_push', 'x', 'pending', 't')",
-                (str(self.beta),),
-            )
-            conn.execute(
-                "INSERT INTO decision_records (created_at, project, kind, situation, outcome) "
-                "VALUES ('t', 'beta-project', 'task_claim', 's', 'claim_accepted')"
-            )
+        with closing(sqlite3.connect(self.db)) as conn:
+            with conn:
+                for table in ("runs", "conversations"):  # the second project's work was recorded against the shared workspace
+                    conn.execute(f"UPDATE {table} SET workspace_id = 'ws_alpha' WHERE workspace_id = 'ws_beta'")
+                conn.execute(
+                    "INSERT INTO schedules (id, project, workspace_id, goal, kind, active, created_at, next_run_at) "
+                    "VALUES ('sched_beta', 'beta-project', 'ws_alpha', '每天跑測試', 'daily', 1, 't', 't')"
+                )
+                conn.execute(
+                    "INSERT INTO approval_requests (id, conversation_id, workspace, working_directory, reason, proposed_action, "
+                    "status, created_at) VALUES ('appr_beta', 'chat_bet', 'ws_alpha', ?, 'git_push', 'x', 'pending', 't')",
+                    (str(self.beta),),
+                )
+                conn.execute(
+                    "INSERT INTO decision_records (created_at, project, kind, situation, outcome) "
+                    "VALUES ('t', 'beta-project', 'task_claim', 's', 'claim_accepted')"
+                )
             conn.commit()
 
     def test_they_become_one_plan_with_the_second_as_a_repo(self) -> None:

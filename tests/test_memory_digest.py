@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
@@ -32,8 +33,9 @@ def _add_turn(store: TraceStore, speaker: str, content: str, created_at: str) ->
     turn_id = store.append_primary_session_turn(
         primary_session_id=SESSION, project="proj", speaker=speaker, turn_type="chat", content=content
     )
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        with conn:
+            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
     return turn_id
 
 
@@ -362,8 +364,9 @@ class ScheduleActivityInDigestTests(TestCase):
             speaker="system" if kind == "schedule_trigger" else "work_session_report",
             turn_type=kind, content=content, schedule_id=schedule_id,
         )
-        with sqlite3.connect(self.store.db_path) as conn:
-            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (at, turn_id))
+        with closing(sqlite3.connect(self.store.db_path)) as conn:
+            with conn:
+                conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (at, turn_id))
 
     def test_only_each_schedules_last_result_is_shown_with_a_count(self) -> None:
         _add_turn(self.store, "user", "今天看盤", "2026-09-30T01:00:00+00:00")

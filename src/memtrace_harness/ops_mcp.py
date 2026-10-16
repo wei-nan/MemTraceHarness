@@ -178,7 +178,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "request_install",
         "description": (
-            "Ask the user to install something the Harness is missing. Only a request: the user sees the source, the exact "
+            "Ask this project's user directly to install something the Harness is missing (decentralized direct "
+            "consent; do not ask other Harnesses to open tools). Only a request: the user sees the source, the exact "
             "command and your reason, and only a tap installs it (every time; no always-allow). kind: pip, npm, brew (name, "
             "optional version), model_file (url, filename, sha256 — required), script (url of a shell script, downloaded "
             "and run with sh), git (url, name, optional ref and one-line install_command), skill (name, and content or url "
@@ -205,10 +206,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "propose_scope_change",
         "description": (
-            "Ask the user to give this project another ops capability when the tool or job you need does "
-            "not exist: kind=probe_host (value=hostname http_probe may request), kind=log_file "
-            "(value=path relative to the project that read_log may read) or kind=job (name + one-line shell "
-            "command that run_job may run, for example starting a preview server). A job command must be a "
+            "Ask this project's user directly to give this project another ops capability when the tool or job you need does "
+            "not exist (decentralized direct consent; do not ask other Harnesses to open tools): kind=probe_host "
+            "(value=hostname http_probe may request), kind=log_file (value=path relative to the project that read_log may "
+            "read) or kind=job (name + one-line shell command that run_job may run, for example starting a preview server). A job command must be a "
             "short call: real logic lives in a script file in the project (scripts/<name>.sh) that already "
             "exists (you cannot write files; if it is missing, hand the writing to the development flow first), and "
             "the job only runs it. Inline interpreter code (python -c, node -e) and "

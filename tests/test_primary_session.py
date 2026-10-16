@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase
@@ -45,10 +47,12 @@ class PrimarySessionTests(TestCase):
 
 
 def _stamp(store: TraceStore, turn_id: int, created_at: str) -> None:
+    from contextlib import closing
     import sqlite3
 
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
+    with closing(sqlite3.connect(store.db_path)) as conn:
+        with conn:
+            conn.execute("UPDATE primary_sessions_hot_log SET created_at = ? WHERE id = ?", (created_at, turn_id))
 
 
 class ScheduleNoiseTests(TestCase):
@@ -151,13 +155,14 @@ class LegacyScheduleRetagTests(TestCase):
                 ("user", "decision", "請開發某功能"),                      # a human-started task
                 ("work_session_report", "dev_report", "Chat-triggered loop chat_2 completed with status succeeded: 開發結果"),
             ]
-            with sqlite3.connect(db_path) as conn:
-                for seq, (speaker, turn_type, content) in enumerate(rows, start=1):
-                    conn.execute(
-                        "INSERT INTO primary_sessions_hot_log (primary_session_id, project, turn_seq, created_at, "
-                        "speaker, turn_type, content, consolidated) VALUES ('psess_p', 'p', ?, '2026-09-22T05:00:00+00:00', ?, ?, ?, 1)",
-                        (seq, speaker, turn_type, content),
-                    )
+            with closing(sqlite3.connect(db_path)) as conn:
+                with conn:
+                    for seq, (speaker, turn_type, content) in enumerate(rows, start=1):
+                        conn.execute(
+                            "INSERT INTO primary_sessions_hot_log (primary_session_id, project, turn_seq, created_at, "
+                            "speaker, turn_type, content, consolidated) VALUES ('psess_p', 'p', ?, '2026-09-22T05:00:00+00:00', ?, ?, ?, 1)",
+                            (seq, speaker, turn_type, content),
+                        )
 
             for _ in range(2):  # the second open must change nothing
                 turns = TraceStore(db_path).get_primary_session_turns("psess_p")
