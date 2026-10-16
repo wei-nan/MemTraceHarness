@@ -354,3 +354,9 @@ button.stage-detail-close:hover { color: var(--text); }
 .peer-links button.pl-revoke, .peer-links button.pl-remove, .chain-reset, .chain-add { background: var(--chip); color: var(--text); border: 1px solid var(--border); }
 button:disabled { opacity: 0.5; cursor: default; }
 button:hover:not(:disabled) { filter: brightness(1.1); }
+
+/* an on/off switch lives on the collapsed line itself */
+details.fold.memory-feature { padding: 0; border-top: 1px solid var(--border); }
+.fold-switch { display: inline-flex; align-items: center; gap: 0.5rem; margin-left: 0.6rem; }
+.fold-switch .memory-feature-toggle { font-size: 1rem; padding: 0.3rem 0.2rem 0.3rem 0.5rem; cursor: pointer; white-space: nowrap; }
+.fold-switch input { width: 1.3rem; height: 1.3rem; }
