@@ -1,5 +1,6 @@
-"""Pairing from the status page: link storage, the Harness routes, the A2A service reading links live, and two Harnesses made
-to talk by one click, end to end."""
+"""Legacy link migration, stable Harness labels, and live authorization refresh.
+New contact approval and website flows are covered in test_contacts.py.
+"""
 
 import json
 import os
@@ -25,7 +26,6 @@ from memtrace_services.a2a.gateway import PeerGateway
 from memtrace_services.a2a.protocol import Dispatcher
 from memtrace_services.a2a.server import start_server as start_a2a
 from memtrace_services.client import HarnessError
-from memtrace_services.web import pairing
 from memtrace_services.web.aggregate import Aggregator, HarnessTarget
 from memtrace_services.web.chat import ChatHub
 from memtrace_services.web.server import start_server as start_web
@@ -60,7 +60,7 @@ class LinkStoreTests(TestCase):
         for secret in ("secret-out-token", "token_sha256", "token"):
             self.assertNotIn(secret, public)
         service = self.links.snapshot_for_service()
-        self.assertEqual(service["outbound"], [{"name": "platform", "url": "http://127.0.0.1:8900", "token": "secret-out-token", "collaborate": True}])
+        self.assertEqual(service["outbound"], [{"name": "platform", "display_name": "platform", "url": "http://127.0.0.1:8900", "token": "secret-out-token", "collaborate": True}])
 
     def test_changes_and_revocation(self) -> None:
         self.links.create_inbound("beri", "ask")
@@ -160,141 +160,6 @@ class Harnesses:
         return PeerLinks(links_path(self.h[name]["config"])).public_view()
 
 
-class PairingTests(TestCase):
-    def setUp(self) -> None:
-        self.w = Harnesses(self)
-
-    def test_one_click_makes_alpha_able_to_ask_beta_and_no_token_reaches_the_browser(self) -> None:
-        status, body = self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        self.assertEqual((status, body), (200, {"links": [{"from": "alpha", "to": "beta", "trust": "ask"}]}))
-        self.assertEqual([(l["name"], l["trust"]) for l in self.w.links("beta")["inbound"]], [("alpha", "ask")])
-        out = self.w.links("alpha")["outbound"]
-        self.assertEqual([(l["name"], l["collaborate"]) for l in out], [("beta", False)])
-        self.assertEqual(out[0]["url"], self.w.links("beta")["endpoint"])
-        # nothing secret is on the page's data, in its response, or readable through the main-token view
-        token = PeerLinks(links_path(self.w.h["alpha"]["config"])).snapshot_for_service()["outbound"][0]["token"]
-        for text in (json.dumps(body), json.dumps(self.w.aggregator.collect()), json.dumps(self.w.links("alpha"))):
-            self.assertNotIn(token, text)
-
-    def test_the_paired_harnesses_really_talk_without_a_restart_or_a_file(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        alpha = self.w.h["alpha"]
-        alpha["carrier"].sync_directory()  # what the service does on its next round
-        self.assertEqual([p["name"] for p in alpha["store"].list_peer_directory()], ["beta"])
-        queue_outbound(alpha["store"], "alpha", "beta", "beta 現在用什麼資料庫？")
-        delivered = []
-        with patch("memtrace_harness.peer.CliProcessRunner.run", return_value=reply("SQLite。")), \
-                patch.object(alpha["service"], "_record_order_turn", side_effect=lambda p, t: delivered.append(t)):
-            self.assertEqual(alpha["carrier"].run_once(), 1)
-            deadline = __import__("time").time() + 8
-            while __import__("time").time() < deadline and alpha["store"].count_peer_outbound_unfinished():
-                __import__("time").sleep(0.05)
-        self.assertEqual(len(delivered), 1)
-        self.assertIn("SQLite。", delivered[0])
-        self.assertEqual(self.w.h["beta"]["store"].list_peer_requests("alpha")[0]["skill"], "ask")
-
-    def test_collaborate_sets_both_halves_and_lets_the_model_report_issues(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "collaborate"})
-        self.assertEqual(self.w.links("beta")["inbound"][0]["trust"], "collaborate")
-        self.assertTrue(self.w.links("alpha")["outbound"][0]["collaborate"])
-        alpha = self.w.h["alpha"]
-        alpha["carrier"].sync_directory()
-        self.assertTrue(alpha["store"].list_peer_directory()[0]["collaborate"])
-
-    def test_both_directions_in_one_go(self) -> None:
-        status, body = self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "collaborate", "both": True})
-        self.assertEqual(status, 200)
-        self.assertEqual([(l["from"], l["to"], l["trust"]) for l in body["links"]],
-                         [("alpha", "beta", "collaborate"), ("beta", "alpha", "ask")])
-        self.assertEqual([l["name"] for l in self.w.links("alpha")["inbound"]], ["beta"])
-        self.assertEqual([l["name"] for l in self.w.links("beta")["outbound"]], ["alpha"])
-
-    def test_revoking_stops_the_peer_at_once_and_the_asker_is_told_why(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        alpha = self.w.h["alpha"]
-        alpha["carrier"].sync_directory()
-        self.assertEqual(self.w.post("/api/peer-link-revoke", {"project": "beta", "name": "alpha"})[0], 200)
-        queue_outbound(alpha["store"], "alpha", "beta", "still there?")
-        delivered = []
-        with patch.object(alpha["service"], "_record_order_turn", side_effect=lambda p, t: delivered.append(t)):
-            alpha["carrier"].run_once()
-            deadline = __import__("time").time() + 8
-            while __import__("time").time() < deadline and alpha["store"].count_peer_outbound_unfinished():
-                __import__("time").sleep(0.05)
-        self.assertIn("peer answered HTTP 401", delivered[0])
-
-    def test_trust_can_be_changed_and_a_link_removed_from_the_page(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        self.assertEqual(self.w.post("/api/peer-link-trust", {"project": "beta", "name": "alpha", "trust": "collaborate"})[0], 200)
-        self.assertEqual(self.w.links("beta")["inbound"][0]["trust"], "collaborate")
-        self.assertEqual(self.w.post("/api/peer-link-outbound-flag", {"project": "alpha", "name": "beta", "collaborate": True})[0], 200)
-        self.assertTrue(self.w.links("alpha")["outbound"][0]["collaborate"])
-        self.assertEqual(self.w.post("/api/peer-link-outbound-remove", {"project": "alpha", "name": "beta"})[0], 200)
-        self.assertEqual(self.w.links("alpha")["outbound"], [])
-        self.assertEqual(self.w.post("/api/peer-link-trust", {"project": "beta", "name": "alpha", "trust": "root"})[0], 400)
-
-    def test_refusals_are_plain_and_change_nothing(self) -> None:
-        for body, expect in (
-            ({"from": "alpha", "to": "alpha", "trust": "ask"}, "自己"),
-            ({"from": "alpha", "to": "nobody", "trust": "ask"}, "找不到"),
-            ({"from": "alpha", "to": "beta", "trust": "root"}, "ask 或 collaborate"),
-        ):
-            status, out = self.w.post("/api/peer-pair", body)
-            self.assertEqual(status, 400)
-            self.assertIn(expect, out["error"])
-        self.assertEqual((self.w.links("alpha")["outbound"], self.w.links("beta")["inbound"]), ([], []))
-
-    def test_the_page_cannot_create_a_link_or_read_a_token_through_the_generic_routes(self) -> None:
-        for path in ("/api/peer-link-inbound-create", "/api/peer-link-outbound-set", "/api/peer-link-create"):
-            self.assertEqual(self.w.post(path, {"project": "beta", "name": "x", "trust": "ask"})[0], 404)
-
-    def test_half_a_pairing_is_taken_back(self) -> None:
-        from memtrace_services.client import HarnessClient
-
-        real = HarnessClient.admin
-
-        def failing(client, setting, body, *a, **k):
-            if setting == "peer-link-outbound-set":
-                raise HarnessError(400, "boom")
-            return real(client, setting, body, *a, **k)
-
-        with patch.object(HarnessClient, "admin", failing):
-            status, out = self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        self.assertEqual(status, 400)
-        self.assertIn("撤回", out["error"])
-        self.assertEqual(self.w.links("beta")["inbound"], [])  # beta's half was revoked again
-
-
-class NoServiceTests(TestCase):
-    def test_a_harness_whose_a2a_service_is_not_running_is_named_in_the_error(self) -> None:
-        w = Harnesses(self, with_a2a=("alpha",))
-        status, out = w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        self.assertEqual(status, 400)
-        self.assertIn("「beta」", out["error"])
-        self.assertIn("HARNESS_PEER_API_TOKEN", out["error"])
-        self.assertEqual(w.links("beta")["inbound"], [])
-
-
-class InviteTests(TestCase):
-    def setUp(self) -> None:
-        self.w = Harnesses(self)
-
-    def test_an_invite_made_on_one_page_is_accepted_on_another(self) -> None:
-        status, out = self.w.post("/api/peer-invite", {"project": "beta", "name": "Gamma", "trust": "collaborate"})
-        self.assertEqual(status, 200)
-        self.assertTrue(out["invite"].startswith("mtinv1:"))
-        self.assertEqual([(l["name"], l["trust"]) for l in self.w.links("beta")["inbound"]], [("gamma", "collaborate")])
-        status, accepted = self.w.post("/api/peer-accept", {"project": "alpha", "invite": out["invite"]})
-        self.assertEqual((status, accepted["name"], accepted["collaborate"]), (200, "beta", True))
-        self.assertEqual(self.w.links("alpha")["outbound"][0]["url"], self.w.links("beta")["endpoint"])
-
-    def test_a_damaged_or_foreign_invite_is_refused(self) -> None:
-        for bad in ("", "hello", "mtinv1:!!!", "mtinv1:" + "e30="):  # e30= is "{}"
-            status, out = self.w.post("/api/peer-accept", {"project": "alpha", "invite": bad})
-            self.assertEqual(status, 400, bad)
-        self.assertEqual(self.w.links("alpha")["outbound"], [])
-
-
 class LiveConfigTests(TestCase):
     class Gateway:
         def __init__(self) -> None:
@@ -345,7 +210,8 @@ class LiveConfigTests(TestCase):
         gateway.reply = {"inbound": [{"name": "page", "token_sha256": hash_token("page-token"), "trust": "ask"}], "outbound": []}
         self.assertIsNotNone(live.authenticate("page-token"))
         gateway.reply = RuntimeError("down")
-        self.assertIsNotNone(live.authenticate("page-token"))  # last known stands
+        self.assertIsNone(live.authenticate("page-token"))  # unavailable authority cannot prove an unrevoked grant
+        self.assertIn("page", live.peers)  # discovery can still show the cached entry
 
     def test_links_are_cached_for_the_ttl(self) -> None:
         gateway = self.Gateway()
@@ -395,53 +261,3 @@ class HarnessNameTests(TestCase):
         self.assertEqual(agent_card(base)["name"], "from-file")
         self.assertEqual(agent_card(base, None, "alpha-app")["name"], "alpha-app")
         self.assertEqual(agent_card(base, None, "  ")["name"], "from-file")
-
-
-class PairingByHarnessNameTests(TestCase):
-    def setUp(self) -> None:
-        self.w = Harnesses(self)
-        # alpha's project is "alpha" but it is called "alpha-app" on the peer network (set on the config the Harness uses)
-        api = self.w.h["alpha"]["api"]
-        api.config = replace(api.config, peer_name="alpha-app")
-        self.w.aggregator._invalidate()
-
-    def test_links_are_made_under_the_harness_names_not_the_project_names(self) -> None:
-        status, body = self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask", "both": True})
-        self.assertEqual(status, 200)
-        self.assertEqual([l["name"] for l in self.w.links("beta")["inbound"]], ["alpha-app"])
-        self.assertEqual([l["name"] for l in self.w.links("alpha")["outbound"]], ["beta"])
-        self.assertEqual([l["name"] for l in self.w.links("alpha")["inbound"]], ["beta"])
-        self.assertEqual([l["name"] for l in self.w.links("beta")["outbound"]], ["alpha-app"])
-
-    def test_two_harnesses_with_the_same_name_cannot_be_paired(self) -> None:
-        api = self.w.h["beta"]["api"]
-        api.config = replace(api.config, peer_name="alpha-app")
-        self.w.aggregator._invalidate()
-        status, out = self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        self.assertEqual(status, 400)
-        self.assertIn("名稱都是「alpha-app」", out["error"])
-        self.assertEqual(self.w.links("beta")["inbound"], [])
-
-    def test_an_invite_names_the_harness_not_the_project(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "beta", "to": "alpha", "trust": "ask"})  # (any link: alpha's own is what we test)
-        status, out = self.w.post("/api/peer-invite", {"project": "alpha", "name": "gamma", "trust": "ask"})
-        self.assertEqual(status, 200)
-        status, accepted = self.w.post("/api/peer-accept", {"project": "beta", "invite": out["invite"]})
-        self.assertEqual((status, accepted["name"]), (200, "alpha-app"))
-
-    def test_renaming_does_not_break_a_working_link(self) -> None:
-        self.w.post("/api/peer-pair", {"from": "alpha", "to": "beta", "trust": "ask"})
-        alpha = self.w.h["alpha"]
-        alpha["api"].config = replace(alpha["api"].config, peer_name="renamed")  # a label, not the credential
-        alpha["carrier"].sync_directory()
-        queue_outbound(alpha["store"], "alpha", "beta", "still works after the rename?")
-        delivered = []
-        with patch("memtrace_harness.peer.CliProcessRunner.run", return_value=reply("yes")), \
-                patch.object(alpha["service"], "_record_order_turn", side_effect=lambda p, t: delivered.append(t)):
-            alpha["carrier"].run_once()
-            import time
-
-            deadline = time.time() + 8
-            while time.time() < deadline and alpha["store"].count_peer_outbound_unfinished():
-                time.sleep(0.05)
-        self.assertIn("yes", delivered[0])

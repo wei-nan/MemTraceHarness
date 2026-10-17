@@ -114,7 +114,7 @@ address a service handed in earlier (`tg:<chat>`), or `null` for "the operator, 
 Harness only through `/v1/peer/*` with `HARNESS_PEER_API_TOKEN`, a token that opens nothing else. With
 `[outbound.*]` configured it also carries this Harness's `ask_peer` / `report_issue` questions to those peers; a peer with
 `trust = "collaborate"` may report problems for this Harness to diagnose and fix. Who may talk to whom is
-made on the status page (設定 → Harness 連線) and kept by the Harness; the service reads it live. Design,
+approved by the receiving operator after a contact request (設定 → 聯絡與授權) and kept by the Harness; the service reads it live. Design,
 rules and limits: [`a2a-peers.md`](a2a-peers.md).
 
 ### Running an A2A service
@@ -131,7 +131,8 @@ scripts/run-a2a.sh ~/.config/memtraceharness/<Project>/a2a.toml        # foregro
 As a launchd job, copy `com.memtraceharness.<Project>.a2a.plist` (same shape as the status page's) into
 `~/Library/LaunchAgents/` and `launchctl bootstrap gui/$(id -u) <plist>`; `scripts/restart-harness.sh all` skips `*.a2a`.
 The service is up when `curl http://127.0.0.1:<port>/.well-known/agent-card.json` answers; the status page's
-設定 → Harness 連線 then shows its address, and pairing works.
+設定 → 聯絡與授權 then shows its address. The running website service relays new contact requests among
+its configured Harnesses; its operator approves before any new grant becomes usable.
 
 ## The status page
 

@@ -42,11 +42,12 @@ class RpcError(Exception):
         self.code, self.message = code, message
 
 
-def agent_card(config: A2aConfig, description: str | None = None, name: str | None = None) -> dict:
+def agent_card(config: A2aConfig, description: str | None = None, name: str | None = None, identity: str | None = None) -> dict:
     """What anyone may read: no paths, no limits, no other peers' names. `description` is what the Harness's operator wrote
     on the status page and `name` is what the Harness is called there; the file's own are the fallback when the Harness
     has none or cannot be reached."""
     return {
+        **({"metadata": {"memtrace.harness/id": identity}} if identity else {}),
         "name": (name or "").strip() or config.name,
         "description": (description or "").strip() or config.description,
         "version": "1",

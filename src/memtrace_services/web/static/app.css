@@ -226,6 +226,8 @@ details.chain-edit summary { cursor: pointer; color: var(--accent); font-size: 0
 
 .peer-links .pl-row { margin: 0.3rem 0; display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .peer-links code { font-size: 0.75rem; }
+.peer-links .contact-reason { flex: 1; min-width: min(18rem, 100%); max-width: 36rem; }
+.peer-links code { overflow-wrap: anywhere; }
 .peer-links textarea { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px; font: inherit; min-width: 20rem; }
 
 .shared-memory { padding: 0.75rem 0; border-bottom: 1px solid var(--border); }

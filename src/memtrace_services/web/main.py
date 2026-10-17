@@ -13,6 +13,7 @@ from pathlib import Path
 from memtrace_services.envfile import file_mode_problem
 from memtrace_services.web.aggregate import Aggregator, HarnessTarget
 from memtrace_services.web.chat import ChatHub
+from memtrace_services.web.contacts import ContactRelay
 from memtrace_services.web.server import start_server
 from memtrace_services.observation import ObservationRelay
 
@@ -54,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
 
     aggregator = Aggregator(targets)
     aggregator.start()
+    contacts = ContactRelay(targets)
+    contacts.start()
     observation = ObservationRelay(targets)
     observation.start()
     chat = ChatHub(targets)
@@ -65,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     stop.wait()
     aggregator.stop()
+    contacts.stop()
     observation.stop()
     chat.stop()
     server.shutdown()

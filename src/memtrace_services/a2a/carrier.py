@@ -11,7 +11,7 @@ import time
 from typing import Callable
 
 from memtrace_services.a2a.client import PeerCallError, PeerClient
-from memtrace_services.a2a.config import A2aConfig
+from memtrace_services.a2a.config import A2aConfig, LiveConfig
 from memtrace_services.client import HarnessError, HarnessUnavailable
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,8 @@ class Carrier:
 
     def _client(self, name: str) -> PeerClient | None:
         """The client for a peer as it is configured now (made again if its address or token changed)."""
-        peer = self.config.outbound.get(name)
+        current = self.config.current(force=True) if isinstance(self.config, LiveConfig) else self.config
+        peer = current.outbound.get(name)
         if peer is None:
             self._clients.pop(name, None)
             return None
@@ -47,7 +48,7 @@ class Carrier:
         return cached[1]
 
     def _outbound_signature(self) -> frozenset:
-        return frozenset((p.name, p.url, p.collaborate) for p in self.config.outbound.values())
+        return frozenset((p.name, p.url, p.collaborate, p.display_name) for p in self.config.outbound.values())
 
     def sync_directory(self) -> None:
         """Tell the Harness who it can reach, each described in the peer's own words (its Agent Card); the description in
@@ -59,7 +60,10 @@ class Carrier:
                 own = self._client(p.name).card_description()
             except Exception:  # noqa: BLE001 — a peer being down must not stop the directory from syncing
                 logger.warning(f"could not read {p.name}'s Agent Card")
-            peers.append({"name": p.name, "description": own or p.description, "collaborate": p.collaborate})
+            description = own or p.description
+            if p.display_name and p.display_name != p.name:
+                description = f"{p.display_name}: {description}"
+            peers.append({"name": p.name, "description": description, "collaborate": p.collaborate})
         self.gateway.sync_directory(peers)
         self._last_sync = time.monotonic()
         self._synced_for = self._outbound_signature()

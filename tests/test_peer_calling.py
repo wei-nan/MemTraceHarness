@@ -67,7 +67,7 @@ def serve_a2a(case: TestCase, side: Side, peers: dict[str, "str | tuple[str, tup
         name="B", description=description, host="127.0.0.1", port=port, public_url=f"http://127.0.0.1:{port}",
         harness_url=side.url, harness_peer_token=side.peer_token,
         peers={
-            name: PeerEntry(name, hash_token(t if isinstance(t, str) else t[0]), skills=("ask",) if isinstance(t, str) else t[1], rate_per_min=100)
+            name: PeerEntry(name, hash_token(t if isinstance(t, str) else t[0]), skills=("ask",) if isinstance(t, str) else t[1])
             for name, t in peers.items()
         },
     )
@@ -250,6 +250,36 @@ class EndToEndTests(TestCase):
         self.assertEqual(len(recorded), 1)
         self.assertNotIn("HARNESS_", recorded[0])
 
+    def test_a_slow_answer_survives_more_than_ten_polls_at_the_default_rate_limit(self) -> None:
+        release = threading.Event()
+        polls = []
+
+        def slow(*args, **kwargs):
+            release.wait(5)
+            return reply("慢一點但有收到的答覆")
+
+        def sleep(seconds):
+            polls.append(seconds)
+            if len(polls) >= 15:
+                release.set()
+            time.sleep(0.02)
+
+        self.carrier._client_factory = lambda peer: PeerClient(peer, sleep=sleep, deadline_seconds=5)
+        request_id = queue_outbound(self.a.store, self.a.scope.name, "beri", "q")
+        recorded = []
+        with patch("memtrace_harness.peer.CliProcessRunner.run", side_effect=slow) as run, \
+                patch.object(self.a.service, "_record_order_turn", side_effect=lambda p, t: recorded.append(t)):
+            try:
+                self.carrier.run_once()
+                self.settle()
+            finally:
+                release.set()
+        self.assertGreaterEqual(len(polls), 15)
+        self.assertEqual(self.a.store.get_peer_outbound(request_id)["state"], "completed")
+        self.assertEqual(len(recorded), 1)
+        self.assertIn("慢一點但有收到的答覆", recorded[0])
+        self.assertEqual(run.call_count, 1)
+
     def test_an_unreachable_or_wrong_token_peer_is_reported_not_hung(self) -> None:
         bad = Carrier(
             A2aConfig(
@@ -295,6 +325,71 @@ class EndToEndTests(TestCase):
         with patch("memtrace_services.a2a.client._OPENER.open", side_effect=urllib.error.HTTPError("u", 302, "Found", {}, None)):
             with self.assertRaises(PeerCallError):
                 client.ask("q", "c", 0)
+
+
+class PollRecoveryTests(TestCase):
+    def client(self, **kwargs):
+        return PeerClient(OutboundPeer("beri", "http://127.0.0.1:1", "t"), **kwargs)
+
+    def test_http_failures_expose_only_safe_reason_and_retry_timing(self) -> None:
+        for code, header, delay in ((429, "12", 12), (429, "bad", 60), (503, "", 5), (401, "", None)):
+            with self.subTest(code=code, header=header):
+                error = urllib.error.HTTPError("private-url", code, "private-details", {"Retry-After": header}, None)
+                with patch("memtrace_services.a2a.client._OPENER.open", side_effect=error):
+                    with self.assertRaises(PeerCallError) as caught:
+                        self.client()._open(urllib.request.Request("http://127.0.0.1:1"))
+                self.assertEqual(str(caught.exception), f"peer answered HTTP {code}")
+                self.assertEqual(caught.exception.retry_after, delay)
+
+    def test_transient_poll_failures_follow_the_original_task_without_resending(self) -> None:
+        working = {"id": "original", "status": {"state": "TASK_STATE_WORKING"}}
+        done = {"id": "original", "status": {"state": "TASK_STATE_COMPLETED"},
+                "artifacts": [{"parts": [{"text": "answer"}]}]}
+        for skill in ("ask", "collaborate"):
+            with self.subTest(skill=skill):
+                now, sleeps = [0.0], []
+
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    now[0] += seconds
+
+                client = self.client(sleep=sleep)
+                with patch("memtrace_services.a2a.client.time.monotonic", side_effect=lambda: now[0]), \
+                        patch.object(client, "_rpc", side_effect=[
+                            {"task": working}, PeerCallError("peer answered HTTP 429", retry_after=12),
+                            PeerCallError("peer unreachable", retry_after=5), done,
+                        ]) as rpc:
+                    self.assertEqual(client.ask("q", "c", 0, skill), ("completed", "answer", None))
+                self.assertEqual(sleeps, [2, 12, 5] if skill == "ask" else [10, 12, 10])
+                self.assertEqual([c.args[0] for c in rpc.call_args_list], ["SendMessage", "GetTask", "GetTask", "GetTask"])
+                self.assertTrue(all(c.args[1] == {"id": "original"} for c in rpc.call_args_list[1:]))
+
+    def test_repeated_poll_failures_stop_at_the_deadline_and_cancel_the_original_task(self) -> None:
+        now, sleeps = [0.0], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        task = {"id": "original", "status": {"state": "TASK_STATE_WORKING"}}
+        client = self.client(deadline_seconds=5, sleep=sleep)
+        with patch("memtrace_services.a2a.client.time.monotonic", side_effect=lambda: now[0]), \
+                patch.object(client, "_rpc", side_effect=[
+                    {"task": task}, PeerCallError("peer answered HTTP 429", retry_after=60), task,
+                ]) as rpc:
+            self.assertEqual(client.ask("q", "c", 0), ("failed", None, "the peer did not answer in time"))
+        self.assertEqual(sleeps, [2, 3])
+        self.assertEqual(rpc.call_args.args, ("CancelTask", {"id": "original"}))
+
+    def test_submission_and_non_transient_poll_failures_are_not_replayed(self) -> None:
+        task = {"id": "original", "status": {"state": "TASK_STATE_WORKING"}}
+        for replies, methods in (([PeerCallError("peer unreachable", retry_after=5)], ["SendMessage"]),
+                                  ([{"task": task}, PeerCallError("peer answered HTTP 401")], ["SendMessage", "GetTask"])):
+            client = self.client(sleep=lambda s: None)
+            with patch.object(client, "_rpc", side_effect=replies) as rpc:
+                with self.assertRaises(PeerCallError):
+                    client.ask("q", "c", 0)
+            self.assertEqual([c.args[0] for c in rpc.call_args_list], methods)
 
 
 class SinglePermissionTests(TestCase):

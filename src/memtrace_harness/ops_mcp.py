@@ -586,6 +586,12 @@ def call_tool(ctx: OpsContext, name: str, arguments: dict[str, Any]) -> str:
     if spec is None or name not in ctx.tool_names():
         raise OpsError(f"unknown tool: {name}")
     if spec.tier == tool_registry.CHANGE:
+        # Bounded contact authorization covers only subsequent read-only questions, never
+        # issue reports, development, installations, or generic stored allowlists.
+        if name == "ask_peer":
+            from memtrace_harness.peer_tools import contact_authorized
+            if contact_authorized(ctx, arguments):
+                return run_confirmed_tool(ctx, name, arguments)
         return _request_tool_call(ctx, spec, arguments)
     return spec.handler(ctx, arguments)
 

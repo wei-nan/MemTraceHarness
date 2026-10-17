@@ -72,6 +72,7 @@ class OutboundPeer:
     token: str
     description: str = ""
     collaborate: bool = False  # this Harness may report issues to it (the other side must trust us that way)
+    display_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -156,12 +157,12 @@ class LiveConfig:
         self._at: float | None = None
         self._lock = threading.Lock()
 
-    def current(self) -> A2aConfig:
+    def current(self, *, force: bool = False) -> A2aConfig:
         if self._gateway is None:
             return self._base
         with self._lock:
             now = self._clock()
-            if self._at is None or now - self._at >= self._ttl:
+            if force or self._at is None or now - self._at >= self._ttl:
                 self._at = now
                 try:
                     links = self._gateway.links()
@@ -176,10 +177,13 @@ class LiveConfig:
                         outbound[item["name"]] = OutboundPeer(
                             name=item["name"], url=str(item["url"]).rstrip("/"), token=str(item["token"]),
                             collaborate=bool(item.get("collaborate")),
+                            display_name=str(item.get("display_name") or ""),
                         )
                     self._merged = replace(self._base, peers=peers, outbound=outbound)
                 except Exception:  # noqa: BLE001 — keep serving with what we had
                     logger.warning("could not read the Harness's peer links; using the last ones")
+                    if force:
+                        return replace(self._base, peers={}, outbound={})
             return self._merged
 
     @property
@@ -191,7 +195,7 @@ class LiveConfig:
         return self.current().outbound
 
     def authenticate(self, supplied: str) -> PeerEntry | None:
-        return self.current().authenticate(supplied)
+        return self.current(force=True).authenticate(supplied)
 
     def __getattr__(self, name: str):
         # Only reached for what is not defined above: the file's own, unchanging fields.

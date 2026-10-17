@@ -87,6 +87,20 @@ class AuthTests(A2aCase):
         self.assertEqual([self.rpc("ListTasks")[0] for _ in range(3)], [200, 200, 429])
         self.assertEqual(self.rpc("ListTasks", token=OTHER_TOKEN)[0], 200)  # another peer has its own budget
 
+    def test_task_polling_and_cancellation_have_separate_bounded_budgets(self) -> None:
+        self.cfg.peers["beri"] = PeerEntry("beri", hash_token(BERI_TOKEN), rate_per_min=2)
+        self.assertEqual([self.rpc("ListTasks")[0] for _ in range(3)], [200, 200, 429])
+        # Polling an accepted task still works after the request budget is exhausted.
+        for _ in range(15):
+            status, body = self.rpc("GetTask", {"id": "unknown"})
+            self.assertEqual((status, body["error"]["code"]), (200, -32001))
+        for _ in range(105):
+            self.assertTrue(self.limiter.allow("beri", 120, budget="task-status"))
+        self.assertEqual(self.rpc("GetTask", {"id": "unknown"})[0], 429)
+        # A saturated poller cannot prevent cancellation, nor remove the other peer's budget.
+        self.assertEqual(self.rpc("CancelTask", {"id": "unknown"})[0], 200)
+        self.assertEqual(self.rpc("GetTask", {"id": "unknown"}, token=OTHER_TOKEN)[0], 200)
+
     def test_a_bad_body_is_a_json_rpc_error_not_a_crash(self) -> None:
         request = urllib.request.Request(
             self.a2a_url + "/rpc", data=b"{not json",

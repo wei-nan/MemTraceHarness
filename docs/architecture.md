@@ -60,6 +60,22 @@ The older controller/snapshot descriptions below document the low-level loop and
 profiles. The operating contract's "One primary agent and single-use confirmation" section takes
 precedence for current service and CLI behavior.
 
+## Contact authorization
+
+`contacts.py` owns persistent Harness identity, discovery snapshots, directional contact proposals and
+approval/revocation state in the protected local link store. The existing private main API token identifies
+that Harness to the operator-managed `web/contacts.py` relay. The relay attests identities through its
+configured local API targets, distributes a public directory and reconciles request outcomes. Models only
+record proposals and inspect states; they neither receive credentials nor open network calls.
+
+Receiver approval in chat or the website activates a connection-specific token hash; its secret remains
+at the caller and becomes usable there only after approval is reconciled. New grants permit ongoing
+read-only questions; issue reports and fixes keep individual confirmations. `plan_runner.py` waits for
+contact approval and remote answers independently. A2A checks live receiving grants on each call, and
+fails closed when authority cannot be read. Revocation does not cancel already-running work. Legacy
+links remain for migration, while manual website pairing/invites are disabled. Public/cross-machine
+bootstrap is planned; the current contact relay requires the configured website service.
+
 ## Background memory switches
 
 The status page can pause automatic topic archiving, nightly audit, and per-message topic recall
