@@ -19,20 +19,21 @@ logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 100_000
 CARD_PATH = "/.well-known/agent-card.json"
 RPC_PATH = "/rpc"
+TASK_POLL_RATE_PER_MIN = 120  # two active questions polling every two seconds, with headroom
 
 
 class RateLimiter:
-    """At most `limit` calls per peer per rolling minute."""
+    """At most `limit` calls per peer and budget per rolling minute."""
 
     def __init__(self, clock=time.monotonic) -> None:
         self._clock = clock
         self._lock = threading.Lock()
-        self._calls: dict[str, deque[float]] = defaultdict(deque)
+        self._calls: dict[tuple[str, str], deque[float]] = defaultdict(deque)
 
-    def allow(self, peer: str, limit: int) -> bool:
+    def allow(self, peer: str, limit: int, *, budget: str = "requests") -> bool:
         now = self._clock()
         with self._lock:
-            calls = self._calls[peer]
+            calls = self._calls[peer, budget]
             while calls and now - calls[0] >= 60:
                 calls.popleft()
             if len(calls) >= limit:
@@ -70,6 +71,10 @@ class ProfileCache:
         text = self._current().get("name")
         return str(text) if text else None
 
+    def identity(self) -> str | None:
+        value = self._current().get("id")
+        return str(value) if value else None
+
 
 class _Handler(BaseHTTPRequestHandler):
     config: A2aConfig
@@ -96,7 +101,8 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.split("?")[0] == CARD_PATH:
             description = self.profile.description() if self.profile is not None else None
             name = self.profile.name() if self.profile is not None else None
-            self._send(200, agent_card(self.config, description, name), {"Cache-Control": "max-age=30"})
+            identity = self.profile.identity() if self.profile is not None else None
+            self._send(200, agent_card(self.config, description, name, identity), {"Cache-Control": "max-age=30"})
         else:
             self._send(404, {"error": "not found"})
 
@@ -114,17 +120,22 @@ class _Handler(BaseHTTPRequestHandler):
         if peer is None:
             self._send(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
             return
-        if not self.limiter.allow(peer.name, peer.rate_per_min):
+        try:
+            request = json.loads(body.decode("utf-8")) if body is not None else None
+        except (ValueError, RecursionError):
+            request = None
+        method = request.get("method") if isinstance(request, dict) else None
+        # Following an accepted task must not exhaust the budget for asking questions (or vice versa).
+        # Keep all queries bounded, including queries for unknown or another peer's task IDs.
+        budget = "task-status" if method == "GetTask" else "task-cancel" if method == "CancelTask" else "requests"
+        limit = max(peer.rate_per_min, TASK_POLL_RATE_PER_MIN) if budget == "task-status" else peer.rate_per_min
+        if not self.limiter.allow(peer.name, limit, budget=budget):
             self._send(429, {"error": "rate limit"}, {"Retry-After": "60"})
             return
         if (self.headers.get("A2A-Version") or "").strip() != PROTOCOL_VERSION:
             self._send(200, {"jsonrpc": "2.0", "id": None, "error": {
                 "code": VERSION_NOT_SUPPORTED, "message": f"only A2A-Version {PROTOCOL_VERSION} is supported"}})
             return
-        try:
-            request = json.loads(body.decode("utf-8")) if body is not None else None
-        except Exception:
-            request = None
         if body is None or request is None:
             code = PARSE_ERROR if body is not None else INVALID_REQUEST
             self._send(200, {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": "invalid request"}})

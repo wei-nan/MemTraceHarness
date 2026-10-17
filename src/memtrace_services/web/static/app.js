@@ -1,4 +1,4 @@
-var state = { data: null, query: "", prefDrafts: {}, sharedDrafts: {}, sourceDrafts: {}, sourceAccessDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview", invite: null };
+var state = { data: null, query: "", prefDrafts: {}, sharedDrafts: {}, sourceDrafts: {}, sourceAccessDrafts: {}, openDetails: {}, renderDeferred: false, project: null, tab: "overview" };
 var GLOBAL_TAB = "__global__";
 var PROJECT_TABS = [["overview", "總覽"], ["memory", "記憶"], ["schedules", "排程"], ["settings", "設定"]];
 
@@ -1072,62 +1072,73 @@ function trustSelect(cls, value, name) {
 function renderPeerName(project) {
   return fold("peer-name:" + project.name, "Harness 名稱", esc(project.peer_name || project.name),
     '<div class="hint">其他 Harness 用這個名字稱呼這個 Harness（連線、稽核標示都用它），和專案或資料夾的名稱無關。小寫英數字、- 或 _，最多 32 字。'
-    + "改名只改標示，已建立的連線不會斷；但改名後重新配對會多出一筆新連線，舊的要自己撤銷。</div>" +
+    + "改名只改標示；新聯絡以固定 ID 識別，已建立的授權不會因改名而改變。</div>" +
     '<div class="peer-name" data-project="' + esc(project.name) + '">' +
     '<input class="peer-name-text" size="24" maxlength="32" value="' + esc(project.peer_name || "") + '"> ' +
     '<button class="peer-name-save">儲存</button> <span class="peer-name-status rp-status"></span></div>');
 }
 
+function contactTime(value) {
+  if (!value) return "";
+  var date = new Date(value);
+  return isNaN(date.getTime()) ? value : date.toLocaleString("zh-TW", {hour12: false});
+}
+
 function renderPeerLinks(project) {
-  var links = project.peer_links || { endpoint: null, inbound: [], outbound: [] };
-  var others = state.data.projects.filter(function (p) { return p.name !== project.name; });
+  var links = project.peer_links || {};
+  var contacts = links.contacts || {incoming: [], outgoing: [], directory: []};
+  var incoming = contacts.incoming || [], outgoing = contacts.outgoing || [];
+  var legacyIn = (links.inbound || []).filter(function (r) { return !incoming.some(function (c) { return c.source_id === r.name && c.state === "approved"; }); });
+  var legacyOut = (links.outbound || []).filter(function (r) { return !outgoing.some(function (c) { return c.target_id === r.name && c.state === "approved"; }); });
+  var states = {pending: "等待同意", approved: "已授權", rejected: "已拒絕", revoked: "已撤銷", expired: "已過期"};
+  var contacted = {};
+  incoming.forEach(function (r) { contacted[r.source_id] = true; });
+  outgoing.forEach(function (r) { contacted[r.target_id] = true; });
+  legacyIn.concat(legacyOut).forEach(function (r) {
+    var matches = (contacts.directory || []).filter(function (p) { return p.id === r.name || p.name === r.name; });
+    contacted[matches.length === 1 ? matches[0].id : r.name] = true;
+  });
+  var active = incoming.filter(function (r) { return r.state === "approved"; }).length + legacyIn.length;
+  var reachable = outgoing.filter(function (r) { return r.state === "approved"; }).length + legacyOut.length;
+  var pending = incoming.filter(function (r) { return r.state === "pending"; }).length;
   var out = '<div class="peer-links" data-project="' + esc(project.name) + '">';
-  out += '<div class="hint">決定哪些 Harness 可以互相提問、或回報問題請對方處理。連線後立刻生效，不用改設定檔、不用重啟。'
-    + "這個頁面沒有登入，請只在本機使用。</div>";
-  out += '<div class="hint">本 Harness 的名稱：<b>' + esc(project.peer_name || project.name) + "</b></div>";
-  out += links.endpoint
-    ? '<div class="hint">本 Harness 的 A2A 位址：<code>' + esc(links.endpoint) + "</code></div>"
-    : '<div class="hint">A2A 服務還沒有回報位址：memtrace-a2a 沒有在跑，或工作區 .harness.env 沒有 HARNESS_PEER_API_TOKEN。連線要兩邊的 A2A 服務都在跑才做得成。</div>';
-
-  out += '<div class="hint"><b>可以來問我的 Harness</b></div>';
-  out += links.inbound.length ? links.inbound.map(function (l) {
-    return '<div class="pl-row">' + esc(l.name) + " " + trustSelect("pl-trust", l.trust, l.name) +
-      ' <button class="pl-revoke" data-name="' + esc(l.name) + '">撤銷</button></div>';
-  }).join("") : '<div class="hint">（沒有）</div>';
-
-  out += '<div class="hint"><b>我可以問的 Harness</b></div>';
-  out += links.outbound.length ? links.outbound.map(function (l) {
-    return '<div class="pl-row">' + esc(l.name) + ' <code>' + esc(l.url) + "</code> " +
-      '<label><input type="checkbox" class="pl-flag" data-name="' + esc(l.name) + '"' + (l.collaborate ? " checked" : "") +
-      "> 我的模型可以向它回報問題</label>" +
-      ' <button class="pl-remove" data-name="' + esc(l.name) + '">移除</button></div>';
-  }).join("") : '<div class="hint">（沒有）</div>';
-
-  out += '<div class="hint"><b>連到這個頁面上的另一個 Harness</b></div>';
-  if (others.length) {
-    out += '<div class="pl-row">我可以問 <select class="pl-target">' +
-      others.map(function (p) {
-        return '<option value="' + esc(p.name) + '">' + esc(p.peer_name || p.name) + "</option>";
-      }).join("") +
-      "</select> 對方給我的權限：" + trustSelect("pl-newtrust", "ask") +
-      ' <label><input type="checkbox" class="pl-both"> 反過來它也可以問我（只能提問）</label>' +
-      ' <button class="pl-pair">連線</button></div>';
-  } else {
-    out += '<div class="hint">（這個頁面上沒有其他 Harness。跨機器請用下面的邀請碼。）</div>';
+  out += '<div class="hint">聯絡過 ' + Object.keys(contacted).length + ' 個 Harness · 已授權來訪 ' + active + ' 個 · 我可聯絡 ' + reachable + ' 個 · 待審核 ' + pending + ' 個 · 歷史申請 ' + (incoming.length + outgoing.length) + ' 筆</div>';
+  out += '<div class="hint">名稱：<b>' + esc(project.peer_name || project.name) + '</b>　固定 ID：<code>' + esc(contacts.identity_id || "尚未就緒") + '</code></div>';
+  if (contacts.error) out += '<div class="error">' + esc(contacts.error) + '</div>';
+  if (links.endpoint) out += '<div class="hint">A2A 位址：<code>' + esc(links.endpoint) + '</code></div>';
+  out += '<div class="hint">同意後可持續唯讀提問；報修與實際修改仍分別確認。授權只涵蓋對方聯絡你，可隨時撤銷。本頁目前僅供本機使用。</div>';
+  function rows(items, direction) {
+    return items.map(function (r) {
+      var name = direction === "incoming" ? r.source_name : r.target_name;
+      var html = '<div class="pl-row"><b>' + esc(name) + '</b> · ' + esc(states[r.state] || r.state) + ' · ' + esc(r.trust === "collaborate" ? "提問與報修" : "唯讀提問");
+      html += ' <span class="hint">申請 ' + esc(contactTime(r.created_at)) + (r.approved_at ? ' · 授權 ' + esc(contactTime(r.approved_at)) : '') + (r.revoked_at ? ' · 撤銷 ' + esc(contactTime(r.revoked_at)) : '') + (r.last_contact_at ? ' · 最近聯絡 ' + esc(contactTime(r.last_contact_at)) : '') + '</span>';
+      if (direction === "incoming" && r.state === "pending") {
+        html += ' <button class="contact-decision" data-id="' + esc(r.request_id) + '" data-decision="approved" data-trust="ask">同意提問</button>';
+        html += ' <button class="contact-decision" data-id="' + esc(r.request_id) + '" data-decision="approved" data-trust="collaborate">同意提問與報修</button>';
+        html += ' <button class="contact-decision" data-id="' + esc(r.request_id) + '" data-decision="rejected">拒絕</button>';
+      } else if (direction === "incoming" && r.state === "approved") {
+        html += ' <button class="contact-decision" data-id="' + esc(r.request_id) + '" data-decision="revoked">撤銷授權</button>';
+      } else if (direction === "outgoing" && (r.state === "pending" || r.state === "approved")) {
+        html += ' <button class="contact-cancel" data-id="' + esc(r.request_id) + '">' + (r.state === "pending" ? "撤回申請" : "停止聯絡") + '</button>';
+      }
+      return html + '</div><div class="hint">聯絡原因（對方資料）：' + esc(r.reason || "") + '</div>';
+    }).join("") || '<div class="hint">（沒有）</div>';
   }
-
-  out += '<div class="hint"><b>跨機器：邀請碼</b>　在被問的那一邊產生，貼到發問的那一邊。邀請碼含一把密鑰，只顯示這一次。</div>';
-  out += '<div class="pl-row">讓名為 <input class="pl-input pl-invite-name" size="14" placeholder="對方的名稱"> 來問我：' +
-    trustSelect("pl-invite-trust", "ask") + ' <button class="pl-invite">產生邀請碼</button></div>';
-  if (state.invite && state.invite.project === project.name) {
-    out += '<div class="pl-row"><textarea class="pl-invite-text" rows="3" readonly>' + esc(state.invite.text) + "</textarea>" +
-      ' <button class="pl-invite-done">我已複製，清除</button></div>';
+  out += '<div class="hint"><b>對方聯絡我</b></div>' + rows(incoming, "incoming");
+  out += '<div class="hint"><b>我聯絡對方</b></div>' + rows(outgoing, "outgoing");
+  if (legacyIn.length || legacyOut.length) {
+    out += '<div class="hint"><b>既有連線</b> · 保留原權限；可撤銷後改用聯絡申請。</div>';
+    legacyIn.forEach(function (r) { out += '<div class="pl-row">' + esc(r.name) + ' → 我 <button class="pl-revoke" data-name="' + esc(r.name) + '">撤銷</button></div>'; });
+    legacyOut.forEach(function (r) { out += '<div class="pl-row">我 → ' + esc(r.display_name || r.name) + ' <button class="pl-remove" data-name="' + esc(r.name) + '">移除</button></div>'; });
   }
-  out += '<div class="pl-row">貼上別人給我的邀請碼：<textarea class="pl-input pl-accept-text" rows="2" placeholder="mtinv1:…"></textarea> ' +
-    '<button class="pl-accept">接受邀請</button></div>';
+  if ((contacts.directory || []).length) {
+    out += '<div class="hint"><b>提出聯絡申請</b> · 由對方使用者審核</div><div class="pl-row"><select class="contact-target">';
+    contacts.directory.forEach(function (p) { out += '<option value="' + esc(p.id) + '">' + esc(p.name) + '</option>'; });
+    out += '</select> <input class="pl-input contact-reason" maxlength="1000" placeholder="聯絡原因，請勿包含私人資料"> <button class="contact-request">申請聯絡</button></div>';
+  } else out += '<div class="hint">聯絡目錄尚未就緒，請確認網站與 A2A 服務已啟動。</div>';
   out += '<div class="pl-status rp-status"></div></div>';
-  return fold("peer-links:" + project.name, "Harness 連線",
-    "可問我 " + links.inbound.length + " · 我可問 " + links.outbound.length, out);
+  return fold("peer-links:" + project.name, "聯絡與授權",
+    "聯絡過 " + Object.keys(contacted).length + " 個 · 待審核 " + pending + " 個", out);
 }
 
 function peerLinkPost(box, url, body, okText) {
@@ -1177,7 +1188,6 @@ document.addEventListener("click", function (e) {
   if (!t.classList) return;
   var box = t.closest && t.closest(".peer-links");
   if (!box) return;
-  var project = box.getAttribute("data-project");
   if (t.classList.contains("pl-revoke")) {
     var who = t.getAttribute("data-name");
     if (confirm("撤銷後「" + who + "」就不能再來問這個 Harness（它手上的密鑰立刻失效）。確定嗎？"))
@@ -1186,29 +1196,14 @@ document.addEventListener("click", function (e) {
     var target = t.getAttribute("data-name");
     if (confirm("移除後這個 Harness 就不能再問「" + target + "」。對方那邊的授權不會跟著撤銷。確定嗎？"))
       peerLinkPost(box, "/api/peer-link-outbound-remove", { name: target }, "已移除");
-  } else if (t.classList.contains("pl-pair")) {
-    var row = t.closest(".pl-row");
-    var trust = row.querySelector(".pl-newtrust").value;
-    if (trust === "collaborate" && !confirm(COLLAB_WARNING)) return;
-    peerLinkPost(box, "/api/peer-pair", {
-      from: project, to: row.querySelector(".pl-target").value, trust: trust,
-      both: row.querySelector(".pl-both").checked, reverse_trust: "ask"
-    }, "已連線");
-  } else if (t.classList.contains("pl-invite")) {
-    var inviteRow = t.closest(".pl-row");
-    var trustValue = inviteRow.querySelector(".pl-invite-trust").value;
-    if (trustValue === "collaborate" && !confirm(COLLAB_WARNING)) return;
-    peerLinkPost(box, "/api/peer-invite", {
-      name: inviteRow.querySelector(".pl-invite-name").value, trust: trustValue
-    }, "邀請碼已產生，請複製後貼到對方的頁面").then(function (res) {
-      if (res.ok) { state.invite = { project: project, text: res.body.invite }; render(); }
-    });
-  } else if (t.classList.contains("pl-invite-done")) {
-    state.invite = null;
-    render();
-  } else if (t.classList.contains("pl-accept")) {
-    var text = box.querySelector(".pl-accept-text").value;
-    peerLinkPost(box, "/api/peer-accept", { invite: text }, "已接受，現在可以問對方了");
+  } else if (t.classList.contains("contact-request")) {
+    peerLinkPost(box, "/api/contact-request", {peer: box.querySelector(".contact-target").value,
+      reason: box.querySelector(".contact-reason").value}, "已提出，等待對方使用者同意");
+  } else if (t.classList.contains("contact-decision")) {
+    peerLinkPost(box, "/api/contact-resolve", {request_id: t.getAttribute("data-id"),
+      decision: t.getAttribute("data-decision"), trust: t.getAttribute("data-trust") || "ask"}, "已更新授權");
+  } else if (t.classList.contains("contact-cancel")) {
+    peerLinkPost(box, "/api/contact-cancel", {request_id: t.getAttribute("data-id")}, "已停止聯絡");
   }
 });
 
@@ -1218,7 +1213,7 @@ function renderPeerDescription(project) {
   return fold("peer-desc:" + project.name, "給其他 Harness 的自我介紹",
     project.peer_description ? "已填 " + project.peer_description.length + " 字" : "未填寫",
     '<div class="hint">其他 Harness 的 list_peers 和這個 Harness 的 Agent Card 會顯示這段話，它們的模型靠它判斷什麼時候該找你。'
-    + '寫：這是什麼、什麼情況該找它、要附哪些資訊。會被所有已配對的 Harness 看到，不要放金鑰、路徑或私人資料。最多 600 字。</div>' + off +
+    + '寫：這是什麼、什麼情況該找它、要附哪些資訊。會出現在聯絡目錄及對外的 Agent Card，不要放金鑰、路徑或私人資料。最多 600 字。</div>' + off +
     '<div class="peer-desc" data-project="' + esc(project.name) + '">' +
     '<textarea class="peer-desc-text" rows="5" maxlength="600" placeholder="例如：Harness 平台本身。平台的錯誤、卡住的任務、行為不對，請用 report_issue 附上錯誤文字、任務編號與你已排除的原因。">'
     + esc(project.peer_description || "") + "</textarea>" +

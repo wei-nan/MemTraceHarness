@@ -24,6 +24,10 @@ STATE_NAMES |= {"TASK_STATE_INPUT_REQUIRED": "input_required", "TASK_STATE_AUTH_
 class PeerCallError(RuntimeError):
     """The peer could not be asked; the text is safe to show the operator."""
 
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):  # noqa: ANN002, ANN003
@@ -56,9 +60,18 @@ class PeerClient:
             with _OPENER.open(request, timeout=self.timeout) as resp:
                 return resp.read(MAX_RESPONSE_BYTES + 1)[:MAX_RESPONSE_BYTES]
         except urllib.error.HTTPError as exc:
-            raise PeerCallError(f"peer answered HTTP {exc.code}") from None
+            retry_after = None
+            if exc.code == 429:
+                try:
+                    retry_after = max(1.0, min(60.0, float((exc.headers or {}).get("Retry-After", "60"))))
+                except (TypeError, ValueError):
+                    retry_after = 60.0
+            elif exc.code in (502, 503, 504):
+                retry_after = 5.0
+            exc.close()
+            raise PeerCallError(f"peer answered HTTP {exc.code}", retry_after=retry_after) from None
         except (urllib.error.URLError, TimeoutError, OSError):
-            raise PeerCallError("peer unreachable") from None
+            raise PeerCallError("peer unreachable", retry_after=5.0) from None
 
     def card_description(self) -> str | None:
         """What the peer says about itself in its (public) Agent Card, or None when it cannot be read. Single line, capped."""
@@ -126,18 +139,29 @@ class PeerClient:
         task = self._rpc("SendMessage", {"message": message, "configuration": {"returnImmediately": True}}).get("task")
         if not isinstance(task, dict):
             raise PeerCallError("peer did not return a task")
-        started = time.monotonic()
+        expires = time.monotonic() + deadline
+        delay = poll
         while self._state(task) not in TERMINAL:
             if self._state(task) == "auth_required" or (self._state(task) == "input_required" and not collaborate):
                 return "failed", None, "the peer wants more input, which this Harness does not give"
-            if time.monotonic() - started > deadline:
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
                 try:
                     self._rpc("CancelTask", {"id": task.get("id")})
                 except PeerCallError:
                     pass
                 return "failed", None, "the peer did not answer in time"
-            self._sleep(poll)
-            task = self._rpc("GetTask", {"id": task.get("id")})
+            self._sleep(min(delay, remaining))
+            if time.monotonic() >= expires:
+                continue
+            try:
+                task = self._rpc("GetTask", {"id": task.get("id")})
+                delay = poll
+            except PeerCallError as exc:
+                if exc.retry_after is None:
+                    raise
+                # Only repeat a read of the known task. Replaying SendMessage could start duplicate work.
+                delay = max(poll, exc.retry_after)
         return self._outcome(task)
 
     @staticmethod

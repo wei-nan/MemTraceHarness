@@ -327,6 +327,14 @@ class _Handler(BaseHTTPRequestHandler):
                 from memtrace_harness.peer_links import PeerLinks, links_path
 
                 self._send(200, PeerLinks(links_path(self.api.config)).public_view())
+            elif path in ("/v1/contacts", "/v1/contacts/relay"):
+                from memtrace_harness.contacts import ContactBook
+                from memtrace_harness.peer_links import links_path, harness_name
+
+                book = ContactBook(links_path(self.api.config))
+                view = book.relay_view() if path.endswith("/relay") else book.view()
+                self._send(200, {**view, "name": harness_name(self.api.config, self.api.scope),
+                                 "description": self.api.config.peer_description_now()})
             elif path == "/v1/peer/links":
                 from memtrace_harness.peer_links import PeerLinks, links_path
 
@@ -335,6 +343,7 @@ class _Handler(BaseHTTPRequestHandler):
                 from memtrace_harness.peer_links import harness_name
 
                 self._send(200, {
+                    "id": self.api.contact_identity,
                     "name": harness_name(self.api.config, self.api.scope),
                     "description": self.api.config.peer_description_now(),
                 })
@@ -494,6 +503,9 @@ class _Handler(BaseHTTPRequestHandler):
                 peer=peer, context_id=str(body.get("context_id") or "")[:200] or f"ctx_{os.urandom(6).hex()}",
                 text=text, skill=str(body.get("skill") or "ask"), hops=hops,
             )
+            from memtrace_harness.contacts import ContactBook
+            from memtrace_harness.peer_links import links_path
+            ContactBook(links_path(self.api.config)).touch("incoming", peer)
             self._send(202, {"request": created})
         elif len(parts) == 6 and parts[5] == "cancel":
             found = peers.cancel(peer, parts[4])
@@ -557,7 +569,17 @@ class _Handler(BaseHTTPRequestHandler):
                 self.api.bus.publish()
                 self._send(200, {"ok": True, "path": str(dest)})
                 return
+            elif setting.startswith("contact-"):
+                from memtrace_harness.contacts import contact_action
+
+                result = contact_action(config, self.api.scope, self.api.service, setting.removeprefix("contact-"), body)
+                self.api.bus.publish()
+                self._send(200, {"ok": True, **result})
+                return
             elif setting.startswith("peer-link-"):
+                if setting in ("peer-link-inbound-create", "peer-link-outbound-set"):
+                    self._send(410, {"error": "請改用聯絡申請，等待對方使用者同意。"})
+                    return
                 result = admin.peer_link_action(config, setting[len("peer-link-"):], body)
                 self.api.bus.publish()
                 self._send(200, {"ok": True, **result})
@@ -734,6 +756,10 @@ class HarnessApi:
         self.scope = scope
         self.token = config.api_token
         self.peer_token = config.peer_api_token
+        from memtrace_harness.contacts import ContactBook
+        from memtrace_harness.peer_links import links_path
+
+        self.contact_identity = ContactBook(links_path(config)).initialize()
         self.bus = bus or ChangeBus()
         self.started_at = started_at or datetime.now(timezone.utc).isoformat()
         self.worker = MessageWorker(service, self.bus)

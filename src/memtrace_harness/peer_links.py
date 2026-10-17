@@ -186,7 +186,7 @@ class PeerLinks:
                 for n, v in sorted(data["inbound"].items())
             ],
             "outbound": [
-                {"name": n, "url": v.get("url"), "collaborate": bool(v.get("collaborate")), "created_at": v.get("created_at")}
+                {"name": n, "display_name": v.get("display_name", n), "url": v.get("url"), "collaborate": bool(v.get("collaborate")), "created_at": v.get("created_at")}
                 for n, v in sorted(data["outbound"].items())
             ],
         }
@@ -200,7 +200,7 @@ class PeerLinks:
                 for n, v in sorted(data["inbound"].items())
             ],
             "outbound": [
-                {"name": n, "url": v.get("url", ""), "token": v.get("token", ""), "collaborate": bool(v.get("collaborate"))}
+                {"name": n, "display_name": v.get("display_name", n), "url": v.get("url", ""), "token": v.get("token", ""), "collaborate": bool(v.get("collaborate"))}
                 for n, v in sorted(data["outbound"].items())
             ],
         }

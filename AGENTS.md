@@ -61,6 +61,10 @@ Hard project boundaries:
   capability, tool, or scope gaps directly in its own workspace and must ask its own operator via
   single-use confirmation cards (`propose_scope_change`, `request_install`), never asking another
   Harness over A2A or through a coordinator to proxy or grant tool permissions.
+- Operator-approved contact grants (2026-10-16) are a bounded exception for ongoing read-only
+  `ask_peer` questions. Requests are relayed only among operator-configured Harness APIs and require
+  the receiving operator's approval. Reports, fixes and all other actions keep their own taps.
+  Public/cross-machine bootstrap remains planned; see "Contact requests and authorization" in the contract.
 - A task is reported done only when the Controller's goal check answers every success criterion it
   wrote for the user's whole request (`goal_plan.py`); never mark it `succeeded` on the strength of
   one phase.

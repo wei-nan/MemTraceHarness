@@ -34,7 +34,7 @@ NOTE_CHARS = 200
 
 def allowed_step_tool(name: str) -> str | None:
     """Why a tool cannot be a plan step, or None."""
-    if name in {"run_job", "develop", "request_install", "propose_scope_change"}:
+    if name in {"run_job", "develop", "request_install", "propose_scope_change", "request_contact"}:
         return None
     spec = tool_registry.get(name)
     if spec is None:
@@ -254,6 +254,27 @@ class PlanRunner:
             if spec is None:
                 self._fail(step, f"工具 {step['tool']} 已不存在")
                 return
+            from memtrace_harness.ops_mcp import ops_context_for_scope
+            from memtrace_harness.peer_tools import contact_authorized, _contact_book
+            ctx = ops_context_for_scope(scope, self.store)
+            if spec.name == "request_contact" or (spec.name == "ask_peer" and contact_authorized(ctx, step["args"])):
+                try:
+                    if spec.name == "request_contact":
+                        from memtrace_harness.peer_links import harness_name
+                        row = _contact_book(ctx).request(str(step["args"].get("peer") or ""),
+                            str(step["args"].get("reason") or ""), harness_name(self.service.config, scope))
+                        pending_id = "contact:" + row["request_id"]
+                    else:
+                        from memtrace_harness.peer import queue_outbound
+                        args = spec.validate(ctx, step["args"])
+                        pending_id = "peer:" + queue_outbound(self.store, scope.name, args["peer"], args["question"])
+                except (ValueError, tool_registry.OpsError) as exc:
+                    self._fail(step, str(exc))
+                    return
+                self.store.transition_plan_step(plan["plan_id"], step["idx"], (plans.PENDING,), plans.AWAITING,
+                    request_id=pending_id, attempts=step["attempts"] + 1, started_at=now.isoformat(),
+                    note="等待聯絡授權。" if spec.name == "request_contact" else "已送出，等待對方完成。")
+                return
             if spec.tier == tool_registry.READ:
                 self._start_read(plan, step, scope, spec)
                 return
@@ -371,6 +392,18 @@ class PlanRunner:
 
     # ---- results
     def _poll_request(self, plan: dict, step: dict) -> None:
+        if (step["request_id"] or "").startswith("contact:"):
+            from memtrace_harness.contacts import ContactBook
+            from memtrace_harness.peer_links import links_path
+            rows = ContactBook(links_path(self.service.config)).view()["outgoing"]
+            row = next((r for r in rows if r["request_id"] == step["request_id"][8:]), None)
+            if row and row["state"] == "pending":
+                return
+            if row and row["state"] == "approved":
+                self._after_result(plan, step, "對方使用者已同意聯絡，可持續唯讀提問。")
+            else:
+                self._fail(step, "未取得聯絡授權：" + ((row or {}).get("state") or "unknown"))
+            return
         if (step["request_id"] or "").startswith("peer:"):
             peer = self.store.get_peer_outbound(step["request_id"][5:])
             if peer and peer["state"] in {"queued", "sent", "working", "submitted", "input_required"}:

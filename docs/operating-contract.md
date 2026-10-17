@@ -45,7 +45,8 @@ and every older standing-permission or plan-wide-approval rule below.
   not remotely revoked by cancelling the local plan. Ordinary tool/operation plan failures
   retain the existing retry/skip/cancel behavior.
 - Read-only exploration needs no tap. Every action that requires confirmation uses a fresh
-  request and tap. Neither an old allowed.json entry nor a persisted approve_all field grants
+  request and tap, with the explicit ongoing-read-only-contact exception documented below.
+  Neither an old allowed.json entry nor a persisted approve_all field grants
   permission. Legacy permanent-approval and plan-wide-approval callbacks are refused at runtime.
   A declared publish_job also queues a single-use confirmation rather than publishing automatically.
   Double taps cannot execute twice; an expired request or a job whose command changed cannot run.
@@ -254,6 +255,40 @@ Claude Code cannot list its models, so the status page's Claude menu may ask Ant
 - No key, or a failed call, falls back to the built-in list plus models added by hand
   (`.harness/extra_models.json`); nothing else depends on it.
 
+## Contact requests and authorization (operator decision, 2026-10-16)
+
+**ENFORCED** (`contacts.py`, `web/contacts.py`, API/tools/service/website wiring,
+`tests/test_contacts.py`): replaces manual pairing and invitation-code creation in the website.
+
+- Each Harness keeps a persistent random ID independently of its editable name. Its existing main API
+  token remains its private management credential, never a peer credential. Duplicate names require an
+  explicit ID; a copied duplicate ID is refused by the relay. Renaming keeps new contact grants intact.
+- The website service publishes a directory of the operator-configured, reachable Harnesses and relays
+  durable contact requests through their authenticated local APIs. It attests each source ID and name
+  from that source API; a model cannot submit an arbitrary destination URL or impersonate another source.
+  This requires the website service to run. **PLANNED:** public discovery and cross-machine bootstrap;
+  no anonymous/public contact or approval endpoint is provided by this implementation.
+- `list_harnesses` reads the directory and request states. `request_contact` records a proposal without
+  granting access. The receiver's operator approves/rejects it in a chat confirmation card or on the
+  website. Requests expire after 24 hours; repeated delivery is idempotent. Cancellation/rejection/expiry
+  cannot be revived by a late approval/result. Access is directional; approval never grants reverse access.
+- Approval creates a connection-specific credential automatically. Its secret remains at the caller;
+  only its hash passes through the relay and is kept by the receiver. Website responses and model tools
+  contain no credential or hash. The website lists pending, approved, rejected, revoked and expired
+  requests, counts, grant scope, dates and last contact, plus legacy links for migration.
+- **Bounded exception to per-call confirmation:** a newly approved contact explicitly permits ongoing
+  read-only `ask_peer` questions. Runtime checks that exact active contact grant at dispatch; no generic
+  allowlist becomes effective. Legacy links retain their per-question taps. `report_issue`, `peer_fix`,
+  development, installations and all other confirmation-requiring operations still need their own taps.
+  A plan waits for actual contact approval and, separately, for the actual answer to a subsequent question.
+- Receiver-side revocation blocks new authenticated A2A calls immediately, including with a warm service
+  cache. An unavailable authorization API fails authentication closed. The relay updates caller state
+  when reachable (normally on its next two-second pass); source-side withdrawal also propagates through
+  this relay. Already-running work is not remotely cancelled; ordinary task cancellation is separate.
+- Existing links are preserved without upgrading them to continuous-question permission. Old website
+  pairing/invite routes and main-API link creation routes return HTTP 410; credential rotation and
+  outbound replacement use a fresh contact request. Low-level legacy storage helpers remain for migration.
+
 ## Questions from another Harness (operator decision, 2026-10-14)
 
 Another Harness may ask this one a read-only question over A2A (`memtrace_services/a2a`, `peer.py`; design in
@@ -270,7 +305,10 @@ Another Harness may ask this one a read-only question over A2A (`memtrace_servic
   is strictly restricted to read-only inquiries (`ask_peer`) and platform issue reports (`report_issue`).
 - Limits: a request that has passed through 2 Harnesses is rejected (`hops`, cooperative); a global cap of
   `HARNESS_PEER_MAX_CONCURRENT` (default 2) unfinished requests, then `rejected: busy`; per-peer rate and
-  concurrency limits in `a2a.toml`.
+  concurrency limits in `a2a.toml`. A2A `GetTask` polling uses a separate budget of at least 120 calls/minute;
+  `CancelTask` has its own `rate_per_min` budget, so polling cannot prevent cancellation or exhaust the
+  question budget. The caller retries temporary polling failures within the original task deadline,
+  following the known task ID without replaying `SendMessage`.
 - A request is visible only to the peer that made it; another peer's id and a missing id are indistinguishable.
   A peer sees only the answer and fixed reason phrases. Requests are kept in the trace store (`peer_requests`).
 - Asking a peer (`ask_peer`) is a `change`-tier tool: it needs the operator's tap, or a standing "always allow"
@@ -283,13 +321,10 @@ Another Harness may ask this one a read-only question over A2A (`memtrace_servic
   and the tap starts an ordinary governed task. Code changes still go only through the Agent Loop, the peer's Task ends
   with that task, a declined or lapsed card ends it `REJECTED`, and the peer sees only fixed phrases until it
   completes.
-- **A Harness has its own name on the peer network** (`HARNESS_PEER_NAME`, default the project's name lowercased; ENFORCED, `tests/test_peer_pairing.py`): links, the Agent Card and audit labels use it, never the folder's or project's name; a rename changes only the label (access rests on the token), and two Harnesses with one name cannot be paired.
-- **Links are kept by the Harness and changed on the status page** (`peer_links.py`, `web/pairing.py`;
-  ENFORCED, `tests/test_peer_pairing.py`): `.harness/peer_links.json`, mode 0600, holds only the SHA-256 of an inbound token
-  (shown once, when the link is made) and the token of an outbound link; the main-token view and the page's data carry no
-  secret. A revocation takes effect at the A2A service's next read (≤ 10 s) without a restart. A pairing is both halves
-  or neither; the token goes between Harnesses through the page's process and never to the browser (an invite string is the one
-  deliberate exception, shown once). The generic admin routes cannot make a link. The status page has no login.
+- **A Harness has its own name on the peer network** (`HARNESS_PEER_NAME`, default the project's name lowercased; ENFORCED, `tests/test_peer_pairing.py`): links, the Agent Card and audit labels use it, never the folder's or project's name; a rename changes only the label. New contacts use fixed IDs and support duplicate names through explicit IDs; legacy links retain name keys.
+- **Legacy links** remain in `.harness/peer_links.json`, mode 0600. New contact grants use the same
+  protected store with persistent identity and request history; the contact-authorization section above
+  supersedes the former manual pairing and invite-code workflow. No token or hash reaches website views.
 - **POLICY_ONLY:** under Codex the CLI's read-only sandbox, not this code, decides what else the model could read;
   see "Honest limits" in `a2a-peers.md`.
 

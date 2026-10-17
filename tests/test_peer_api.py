@@ -26,6 +26,11 @@ def reply(text: str, code: int = 0) -> ProcessResult:
 
 class PeerApiCase(ApiTestCase):
     def setUp(self) -> None:
+        # Authentication-only tests can still submit a valid question. Never let a missing
+        # test-specific patch launch an installed model CLI or spend the operator's quota.
+        model = patch("memtrace_harness.peer.CliProcessRunner.run", return_value=reply("stubbed peer answer"))
+        model.start()
+        self.addCleanup(model.stop)
         ctx = workspace({
             "HARNESS_API_TOKEN": TOKEN, "HARNESS_PEER_API_TOKEN": PEER_TOKEN,
             "HARNESS_CHAT_PROVIDER": "claude", "HARNESS_CHAT_MODEL": "haiku",
@@ -43,7 +48,12 @@ class PeerApiCase(ApiTestCase):
         self.server = self.api.start()
         self.addCleanup(self.api.stop)
         self.addCleanup(self.server.server_close)
+        self.addCleanup(self._join_peer_threads)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def _join_peer_threads(self) -> None:
+        for thread in list(self.api.peers._threads.values()):
+            thread.join(6)
 
     def ask(self, text="今天進度？", peer="beri", **extra):
         return self._raw("POST", "/v1/peer/requests", {"peer": peer, "text": text, **extra}, token=PEER_TOKEN)

@@ -143,9 +143,14 @@ def _peer_name(config: HarnessConfig, scope: ProjectScope) -> str:
 
 
 def _peer_links_view(config: HarnessConfig) -> dict:
+    from memtrace_harness.contacts import ContactBook
     from memtrace_harness.peer_links import PeerLinks, links_path
 
-    return PeerLinks(links_path(config)).public_view()
+    try:
+        contacts = ContactBook(links_path(config)).view()
+    except (ValueError, OSError):
+        contacts = {"directory": [], "incoming": [], "outgoing": [], "error": "聯絡設定無法讀取，已停止授權操作"}
+    return {**PeerLinks(links_path(config)).public_view(), "contacts": contacts}
 
 
 def collect_status_data(config: HarnessConfig, scope: ProjectScope, started_at: str | None = None) -> dict:

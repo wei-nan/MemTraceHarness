@@ -373,7 +373,7 @@ def queue_outbound(
 
 def outbound_message(row: dict) -> str:
     """What the operator (and the chat transcript) sees when a peer answers or fails."""
-    peer = row["peer"]
+    peer = row.get("display_name") or row["peer"]
     if row["state"] == "completed":
         text, _ = strip_markers(row.get("result_text") or "")
         if len(text) > OUTBOUND_CLIP_CHARS:
@@ -442,6 +442,12 @@ class PeerOutbound:
         row = self.store.get_peer_outbound(request_id)
         if row is None:
             return
+        from memtrace_harness.contacts import ContactBook
+        from memtrace_harness.peer_links import FILE_NAME
+        book = ContactBook(self.store.db_path.parent / FILE_NAME)
+        book.touch("outgoing", row["peer"])
+        labels = {p["id"]: p["name"] for p in book.view()["directory"]}
+        row["display_name"] = labels.get(row["peer"], row["peer"])
         try:
             self._deliver(row["project"], outbound_message(row))
         except Exception:
