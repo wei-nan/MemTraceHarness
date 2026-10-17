@@ -68,5 +68,72 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(plans.verdict([{"status": plans.DONE}, {"status": plans.FAILED}]), "未達成")
 
 
+class ActionMatchingTests(unittest.TestCase):
+    def test_skip_matching(self) -> None:
+        for phrase in [
+            "skip that step and continue",
+            "skip this step and continue",
+            "skip step and continue",
+            "skip and continue",
+            "skip that step",
+            "skip this step",
+            "skip step",
+            "skip",
+            "continue",
+            "略過這一步繼續",
+            "略過那一步繼續",
+            "略過該步驟繼續",
+            "略過此步驟繼續",
+            "略過這一步",
+            "略過並繼續",
+            "略過繼續",
+            "略過",
+            "跳過這一步繼續",
+            "跳過並繼續",
+            "跳過",
+            "繼續",
+            "我已經手動裝好了，略過這一步繼續",
+            "I manually installed it, skip that step and continue",
+        ]:
+            self.assertEqual(plans.match_plan_action(phrase), "plan_skip", msg=phrase)
+
+    def test_retry_matching(self) -> None:
+        for phrase in [
+            "retry that step",
+            "retry this step",
+            "retry step",
+            "retry",
+            "重試這一步",
+            "重試該步驟",
+            "重試",
+        ]:
+            self.assertEqual(plans.match_plan_action(phrase), "plan_retry", msg=phrase)
+
+    def test_cancel_matching(self) -> None:
+        for phrase in [
+            "cancel plan",
+            "cancel the plan",
+            "取消計畫",
+            "取消計劃",
+        ]:
+            self.assertEqual(plans.match_plan_action(phrase), "plan_cancel", msg=phrase)
+
+    def test_negation_and_unrelated_ignored(self) -> None:
+        for phrase in [
+            "不要略過這一步",
+            "別跳過",
+            "don't skip that step",
+            "do not skip",
+            "cannot continue",
+            "無法繼續",
+            "你好",
+            "這一步為什麼會失敗？",
+            "what does winget mean?",
+            "",
+        ]:
+            self.assertIsNone(plans.match_plan_action(phrase), msg=phrase)
+
+
 if __name__ == "__main__":
     unittest.main()
+

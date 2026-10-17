@@ -151,3 +151,57 @@ def render_final(plan: dict, steps: list[dict]) -> str:
         evidence = (step.get("note") or "").strip().replace("\n", " ")
         lines.append(f"{_ICON.get(step['status'], '⬜')} {number}. {step['title']}" + (f" — {evidence[:160]}" if evidence else ""))
     return "\n".join(lines)
+
+
+_SKIP_REGEX = re.compile(
+    r"(?:skip\s+(?:that|this|the)?\s*step(?:\s+and\s+continue)?|"
+    r"skip\s+and\s+continue|"
+    r"\bskip\s+step\b|"
+    r"\bskip\b|"
+    r"(?:略過|跳過)(?:這一步|那一步|該步驟|此步驟|步驟)?(?:[並與及]?繼續)?|"
+    r"(?:略過|跳過)|"
+    r"^(?:請|麻煩)?(?:繼續|continue)[!！。.]*$|"
+    r"(?:繼續執行|continue\s+plan)"
+    r")",
+    re.IGNORECASE,
+)
+
+_RETRY_REGEX = re.compile(
+    r"(?:retry\s+(?:that|this|the)?\s*step|"
+    r"\bretry\s+step\b|"
+    r"\bretry\b|"
+    r"重試(?:這一步|那一步|該步驟|此步驟|步驟)?|"
+    r"重試"
+    r")",
+    re.IGNORECASE,
+)
+
+_CANCEL_REGEX = re.compile(
+    r"(?:cancel\s+(?:the\s+)?plan|"
+    r"取消計[畫劃]"
+    r")",
+    re.IGNORECASE,
+)
+
+_NEGATION_REGEX = re.compile(
+    r"(?:不要|別|勿|不能|不可|無法|don't|do not|never|cannot|can't|couldn't|could not)\s*"
+    r"(?:略過|跳過|skip|重試|retry|取消|cancel|繼續|continue)",
+    re.IGNORECASE,
+)
+
+
+def match_plan_action(text: str) -> str | None:
+    """Detect whether a natural-language message expresses plan_skip, plan_retry, or plan_cancel."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    if _NEGATION_REGEX.search(cleaned):
+        return None
+    if _SKIP_REGEX.search(cleaned):
+        return "plan_skip"
+    if _RETRY_REGEX.search(cleaned):
+        return "plan_retry"
+    if _CANCEL_REGEX.search(cleaned):
+        return "plan_cancel"
+    return None
+
