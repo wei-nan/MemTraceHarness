@@ -605,6 +605,7 @@ class TraceStore:
             ("peer_requests", "fix_job_id", "TEXT"),
             ("peer_outbound", "skill", "TEXT NOT NULL DEFAULT 'ask'"),
             ("peer_directory", "collaborate", "INTEGER NOT NULL DEFAULT 0"),
+            ("plans", "criteria_json", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             if existing and column not in existing:
@@ -1069,7 +1070,8 @@ class TraceStore:
                     message_sent INTEGER NOT NULL DEFAULT 0,
                     rendered_hash TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    criteria_json TEXT NOT NULL DEFAULT '[]'
                 );
                 CREATE TABLE IF NOT EXISTS plan_steps (
                     plan_id TEXT NOT NULL,
@@ -3762,7 +3764,7 @@ class TraceStore:
 
     # ---- multi-step plans (plans.py / plan_runner.py)
     _PLAN_COLUMNS = (
-        "plan_id, project, goal, status, approve_all, audience, message_ref, message_sent, rendered_hash, created_at, updated_at"
+        "plan_id, project, goal, status, approve_all, audience, message_ref, message_sent, rendered_hash, created_at, updated_at, criteria_json"
     )
     _STEP_COLUMNS = (
         "plan_id, idx, title, tool, args_json, expect_json, status, request_id, attempts, result_text, note, "
@@ -3772,9 +3774,10 @@ class TraceStore:
     @staticmethod
     def _plan_dict(row: tuple) -> dict:
         keys = ("plan_id", "project", "goal", "status", "approve_all", "audience", "message_ref", "message_sent",
-                "rendered_hash", "created_at", "updated_at")
+                "rendered_hash", "created_at", "updated_at", "criteria_json")
         out = dict(zip(keys, row))
         out["approve_all"], out["message_sent"] = bool(out["approve_all"]), bool(out["message_sent"])
+        out["criteria"] = json.loads(out.get("criteria_json") or "[]")
         return out
 
     @staticmethod
@@ -3785,7 +3788,10 @@ class TraceStore:
         out["args"], out["expect"] = json.loads(out["args"]), json.loads(out["expect"])
         return out
 
-    def create_plan(self, *, plan_id: str, project: str, goal: str, steps: list[dict], audience: str | None) -> bool:
+    def create_plan(
+        self, *, plan_id: str, project: str, goal: str, steps: list[dict], audience: str | None,
+        criteria: list[str] | None = None,
+    ) -> bool:
         """False when the project already has a plan that is not finished (one at a time)."""
         now = utc_now_iso()
         with self._connection() as conn:
@@ -3794,9 +3800,9 @@ class TraceStore:
             ).fetchone():
                 return False
             conn.execute(
-                "INSERT INTO plans (plan_id, project, goal, status, audience, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'running', ?, ?, ?)",
-                (plan_id, project, goal, audience, now, now),
+                "INSERT INTO plans (plan_id, project, goal, status, audience, created_at, updated_at, criteria_json) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+                (plan_id, project, goal, audience, now, now, json.dumps(criteria or [], ensure_ascii=False)),
             )
             for index, step in enumerate(steps, 1):
                 conn.execute(
@@ -3837,7 +3843,7 @@ class TraceStore:
         return [self._step_dict(r) for r in rows]
 
     def update_plan(self, plan_id: str, **fields: object) -> None:
-        allowed = {"status", "approve_all", "message_ref", "message_sent", "rendered_hash", "audience"}
+        allowed = {"status", "approve_all", "message_ref", "message_sent", "rendered_hash", "audience", "criteria_json"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"cannot update plan fields {sorted(bad)}")
@@ -3847,6 +3853,32 @@ class TraceStore:
                 f"UPDATE plans SET {assignments} WHERE plan_id = ?",
                 (*[int(v) if isinstance(v, bool) else v for v in fields.values()], utc_now_iso(), plan_id),
             )
+
+    def update_plan_step(self, plan_id: str, idx: int, **fields: object) -> bool:
+        """Update any fields on a plan step."""
+        allowed = {"title", "tool", "args_json", "expect_json", "status", "request_id", "attempts", "result_text", "note", "started_at", "finished_at"}
+        bad = set(fields) - allowed
+        if bad:
+            raise ValueError(f"cannot update plan step fields {sorted(bad)}")
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        with self._connection() as conn:
+            return conn.execute(
+                f"UPDATE plan_steps SET {assignments} WHERE plan_id = ? AND idx = ?",
+                (*fields.values(), plan_id, idx),
+            ).rowcount > 0
+
+    def replace_plan_steps(self, plan_id: str, steps: list[dict], from_idx: int = 1) -> None:
+        """Replace steps from `from_idx` onwards with the new steps."""
+        with self._connection() as conn:
+            conn.execute("DELETE FROM plan_steps WHERE plan_id = ? AND idx >= ?", (plan_id, from_idx))
+            for offset, step in enumerate(steps):
+                idx = from_idx + offset
+                conn.execute(
+                    "INSERT INTO plan_steps (plan_id, idx, title, tool, args_json, expect_json, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                    (plan_id, idx, step["title"], step["tool"],
+                     json.dumps(step["args"], ensure_ascii=False), json.dumps(step["expect"], ensure_ascii=False)),
+                )
 
     def transition_plan_step(self, plan_id: str, idx: int, from_statuses: tuple[str, ...], to_status: str, **fields: object) -> bool:
         """Compare-and-set a step's status (so two ticks cannot start the same step), setting any other columns."""
