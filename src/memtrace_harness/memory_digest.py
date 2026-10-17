@@ -49,6 +49,7 @@ DIGEST_HOUR = 2
 # model call.
 AUTO_CATCH_UP_DAYS = 2
 OPEN_ITEM_MAX_AGE_DAYS = 14
+TRIAGE_COOLDOWN_DAYS = 3
 REVIEW_STATUSES = ("decided", "stale", "needs_operator")
 RECENT_DIGESTS_FOR_CONTEXT = 3
 DIGEST_CONTEXT_CHAR_BUDGET = 6000
@@ -512,9 +513,46 @@ def ground_digest(
             )
             continue
         if review and review["status"] == "needs_operator":
-            item = {**item, "needs_operator": True, "operator_question": review["reason"]}
+            has_dialogue = bool(review.get("turns"))
+            has_state_update = bool(review.get("state_refs"))
+            prev_question = str(item.get("operator_question") or "").strip()
+            curr_question = str(review.get("reason") or "").strip()
+            question_changed = bool(prev_question and curr_question and curr_question != prev_question)
+            has_update = has_dialogue or has_state_update or question_changed
+
+            was_already_asking = bool(item.get("needs_operator"))
+            last_presented = item.get("last_presented_on")
+
+            if was_already_asking and not has_update:
+                if last_presented:
+                    try:
+                        days_since = (day - date.fromisoformat(last_presented)).days
+                    except (ValueError, TypeError):
+                        days_since = 0
+                else:
+                    try:
+                        days_since = (day - date.fromisoformat(item.get("since", digest_date))).days
+                    except (ValueError, TypeError):
+                        days_since = 1
+
+                if days_since < TRIAGE_COOLDOWN_DAYS:
+                    suppressed = True
+                else:
+                    suppressed = False
+                    last_presented = digest_date
+            else:
+                suppressed = False
+                last_presented = digest_date
+
+            item = {
+                **item,
+                "needs_operator": True,
+                "operator_question": review["reason"],
+                "last_presented_on": last_presented,
+                "triage_suppressed": suppressed,
+            }
         else:
-            item = {k: v for k, v in item.items() if k not in ("needs_operator", "operator_question")}
+            item = {k: v for k, v in item.items() if k not in ("needs_operator", "operator_question", "triage_suppressed")}
         since = item.get("since") or digest_date
         if (day - date.fromisoformat(since)).days > OPEN_ITEM_MAX_AGE_DAYS:
             expired_items.append(item)
@@ -534,6 +572,24 @@ def ground_digest(
         "discarded_ungrounded": dropped,
     }
     return digest, preferences.items, retirements.items
+
+
+def should_triage_open_item(item: dict, current_date: str | None = None) -> bool:
+    """Whether an open item needs to be presented to the operator in the morning triage."""
+    if not item.get("needs_operator"):
+        return False
+    if "triage_suppressed" in item:
+        return not item["triage_suppressed"]
+    last_presented = item.get("last_presented_on")
+    if last_presented and current_date:
+        try:
+            d_curr = date.fromisoformat(current_date)
+            d_prev = date.fromisoformat(last_presented)
+            if 0 <= (d_curr - d_prev).days < TRIAGE_COOLDOWN_DAYS and not item.get("has_update"):
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
 
 
 def _normalize(text: str) -> str:

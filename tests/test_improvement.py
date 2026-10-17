@@ -309,3 +309,61 @@ class ImprovementTests(TestCase):
         duty.scope = replace(parts.scope, verify_command=None)
         duty._queue()
         self.assertEqual(parts.trace_store.list_queued_tasks(parts.scope.workspace_id), [])
+
+    def test_contains_historical_date_identifies_old_logs(self):
+        from memtrace_harness.improvement import contains_historical_date
+
+        self.assertTrue(contains_historical_date("2026-08-07 與 10-12 的舊證據"))
+        self.assertTrue(contains_historical_date("依據：2026-08-07 歷史紀錄"))
+        self.assertFalse(contains_historical_date("任務未真正啟動，請確認。"))
+        self.assertFalse(contains_historical_date("停利 1-2%，回測勝率 1/2"))
+
+    def test_finding_citing_historical_date_is_marked_historical_and_not_pushed_fresh(self):
+        from memtrace_harness.improvement import contains_historical_date
+
+        _, parts, store = self.harness()
+        self.enable(parts)
+        event_text = "夜間待辦 #132 又整批重列，2026-08-07 與 10-12 的舊證據被當成新觀察。"
+        store.ingest(parts.config, dict(source="Beri", cursor=1, events=[self.event("turn:10", event_text)]))
+        evidence = store.claim(parts.config, 100)
+        finding = dict(
+            key="old-evidence-spam",
+            title="舊證據重複推送",
+            summary="檢查日誌時效。",
+            action="develop",
+            target="platform",
+            evidence=[dict(id="Beri/turn:10", quote="2026-08-07 與 10-12 的舊證據")],
+        )
+        fresh = store.finish(evidence, [finding])
+        # Because the quote contains historical dates, it must NOT be pushed as a fresh discovery
+        self.assertEqual(fresh, [])
+        self.assertEqual(store.public(parts.config)["findings"][0]["state"], "historical")
+        self.assertIsNone(store.queue_one(parts.config, parts.scope))
+
+    def test_recurrence_with_same_evidence_is_suppressed(self):
+        _, parts, store = self.harness()
+        self.enable(parts)
+        self.ingest(parts, store)
+        evidence = store.claim(parts.config, 100)
+        finding = grounded_findings(json.dumps(dict(findings=[self.finding()])), evidence)[0]
+        fresh = store.finish(evidence, [finding])
+        self.assertEqual(len(fresh), 1)
+        queued = store.queue_one(parts.config, parts.scope)
+        store.task_state(queued["id"], "historical")
+
+        # Re-submitting with the same evidence ID must not produce fresh finding
+        repeat = store.finish([], [finding])
+        self.assertEqual(repeat, [])
+
+    def test_export_observations_schedule_uses_last_run_at(self):
+        _, parts, _ = self.harness()
+        update_settings(parts.config, dict(share_enabled=True))
+        with parts.trace_store._connection() as conn:
+            conn.execute(
+                "INSERT INTO schedules(id,project,workspace_id,goal,kind,active,last_run_at,created_at,next_run_at) VALUES ('sched_old',?,?,'old task','interval',1,?,?,?)",
+                (parts.scope.name, parts.scope.workspace_id, "2026-08-07T00:00:00+00:00", "2026-08-07T00:00:00+00:00", "2026-08-07T01:00:00+00:00"),
+            )
+        exported = export_observations(parts.trace_store, parts.config, parts.scope)
+        sched_event = next(e for e in exported["events"] if e["id"].startswith("schedule:sched_old"))
+        self.assertEqual(sched_event["at"], "2026-08-07T00:00:00+00:00")
+
