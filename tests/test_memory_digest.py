@@ -657,3 +657,117 @@ class StateGroundedReviewTest(TestCase):
         self.assertEqual([i["text"] for i in digest["resolved_items"]], ["monitor schedule failing"])
         self.assertEqual(digest["resolved_items"][0]["resolved_state_refs"], ["sched_a"])
         self.assertTrue(all(i["needs_operator"] for i in digest["open_items"]))
+
+
+class OpenItemTriageCooldownTests(TestCase):
+    def test_repeated_open_item_without_new_dialogue_or_state_is_suppressed_under_cooldown(self) -> None:
+        from memtrace_harness.memory_digest import should_triage_open_item
+        from memtrace_harness.duties import _describe_open_item_triage
+
+        carried = [
+            {
+                "text": "查明其他專案重啟通知",
+                "since": "2026-10-12",
+                "needs_operator": True,
+                "operator_question": "需要操作者提供實際結果",
+                "last_presented_on": "2026-10-12",
+            }
+        ]
+        digest, _, _ = ground_digest(
+            {
+                "open_item_review": [
+                    {"index": 0, "status": "needs_operator", "reason": "需要操作者提供實際結果", "turns": []}
+                ],
+            },
+            digest_date="2026-10-13",
+            turns=_turns("assistant"),
+            carried_open_items=carried,
+        )
+        item = digest["open_items"][0]
+        self.assertTrue(item["needs_operator"])
+        self.assertTrue(item["triage_suppressed"])
+        self.assertEqual(item["last_presented_on"], "2026-10-12")
+        self.assertFalse(should_triage_open_item(item, "2026-10-13"))
+
+        # When all items are suppressed, the morning triage message is completely empty
+        msg = _describe_open_item_triage("proj", digest["open_items"])
+        self.assertEqual(msg, "")
+
+    def test_open_item_with_new_turns_breaks_cooldown_suppression(self) -> None:
+        from memtrace_harness.memory_digest import should_triage_open_item
+        from memtrace_harness.duties import _describe_open_item_triage
+
+        carried = [
+            {
+                "text": "查明其他專案重啟通知",
+                "since": "2026-10-12",
+                "needs_operator": True,
+                "operator_question": "需要操作者提供實際結果",
+                "last_presented_on": "2026-10-12",
+            }
+        ]
+        digest, _, _ = ground_digest(
+            {
+                "open_item_review": [
+                    {"index": 0, "status": "needs_operator", "reason": "需要操作者提供實際結果", "turns": [1]}
+                ],
+            },
+            digest_date="2026-10-13",
+            turns=_turns("user"),
+            carried_open_items=carried,
+        )
+        item = digest["open_items"][0]
+        self.assertTrue(item["needs_operator"])
+        self.assertFalse(item["triage_suppressed"])
+        self.assertEqual(item["last_presented_on"], "2026-10-13")
+        self.assertTrue(should_triage_open_item(item, "2026-10-13"))
+
+        msg = _describe_open_item_triage("proj", digest["open_items"])
+        self.assertIn("需要你決定：", msg)
+        self.assertIn("查明其他專案重啟通知", msg)
+
+    def test_open_item_cooldown_expires_after_cooldown_days(self) -> None:
+        from memtrace_harness.memory_digest import TRIAGE_COOLDOWN_DAYS, should_triage_open_item
+        from memtrace_harness.duties import _describe_open_item_triage
+
+        carried = [
+            {
+                "text": "查明其他專案重啟通知",
+                "since": "2026-10-12",
+                "needs_operator": True,
+                "operator_question": "需要操作者提供實際結果",
+                "last_presented_on": "2026-10-12",
+            }
+        ]
+        # 3 days later (= TRIAGE_COOLDOWN_DAYS)
+        digest, _, _ = ground_digest(
+            {
+                "open_item_review": [
+                    {"index": 0, "status": "needs_operator", "reason": "需要操作者提供實際結果", "turns": []}
+                ],
+            },
+            digest_date="2026-10-15",
+            turns=_turns("assistant"),
+            carried_open_items=carried,
+        )
+        item = digest["open_items"][0]
+        self.assertTrue(item["needs_operator"])
+        self.assertFalse(item["triage_suppressed"])
+        self.assertEqual(item["last_presented_on"], "2026-10-15")
+        self.assertTrue(should_triage_open_item(item, "2026-10-15"))
+
+    def test_describe_open_item_triage_deduplicates_by_text(self) -> None:
+        from memtrace_harness.duties import _describe_open_item_triage
+
+        items = [
+            {"text": "問題 A", "resolution": "decided", "resolution_reason": "已修復"},
+            {"text": "問題 A", "resolution": "decided", "resolution_reason": "已修復重複項"},
+            {"text": "問題 B", "needs_operator": True, "operator_question": "請選擇 A 或 B"},
+            {"text": "問題 B", "needs_operator": True, "operator_question": "重複項"},
+        ]
+        msg = _describe_open_item_triage("proj", items)
+        self.assertEqual(msg.count("問題 A"), 1)
+        self.assertEqual(msg.count("問題 B"), 1)
+        self.assertIn("已決議（我已關閉）：", msg)
+        self.assertIn("需要你決定：", msg)
+

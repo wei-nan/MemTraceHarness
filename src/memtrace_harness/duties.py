@@ -33,6 +33,7 @@ from memtrace_harness.memory_digest import (
     due_digest_dates,
     preference_context_for,
     run_digest_for_date,
+    should_triage_open_item,
     sync_digests_to_memtrace,
     sync_operator_profile,
 )
@@ -454,7 +455,10 @@ def run_memory_digests(
             if triage_out is not None:
                 reviewed = [
                     i for i in outcome.digest["resolved_items"] if i.get("resolution") in ("decided", "stale")
-                ] + [i for i in outcome.digest["open_items"] if i.get("needs_operator")]
+                ] + [
+                    i for i in outcome.digest["open_items"]
+                    if i.get("needs_operator") and not i.get("triage_suppressed")
+                ]
                 if reviewed:
                     triage_out.setdefault(scope.name, []).extend(reviewed)
             log(
@@ -520,9 +524,20 @@ def _describe_preference_changes(changes: PreferenceChanges, limit: int = 8) -> 
 
 
 def _describe_open_item_triage(project: str, items: list[dict]) -> str:
-    decided = [i for i in items if i.get("resolution") == "decided"]
-    stale = [i for i in items if i.get("resolution") == "stale"]
-    asking = [i for i in items if i.get("needs_operator")]
+    # Deduplicate items by normalized text, preserving first occurrence
+    seen_texts = set()
+    unique_items = []
+    for item in items:
+        text_key = str(item.get("text") or "").strip()
+        if text_key and text_key not in seen_texts:
+            seen_texts.add(text_key)
+            unique_items.append(item)
+
+    decided = [i for i in unique_items if i.get("resolution") == "decided"]
+    stale = [i for i in unique_items if i.get("resolution") == "stale"]
+    asking = [i for i in unique_items if should_triage_open_item(i)]
+    if not (decided or stale or asking):
+        return ""
     lines = [f"🗂 [{project}] 昨晚整理了未結事項，想跟你確認："]
     if decided:
         lines.append("已決議（我已關閉）：")
@@ -742,6 +757,8 @@ def _run_nightly_digest_pass(
             logger.exception(f"[{outcome.project}] reporting the nightly audit failed")
     for project, items in triage.items():
         text = _describe_open_item_triage(project, items)
+        if not text:
+            continue
         try:
             service.notify_operator(text)
             # Into the chat log too, so the chat model can discuss it when the operator replies.

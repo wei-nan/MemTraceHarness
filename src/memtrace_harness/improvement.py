@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import date, datetime, timezone
 import re
 import threading
 import time
@@ -20,13 +20,46 @@ from memtrace_harness.workspace import models_file, update_model_settings
 
 logger = logging.getLogger(__name__)
 KEY = re.compile(r"^[a-z][a-z0-9_-]{0,79}$")
+_DATE_PATTERNS = re.compile(
+    r"\b(\d{4})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])\b|\b(0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])\b"
+)
+
+
+def contains_historical_date(text: str, max_age_days: int = 2) -> bool:
+    """Check if text quotes or cites explicit dates older than max_age_days (e.g. historical logs)."""
+    if not text:
+        return False
+    today = datetime.now(timezone.utc).date()
+    for match in _DATE_PATTERNS.finditer(text):
+        try:
+            if match.group(1):
+                year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            else:
+                year, month, day = today.year, int(match.group(4)), int(match.group(5))
+            cited_date = date(year, month, day)
+            if (today - cited_date).days > max_age_days:
+                return True
+        except (ValueError, OverflowError):
+            continue
+    return False
+
+
+def is_recent_evidence(ref: dict) -> bool:
+    """An evidence reference must have a recent timestamp and cannot cite historical dates."""
+    at = ref.get("at")
+    if not recent(at):
+        return False
+    quote = ref.get("quote", "")
+    if contains_historical_date(quote):
+        return False
+    return True
 
 
 def recent(stamp) -> bool:
     try:
-        date = datetime.fromisoformat(stamp)
-        age = time.time() - date.timestamp()
-        return date.tzinfo is not None and -300 <= age <= 48 * 3600
+        dt = datetime.fromisoformat(stamp)
+        age = time.time() - dt.timestamp()
+        return dt.tzinfo is not None and -300 <= age <= 48 * 3600
     except (ValueError, TypeError, OverflowError):
         return False
 
@@ -100,7 +133,8 @@ def export_observations(store, config, scope, after: int = 0) -> dict:
         schedules = conn.execute("SELECT id,goal,active,last_run_at,last_run_status,next_run_at FROM schedules WHERE project=? ORDER BY id LIMIT 50", (scope.name,)).fetchall()
         for row in schedules:
             text = _text(json.dumps(dict(zip(("id", "goal", "active", "last_run_at", "last_run_status", "next_run_at"), row)), ensure_ascii=False))
-            events.append({"id": "schedule:" + row[0] + ":" + hashlib.sha256(text.encode()).hexdigest()[:16], "kind": "schedule", "at": datetime.now().astimezone().isoformat(), "text": text})
+            at_stamp = row[3] if (row[3] and isinstance(row[3], str) and row[3].strip()) else datetime.now().astimezone().isoformat()
+            events.append({"id": "schedule:" + row[0] + ":" + hashlib.sha256(text.encode()).hexdigest()[:16], "kind": "schedule", "at": at_stamp, "text": text})
         runs = conn.execute("SELECT c.id,c.updated_at,r.summary_json FROM conversations c JOIN runs r ON r.id=c.active_run_id WHERE c.workspace_id=? AND r.summary_json IS NOT NULL AND julianday(c.updated_at)>=julianday('now','-2 days') ORDER BY c.updated_at DESC LIMIT 20", (scope.workspace_id,)).fetchall()
         for cid, at, raw in runs:
             try:
@@ -125,7 +159,7 @@ class ImprovementStore:
             for row in conn.execute("SELECT id,title,state,conversation_id,updated_at,detail_json FROM improvement_findings ORDER BY updated_at DESC LIMIT 12"):
                 detail = json.loads(row[5])
                 entry = dict(zip(("id", "title", "state", "conversation_id", "updated_at"), row[:5]))
-                if entry["state"] in ("new", "paused") and any(not recent(ref["at"]) for ref in detail["evidence"]):
+                if entry["state"] in ("new", "paused") and any(not is_recent_evidence(ref) for ref in detail["evidence"]):
                     entry["state"] = "historical"
                 findings.append(entry | {"summary": detail["summary"], "evidence": detail["evidence"]})
             pending = conn.execute("SELECT count(*) FROM observation_evidence WHERE processed=0").fetchone()[0]
@@ -207,16 +241,39 @@ class ImprovementStore:
             if not error:
                 for event in evidence:
                     conn.execute("UPDATE observation_evidence SET processed=1 WHERE id=?", (event["id"],))
+
                 for finding in findings:
+                    evidence_is_historical = any(
+                        contains_historical_date(ref.get("quote", ""))
+                        for ref in finding.get("evidence", [])
+                    )
+
                     key = finding["key"]
-                    previous = conn.execute("SELECT id,state,updated_at FROM improvement_findings WHERE finding_key=? OR substr(finding_key,1,?)=? ORDER BY updated_at DESC", (key, len(key) + 1, key + ":")).fetchall()
+                    previous = conn.execute("SELECT id,state,updated_at,detail_json FROM improvement_findings WHERE finding_key=? OR substr(finding_key,1,?)=? ORDER BY updated_at DESC", (key, len(key) + 1, key + ":")).fetchall()
                     if previous:
                         # A genuinely later recurrence gets a new task; existing cases stay settled.
                         if any(row[1] not in ("succeeded", "failed", "cancelled", "failed_to_start", "historical", "interrupted") for row in previous):
                             continue
+                        prev_evidence_ids = set()
+                        try:
+                            prev_detail = json.loads(previous[0][3])
+                            for r in prev_detail.get("evidence", []):
+                                if r.get("id"):
+                                    prev_evidence_ids.add(r["id"])
+                        except (ValueError, TypeError, KeyError):
+                            pass
+
+                        # If all evidence was already in the previous finding, it is not a new recurrence
+                        if bool(finding.get("evidence")) and all(ref.get("id") in prev_evidence_ids for ref in finding.get("evidence", [])):
+                            continue
+
                         def later(ref):
+                            if ref.get("id") in prev_evidence_ids:
+                                return False
+                            if contains_historical_date(ref.get("quote", "")):
+                                return False
                             if previous[0][1] == "historical":
-                                return recent(ref["at"])
+                                return recent(ref.get("at"))
                             try:
                                 stamp = datetime.fromisoformat(ref["at"])
                                 return stamp.tzinfo is not None and stamp.timestamp() > previous[0][2] + 86400
@@ -228,8 +285,9 @@ class ImprovementStore:
                         finding = {**finding, "previous_finding": previous[0][0]}
                     fid = "improve_" + hashlib.sha256(key.encode()).hexdigest()[:20]
                     now = time.time()
-                    created = conn.execute("INSERT OR IGNORE INTO improvement_findings VALUES (?,?,?,?,?,NULL,?,?)", (fid, key, finding["title"], json.dumps(finding, ensure_ascii=False), "new", now, now)).rowcount
-                    if created:
+                    initial_state = "historical" if evidence_is_historical else "new"
+                    created = conn.execute("INSERT OR IGNORE INTO improvement_findings VALUES (?,?,?,?,?,NULL,?,?)", (fid, key, finding["title"], json.dumps(finding, ensure_ascii=False), initial_state, now, now)).rowcount
+                    if created and initial_state == "new":
                         fresh.append({"id": fid, **finding})
             conn.execute("UPDATE improvement_state SET owner_pid=NULL,last_analysis=?,last_error=? WHERE id=1", (time.time(), error))
         return fresh
@@ -247,7 +305,7 @@ class ImprovementStore:
             rows = conn.execute("SELECT id,detail_json FROM improvement_findings WHERE state IN ('new','paused') ORDER BY created_at").fetchall()
             for fid, raw in rows:
                 finding = json.loads(raw)
-                if any(not recent(ref["at"]) for ref in finding["evidence"]):
+                if any(not recent(ref["at"]) or contains_historical_date(ref.get("quote", "")) for ref in finding["evidence"]):
                     conn.execute("UPDATE improvement_findings SET state='historical',updated_at=? WHERE id=?", (time.time(), fid))
                     continue
                 if finding["target"] != "platform" or finding["action"] != "develop":
@@ -277,7 +335,7 @@ class ImprovementStore:
         cfg = settings(config)
         with self.store._connection() as conn:
             row = conn.execute("SELECT detail_json FROM improvement_findings WHERE conversation_id=?", (conversation,)).fetchone()
-        return bool(row and cfg["enabled"] and cfg["auto_develop"] and all(ref["source"] in cfg["sources"] and recent(ref["at"]) for ref in json.loads(row[0])["evidence"]))
+        return bool(row and cfg["enabled"] and cfg["auto_develop"] and all(ref["source"] in cfg["sources"] and recent(ref["at"]) and not contains_historical_date(ref.get("quote", "")) for ref in json.loads(row[0])["evidence"]))
 
 
 def grounded_findings(raw: str, evidence: list[dict]) -> list[dict]:
