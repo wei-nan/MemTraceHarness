@@ -627,6 +627,9 @@ document.addEventListener("click", function (e) {
       if (res.ok) {
         statusEl.className = "approval-status ok";
         statusEl.textContent = res.body.message || "已更新";
+        // A successful answer changes this waiting item. Release focus so a deferred SSE
+        // render can replace the now-settled card after the fresh status arrives.
+        btn.blur();
       } else {
         buttons.forEach(function (b) { b.disabled = false; });
         statusEl.className = "approval-status err";
@@ -1352,11 +1355,20 @@ function isEditingPreference() {
   return !!(el && el.classList && (el.classList.contains("pref-text") || el.classList.contains("pref-scope")));
 }
 
+function isEditingApproval() {
+  var el = document.activeElement;
+  return !!(el && el.closest && el.closest(".approval"));
+}
+
+function renderDeferredWhenIdle() {
+  if (state.renderDeferred && !isEditingPreference() && !isEditingApproval() && !state.chainDirty) render();
+}
+
 function render() {
   if (!state.data) return;
   // An SSE push re-renders everything; don't yank the textarea out from under
   // someone mid-edit — render once they leave it.
-  if (isEditingPreference() || state.chainDirty) { state.renderDeferred = true; return; }
+  if (isEditingPreference() || isEditingApproval() || state.chainDirty) { state.renderDeferred = true; return; }
   state.renderDeferred = false;
   var names = state.data.projects.map(function (p) { return p.name; });
   if (state.project !== GLOBAL_TAB && names.indexOf(state.project) === -1) state.project = names[0] || GLOBAL_TAB;
@@ -1417,8 +1429,12 @@ document.addEventListener("change", function (e) {
 });
 
 document.addEventListener("focusout", function (e) {
-  if (state.renderDeferred && e.target.classList && (e.target.classList.contains("pref-text") || e.target.classList.contains("pref-scope"))) {
-    setTimeout(function () { if (!isEditingPreference()) render(); }, 0);
+  var target = e.target;
+  var wasEditingPreference = target.classList && (target.classList.contains("pref-text") || target.classList.contains("pref-scope"));
+  var wasEditingApproval = target.closest && target.closest(".approval");
+  if (state.renderDeferred && (wasEditingPreference || wasEditingApproval)) {
+    // Let a pointer click on an approval button finish before replacing the banner.
+    setTimeout(renderDeferredWhenIdle, 200);
   }
 });
 
