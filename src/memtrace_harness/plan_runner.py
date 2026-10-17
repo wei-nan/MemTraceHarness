@@ -73,15 +73,35 @@ class PlanRunner:
                 if not isinstance(step["args"].get("goal"), str) or not step["args"]["goal"].strip():
                     return f"⚠️ 第 {number} 步的 develop 需要 goal。"
             if step["tool"] == "run_job":
-                command = (scope.jobs or {}).get(str(step["args"].get("name")))
+                command = step["args"].get("command") or (scope.jobs or {}).get(str(step["args"].get("name")))
                 if command is None and not any(s["tool"] == "propose_scope_change" for s in plan["steps"][:number - 1]):
                     return f"⚠️ 這個多步驟計畫沒有建立：第 {number} 步的工作 {step['args'].get('name')!r} 沒有在專案設定裡"
                 reason = forbidden_reason(command) if command is not None else None
                 if reason:
                     return f"⚠️ 這個多步驟計畫沒有建立：第 {number} 步的工作是「{reason}」，{self._hint()}"
+
+        active_plans = [p for p in self.store.list_active_plans() if p["project"] == scope.name]
+        if active_plans:
+            active = active_plans[0]
+            steps = self.store.list_plan_steps(active["plan_id"])
+            failed = next((s for s in steps if s["status"] == plans.FAILED), None)
+            if active["status"] == plans.P_ATTENTION or failed is not None:
+                # Carry forward the original goal and revise the failing operation without duplicate plan
+                first_incomplete = next((s for s in steps if s["status"] not in {plans.DONE, plans.SKIPPED}), None)
+                from_idx = first_incomplete["idx"] if first_incomplete else (failed["idx"] if failed else len(steps))
+                self.store.replace_plan_steps(active["plan_id"], plan["steps"], from_idx=from_idx)
+                if plan.get("criteria"):
+                    merged = list(dict.fromkeys(active.get("criteria", []) + plan["criteria"]))
+                    self.store.update_plan(active["plan_id"], criteria_json=json.dumps(merged, ensure_ascii=False))
+                self.store.update_plan(active["plan_id"], status=plans.P_RUNNING)
+                logger.info(f"Revised active plan {active['plan_id']} from step {from_idx} under goal '{active['goal']}'")
+                return None
+            return "⚠️ 目前已經有一個進行中的計畫，請等它結束或先取消，才能開新的。"
+
         plan_id = f"plan_{uuid.uuid4().hex[:10]}"
         if not self.store.create_plan(
-            plan_id=plan_id, project=scope.name, goal=plan["goal"], steps=plan["steps"], audience=audience
+            plan_id=plan_id, project=scope.name, goal=plan["goal"], steps=plan["steps"], audience=audience,
+            criteria=plan.get("criteria"),
         ):
             return "⚠️ 目前已經有一個進行中的計畫，請等它結束或先取消，才能開新的。"
         return None
@@ -178,6 +198,8 @@ class PlanRunner:
                     # In a plan, running the job is its own `run_job` step with its own confirm, so a
                     # `run_after` the model set here is dropped rather than failing the plan or running it twice.
                     args = {key: value for key, value in step["args"].items() if key != "run_after"}
+                    if not args.get("kind") and ("command" in args or "name" in args):
+                        args["kind"] = "job"
                     change = validate_scope_change(
                         scope.working_directory, str(args.get("kind", "")),
                         args.get("value"), args.get("name"), args.get("command"),
@@ -190,7 +212,9 @@ class PlanRunner:
                 return
         elif step["tool"] == "run_job":
             name = str(step["args"].get("name"))
-            command = (scope.jobs or {}).get(name)
+            command = step["args"].get("command") or (scope.jobs or {}).get(name)
+            if step["args"].get("command") and scope.jobs is not None:
+                scope.jobs[name] = command
             if command is None:
                 self._fail(step, f"工作 {name} 已不在專案設定裡")
                 return
@@ -430,6 +454,50 @@ class PlanRunner:
         self.store.update_plan(plan_id, status=plans.P_RUNNING)
         return "好，繼續。"
 
+    def revise_step(
+        self,
+        plan_id: str,
+        idx: int,
+        *,
+        tool: str | None = None,
+        args: dict | None = None,
+        title: str | None = None,
+        expect: dict | None = None,
+    ) -> bool:
+        """Revise a specific step in a plan and set it back to pending, resuming the plan."""
+        plan = self.store.get_plan(plan_id)
+        if not plan:
+            return False
+        fields: dict[str, Any] = {"status": plans.PENDING, "note": "", "attempts": 0, "request_id": None}
+        if tool is not None:
+            fields["tool"] = tool
+        if args is not None:
+            fields["args_json"] = json.dumps(args, ensure_ascii=False)
+        if title is not None:
+            fields["title"] = title
+        if expect is not None:
+            fields["expect_json"] = json.dumps(expect, ensure_ascii=False)
+        updated = self.store.update_plan_step(plan_id, idx, **fields)
+        if updated:
+            self.store.update_plan(plan_id, status=plans.P_RUNNING)
+        return updated
+
+    def revise_failed_step(
+        self,
+        plan_id: str,
+        *,
+        tool: str | None = None,
+        args: dict | None = None,
+        title: str | None = None,
+        expect: dict | None = None,
+    ) -> bool:
+        """Find the failed step in the plan, revise it, and resume."""
+        steps = self.store.list_plan_steps(plan_id)
+        failed = next((s for s in steps if s["status"] == plans.FAILED), None)
+        if not failed:
+            return False
+        return self.revise_step(plan_id, failed["idx"], tool=tool, args=args, title=title, expect=expect)
+
     def _cancel(self, plan: dict, steps: list[dict], note: str) -> None:
         self.store.update_plan(plan["plan_id"], status=plans.P_CANCELLED)
         for step in steps:
@@ -455,11 +523,17 @@ class PlanRunner:
                         if self.store.transition_job_request(step["request_id"], ("pending", "awaiting"), "cancelled"):
                             self.store.finish_job_request(step["request_id"], "cancelled")
                             self.service.clear_actions(row["message_ref"])
+                step_note = step.get("note") if step["status"] == plans.FAILED and step.get("note") else note
                 self.store.transition_plan_step(
                     plan["plan_id"], step["idx"],
-                    (plans.PENDING, plans.AWAITING, plans.RUNNING, plans.CHECKING, plans.FAILED), plans.SKIPPED, note=note,
+                    (plans.PENDING, plans.AWAITING, plans.RUNNING, plans.CHECKING, plans.FAILED), plans.SKIPPED, note=step_note,
                 )
         self.store.update_plan(plan["plan_id"], status=plans.P_CANCELLED)
+        steps_final = self.store.list_plan_steps(plan["plan_id"])
+        final_msg = plans.render_final({**plan, "status": plans.P_CANCELLED}, steps_final)
+        self._record_progress(plan, final_msg)
+        if plan.get("audience"):
+            self.service.send_message(plan["audience"], final_msg)
 
     def auto_approves(self, request_id: str) -> bool:
         """Legacy callers/checkpoints cannot turn a plan into a standing grant."""

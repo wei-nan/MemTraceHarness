@@ -17,7 +17,7 @@ MAX_STEPS = 10
 MAX_TITLE_CHARS = 120
 MAX_ARGS_CHARS = 2000
 MAX_EXPECT_CHARS = 300
-EXPECT_KINDS = ("ok", "contains", "not_contains", "regex", "model")
+EXPECT_KINDS = ("ok", "contains", "not_contains", "regex", "model", "commit_alignment")
 
 # step statuses
 PENDING, RUNNING, AWAITING, CHECKING, DONE, FAILED, SKIPPED = (
@@ -25,6 +25,28 @@ PENDING, RUNNING, AWAITING, CHECKING, DONE, FAILED, SKIPPED = (
 )
 # plan statuses
 P_RUNNING, P_ATTENTION, P_DONE, P_CANCELLED = "running", "needs_attention", "done", "cancelled"
+
+# stage categories
+STAGE_SETUP = "工作設定"
+STAGE_EXEC = "執行"
+STAGE_READBACK = "讀取結果"
+
+
+def step_stage(step: dict) -> str:
+    """Classify a step into setup (計畫/工作設定), execution (執行), or readback (讀取結果)."""
+    s = str(step.get("stage") or "").strip().lower()
+    if s in {"setup", "job_setup", "工作設定", "計畫/工作設定", "計畫設定"}:
+        return STAGE_SETUP
+    if s in {"exec", "execution", "執行", "執行中"}:
+        return STAGE_EXEC
+    if s in {"readback", "read", "讀取", "讀取結果", "檢查", "確認"}:
+        return STAGE_READBACK
+    tool = str(step.get("tool") or "").strip()
+    if tool in {"propose_scope_change", "request_install"}:
+        return STAGE_SETUP
+    if tool in {"read_file", "ops_read", "browse", "read_log", "query_db", "system_status", "http_probe", "list_jobs"}:
+        return STAGE_READBACK
+    return STAGE_EXEC
 
 
 class PlanError(ValueError):
@@ -47,6 +69,10 @@ def parse_plan(payload: str, *, allowed_tool: Any) -> dict[str, Any]:
         raise PlanError("計畫要有至少一個步驟")
     if len(raw_steps) > MAX_STEPS:
         raise PlanError(f"計畫最多 {MAX_STEPS} 步")
+    raw_criteria = data.get("success_criteria") or data.get("criteria")
+    criteria: list[str] = []
+    if isinstance(raw_criteria, list):
+        criteria = [str(c).strip() for c in raw_criteria if str(c).strip()]
     steps = []
     for index, raw in enumerate(raw_steps, 1):
         if not isinstance(raw, dict):
@@ -61,8 +87,12 @@ def parse_plan(payload: str, *, allowed_tool: Any) -> dict[str, Any]:
             raise PlanError(f"第 {index} 步的工具 {tool!r} 不能放進計畫：{reason}")
         if not isinstance(args, dict) or len(json.dumps(args, ensure_ascii=False)) > MAX_ARGS_CHARS:
             raise PlanError(f"第 {index} 步的 args 要是不太大的物件")
-        steps.append({"title": title, "tool": tool, "args": args, "expect": _normalize_expect(raw.get("expect"), index)})
-    return {"goal": goal, "steps": steps}
+        step_dict = {"title": title, "tool": tool, "args": args, "expect": _normalize_expect(raw.get("expect"), index)}
+        stage = str(raw.get("stage") or "").strip()
+        if stage:
+            step_dict["stage"] = stage
+        steps.append(step_dict)
+    return {"goal": goal, "criteria": criteria, "steps": steps}
 
 
 def _normalize_expect(raw: Any, index: int) -> dict[str, str]:
@@ -102,11 +132,40 @@ def check_expectation(expect: dict[str, str], result_text: str) -> tuple[bool | 
     if kind == "regex":
         found = re.search(value, result_text, re.MULTILINE) is not None
         return found, f"結果{'符合' if found else '不符合'} /{value}/"
+    if kind == "commit_alignment":
+        lower_text = result_text.lower()
+        has_pipeline = any(kw in lower_text for kw in ("pipeline", "passed", "success", "running", "failed", "ci", "#"))
+        val_lower = value.lower()
+        has_commit = val_lower in lower_text
+        if has_commit and has_pipeline:
+            return True, f"管線狀態已確認且 commit 符合「{value}」"
+        if not has_commit:
+            return False, f"輸出未包含預期 commit「{value}」"
+        return False, "輸出未包含可識別的管線狀態"
     return None, f"需要判斷：{value}"
 
 
 _ICON = {PENDING: "⬜", RUNNING: "▶️", AWAITING: "🕓", CHECKING: "🔎", DONE: "✅", FAILED: "❌", SKIPPED: "⏭"}
-_WAITING = {AWAITING: "（等你確認）", CHECKING: "（確認結果中）", RUNNING: "（執行中）"}
+
+
+def _step_label_suffix(step: dict) -> str:
+    status = step.get("status")
+    stage = step_stage(step)
+    if status == AWAITING:
+        if stage == STAGE_SETUP:
+            return "（工作設定：等你確認）"
+        if stage == STAGE_READBACK:
+            return "（讀取結果：等你確認）"
+        return "（等你確認）"
+    if status == RUNNING:
+        if stage == STAGE_SETUP:
+            return "（工作設定中）"
+        if stage == STAGE_READBACK:
+            return "（讀取結果中）"
+        return "（執行中）"
+    if status == CHECKING:
+        return "（讀取結果中）"
+    return ""
 
 
 def render_progress(plan: dict, steps: list[dict]) -> tuple[str, list[list[dict[str, str]]]]:
@@ -119,8 +178,12 @@ def render_progress(plan: dict, steps: list[dict]) -> tuple[str, list[list[dict[
         P_CANCELLED: "🛑 計畫已取消",
     }.get(plan["status"], "📋 計畫")
     lines = [f"{header}（{done}/{len(steps)}）", f"目標：{plan['goal']}", ""]
+    if plan.get("criteria"):
+        lines.append("驗收條件：" + "；".join(plan["criteria"]))
+        lines.append("")
     for number, step in enumerate(steps, 1):
-        lines.append(f"{_ICON.get(step['status'], '⬜')} {number}. {step['title']}{_WAITING.get(step['status'], '')}")
+        suffix = _step_label_suffix(step)
+        lines.append(f"{_ICON.get(step['status'], '⬜')} {number}. {step['title']}{suffix}")
         if step["status"] == FAILED and step.get("note"):
             lines.append(f"    ↳ {step['note']}")
     keyboard: list[list[dict[str, str]]] = []
@@ -137,8 +200,61 @@ def render_progress(plan: dict, steps: list[dict]) -> tuple[str, list[list[dict[
     return "\n".join(lines), keyboard
 
 
-def verdict(steps: list[dict]) -> str:
-    if all(s["status"] == DONE for s in steps):
+def get_unresolved_criteria(plan: dict, steps: list[dict]) -> list[str]:
+    """Identify which success criteria remain unresolved based on completed steps and output."""
+    criteria = plan.get("criteria") or []
+    if not criteria:
+        return [f"{s['title']}（未完成）" for s in steps if s.get("status") != DONE]
+
+    unresolved = []
+    done_steps = [s for s in steps if s.get("status") == DONE]
+    for crit in criteria:
+        crit_lower = crit.lower()
+        matched = False
+        for s in done_steps:
+            title_lower = (s.get("title") or "").lower()
+            note_lower = (s.get("note") or "").lower()
+            res_lower = (s.get("result_text") or "").lower()
+            commits = re.findall(r"\b[0-9a-f]{7,40}\b", crit_lower)
+            if commits:
+                if all(c in res_lower or c in note_lower or c in title_lower for c in commits):
+                    repos = re.findall(r"\bcdmp(?:_[a-z0-9_]+)?\b", crit_lower)
+                    if not repos or any(r in res_lower or r in note_lower or r in title_lower for r in repos):
+                        matched = True
+                        break
+            else:
+                if crit_lower in title_lower or crit_lower in note_lower or title_lower in crit_lower:
+                    matched = True
+                    break
+        if not matched:
+            unresolved.append(crit)
+    return unresolved
+
+
+def get_last_concrete_error(steps: list[dict]) -> str | None:
+    """Return the last concrete failure note from the plan steps."""
+    for s in reversed(steps):
+        note = s.get("note") or ""
+        if s.get("status") == FAILED and note:
+            return note
+        if note and any(err_kw in note.lower() for err_kw in ("error", "failed", "失敗", "command not found", "not found", "unknown flag", "未包含", "cannot parse", "127")):
+            return note
+        res = s.get("result_text") or ""
+        if res:
+            first_line = res.strip().split("\n")[0]
+            if any(err_kw in first_line.lower() for err_kw in ("error", "failed", "失敗", "command not found", "not found", "unknown flag", "cannot parse")):
+                return first_line
+    return None
+
+
+def verdict(steps: list[dict], criteria: list[str] | None = None) -> str:
+    all_done = all(s["status"] == DONE for s in steps)
+    if all_done:
+        if criteria:
+            dummy_plan = {"criteria": criteria}
+            unresolved = get_unresolved_criteria(dummy_plan, steps)
+            if unresolved:
+                return "部分達成（有未滿足的條件）"
         return "達成"
     if any(s["status"] == DONE for s in steps) and not any(s["status"] == FAILED for s in steps):
         return "部分達成（有略過的步驟）"
@@ -146,8 +262,21 @@ def verdict(steps: list[dict]) -> str:
 
 
 def render_final(plan: dict, steps: list[dict]) -> str:
-    lines = [f"📋 計畫結束：{verdict(steps)}", f"目標：{plan['goal']}", ""]
+    v = verdict(steps, plan.get("criteria"))
+    lines = [f"📋 計畫結束：{v}", f"目標：{plan['goal']}", ""]
     for number, step in enumerate(steps, 1):
         evidence = (step.get("note") or "").strip().replace("\n", " ")
         lines.append(f"{_ICON.get(step['status'], '⬜')} {number}. {step['title']}" + (f" — {evidence[:160]}" if evidence else ""))
+
+    unresolved = get_unresolved_criteria(plan, steps)
+    if unresolved and v != "達成":
+        lines.append("")
+        lines.append("未滿足條件：" + "；".join(unresolved))
+
+    last_err = get_last_concrete_error(steps)
+    if last_err and v != "達成":
+        if not unresolved:
+            lines.append("")
+        lines.append(f"最後具體錯誤：{last_err}")
+
     return "\n".join(lines)
