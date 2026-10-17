@@ -617,6 +617,23 @@ class HarnessService:
                 if candidate and candidate.status == "pending":
                     pending_approval = candidate
 
+            if pending_approval is None:
+                attention_plan = self._find_attention_plan(scope)
+                if attention_plan is not None:
+                    plan_action = plans_mod.match_plan_action(text)
+                    if plan_action is not None:
+                        res = self.plan_runner.handle_action(plan_action, attention_plan["plan_id"])
+                        self.plan_runner.tick()
+                        reply = self._plan_action_reply(plan_action, attention_plan, res)
+                        self.send_message(audience, reply)
+                        self.primary_session_mgr.record_turn(
+                            project=scope.name,
+                            speaker="assistant",
+                            turn_type="chat",
+                            content=reply,
+                        )
+                        return reply
+
             return self._chat_reply_and_maybe_start_task(
                 scope,
                 audience,
@@ -3409,6 +3426,38 @@ class HarnessService:
             "不要在同一則回覆同時輸出這一行和任務啟動標記。\n\n"
         )
 
+    def _find_attention_plan(self, scope: ProjectScope) -> dict | None:
+        for plan in self.approval_manager.trace_store.list_active_plans():
+            if plan["project"] == scope.name and plan["status"] == plans_mod.P_ATTENTION:
+                return plan
+        return None
+
+    @staticmethod
+    def _plan_action_reply(action: str, plan: dict, handle_result: str) -> str:
+        if handle_result != "好，繼續。":
+            return handle_result
+        if action == "plan_skip":
+            return f"已略過計畫「{plan['goal']}」失敗的步驟並繼續執行。"
+        if action == "plan_retry":
+            return f"已重試計畫「{plan['goal']}」失敗的步驟。"
+        if action == "plan_cancel":
+            return f"已取消計畫「{plan['goal']}」。"
+        return handle_result
+
+    def _active_plan_notice(self, scope: ProjectScope) -> str:
+        plan = self._find_attention_plan(scope)
+        if plan is None:
+            return ""
+        steps = self.approval_manager.trace_store.list_plan_steps(plan["plan_id"])
+        failed = next((s for s in steps if s["status"] == plans_mod.FAILED), None)
+        failed_info = f"（第 {failed['idx']} 步「{failed['title']}」失敗：{failed.get('note') or '未達成'}）" if failed else ""
+        return (
+            f"⚠️ 目前已有進行中的多步驟計畫「{plan['goal']}」{failed_info}，停在等待使用者決定（needs_attention）。\n"
+            "請注意：\n"
+            "- 絕對不要在回覆最後輸出 HARNESS_PLAN 嘗試建立新計畫（會被系統拒絕，且舊計畫仍會保持鎖定）。\n"
+            "- 如果使用者的意思是略過失敗步驟繼續、重試或取消，請明確引導使用者點選對話中的按鈕（「略過這一步」、「重試這一步」、「取消計畫」），或直接回答「略過這一步繼續」、「重試這一步」、「取消計畫」。\n\n"
+        )
+
     def report_chat_wait(self, text: str, audience: str | None) -> None:
         """Answer a progress-only follow-up without cancelling the pending dialogue call."""
         msg = "有，上一則訊息還在處理中，目前仍在等待結果；完成後會接著回報。"
@@ -3536,6 +3585,7 @@ class HarnessService:
             f"{self._status_notice(scope)}"
             f"{self._quoted_reply_notice(quoted_text)}"
             f"{self._pending_approval_notice(pending_approval)}"
+            f"{self._active_plan_notice(scope)}"
             f"{attachments_mod.prompt_notice(attachments or [])}"
             f"使用者訊息：{text}"
         )

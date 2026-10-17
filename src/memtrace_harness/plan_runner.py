@@ -66,6 +66,36 @@ class PlanRunner:
             plan = plans.parse_plan(payload, allowed_tool=allowed_step_tool)
         except plans.PlanError as exc:
             return f"⚠️ 這個多步驟計畫沒有建立：{exc}"
+        expanded_steps = []
+        for number, step in enumerate(plan["steps"], 1):
+            if step["tool"] == "propose_scope_change" and step["args"].get("run_after"):
+                job_name = str(step["args"].get("name") or "").strip()
+                if step["args"].get("kind") != "job" or not job_name:
+                    return f"⚠️ 這個多步驟計畫沒有建立：第 {number} 步的 run_after 只能用於指定名稱的 job"
+                clean_args = {k: v for k, v in step["args"].items() if k != "run_after"}
+                step_copy = dict(step)
+                step_copy["args"] = clean_args
+                orig_expect = step.get("expect") or {"kind": "ok", "value": ""}
+                step_copy["expect"] = {"kind": "ok", "value": ""}
+                expanded_steps.append(step_copy)
+                has_next_run_job = (
+                    number < len(plan["steps"])
+                    and plan["steps"][number].get("tool") == "run_job"
+                    and str(plan["steps"][number].get("args", {}).get("name") or "").strip() == job_name
+                )
+                if not has_next_run_job:
+                    expanded_steps.append({
+                        "title": f"執行工作 {job_name}",
+                        "tool": "run_job",
+                        "args": {"name": job_name},
+                        "expect": orig_expect,
+                    })
+            else:
+                expanded_steps.append(step)
+        if len(expanded_steps) > plans.MAX_STEPS:
+            return f"⚠️ 這個多步驟計畫沒有建立：加上執行工作後超過最大步驟數 {plans.MAX_STEPS} 步"
+        plan["steps"] = expanded_steps
+
         for number, step in enumerate(plan["steps"], 1):
             if step["tool"] == "develop":
                 if not scope.agent_loop_enabled:
@@ -74,7 +104,12 @@ class PlanRunner:
                     return f"⚠️ 第 {number} 步的 develop 需要 goal。"
             if step["tool"] == "run_job":
                 command = (scope.jobs or {}).get(str(step["args"].get("name")))
-                if command is None and not any(s["tool"] == "propose_scope_change" for s in plan["steps"][:number - 1]):
+                if command is None:
+                    for prev in plan["steps"][:number - 1]:
+                        if prev["tool"] == "propose_scope_change" and prev["args"].get("name") == step["args"].get("name"):
+                            command = prev["args"].get("command")
+                            break
+                if command is None:
                     return f"⚠️ 這個多步驟計畫沒有建立：第 {number} 步的工作 {step['args'].get('name')!r} 沒有在專案設定裡"
                 reason = forbidden_reason(command) if command is not None else None
                 if reason:
@@ -83,6 +118,15 @@ class PlanRunner:
         if not self.store.create_plan(
             plan_id=plan_id, project=scope.name, goal=plan["goal"], steps=plan["steps"], audience=audience
         ):
+            for existing in self.store.list_active_plans():
+                if existing["project"] == scope.name and existing["status"] == plans.P_ATTENTION:
+                    steps = self.store.list_plan_steps(existing["plan_id"])
+                    failed = next((s for s in steps if s["status"] == plans.FAILED), None)
+                    failed_title = f"第 {failed['idx']} 步「{failed['title']}」" if failed else "有步驟"
+                    return (
+                        f"⚠️ 目前計畫「{existing['goal']}」因{failed_title}失敗而停在等待處理。"
+                        "請使用訊息中的按鈕略過或重試該步驟（或回覆「略過這一步繼續」），或先取消計畫，才能開新的。"
+                    )
             return "⚠️ 目前已經有一個進行中的計畫，請等它結束或先取消，才能開新的。"
         return None
 
@@ -96,7 +140,7 @@ class PlanRunner:
     def tick(self) -> None:
         for plan in self.store.list_active_plans():
             try:
-                if plan["status"] == plans.P_RUNNING:
+                if plan["status"] in {plans.P_RUNNING, plans.P_ATTENTION}:
                     self._advance(plan)
             except Exception:
                 logger.exception(f"advancing plan {plan['plan_id']} failed; continuing")
@@ -105,8 +149,12 @@ class PlanRunner:
     def _advance(self, plan: dict) -> None:
         steps = self.store.list_plan_steps(plan["plan_id"])
         created = datetime.fromisoformat(plan["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) - created > PLAN_LIFETIME:
             self._cancel(plan, steps, "超過 24 小時，計畫自動取消。")
+            return
+        if plan["status"] == plans.P_ATTENTION:
             return
         current = next((s for s in steps if s["status"] not in {plans.DONE, plans.SKIPPED}), None)
         if current is None:

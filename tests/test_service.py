@@ -994,6 +994,143 @@ class HarnessServiceTests(TestCase):
         self.assertEqual(store.get_plan(second)["status"], "cancelled")
         self.assertEqual(self._open_requests(store), [])
 
+    def test_natural_language_skip_advances_active_failed_plan_exactly_once(self) -> None:
+        gateway, scope, store, calls, out = self._plan_gateway()
+        out["text"] = "nope"
+        # 3-step plan: step 1 run_job (hello), step 2 t_status (fails), step 3 t_status (pending)
+        plan_3 = json.dumps({
+            "goal": "多步驟工作",
+            "steps": [
+                {"title": "重啟 Beri", "tool": "run_job", "args": {"name": "hello"}, "expect": {"kind": "contains", "value": "restarted"}},
+                {"title": "確認狀態 1", "tool": "t_status", "args": {"x": "1"}, "expect": {"kind": "contains", "value": "ok"}},
+                {"title": "確認狀態 2", "tool": "t_status", "args": {"x": "2"}, "expect": {"kind": "contains", "value": "ok"}},
+            ],
+        }, ensure_ascii=False)
+        self.assertIsNone(gateway.plan_runner.create(scope, 12345, plan_3))
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        # Drive step 1 (done) and step 2 (fails because out["text"] = "nope")
+        self._drive(gateway, store, 6, confirm=True)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+        steps = store.list_plan_steps(plan_id)
+        self.assertEqual([s["status"] for s in steps], ["done", "failed", "pending"])
+
+        # User sets out["text"] = "ok" for step 3, then sends natural-language skip message
+        out["text"] = "ok"
+        reply = gateway.handle_message("skip that step and continue", audience=12345)
+        self.assertIn("已略過", reply)
+
+        # Verify step 2 is skipped and plan resumed to running, exactly once
+        steps_after = store.list_plan_steps(plan_id)
+        self.assertEqual(steps_after[1]["status"], "skipped")
+        self.assertNotEqual(steps_after[2]["status"], "skipped")
+        self.assertEqual(store.get_plan(plan_id)["status"], "running")
+
+        # Driving now finishes step 3
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        steps_final = store.list_plan_steps(plan_id)
+        self.assertEqual([s["status"] for s in steps_final], ["done", "skipped", "done"])
+
+    def test_natural_language_skip_chinese_and_retry(self) -> None:
+        gateway, scope, store, calls, out = self._plan_gateway()
+        out["text"] = "nope"
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        self._drive(gateway, store, 6, confirm=True)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+
+        # Test retry via natural language
+        out["text"] = "nope"
+        reply = gateway.handle_message("重試這一步", audience=12345)
+        self.assertIn("已重試", reply)
+        self._drive(gateway, store, 4)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+
+        # Test skip via Chinese natural language
+        reply = gateway.handle_message("略過這一步繼續", audience=12345)
+        self.assertIn("已略過", reply)
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+        self.assertEqual(store.list_plan_steps(plan_id)[1]["status"], "skipped")
+
+    def test_expiry_of_needs_attention_plan_releases_lock(self) -> None:
+        gateway, scope, store, _calls, out = self._plan_gateway()
+        out["text"] = "nope"
+        gateway.plan_runner.create(scope, 12345, self.PLAN)
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        self._drive(gateway, store, 6, confirm=True)
+        self.assertEqual(store.get_plan(plan_id)["status"], "needs_attention")
+
+        # Cannot create new plan while old plan is in needs_attention
+        refused = gateway.plan_runner.create(scope, 12345, self.PLAN)
+        self.assertIn("停在等待處理", refused)
+
+        # Set created_at to 25 hours ago
+        expired_at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        with store._connection() as conn:
+            conn.execute("UPDATE plans SET created_at = ? WHERE plan_id = ?", (expired_at, plan_id))
+
+        # tick() should detect expiration and cancel the plan
+        gateway.plan_runner.tick()
+        self.assertEqual(store.get_plan(plan_id)["status"], "cancelled")
+        steps = store.list_plan_steps(plan_id)
+        self.assertEqual(steps[1]["status"], "skipped")
+        self.assertIn("超過 24 小時", steps[1]["note"])
+
+        # Now lock is released, can create new plan
+        self.assertIsNone(gateway.plan_runner.create(scope, 12345, self.PLAN))
+        self.assertEqual(len(store.list_active_plans()), 1)
+
+    def test_propose_scope_change_run_after_creates_and_executes_run_job_step(self) -> None:
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        tmp = Path(tempfile.mkdtemp())
+        scope_file = tmp / "harness-scope.md"
+        scope_file.write_text(f"- workspace_id: {scope.workspace_id}\n- working_directory: {tmp}\n", encoding="utf-8")
+        scope.scope_file_path = scope_file
+        scope.working_directory = tmp
+
+        plan_payload = json.dumps({
+            "goal": "新增工作並執行它",
+            "steps": [
+                {
+                    "title": "新增工作 run_test",
+                    "tool": "propose_scope_change",
+                    "args": {"kind": "job", "name": "run_test", "command": "echo test_job_done", "run_after": True},
+                    "expect": {"kind": "contains", "value": "test_job_done"},
+                }
+            ],
+        }, ensure_ascii=False)
+        self.assertIsNone(gateway.plan_runner.create(scope, 12345, plan_payload))
+        plan_id = store.list_active_plans()[0]["plan_id"]
+        steps = store.list_plan_steps(plan_id)
+        # Should be expanded to 2 steps: propose_scope_change + run_job
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["tool"], "propose_scope_change")
+        self.assertNotIn("run_after", steps[0]["args"])
+        self.assertEqual(steps[1]["tool"], "run_job")
+        self.assertEqual(steps[1]["args"], {"name": "run_test"})
+        self.assertEqual(steps[1]["expect"], {"kind": "contains", "value": "test_job_done"})
+
+        # Drive plan: confirm scope proposal, then confirm run_job
+        self._drive(gateway, store, 6, confirm=True)
+        steps_final = store.list_plan_steps(plan_id)
+        self.assertEqual([s["status"] for s in steps_final], ["done", "done"])
+        self.assertEqual(store.get_plan(plan_id)["status"], "done")
+
+    def test_propose_scope_change_run_after_non_job_is_refused(self) -> None:
+        gateway, scope, store, _calls, _out = self._plan_gateway()
+        plan_payload = json.dumps({
+            "goal": "新增主機",
+            "steps": [
+                {
+                    "title": "新增 probe_host",
+                    "tool": "propose_scope_change",
+                    "args": {"kind": "probe_host", "value": "example.com", "run_after": True},
+                }
+            ],
+        }, ensure_ascii=False)
+        refused = gateway.plan_runner.create(scope, 12345, plan_payload)
+        self.assertIn("run_after 只能用於指定名稱的 job", refused)
+
     def test_a_plan_is_refused_when_one_is_running_or_a_step_is_not_allowed(self) -> None:
         gateway, scope, store, _calls, _out = self._plan_gateway()
         self.assertIsNone(gateway.plan_runner.create(scope, 12345, self.PLAN))
